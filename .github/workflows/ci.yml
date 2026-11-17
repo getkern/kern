@@ -193,7 +193,9 @@ jobs:
 
   bindings:
     name: python binding (${{ matrix.python }})
-    runs-on: ubuntu-latest
+    # PINNED, NOT `ubuntu-latest`: since the runners moved to Ubuntu 26.04 `setup-python` has no 3.9
+    # for them, and this job exists to test the 3.9 floor `pyproject.toml` declares. 24.04 still has it.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

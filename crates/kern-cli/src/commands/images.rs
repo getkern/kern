@@ -409,10 +409,54 @@ pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) ->
 /// feedback: what it freed on success; any unknown ref is collected and the command FAILS (non-zero
 /// exit, one error listing them) so `kern rmi x && …` can't proceed on a no-op - matching `docker rmi`.
 pub fn image_rm(refs: &[String]) -> Result<(), Error> {
+    image_rm_with(refs, false)
+}
+
+/// The reference as a box records it: a name without a tag or digest is `:latest`, as `pull` reads it.
+fn normalised_ref(r: &str) -> String {
+    let last = r.rsplit('/').next().unwrap_or(r);
+    if last.contains(':') || r.contains('@') {
+        r.to_string()
+    } else {
+        format!("{r}:latest")
+    }
+}
+
+/// The box that uses `r` as its image, running or kept, if any.
+fn box_using_image(r: &str) -> Option<String> {
+    let want = normalised_ref(r);
+    let same = |img: &str| !img.is_empty() && normalised_ref(img) == want;
+    if let Some(i) = crate::registry::list().into_iter().find(|i| same(&i.image)) {
+        return Some(i.name);
+    }
+    crate::keepbox::list_matching(|_| true)
+        .into_iter()
+        .find(|k| same(&k.meta.image))
+        .map(|k| k.name)
+}
+
+/// `kern rmi [-f] <image>...`.
+///
+/// AN IMAGE A BOX USES IS REFUSED WITHOUT `-f`, in Docker's words. It was removed with "freed 3 B"
+/// under a running compose service, whose next `up` then read the service as "definition changed"
+/// and rebuilt it (reported). MEASURED on Docker 29: `docker rmi` of the only tag of an image a
+/// container uses, running OR stopped, answers `conflict: unable to remove repository reference
+/// "<ref>" (must force) - container <id> is using its referenced image <id>` and exits 1.
+pub fn image_rm_with(refs: &[String], force: bool) -> Result<(), Error> {
     if refs.is_empty() {
         return Err(Error::Usage(
-            "rmi <image>... - name at least one image (see `kern images`)",
+            "rmi [-f] <image>... - name at least one image (see `kern images`)",
         ));
+    }
+    if !force {
+        for r in refs {
+            if let Some(name) = box_using_image(r) {
+                return Err(Error::Oci(format!(
+                    "conflict: unable to remove repository reference \"{r}\" (must force) - box \
+                     {name} is using its referenced image. `kern rm {name}` first, or `kern rmi -f`"
+                )));
+            }
+        }
     }
     let cache = cache_dir();
     let p = crate::ui::Palette::detect();

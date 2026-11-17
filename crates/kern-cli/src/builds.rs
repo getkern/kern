@@ -219,6 +219,22 @@ impl Record {
         }
         now_unix.saturating_sub(self.started).saturating_mul(1000)
     }
+
+    /// [`Record::elapsed_ms`], and for an INTERRUPTED build (running, process gone) how long it ran:
+    /// from its start to the instant its captured output ended, which the capture's logger records at
+    /// EOF (`ended_path`). A Ctrl-C after 4 s showed `0ms`, and then, read from the log's last write,
+    /// 0.4 s for a RUN that slept silently (both reported). With no such record it stays 0. Separate
+    /// from `elapsed_ms` because it reads the build store, which a pure test of the clock must not.
+    pub fn shown_ms(&self, now_unix: u64) -> u64 {
+        if self.duration_ms == 0 && !self.is_live() && matches!(self.status, Status::Running) {
+            return std::fs::read_to_string(ended_path(&self.id))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|end| end.saturating_sub(self.started.saturating_mul(1000)))
+                .unwrap_or(0);
+        }
+        self.elapsed_ms(now_unix)
+    }
 }
 
 /// Collapse newlines so one free-text field stays on its own record line (same guard as the box
@@ -258,6 +274,12 @@ fn open_private(path: &Path, append: bool) -> io::Result<std::fs::File> {
 /// The transcript log path for build `id`.
 pub fn log_path(id: &str) -> PathBuf {
     record_dir(id).join("log")
+}
+
+/// The file holding the Unix time in milliseconds at which the build's captured output ended, written
+/// by the capture's logger at EOF. What an INTERRUPTED record shows as its duration.
+pub fn ended_path(id: &str) -> PathBuf {
+    record_dir(id).join("ended")
 }
 
 /// Write (or overwrite) the record's `meta` file. Called once at build start (status `running`) and
@@ -367,7 +389,7 @@ pub fn read_log(id: &str) -> Option<String> {
     if !valid_id(id) {
         return None;
     }
-    read_nofollow(&log_path(id), MAX_LOG_BYTES)
+    read_nofollow(&log_path(id), READ_LOG_BYTES)
 }
 
 /// All build records, newest first (by `started`, then id).
@@ -701,25 +723,63 @@ pub fn prune_to_config() -> usize {
     else {
         return 0;
     };
-    prune_sparing_live(
-        &record_ids_newest_first(),
-        keep as usize,
-        |id| get(id).is_some_and(|r| r.is_live()),
-        remove,
-    )
+    let ids = record_ids_newest_first();
+    // Nothing can go: the common case once the store is at its size costs no record read.
+    if ids.len() <= keep as usize {
+        return 0;
+    }
+    // NEWEST BY WHEN THEY ENDED, not by when they started. Ordered by start, a long build that ends
+    // after six short ones is the OLDEST record, so it either removed itself the moment it was
+    // written or, spared as live, left N+1 behind: measured against 6d93b85, 5 builds in parallel
+    // with `build_keep 3` left 4 records, and a 30 s build finishing after 6 others left 4.
+    let mut ended: Vec<(u64, String)> = Vec::with_capacity(ids.len());
+    let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for id in ids {
+        match get(&id) {
+            // A build in flight is not a record to keep yet: spared, and not counted.
+            Some(r) if matches!(r.status, Status::Running) && r.is_live() => {
+                live.insert(id);
+            }
+            Some(r) => ended.push((
+                r.started.saturating_mul(1000).saturating_add(r.duration_ms),
+                id,
+            )),
+            // Unreadable: placed by the start time its id carries, as every record used to be.
+            None => {
+                let started = id
+                    .split('-')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                ended.push((started.saturating_mul(1000), id));
+            }
+        }
+    }
+    ended.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut order: Vec<String> = live.iter().cloned().collect();
+    order.extend(ended.into_iter().map(|(_, id)| id));
+    prune_sparing_live(&order, keep as usize, |id| live.contains(id), remove)
 }
 
-/// The retention rule of [`prune_to_config`] over a newest-first id list, with liveness and removal
-/// supplied, so the rule is testable without a running build or the real build store.
+/// The retention rule of [`prune_to_config`] over an id list ordered newest first, with liveness
+/// and removal supplied, so the rule is testable without a running build or the real build store.
+///
+/// A LIVE BUILD IS SPARED AND NOT COUNTED: the `keep` newest ENDED records stay. Counting a build in
+/// flight among the kept is what let two builds that ended together each see the other as one of
+/// the N and leave N+1 behind.
 fn prune_sparing_live(
     ids_newest_first: &[String],
     keep: usize,
     live: impl Fn(&str) -> bool,
     mut remove: impl FnMut(&str) -> std::io::Result<bool>,
 ) -> usize {
-    let mut removed = 0;
-    for id in ids_newest_first.iter().skip(keep) {
+    let (mut kept, mut removed) = (0usize, 0usize);
+    for id in ids_newest_first {
         if live(id) {
+            continue;
+        }
+        if kept < keep {
+            kept += 1;
             continue;
         }
         match remove(id) {
@@ -733,27 +793,86 @@ fn prune_sparing_live(
 
 // ── Transcript capture ────────────────────────────────────────────────────────────────────────────
 //
-// A build prints its step lines (and each RUN box's output) to stderr. To persist that for `kern build
-// logs <id>` without threading a writer through every build function, [`Capture`] redirects this
-// process's fd 2 into the build's `log` file for the build's lifetime, teed LIVE back to the real
-// stderr so the user still sees the build. Child RUN boxes inherit the redirected fd 2, so their
-// stderr is captured too. On drop, stderr is restored and the logger drains and exits. stdout
-// (fd 1) is untouched, so `kern build ... | …` piping and the final `built '<tag>'` line are unchanged.
+// A build prints its step lines to stderr and each RUN box's output to stdout and stderr. To persist
+// that for `kern build logs <id>` without threading a writer through every build function, [`Capture`]
+// redirects this process's fd 2 into the build's `log` file for the build's lifetime, teed LIVE back to
+// the real stderr so the user still sees the build. Child RUN boxes inherit the redirected fd 2, so
+// their stderr is captured too.
 //
-// FORK SAFETY: the pipe is drained by a CHILD PROCESS, not a background thread - deliberately. A
+// RUN STDOUT GOES THROUGH A SECOND PIPE, handed to each RUN box by [`run_stdout`] and teed back to the
+// real stdout. kern's OWN fd 1 is untouched, so `kern build ... | …` piping, the final `built '<tag>'`
+// line and every terminal check on stdout are unchanged. Before this, a RUN's stdout went straight to
+// the terminal and never reached the log: measured on 6d93b85, `RUN echo OUT-42-X` printed `OUT-42-X`
+// and `kern build logs` held only the trailer line. Most of what a RUN prints (`apt`, `pip`, `make`)
+// is stdout, so the log was missing the part a failed build is read for.
+//
+// FORK SAFETY: the pipes are drained by a CHILD PROCESS, not a background thread - deliberately. A
 // reader THREAD would make `kern build` multi-threaded for the whole build, and a multi-stage build
 // then `fork()`s (and allocates in the child) to read a source stage's merged overlay view for
 // `COPY --from` (see `commands::merged_view_extract`) - which its fork-safety guard (correctly)
 // REFUSES in a multi-threaded process, breaking every multi-stage build. A separate logger process
 // keeps this process single-threaded, so that fork stays safe without weakening the guard.
 
-/// Cap the captured transcript so a pathological build can't grow an unbounded log.
+/// Cap the captured transcript so a pathological build can't grow an unbounded log: the FIRST half
+/// and the LAST half of it are kept, with a line saying how much was left out between them.
+///
+/// THE END IS WHERE A FAILED BUILD SAYS WHY. Keeping only the first MiB meant a noisy RUN before a
+/// failing one pushed the failure out of `kern build logs` entirely (reported: 3 MB of output, then
+/// `THE-REAL-ERROR`, and the log held 1 MiB of the noise and no error).
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
+const LOG_HEAD_BYTES: usize = (MAX_LOG_BYTES / 2) as usize;
+const LOG_TAIL_BYTES: usize = (MAX_LOG_BYTES / 2) as usize;
+/// What `read_log` reads: the cap, the omission line and the summary line appended after capture.
+const READ_LOG_BYTES: u64 = MAX_LOG_BYTES + 64 * 1024;
+
+/// The write end of the RUN-stdout pipe of the [`Capture`] in force, or -1. CLOEXEC, so nothing
+/// inherits it except a RUN box that is handed a duplicate by [`run_stdout`]. One build per process,
+/// one capture at a time: the value is published with `Release` once the pipe exists and read with
+/// `Acquire`, and swapped back to -1 before the fd is closed.
+static RUN_STDOUT_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// The stdout a RUN box should get: the capture's pipe while a build is being recorded, so its output
+/// reaches `kern build logs`, or `None` (inherit kern's own stdout, as before) when nothing records.
+pub fn run_stdout() -> Option<std::process::Stdio> {
+    use std::os::fd::FromRawFd as _;
+    let fd = RUN_STDOUT_FD.load(std::sync::atomic::Ordering::Acquire);
+    if fd < 0 {
+        return None;
+    }
+    // A duplicate per box: `Stdio` takes ownership and closes it after the spawn, the capture keeps
+    // the original until it ends.
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return None;
+    }
+    Some(std::process::Stdio::from(unsafe {
+        std::os::fd::OwnedFd::from_raw_fd(dup)
+    }))
+}
+
+/// Write all of `buf` to `fd`, retrying a short write and `EINTR`. `false` when the sink failed
+/// (its reader went away: `kern build | head -1`), and the caller stops teeing to it.
+fn write_all_fd(fd: i32, mut buf: &[u8]) -> bool {
+    while !buf.is_empty() {
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n > 0 {
+            buf = &buf[n as usize..];
+        } else if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
 
 /// RAII stderr→log tee. `start` returns `None` (build proceeds uncaptured) if the pipe/dup/fork fails -
 /// a logging problem must never fail a build.
 pub struct Capture {
     saved_err: i32,
+    /// The RUN-stdout pipe's write end (also published in [`RUN_STDOUT_FD`]), or -1 when the stdout
+    /// half could not be set up and RUN boxes inherit kern's stdout as before.
+    out_wr: i32,
     logger_pid: libc::pid_t,
 }
 
@@ -781,6 +900,26 @@ impl Capture {
             }
             return None;
         }
+        // The stdout half, optional: without it the build is still recorded, minus RUN stdout, which
+        // is exactly what it was before. Both ends CLOEXEC, for the reason `saved_err` is.
+        let saved_out = unsafe { libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 0) };
+        let mut ofds = [-1i32; 2];
+        let (out_rd, out_wr) =
+            if saved_out >= 0 && unsafe { libc::pipe2(ofds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
+                (ofds[0], ofds[1])
+            } else {
+                if saved_out >= 0 {
+                    unsafe { libc::close(saved_out) };
+                }
+                (-1, -1)
+            };
+        let close_out = || unsafe {
+            if out_rd >= 0 {
+                libc::close(out_rd);
+                libc::close(out_wr);
+                libc::close(saved_out);
+            }
+        };
         // Drain the tee in a child PROCESS (see the FORK SAFETY note above). Fork here, while the build
         // is still single-threaded, so this is a plain safe fork.
         let logger_pid = unsafe { libc::fork() };
@@ -790,29 +929,123 @@ impl Capture {
                 libc::close(wr);
                 libc::close(saved_err);
             }
+            close_out();
             return None;
         }
+        // Where the logger writes the moment the build's output ENDED (see `ended_path`), resolved
+        // before the fork like everything else the child uses.
+        let ended_at = ended_path(id);
         if logger_pid == 0 {
-            // ---- LOGGER CHILD: read the pipe, tee to the real stderr (inherited `saved_err`) + the log,
-            // until EOF. Holds only the read end - closing our copy of the write end is what lets the
-            // final EOF ever arrive once the parent (and any RUN box) drops fd 2. ----
-            unsafe { libc::close(wr) };
-            let mut buf = [0u8; 4096];
-            let mut written: u64 = 0;
-            loop {
-                let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
-                if n <= 0 {
-                    break; // EOF (all write ends closed) or error
-                }
-                let n = n as usize;
-                unsafe { libc::write(saved_err, buf.as_ptr().cast(), n) };
-                if written < MAX_LOG_BYTES {
-                    let _ = logf.write_all(&buf[..n]);
-                    written += n as u64;
+            // A Ctrl-C reaches the whole foreground group, this logger included, and a closing
+            // terminal sends SIGHUP after it. Ignored here, the logger outlives the build and its EOF
+            // is the build's end: the instant written below is what an interrupted record shows as
+            // its TIME. Taking the log's last write instead showed 0.4 s for a RUN that slept silently
+            // for 4 s before the Ctrl-C (reported). It cannot outlive the build: it ends at EOF, when
+            // the last process holding the pipe has gone.
+            unsafe {
+                for sig in [libc::SIGINT, libc::SIGHUP, libc::SIGTERM, libc::SIGQUIT] {
+                    libc::signal(sig, libc::SIG_IGN);
                 }
             }
+            // ---- LOGGER CHILD: read both pipes, tee each to its real stream (the inherited saved
+            // fds) and both to the log, until both reach EOF. Holds only the read ends - closing our
+            // copies of the write ends is what lets the final EOF ever arrive once the parent (and
+            // any RUN box) drops them. ----
             unsafe {
-                libc::close(rd);
+                libc::close(wr);
+                if out_wr >= 0 {
+                    libc::close(out_wr);
+                }
+            }
+            let mut pfds = [
+                libc::pollfd {
+                    fd: rd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                // A negative fd is ignored by `poll`: no stdout half, one stream.
+                libc::pollfd {
+                    fd: out_rd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // A READER THAT GOES AWAY ENDS THE TEE, NOT THE BUILD. kern restores SIGPIPE's
+            // default (main.rs), and this child inherits it: with `kern build ... | head -1` the
+            // first write after `head` exits killed the logger, the RUN box then wrote into a pipe
+            // nobody read and died of SIGPIPE too, and the build failed with exit 141 (measured,
+            // the same on 2acff4c before the stdout pipe existed, where the RUN wrote to the closed
+            // stdout directly). Ignored here, a failed write retires that one sink: the stream is
+            // still drained and still logged, so the RUN runs to its end and `kern build logs` has it.
+            // `build_one` already ignores SIGPIPE before this fork, so today this line is inherited
+            // anyway (a sabotage of it alone is NOT caught, measured); it keeps the tee correct for a
+            // caller that starts a capture without that guard.
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+            let mut sinks = [saved_err, if out_rd >= 0 { saved_out } else { -1 }];
+            let mut open = if out_rd >= 0 { 2 } else { 1 };
+            let mut buf = [0u8; 4096];
+            let mut head_written: usize = 0;
+            let mut tail: Vec<u8> = Vec::new();
+            let mut omitted: u64 = 0;
+            while open > 0 {
+                if crate::eintr::poll(&mut pfds, -1) < 0 {
+                    break;
+                }
+                for (p, sink) in pfds.iter_mut().zip(sinks.iter_mut()) {
+                    if p.fd < 0 || p.revents == 0 {
+                        continue;
+                    }
+                    let n = unsafe { libc::read(p.fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if n <= 0 {
+                        // EOF (all write ends closed) or an error: this stream is done.
+                        unsafe { libc::close(p.fd) };
+                        p.fd = -1;
+                        open -= 1;
+                        continue;
+                    }
+                    let chunk = &buf[..n as usize];
+                    if *sink >= 0 && !write_all_fd(*sink, chunk) {
+                        *sink = -1;
+                    }
+                    // The head goes to the file as it comes; past it, the last LOG_TAIL_BYTES are
+                    // held here and written at the end, after a line naming what fell between.
+                    let room = LOG_HEAD_BYTES.saturating_sub(head_written);
+                    let (to_head, rest) = chunk.split_at(room.min(chunk.len()));
+                    if !to_head.is_empty() {
+                        let _ = logf.write_all(to_head);
+                        head_written += to_head.len();
+                    }
+                    if !rest.is_empty() {
+                        tail.extend_from_slice(rest);
+                        if tail.len() > 2 * LOG_TAIL_BYTES {
+                            let drop_n = tail.len() - LOG_TAIL_BYTES;
+                            omitted += drop_n as u64;
+                            tail.drain(..drop_n);
+                        }
+                    }
+                }
+            }
+            if tail.len() > LOG_TAIL_BYTES {
+                let drop_n = tail.len() - LOG_TAIL_BYTES;
+                omitted += drop_n as u64;
+                tail.drain(..drop_n);
+            }
+            if omitted > 0 {
+                let _ = write!(
+                    logf,
+                    "\n[kern: {omitted} bytes of this build's output are not kept here; the first \
+                     and the last {} KiB are]\n",
+                    LOG_TAIL_BYTES / 1024
+                );
+            }
+            let _ = logf.write_all(&tail);
+            if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                let _ = std::fs::write(&ended_at, d.as_millis().to_string());
+            }
+            unsafe {
                 // `_exit`: skip atexit/flush and never unwind back into the parent's build logic.
                 libc::_exit(0)
             };
@@ -832,10 +1065,16 @@ impl Capture {
             libc::close(rd);
             libc::dup2(wr, 2);
             libc::close(wr);
+            if out_rd >= 0 {
+                libc::close(out_rd);
+                libc::close(saved_out);
+            }
         }
         drop(logf);
+        RUN_STDOUT_FD.store(out_wr, std::sync::atomic::Ordering::Release);
         Some(Capture {
             saved_err,
+            out_wr,
             logger_pid,
         })
     }
@@ -843,6 +1082,12 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        // Unpublish the stdout pipe, then close it: no RUN box can be handed it after this, and with
+        // fd 2 restored below the last write ends are gone, so the logger reaches EOF on both.
+        RUN_STDOUT_FD.store(-1, std::sync::atomic::Ordering::Release);
+        if self.out_wr >= 0 {
+            unsafe { libc::close(self.out_wr) };
+        }
         // Restore fd 2 → the last pipe-write ref is gone → the logger child hits EOF and exits.
         unsafe { libc::dup2(self.saved_err, 2) };
         // fd 2 is the user's stream again: the gate asks it directly.
@@ -1529,8 +1774,8 @@ mod build_keep_tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// `build_keep`: the newest N stay, older ones go, and a build still running is never removed
-    /// however old it is.
+    /// `build_keep`: the newest N ended records stay, older ones go, and a build still running is
+    /// never removed however old it is, and does not take one of the N places.
     #[test]
     fn the_newest_n_are_kept_and_a_running_build_is_spared() {
         let ids: Vec<String> = (0..6).rev().map(|i| format!("170000000{i}-1")).collect();
@@ -1549,6 +1794,24 @@ mod build_keep_tests {
             *gone.borrow(),
             vec!["1700000003-1", "1700000002-1", "1700000000-1"],
             "the two newest are kept and the running one is spared"
+        );
+        // A LIVE BUILD DOES NOT TAKE ONE OF THE N PLACES: with the newest one in flight, the two
+        // ended ones after it are kept. Counting it, as before, kept one ended record and let two
+        // builds ending together each see the other as kept, leaving N+1.
+        let gone = RefCell::new(Vec::new());
+        let n = prune_sparing_live(
+            &ids,
+            2,
+            |id| id == "1700000005-1",
+            |id| {
+                gone.borrow_mut().push(id.to_string());
+                Ok(true)
+            },
+        );
+        assert_eq!(n, 3);
+        assert_eq!(
+            *gone.borrow(),
+            vec!["1700000002-1", "1700000001-1", "1700000000-1"]
         );
     }
 

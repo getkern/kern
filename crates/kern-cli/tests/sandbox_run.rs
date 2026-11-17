@@ -4627,7 +4627,12 @@ fn run_applies_vcpu_profile_from_kern_toml() {
     let _ = fs::create_dir_all(cfgdir.join("kern"));
     fs::write(
         cfgdir.join("kern/kern.toml"),
-        "[[vcpu]]\nname = \"pinned\"\nbackend = \"host\"\ncpuset = \"0\"\nmemory = \"64m\"\n",
+        // NO `memory`: the profile asks only for what the comment above promises to observe on
+        // any host. With `memory = "64m"` a host that cannot enforce it refuses the box ("--memory
+        // was requested and nothing here enforces it"), which is right, and the test then failed
+        // on an empty stdout for a reason that has nothing to do with the pin (reported on WSL2
+        // with no delegated memory controller). The memory half is covered where it is enforced.
+        "[[vcpu]]\nname = \"pinned\"\nbackend = \"host\"\ncpuset = \"0\"\n",
     )
     .unwrap();
     // Retry on empty stdout - `kern run` re-execs into a systemd scope whose piped output can come

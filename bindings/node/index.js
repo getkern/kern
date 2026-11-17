@@ -2807,6 +2807,131 @@ function tmpfsItems(spec) {
   return Object.entries(spec);
 }
 
+// The components a source's CONTENTS are scanned for, minus three that are ordinary in a project, and
+// the scan's bounds. See `_MOUNT_SCAN_EXEMPT` / `_credential_inside` in the Python binding, which
+// this mirrors: `mounts={"/home": ...}` was accepted and the box read `alex/.ssh`.
+const MOUNT_SCAN_EXEMPT = new Set([".npmrc", ".pypirc", ".docker"]);
+const MOUNT_SCAN_DEPTH = 2;
+// How long the scan may take before the source is REFUSED: a FUSE source whose READDIR never answers
+// held the constructor in an uninterruptible read (reported), and an unchecked source is not mounted.
+// Mirrors `_MOUNT_SCAN_DEADLINE_S`.
+const MOUNT_SCAN_DEADLINE_MS = 10000;
+
+/** `credentialInside` in a worker thread with a deadline: `{ done: false }` when it did not finish.
+ * The constructor is synchronous, so the main thread waits on shared memory (`Atomics.wait`) rather
+ * than on the event loop; a worker stuck in a kernel read stays stuck, unreferenced, and the caller
+ * gets an answer. */
+function credentialInsideBounded(real, deadlineMs = MOUNT_SCAN_DEADLINE_MS) {
+  const { Worker } = require("node:worker_threads");
+  const flag = new Int32Array(new SharedArrayBuffer(4));
+  const out = new Uint8Array(new SharedArrayBuffer(8192));
+  const src = `
+    const fs = require("node:fs"), path = require("node:path");
+    const { workerData } = require("node:worker_threads");
+    const REFUSED_MOUNT_COMPONENTS = new Set(${JSON.stringify([...REFUSED_MOUNT_COMPONENTS])});
+    const REFUSED_MOUNT_PAIRS = new Set(${JSON.stringify([...REFUSED_MOUNT_PAIRS])});
+    const MOUNT_SCAN_EXEMPT = new Set(${JSON.stringify([...MOUNT_SCAN_EXEMPT])});
+    const MOUNT_SCAN_DEPTH = ${MOUNT_SCAN_DEPTH};
+    ${credentialInside.toString()}
+    // A scan that THREW did not look: reported as such, and the caller refuses (it used to read as
+    // "nothing found" and accept, found by review).
+    let result;
+    try { result = { hit: credentialInside(workerData.real) }; } catch { result = { error: true }; }
+    const bytes = Buffer.from(JSON.stringify(result));
+    const n = Math.min(bytes.length, workerData.out.length);
+    workerData.out.set(bytes.subarray(0, n));
+    Atomics.store(workerData.flag, 0, n + 1);
+    Atomics.notify(workerData.flag, 0);
+  `;
+  const w = new Worker(src, { eval: true, workerData: { real, flag, out } });
+  w.unref();
+  Atomics.wait(flag, 0, 0, deadlineMs);
+  // No result written means the scan did not finish, whatever woke the wait.
+  const n = Atomics.load(flag, 0);
+  if (n === 0) {
+    w.terminate().catch(() => {});
+    return { done: false, hit: null };
+  }
+  let result;
+  try {
+    result = JSON.parse(Buffer.from(out.subarray(0, n - 1)).toString("utf8"));
+  } catch {
+    // A result that does not parse is a scan that did not report: treated as not finished.
+    return { done: false, hit: null };
+  }
+  if (!result || result.error) return { done: false, hit: null };
+  return { done: true, hit: result.hit === undefined ? null : result.hit };
+}
+
+/** Is `p` the directory `root` itself or anything beneath it (both normalised)? `/` is only itself. */
+function isInside(p, root) {
+  if (root === "/") return p === "/";
+  return p === root || p.startsWith(root + "/");
+}
+
+/** The first credential name in the first MOUNT_SCAN_DEPTH levels under `real`, relative, or null. */
+function credentialInside(real) {
+  const pairs = new Map();
+  for (const pair of [...REFUSED_MOUNT_PAIRS].sort()) {
+    const [a, b] = pair.split("/");
+    if (!pairs.has(a)) pairs.set(a, []);
+    pairs.get(a).push(b);
+  }
+  // PATHS AS BYTES: a directory whose name is not valid UTF-8 came back as a lossy string that
+  // could not be reopened, so a `.ssh` below it was never seen (found by review). The names this
+  // compares against are ASCII, so a byte name is compared as latin1, which maps every byte.
+  const slash = Buffer.from("/");
+  let level = [[Buffer.from(real), ""]];
+  for (let depth = 0; depth < MOUNT_SCAN_DEPTH; depth++) {
+    const next = [];
+    for (const [dir, rel] of level) {
+      // ONE ENTRY AT A TIME (bufferSize 1), as Python's `os.scandir` reads, so the scan stops at the
+      // first hit: the default (32) made libuv read on to 32 entries or the end, a second READDIR
+      // before the first entry came back (measured on a slow FUSE source: 6.02 s against 3.00 s).
+      let handle;
+      try {
+        handle = fs.opendirSync(dir, { bufferSize: 1, encoding: "buffer" });
+      } catch {
+        continue;
+      }
+      try {
+        for (;;) {
+          let e;
+          try {
+            e = handle.readSync();
+          } catch {
+            break;
+          }
+          if (e === null) break;
+          const name = Buffer.isBuffer(e.name) ? e.name.toString("latin1") : String(e.name);
+          const here = rel + name;
+          if (REFUSED_MOUNT_COMPONENTS.has(name) && !MOUNT_SCAN_EXEMPT.has(name)) return here;
+          const child_path = Buffer.concat([dir, slash, Buffer.isBuffer(e.name) ? e.name : Buffer.from(name)]);
+          for (const child of pairs.get(name) || []) {
+            let present = false;
+            try {
+              fs.lstatSync(Buffer.concat([child_path, slash, Buffer.from(child)]));
+              present = true;
+            } catch {
+              present = false;
+            }
+            if (present) return `${here}/${child}`;
+          }
+          if (e.isDirectory()) next.push([child_path, here + "/"]);
+        }
+      } finally {
+        try {
+          handle.closeSync();
+        } catch {
+          // already closed
+        }
+      }
+    }
+    level = next;
+  }
+  return null;
+}
+
 /** Validate one host->box mount; refuse unsafe sources/targets. Returns [absRealSource, target]. */
 function validateMount(source, target) {
   if (typeof target !== "string" || !target.startsWith("/"))
@@ -2835,6 +2960,22 @@ function validateMount(source, target) {
     throw new MountRefused(
       `refusing to mount the sensitive host path ${JSON.stringify(real)} into a sandbox ` +
         "(this would defeat the isolation)",
+    );
+  // A PARENT OF A REFUSED PATH IS REFUSED, because it holds it (`/home` holds `$HOME`). Mirrors Python.
+  const protectedPaths = [[home, "your home directory"]];
+  for (const t of REFUSED_MOUNT_TREES) protectedPaths.push([t, "a host credential path"]);
+  for (const t of REFUSED_MOUNT_SOURCES) if (t !== "/") protectedPaths.push([t, "a sensitive host path"]);
+  for (const [state, what] of kernStateDirs()) {
+    let sreal;
+    try { sreal = fs.realpathSync(state); } catch { sreal = state; }
+    protectedPaths.push([sreal, what]);
+  }
+  protectedPaths.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+  const held = protectedPaths.find(([t]) => t !== real && isInside(t, real));
+  if (held !== undefined)
+    throw new MountRefused(
+      `refusing to mount ${JSON.stringify(real)}: it contains ${JSON.stringify(held[0])}, ${held[1]}, ` +
+        "and code in the box would read it. Mount the subdirectory the job needs instead",
     );
   for (const [state, what] of kernStateDirs()) {
     let sreal;
@@ -2870,6 +3011,29 @@ function validateMount(source, target) {
       `refusing to mount ${JSON.stringify(real)}: ${JSON.stringify(hit)} holds credentials, and code ` +
         "in the box would read them. If the job needs one secret, write THAT FILE into the workspace " +
         "(sbx.writeFile) or mount a directory that holds only it",
+    );
+  let isDir = false;
+  try {
+    isDir = fs.statSync(real).isDirectory();
+  } catch {
+    isDir = false;
+  }
+  let inside = null;
+  if (isDir) {
+    const scan = credentialInsideBounded(real);
+    if (!scan.done)
+      throw new MountRefused(
+        `refusing to mount ${JSON.stringify(real)}: its contents could not be checked for credentials ` +
+          `within ${MOUNT_SCAN_DEADLINE_MS / 1000} s (a filesystem that does not answer), and an ` +
+          "unchecked source is not mounted",
+      );
+    inside = scan.hit;
+  }
+  if (inside !== null)
+    throw new MountRefused(
+      `refusing to mount ${JSON.stringify(real)}: it contains ${JSON.stringify(inside)}, which holds ` +
+        "credentials, and code in the box would read them. Mount the subdirectory the job needs, or " +
+        "write the one file it needs into the workspace (sbx.writeFile)",
     );
   return [real, target];
 }
@@ -7155,7 +7319,8 @@ class Kernel {
       return ["startup_failed", "the kernel box failed to start", rc];
     // NO SIGNAL AND A REAL EXIT STATUS: the cell ended the interpreter itself, `os._exit(N)` being the
     // ordinary way. The one-shot path reports that as exitCode N and no fault; this one said `killed`.
-    // Mirrors the Python branch, which is placed after the cap branch there and reaches the same answer.
+    // Before the cap branch, as in Python: there it used to sit after it, and on a host without cgroup
+    // delegation (`capSignal === 2`) the two bindings then disagreed about `os._exit(3)`.
     if (workloadSignal === 0 && exitStatus !== null) return [null, "", exitStatus];
     if (capSignal === 2)
       return [
@@ -7898,6 +8063,9 @@ module.exports = {
   // own comment records a verb-parsing defect "found in both bindings at once, with no test on it", and
   // the next one was a mode-0 FILE reported as somebody else's DIRECTORY. What it names is the only
   // thing a caller has to go on, so what it names is a contract.
+  // The bounded mount scan, exported for its tests only: the deadline branch is the one a hostile
+  // filesystem reaches, and a test cannot build one; a deadline of 0 reaches it deterministically.
+  _credentialInsideBounded: credentialInsideBounded,
   _pathRefusal: pathRefusal,
   _CLOSED_PATH_CAUSES: CLOSED_PATH_CAUSES,
   // The workspace cap's POLICY, exported for its tests only: how long the poller waits is what decides

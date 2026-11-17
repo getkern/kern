@@ -179,6 +179,9 @@ impl Error {
             }
             // The right hint depends on *why* the pull failed - telling someone whose image name is
             // wrong to "install curl and tar" sends them down the wrong path. Branch on the message.
+            // A refusal that already names the box and both ways out has no hint to add; the generic
+            // one ("check the image name and tag exist") contradicted it, the name being right.
+            Error::Oci(msg) if msg.starts_with("conflict: unable to remove") => None,
             Error::Oci(msg) => Some(oci_hint(msg)),
             // THE HINT USED TO DESCRIBE THE WRONG FILE FORMAT. kern reads two kinds of stack: a
             // `docker-compose.yml` and its own TOML. The hint named only the TOML

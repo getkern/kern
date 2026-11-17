@@ -125,11 +125,16 @@ pub fn upsert_block(raw: &str, header: &str, name: &str, body_lines: &[String]) 
 }
 
 /// The `key` of a `key = value` line (trimmed), or `None` for a comment / blank / section line.
-fn line_key(trimmed: &str) -> Option<&str> {
+fn line_key(trimmed: &str) -> Option<std::borrow::Cow<'_, str>> {
     if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
         return None;
     }
-    trimmed.split_once('=').map(|(k, _)| k.trim())
+    // The key as the reader names it, so a quoted `"log_max_size"` is found by `get` and replaced by
+    // `set` exactly as the reader applies it (`crate::config::toml_key`).
+    trimmed.split_once('=').map(|(k, _)| {
+        let k = k.trim();
+        crate::config::toml_key(k).unwrap_or(std::borrow::Cow::Borrowed(k))
+    })
 }
 
 /// Like [`upsert_block`], but **field-surgical**: when the block already exists it keeps every line
@@ -201,13 +206,16 @@ pub fn delete_block(raw: &str, header: &str, name: &str) -> String {
 
 /// Is this trimmed line the header of the single table `[table]` (not an array of tables)?
 fn is_table_header(trimmed: &str, table: &str) -> bool {
+    // Compared as the reader names it (`crate::config::key_path`): `[ "kern" ]` IS `[kern]`, so a
+    // `set` lands in it instead of appending a second `[kern]`.
     !trimmed.starts_with("[[")
         && trimmed
             .strip_prefix('[')
             .and_then(|r| r.split_once(']'))
             .is_some_and(|(name, rest)| {
                 let rest = rest.trim();
-                name.trim() == table && (rest.is_empty() || rest.starts_with('#'))
+                crate::config::key_path(name).is_some_and(|p| p.join(".") == table)
+                    && (rest.is_empty() || rest.starts_with('#'))
             })
 }
 
@@ -226,25 +234,70 @@ fn append_section(raw: &str, text: &str) -> String {
     s
 }
 
+/// Which lines lie INSIDE a multi-line string (`"""` or `'''`), the opening line excluded: what looks
+/// like a header or a key there is string content, and the reader (`crate::config::parse`) reads it
+/// as such. The edits below skip those lines, or `config set` wrote `publish_bind` into a `[kern]`
+/// that was only text inside a string, `get` echoed it back, and the reader applied nothing, leaving
+/// ports on 0.0.0.0 (found by review). Same opening rule as the reader: a value that starts with the
+/// delimiter and does not close it on its own line.
+fn inside_multiline_string(lines: &[&str]) -> Vec<bool> {
+    let mut mask = vec![false; lines.len()];
+    let mut open: Option<&str> = None;
+    for (i, l) in lines.iter().enumerate() {
+        if let Some(delim) = open {
+            mask[i] = true;
+            if l.contains(delim) {
+                open = None;
+            }
+            continue;
+        }
+        let code = kern_common::toml_lite::strip_comment(l);
+        if let Some((_, v)) = code.split_once('=') {
+            let v = v.trim();
+            for delim in ["\"\"\"", "'''"] {
+                if v.starts_with(delim) && !v[3..].contains(delim) {
+                    open = Some(delim);
+                }
+            }
+        }
+    }
+    mask
+}
+
 /// Set `key` in the single table `[table]` to the whole line `line` (`key = value`), or remove it
 /// with `None`. The key is replaced where it stands; a new key goes after the table's last key line,
 /// and a missing table is appended at the end. Every other line is kept byte for byte.
 pub fn set_table_key(raw: &str, table: &str, key: &str, line: Option<&str>) -> String {
     let lines: Vec<&str> = raw.lines().collect();
-    let Some(start) = lines.iter().position(|l| is_table_header(l.trim(), table)) else {
+    let in_str = inside_multiline_string(&lines);
+    let Some(start) =
+        (0..lines.len()).find(|&i| !in_str[i] && is_table_header(lines[i].trim(), table))
+    else {
         return match line {
             Some(line) => append_section(raw, &format!("[{table}]\n{line}")),
             None => raw.to_string(),
         };
     };
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| starts_any_section(l.trim()))
-        .map_or(lines.len(), |i| start + 1 + i);
+    let end = (start + 1..lines.len())
+        .find(|&i| !in_str[i] && starts_any_section(lines[i].trim()))
+        .unwrap_or(lines.len());
     let mut out: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
-    match (start + 1..end).find(|&i| line_key(lines[i].trim()) == Some(key)) {
+    match (start + 1..end)
+        .find(|&i| !in_str[i] && line_key(lines[i].trim()).as_deref() == Some(key))
+    {
         Some(i) => match line {
-            Some(l) => out[i] = l.to_string(),
+            // The line's own comment stays with it: `log_max_size = "16m"   # my note` set to 10m
+            // keeps `   # my note`, the spacing included. Only the `key = value` part is the
+            // caller's to replace.
+            Some(l) => {
+                let code = kern_common::toml_lite::strip_comment(lines[i]);
+                let comment = &lines[i][code.len()..];
+                out[i] = if comment.is_empty() {
+                    l.to_string()
+                } else {
+                    format!("{l}{}{comment}", &code[code.trim_end().len()..])
+                };
+            }
             None => {
                 out.remove(i);
             }
@@ -253,8 +306,13 @@ pub fn set_table_key(raw: &str, table: &str, key: &str, line: Option<&str>) -> S
             if let Some(l) = line {
                 let after = (start + 1..end)
                     .rev()
-                    .find(|&i| line_key(lines[i].trim()).is_some())
+                    .find(|&i| !in_str[i] && line_key(lines[i].trim()).is_some())
                     .unwrap_or(start);
+                // Never inside a string that the last key opened: after its closing line.
+                let after = (after + 1..end)
+                    .take_while(|&i| in_str[i])
+                    .last()
+                    .unwrap_or(after);
                 out.insert(after + 1, l.to_string());
             }
         }
@@ -267,14 +325,14 @@ pub fn set_table_key(raw: &str, table: &str, key: &str, line: Option<&str>) -> S
 /// and key rules, so `kern config get` reports exactly the line `kern config set` wrote.
 pub fn get_table_key(raw: &str, table: &str, key: &str) -> Option<String> {
     let lines: Vec<&str> = raw.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| is_table_header(l.trim(), table))?;
-    lines[start + 1..]
-        .iter()
-        .take_while(|l| !starts_any_section(l.trim()))
-        .find(|l| line_key(l.trim()) == Some(key))
-        .and_then(|l| l.split_once('='))
+    let in_str = inside_multiline_string(&lines);
+    let start =
+        (0..lines.len()).find(|&i| !in_str[i] && is_table_header(lines[i].trim(), table))?;
+    (start + 1..lines.len())
+        .filter(|&i| !in_str[i])
+        .take_while(|&i| !starts_any_section(lines[i].trim()))
+        .find(|&i| line_key(lines[i].trim()).as_deref() == Some(key))
+        .and_then(|i| lines[i].split_once('='))
         .map(|(_, v)| kern_common::toml_lite::strip_comment(v).trim().to_string())
 }
 
@@ -290,6 +348,84 @@ fn with_trailing_newline(s: &str, original: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Text inside a multi-line string is not a header or a key: `set` neither writes into a `[kern]`
+    /// that is string content nor replaces a `publish_bind` line inside a string (found by review:
+    /// the write went where the reader applies nothing, and ports stayed on 0.0.0.0).
+    #[test]
+    fn a_multi_line_string_is_never_edited_as_a_table() {
+        let raw = "[future]\nnote = \"\"\"\n[kern]\n\"\"\"\n";
+        let out = set_table_key(
+            raw,
+            "kern",
+            "publish_bind",
+            Some("publish_bind = \"127.0.0.1\""),
+        );
+        assert!(
+            out.ends_with("\"\"\"\n\n[kern]\npublish_bind = \"127.0.0.1\"\n"),
+            "{out}"
+        );
+        assert_eq!(get_table_key(raw, "kern", "publish_bind"), None);
+        let raw = "[kern]\nnotes = \"\"\"\npublish_bind = \"0.0.0.0\"\n\"\"\"\npublish_bind = \"0.0.0.0\"\n";
+        let out = set_table_key(
+            raw,
+            "kern",
+            "publish_bind",
+            Some("publish_bind = \"127.0.0.1\""),
+        );
+        assert_eq!(
+            out,
+            "[kern]\nnotes = \"\"\"\npublish_bind = \"0.0.0.0\"\n\"\"\"\npublish_bind = \"127.0.0.1\"\n"
+        );
+        let c = crate::config::parse(&out).expect("parses");
+        assert_eq!(c.kern.publish_bind.as_deref(), Some("127.0.0.1"));
+    }
+
+    /// A quoted header IS the table: `set` writes into `[ "kern" ]` instead of appending a second
+    /// `[kern]`, which TOML refuses (reported: `Cannot declare ('kern',) twice`).
+    #[test]
+    fn a_quoted_header_is_the_table_a_set_writes_into() {
+        let raw = "[ \"kern\" ]\nlog_max_size = \"10m\"\n";
+        assert_eq!(
+            set_table_key(raw, "kern", "log_max_file", Some("log_max_file = 2")),
+            "[ \"kern\" ]\nlog_max_size = \"10m\"\nlog_max_file = 2\n"
+        );
+    }
+
+    /// A quoted key is found and replaced as the bare one, because the reader applies it as such.
+    #[test]
+    fn a_quoted_key_is_found_and_replaced() {
+        let raw = "[kern]\n\"log_max_size\" = \"10m\"\n";
+        assert_eq!(
+            get_table_key(raw, "kern", "log_max_size").as_deref(),
+            Some("\"10m\"")
+        );
+        assert_eq!(
+            set_table_key(raw, "kern", "log_max_size", Some("log_max_size = \"20m\"")),
+            "[kern]\nlog_max_size = \"20m\"\n"
+        );
+    }
+
+    /// Measured on 6d93b85: `config set` on a line carrying a comment dropped the comment.
+    #[test]
+    fn a_set_keeps_the_comment_on_the_line_it_replaces() {
+        let raw = "[kern]\nlog_max_size = \"16m\"   # my own note\nlog_max_file = 2\n";
+        assert_eq!(
+            set_table_key(raw, "kern", "log_max_size", Some("log_max_size = \"10m\"")),
+            "[kern]\nlog_max_size = \"10m\"   # my own note\nlog_max_file = 2\n"
+        );
+        // A `#` inside the value is not a comment and is not carried over.
+        let raw = "[kern]\nlog_level = \"a#b\"\n";
+        assert_eq!(
+            set_table_key(raw, "kern", "log_level", Some("log_level = \"info\"")),
+            "[kern]\nlog_level = \"info\"\n"
+        );
+        // Unset removes the line, comment and all.
+        assert_eq!(
+            set_table_key("[kern]\nx = 1 # c\n", "kern", "x", None),
+            "[kern]\n"
+        );
+    }
 
     #[test]
     fn a_kern_key_is_set_in_place_added_after_the_last_key_and_removed() {

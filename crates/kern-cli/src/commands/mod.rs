@@ -1402,6 +1402,8 @@ struct BuildSpec<'a> {
     cpuset: Option<String>,
     vgpio_devs: Vec<String>,
     vgpio_sysfs: Vec<String>,
+    /// See `kern_isolation::SandboxSpec::gpu_sysfs`.
+    gpu_sysfs: Vec<String>,
     gpu_enumeration: kern_isolation::GpuEnumeration,
     refresh_ldcache: bool,
     /// See `kern_isolation::SandboxSpec::ldconfig_dirs`.
@@ -1729,6 +1731,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         pty_sock_parent: None,
         vgpio_devs: b.vgpio_devs,
         vgpio_sysfs: b.vgpio_sysfs,
+        gpu_sysfs: b.gpu_sysfs,
         gpu_enumeration: b.gpu_enumeration,
         // The loader caches a GPU box's `ldconfig` produced, kept beside the image cache for the
         // next box of the same image and grant: see `kern_isolation`'s `ldcache_key`.
@@ -4418,8 +4421,17 @@ const STAGE_TAG_PREFIX: &str = ".stage-";
 /// can't drift.
 fn announce_built(tag: &str) {
     if !tag.starts_with(STAGE_TAG_PREFIX) {
-        println!("built '{tag}'");
-        println!("  run: kern box myapp --image {tag}");
+        // NOT `println!`: this runs while the build ignores SIGPIPE (see `build_one`), and a
+        // `println!` to a closed stdout panics. A reader that went away misses the line; the
+        // build, its record and its image are not affected by that.
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "built '{tag}'");
+        // The `run:` hint is for an image someone built by hand; one built for a stack is run by it.
+        if crate::global_env("KERN_BUILD_FOR_COMPOSE").is_none() {
+            let _ = writeln!(out, "  run: kern box myapp --image {tag}");
+        }
+        let _ = out.flush();
     }
 }
 
@@ -5093,6 +5105,11 @@ fn run_build_step(
     cmd.arg("--");
     for a in argv {
         cmd.arg(a);
+    }
+    // While the build is recorded, the RUN's stdout goes through the capture so `kern build logs`
+    // holds it too (see `builds::Capture`); it still reaches the terminal through the tee.
+    if let Some(out) = crate::builds::run_stdout() {
+        cmd.stdout(out);
     }
     let status = cmd
         .status()
@@ -5788,13 +5805,31 @@ pub(crate) fn resolve_builds_for(
             if !build_wanted(policy, b.pull.as_deref(), image)? {
                 continue;
             }
+        } else if policy != BuildPolicy::Always
+            && b.pull
+                .as_deref()
+                .map(|p| p.trim().to_ascii_lowercase())
+                .as_deref()
+                != Some("build")
+        {
+            // `build:` ALONE IS BUILT WHEN ITS IMAGE IS MISSING, as Docker builds it: `up` reuses the
+            // image the last build made, and `--build` (or `pull_policy: build`) builds again. It was
+            // rebuilt on EVERY `up`, which on a real stack meant a second `up` rebuilt the app and
+            // recreated it, where Docker left it running (reported on a Postgres + Hatchet stack;
+            // measured here: Docker `Running`, kern `definition changed, recreating: app`). Only the
+            // local store is asked: this tag is kern's own and no registry has it.
+            let tag = synthesized_build_tag(&b.name);
+            if resolve_image_depth(&tag, 0, PullPolicy::Never).is_ok() {
+                b.image = Some(tag);
+                continue;
+            }
         }
         let Some((ctx_abs, dfile)) = resolved_build_context(b, &base, &root)? else {
             continue;
         };
 
         // Guard 4 - `image:` + `build:` = Docker's rule (`build_wanted`, above), and a build is tagged
-        // as `image`; `build:` alone → synthesized tag, rebuilt every time.
+        // as `image`; `build:` alone → synthesized tag, built when missing (above) or on `--build`.
         // LOWERCASED, BECAUSE KERN GENERATES THIS NAME AND OCI REPOSITORY NAMES ARE LOWERCASE.
         //
         // The box name carries the project directory, and a directory with a capital letter is
@@ -5814,6 +5849,7 @@ pub(crate) fn resolve_builds_for(
 
         kern_common::progress!("→ building '{}' from {}", b.name, bd.context);
         let mut cmd = std::process::Command::new(self_exe);
+        cmd.env("KERN_BUILD_FOR_COMPOSE", "1");
         cmd.arg("build").arg("-t").arg(&tag);
         if let Some(df) = &dfile {
             cmd.arg("-f").arg(df);
@@ -6550,6 +6586,19 @@ pub(crate) fn declared_host_ports(b: &crate::compose::ComposeBox) -> Vec<u16> {
 /// equality check between two runs of the SAME binary, not a security boundary - collisions here
 /// would mean a missed recreate, not a trust decision, and no adversary chooses the input.
 fn definition_hash(b: &crate::compose::ComposeBox) -> String {
+    // A `build:`-only service is hashed under the tag its build gets. This runs BEFORE the builds of
+    // an `up`, when that service has no image yet, while the launch recorded the hash WITH the tag:
+    // the two never matched, and every `up` recreated the service (reported on a real stack, where
+    // Docker left it running).
+    let tagged;
+    let b = if b.image.is_none() && b.build.is_some() {
+        let mut c = b.clone();
+        c.image = Some(synthesized_build_tag(&b.name));
+        tagged = c;
+        &tagged
+    } else {
+        b
+    };
     let mut cmd = std::process::Command::new("kern");
     b.push_box_flags(&mut cmd);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -6566,6 +6615,20 @@ fn definition_hash(b: &crate::compose::ComposeBox) -> String {
     for c in &b.command {
         eat(c.as_bytes());
         eat(&[0]);
+    }
+    // AND, FOR A SERVICE BUILT HERE, WHAT ITS IMAGE IS: the layer list, read from the local store
+    // only. A rebuild that changed the image changes the hash, so `up --build` recreates the service
+    // as Docker does when the image ID moves, and a rebuild that changed nothing leaves it running.
+    if b.build.is_some() {
+        if let Some(img) = b.image.as_deref() {
+            if let Ok((layers, _)) = resolve_image_depth(img, 0, PullPolicy::Never) {
+                eat(b"\0image\0");
+                for l in &layers {
+                    eat(l.as_bytes());
+                    eat(&[0]);
+                }
+            }
+        }
     }
     format!("{h:016x}")
 }
@@ -11521,24 +11584,8 @@ pub(crate) fn tailored_kern_toml(h: &HostInv) -> String {
     s
 }
 
-/// `kern validate [path]` - parse a `kern.toml` (the given path, or the default location) and report
-/// success with profile counts, or the offending line. Exits non-zero on a parse error.
-/// Count `[` and `]` in `line` that are OUTSIDE single/double quotes - so a bracket inside a string
-/// value doesn't fool the multi-line-array tracking in `validate`. Escape-agnostic (TOML basic strings
-/// use `\\`, but for bracket-balance the simple quote toggle is sufficient for a best-effort linter).
-fn brackets_outside_quotes(line: &str) -> (usize, usize) {
-    let (mut opens, mut closes, mut q) = (0usize, 0usize, 0u8);
-    for b in line.bytes() {
-        match b {
-            b'"' | b'\'' if q == 0 => q = b,
-            _ if b == q => q = 0,
-            b'[' if q == 0 => opens += 1,
-            b']' if q == 0 => closes += 1,
-            _ => {}
-        }
-    }
-    (opens, closes)
-}
+#[cfg(test)]
+pub(crate) use crate::config::brackets_outside_quotes;
 
 /// A ready-to-use example config covering the resource families kern-public supports (CPU/GPIO/disk).
 const EXAMPLE_KERN_TOML: &str = r#"# ~/.config/kern/kern.toml - resource profiles for `kern run`/`kern box`.

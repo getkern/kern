@@ -787,6 +787,14 @@ impl Drop for ReaperHold {
     }
 }
 
+/// How long a teardown waits for a SIGKILLed init to be gone, then how long after a second SIGKILL,
+/// before it reports the box unconfirmed: Docker's two waits on Linux (`daemon/kill.go`: 10 s after
+/// the SIGKILL, then a direct kill and 2 s more). Both end the moment the box exits, so an ordinary
+/// stop pays neither. 5 s was not enough on a saturated WSL2 host: 6 of 28 stops under a 20-box load
+/// gave up at 6.0 s and the pid was gone 10 ms later (reported).
+const KILL_CONFIRM_MS: i32 = 10_000;
+const KILL_RECONFIRM_MS: i32 = 2_000;
+
 /// What a teardown did, and the box's real exit code when it could be observed.
 ///
 /// `stop` is the box's LAST owner: its group signal kills the supervisor, which therefore never
@@ -965,13 +973,27 @@ pub(crate) fn kill_box_graceful(
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
     if pidfd >= 0 {
-        // Wait (bounded) for the init to actually exit - POLLIN fires on termination.
+        // Wait (bounded) for the init to actually exit - POLLIN fires on termination, so the bound
+        // costs nothing on the ordinary path and is only reached by a process stuck in the kernel.
+        // DOCKER'S WAITS, NOT ONE SECOND: a SIGKILL cannot be refused, only delayed by an exit that
+        // takes long (a writer at full speed into a large log, on a slow host). Reported on WSL2:
+        // with 1 s, `kern stop -t 1` on `sh -c yes` with a 300m log said "did not exit in time" 3 of
+        // 3, and with 5 s 6 of 28 under load; each time the box was gone a moment later. Not
+        // reproduced on this desktop (3 of 3 confirmed in about 1050 ms). See `KILL_CONFIRM_MS`.
         let mut pfd = libc::pollfd {
             fd: pidfd,
             events: libc::POLLIN,
             revents: 0,
         };
-        let ready = crate::eintr::poll(std::slice::from_mut(&mut pfd), 1000);
+        let mut ready = crate::eintr::poll(std::slice::from_mut(&mut pfd), KILL_CONFIRM_MS);
+        if ready <= 0 {
+            // The second kill, as Docker's: to the init and to the group again, then a short wait.
+            unsafe { signal_box(pidfd, pid1, libc::SIGKILL) };
+            if pid > 1 {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+            ready = crate::eintr::poll(std::slice::from_mut(&mut pfd), KILL_RECONFIRM_MS);
+        }
         unsafe { libc::close(pidfd) };
         if ready > 0 {
             // Read it again now that it is definitely dead: our SIGKILL leaves a status of 137, and
@@ -986,7 +1008,7 @@ pub(crate) fn kill_box_graceful(
         // No pidfd (pid1 unrecorded, or a kernel < 5.3): best-effort probe on the recorded pids. The
         // signal still went out via `signal_box`/the group sweep; we just can't confirm as precisely.
         let probe = if pid1 > 0 { pid1 } else { pid };
-        for _ in 0..100 {
+        for _ in 0..(KILL_CONFIRM_MS + KILL_RECONFIRM_MS) / 10 {
             if unsafe { libc::kill(probe, 0) } != 0 {
                 return Teardown::Gone(already); // ESRCH - the target is gone
             }

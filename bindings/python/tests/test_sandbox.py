@@ -1351,6 +1351,14 @@ def test_classify_oom_byte_is_the_authority_and_stderr_is_the_fallback():
     assert k._kernel_death_fault(_KERN_OOM_LINE, 0, None, None, True)[0] == "oom"  # old kern, torn down
     # The byte wins over the box-did-not-start heuristic too: a box that reached the OOM killer ran.
     assert k._kernel_death_fault("error: sandbox: could not map uid 1000\n", 1, 1)[0] == "oom"
+    # `os._exit(N)` IS THE CELL'S OWN EXIT ON EVERY HOST, including one where kern could not apply the
+    # cap (`cap_signal == 2`): that branch used to answer first, so the cell read `killed`, exit -1,
+    # with kern's cgroup warning as its message (reported 6 of 6 on WSL2, where Node already said exit).
+    warning = "kern: --memory accepted but NOT enforced here - the `memory` controller is not delegated\n"
+    for cap in (0, 1, 2):
+        assert k._kernel_death_fault(warning, cap, 0, 0, True, exit_status=3) == (None, "", 3), cap
+    # The control: with the box SIGKILLed (fourth byte 9) on that host it is still a kill.
+    assert k._kernel_death_fault(warning, 2, 0, 9, True, exit_status=None)[0] == "killed"
 
 
 def test_the_binary_identity_is_re_asserted_per_box_not_once_per_sandbox(tmp_path):
@@ -5099,6 +5107,59 @@ def test_the_two_bindings_refuse_the_same_credential_names():
     assert js_set("REFUSED_MOUNT_PAIRS") == {
         f"{a}/{b}" for a, b in kern._REFUSED_MOUNT_PAIRS
     }
+    # The contents scan: the same exemptions and the same bounds, or one binding refuses a project
+    # directory the other accepts.
+    assert js_set("MOUNT_SCAN_EXEMPT") == kern._MOUNT_SCAN_EXEMPT
+    assert re.search(rf"const MOUNT_SCAN_DEPTH = {kern._MOUNT_SCAN_DEPTH};", js)
+    assert "MOUNT_SCAN_BUDGET" not in js and not hasattr(kern, "_MOUNT_SCAN_BUDGET"), (
+        "an entry budget accepted what it did not check; the deadline is the only bound"
+    )
+    assert f"const MOUNT_SCAN_DEADLINE_MS = {int(kern._MOUNT_SCAN_DEADLINE_S * 1000)};" in js
+
+
+def test_a_source_that_holds_a_refused_path_or_a_credential_directory_is_refused(tmp_path):
+    """A parent is refused for what it holds, not only a source for its own name.
+
+    MEASURED by an external test: `mounts={"/home": "/m"}` and `"/home/./alex/.."` were accepted while
+    `~` was refused, and the box read `/m/alex/.ssh` (three files, all readable) and
+    `/m/alex/.bash_history`; a directory with `.ssh` or `.aws` inside it went through the same way.
+    Each refusal below has its accepted control: a project with its own `.npmrc` (exempt from the
+    scan) and a directory whose credential directory is deeper than the scan looks.
+    """
+    home = os.path.realpath(os.path.expanduser("~"))
+    parent = os.path.dirname(home)
+    if parent != "/":
+        with pytest.raises(kern.MountRefused, match="your home directory"):
+            kern._validate_mount(parent, "/m")
+        with pytest.raises(kern.MountRefused, match="your home directory"):
+            kern._validate_mount(f"{parent}/./{os.path.basename(home)}/..", "/m")
+    if os.path.isdir("/etc/ssl"):
+        with pytest.raises(kern.MountRefused, match="/etc/ssl/private"):
+            kern._validate_mount("/etc/ssl", "/m")
+    for rel, found in (
+        ("fake/.ssh", "'.ssh'"),
+        ("homes/bob/.aws", "'bob/.aws'"),
+        ("cfg/.config/gh", "'.config/gh'"),
+        ("hist/.bash_history", "'.bash_history'"),
+    ):
+        p = tmp_path / rel
+        if rel.endswith("history"):
+            p.parent.mkdir(parents=True)
+            p.write_text("x")
+        else:
+            p.mkdir(parents=True)
+        src = tmp_path / rel.split("/")[0]
+        with pytest.raises(kern.MountRefused, match=re.escape(found)):
+            kern._validate_mount(str(src), "/m")
+    # Controls: accepted.
+    proj = tmp_path / "proj"
+    (proj / "src").mkdir(parents=True)
+    (proj / ".npmrc").write_text("registry=https://example.invalid/\n")
+    (proj / ".docker").mkdir()
+    assert kern._validate_mount(str(proj), "/m")[0] == str(proj)
+    deep = tmp_path / "deep"
+    (deep / "a" / "b" / ".ssh").mkdir(parents=True)
+    assert kern._validate_mount(str(deep), "/m")[0] == str(deep), "past the scan depth, by design"
 
 
 def test_the_uid_range_is_skipped_exactly_when_cap_drop_all_makes_it_useless():
@@ -6243,3 +6304,36 @@ def test_image_none_is_the_default_and_a_bad_image_is_refused_by_name():
     for bad in ("", "   ", 42, ["python:3.12-slim"]):
         with pytest.raises(SandboxError, match="image must be an image reference string"):
             Sandbox(image=bad)
+
+
+def test_a_mount_scan_that_does_not_finish_in_time_is_refused(tmp_path, monkeypatch):
+    """The scan is bounded: a source whose listing does not come back in time is REFUSED.
+
+    A FUSE source whose READDIR never answered held the constructor 170 s in an uninterruptible read
+    (reported). A scan that cannot finish did not look, so the source is not mounted. Simulated with a
+    scan slower than a shortened deadline; the control is the real scan, which finishes.
+    """
+    import time as _time
+
+    (tmp_path / "src").mkdir()
+    monkeypatch.setattr(kern, "_MOUNT_SCAN_DEADLINE_S", 0.2)
+    real_scan = kern._credential_inside
+    monkeypatch.setattr(kern, "_credential_inside", lambda p: (_time.sleep(2), real_scan(p))[1])
+    started = _time.monotonic()
+    with pytest.raises(kern.MountRefused, match="could not be checked"):
+        kern._validate_mount(str(tmp_path / "src"), "/m")
+    assert _time.monotonic() - started < 1.5, "the caller waited for the scan instead of the deadline"
+    monkeypatch.setattr(kern, "_credential_inside", real_scan)
+    assert kern._validate_mount(str(tmp_path / "src"), "/m")[0] == str(tmp_path / "src")
+
+
+def test_a_large_directory_beside_a_credential_directory_is_still_refused(tmp_path):
+    """No entry budget: 10,001 files scanned first used to end the scan and ACCEPT the source, so a
+    `.ssh` beside them was never seen (found by review). The deadline is the only bound."""
+    big = tmp_path / "src" / "big"
+    big.mkdir(parents=True)
+    for i in range(10_001):
+        (big / f"f{i}").touch()
+    (tmp_path / "src" / "alex" / ".ssh").mkdir(parents=True)
+    with pytest.raises(kern.MountRefused, match="alex/.ssh"):
+        kern._validate_mount(str(tmp_path / "src"), "/m")

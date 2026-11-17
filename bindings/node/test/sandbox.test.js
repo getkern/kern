@@ -4334,3 +4334,87 @@ test("the host's credential files under /etc are refused, the rest of /etc is no
   for (const ok of ["/etc/resolv.conf", "/etc/hostname"].filter((p) => fs.existsSync(p)))
     assert.doesNotThrow(() => new kern.Sandbox({ mounts: { [ok]: "/x" } }), ok);
 });
+
+// A parent is refused for what it holds, and a directory for a credential directory among its first two
+// levels. MEASURED by an external test: `mounts={"/home": ...}` was accepted and the box read
+// `alex/.ssh` and `alex/.bash_history`. Same cases as the Python test of the same rule, with the same
+// accepted controls: a project's own `.npmrc` / `.docker`, and a `.ssh` deeper than the scan looks.
+test("a source that holds a refused path or a credential directory is refused", () => {
+  const home = fs.realpathSync(os.homedir());
+  const parent = path.dirname(home);
+  if (parent !== "/") {
+    assert.throws(() => new kern.Sandbox({ mounts: { [parent]: "/m" } }), /your home directory/);
+    assert.throws(
+      () => new kern.Sandbox({ mounts: { [`${parent}/./${path.basename(home)}/..`]: "/m" } }),
+      /your home directory/,
+    );
+  }
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "kern-mscan-"));
+  try {
+    for (const [rel, found] of [
+      ["fake/.ssh", '".ssh"'],
+      ["homes/bob/.aws", '"bob/.aws"'],
+      ["cfg/.config/gh", '".config/gh"'],
+    ]) {
+      fs.mkdirSync(path.join(d, rel), { recursive: true });
+      const src = path.join(d, rel.split("/")[0]);
+      assert.throws(
+        () => new kern.Sandbox({ mounts: { [src]: "/m" } }),
+        (e) => e instanceof kern.MountRefused && e.message.includes(found),
+      );
+    }
+    fs.mkdirSync(path.join(d, "hist"));
+    fs.writeFileSync(path.join(d, "hist", ".bash_history"), "x");
+    assert.throws(() => new kern.Sandbox({ mounts: { [path.join(d, "hist")]: "/m" } }), kern.MountRefused);
+    const proj = path.join(d, "proj");
+    fs.mkdirSync(path.join(proj, "src"), { recursive: true });
+    fs.writeFileSync(path.join(proj, ".npmrc"), "registry=https://example.invalid/\n");
+    fs.mkdirSync(path.join(proj, ".docker"));
+    new kern.Sandbox({ mounts: { [proj]: "/m" } });
+    const deep = path.join(d, "deep");
+    fs.mkdirSync(path.join(deep, "a", "b", ".ssh"), { recursive: true });
+    new kern.Sandbox({ mounts: { [deep]: "/m" } }); // past the scan depth, by design
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+// The scan is bounded: a source whose listing does not come back in time is REFUSED, not waited on
+// (a FUSE source whose READDIR never answered held the constructor in an uninterruptible read).
+// A deadline of 0 reaches that branch without a hostile filesystem; the control finishes in time.
+test("a mount scan that does not finish in time is refused", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "kern-mscan-dl-"));
+  try {
+    fs.mkdirSync(path.join(d, ".ssh"));
+    assert.deepStrictEqual(kern._credentialInsideBounded(d, 0), { done: false, hit: null });
+    assert.deepStrictEqual(kern._credentialInsideBounded(d), { done: true, hit: ".ssh" });
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+// No entry budget (a scan that hit it accepted the source unchecked), and names read as BYTES, so a
+// `.ssh` under a directory whose name is not valid UTF-8 is still found (both found by review).
+test("the mount scan has no accepting budget and reads names as bytes", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "kern-mscan-big-"));
+  try {
+    const big = path.join(d, "src", "big");
+    fs.mkdirSync(big, { recursive: true });
+    for (let i = 0; i < 10001; i++) fs.writeFileSync(path.join(big, `f${i}`), "");
+    fs.mkdirSync(path.join(d, "src", "alex", ".ssh"), { recursive: true });
+    assert.throws(
+      () => new kern.Sandbox({ mounts: { [path.join(d, "src")]: "/m" } }),
+      (e) => e instanceof kern.MountRefused && e.message.includes("alex/.ssh"),
+    );
+    const odd = Buffer.concat([Buffer.from(path.join(d, "odd") + "/"), Buffer.from([0x66, 0xff, 0x6f])]);
+    fs.mkdirSync(Buffer.from(path.join(d, "odd")), { recursive: true });
+    fs.mkdirSync(odd);
+    fs.mkdirSync(Buffer.concat([odd, Buffer.from("/.ssh")]));
+    assert.throws(
+      () => new kern.Sandbox({ mounts: { [path.join(d, "odd")]: "/m" } }),
+      (e) => e instanceof kern.MountRefused && e.message.includes(".ssh"),
+    );
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});

@@ -117,6 +117,8 @@ pub use cgroup::box_was_oom_killed;
 /// [`cgroup::box_workload_signal`]: kern's own exit code cannot carry this, because propagating
 /// `128 + N` makes a killed workload and one that called `exit(137)` indistinguishable.
 pub use cgroup::box_workload_signal;
+/// [`cgroup::box_workload_started`]: whether the workload was exec'd, from the exec witness.
+pub use cgroup::box_workload_started;
 /// Was a `kern exec`'d command OOM-killed with its box? See [`cgroup::exec_was_oom_killed`].
 pub use cgroup::exec_was_oom_killed;
 /// Did `kern exec` refuse the command before running it? See [`cgroup::exec_was_refused`].
@@ -146,6 +148,7 @@ pub use real::is_driver_tool;
 pub use real::is_initial_root;
 pub use real::is_root_of_ranged_userns;
 pub use real::single_threaded;
+pub use real::want_exec_witness;
 pub use real::with_id_mapped_userns;
 /// Which of the host's NVIDIA cards a box may see in the driver's own `/proc` enumeration.
 pub use real::GpuEnumeration;

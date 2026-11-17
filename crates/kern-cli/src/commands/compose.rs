@@ -2347,7 +2347,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             | ComposeAction::Run
             | ComposeAction::Config
     );
-    if default_bridge && wiring_is_the_subject {
+    // AND ONLY WHEN THE WIRING IS BUILT NOW: an `up` on a stack whose pod is already running builds
+    // nothing, and the note was printed on every `up` (reported: "the notes are repeated").
+    // `config` keeps it, because there the question is asked on purpose.
+    let wiring_built_now =
+        matches!(action, ComposeAction::Config) || crate::pod::holder_pid(&pod).is_none();
+    if default_bridge && wiring_is_the_subject && wiring_built_now {
         eprintln!(
             "kern: note: compose: each of this stack's {} services gets its own network namespace \
              on a bridge, which is the arrangement Docker has: a port a service binds on its \
@@ -2362,7 +2367,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // `logs`, `port` - where no wiring is being decided and the reader cannot act on it. A field
     // report named it: the note "came out on every command". A standing note on a correct stack is
     // what teaches a reader to skim past kern's output, which costs more than the line buys.
-    if wiring_is_the_subject && auto_bridge && !default_bridge {
+    // Said when the wiring is BUILT, like the note above: it repeated on every `up` of a running
+    // stack (reported as noise on a real stack).
+    if wiring_is_the_subject && auto_bridge && !default_bridge && wiring_built_now {
         // NAMED, because an unactionable note is a note nobody acts on. The collision is identified
         // by service and by port when it comes from the FILE; when it comes from two images' EXPOSE
         // the names live in `image_expose_collisions`, so the generic wording stands for that case
@@ -2892,6 +2899,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     let mut kept_boxes: Vec<String> = Vec::new();
     // The services the reconcile below recreates: stopped AFTER the builds (see there).
     let mut stale_to_stop: Vec<String> = Vec::new();
+    // Running `build:` services under `--build`, with the hash they were launched with: decided once
+    // their images are built (see the reconcile below and the builds).
+    let mut decide_after_build: Vec<(String, String)> = Vec::new();
     if action == ComposeAction::Up {
         let mut kept = 0usize;
         let mut stale: Vec<String> = Vec::new();
@@ -2913,6 +2923,15 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         true // not running: launch it
                     }
                     Some(inst) => match reconcile_decision(&inst, &definition_hash(b), recreate) {
+                        // UNDER `--build` A BUILT SERVICE IS DECIDED AFTER ITS BUILD: whether its
+                        // image changed is known only then. Kept in the plan for now.
+                        Reconcile::UpToDate
+                            if build_policy == crate::commands::BuildPolicy::Always
+                                && b.build.is_some() =>
+                        {
+                            decide_after_build.push((n.clone(), inst.def_hash.clone()));
+                            true
+                        }
                         Reconcile::UpToDate => {
                             kept += 1;
                             kept_boxes.push(n.clone());
@@ -3090,6 +3109,41 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             build_args,
             build_policy,
         )?;
+    }
+
+    // `--build`: a running built service whose image the build changed is recreated, one whose
+    // image is the same is left running, as Docker compares image IDs.
+    if !decide_after_build.is_empty() {
+        let mut unchanged: Vec<String> = Vec::new();
+        let mut rebuilt: Vec<String> = Vec::new();
+        for (n, launched) in &decide_after_build {
+            let Some(b) = boxes.iter().find(|b| &b.name == n) else {
+                continue;
+            };
+            if launched.is_empty() || *launched == crate::commands::definition_hash(b) {
+                unchanged.push(n.clone());
+            } else {
+                rebuilt.push(n.clone());
+            }
+        }
+        for level in &mut levels {
+            level.retain(|n| !unchanged.contains(n));
+        }
+        if !rebuilt.is_empty() {
+            let short: Vec<String> = rebuilt
+                .iter()
+                .map(|n| short_service_name(&boxes, n, &pod))
+                .collect();
+            println!("→ image rebuilt, recreating: {}", short.join(", "));
+            stale_to_stop.extend(rebuilt);
+        }
+        if !unchanged.is_empty() {
+            let short: Vec<String> = unchanged
+                .iter()
+                .map(|n| short_service_name(&boxes, n, &pod))
+                .collect();
+            println!("→ image unchanged, left running: {}", short.join(", "));
+        }
     }
 
     // ⛔ THE RECREATED SERVICES STOP AFTER THE BUILDS, as Docker builds and then recreates. MEASURED
@@ -3458,7 +3512,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // from the type system rather than from remembering to clean up on eleven error paths.
     let gates: std::sync::Mutex<Vec<(String, std::os::fd::OwnedFd)>> =
         std::sync::Mutex::new(Vec::new());
-    if use_pod && crate::pod::holder_pid(&pod).is_none() {
+    // Whether this `up` made the pod: what the closing summary is said for (see there).
+    let pod_created_now = use_pod && crate::pod::holder_pid(&pod).is_none();
+    if pod_created_now {
         // Map a uid RANGE into the pod's shared user ns when ANY member needs it (`wants_uid_range`,
         // the single statement of that rule). A pod member setns's into the holder's user ns and writes
         // NO map of its own, so the holder's map is authoritative - `--uid-range` on the member alone is
@@ -3558,7 +3614,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // ONE-service stack, which is the first thing anyone writes. The gap is older than the change
     // that exposes it, and being consistent with an existing gap is not the same as it being
     // acceptable, so the operator is told rather than left to discover it after a reboot.
-    if use_pod {
+    // ONCE, WHEN THE POD IS MADE: three services with `restart:` printed this paragraph three times
+    // on EVERY `up` of a running stack (reported). The fact it states does not change between ups.
+    if use_pod && pod_created_now {
         // The unit name the `systemd` verb suggests, so the two commands can be pasted.
         let project_slug = pod.trim_start_matches("kern-");
         for b in boxes.iter().filter(|b| b.restart_always) {
@@ -4228,6 +4286,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                     gate_rd = Some(rd);
                                 }
                                 cmd.arg("-d");
+                                // The box's own start line and its `next:` hints are for a person who
+                                // typed `kern box`; under `up` the stack's summary says it, as Docker
+                                // prints one line for the stack. What the box has to SAY (a cap it
+                                // could not apply) is still printed.
+                                cmd.env("KERN_COMPOSE_LAUNCH", "1");
                                 if !b.command.is_empty() {
                                     cmd.arg("--").args(&b.command);
                                 }
@@ -4659,6 +4722,15 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     } else {
         BRING_UP_SETTLE_MS
     };
+    // Told to the guard BEFORE anything below can return, so the two numbers come from one place:
+    // if the whole stack has exited by the time the guard runs, its message says how many services
+    // this invocation started rather than claiming none did. It was told AFTER the dead-service
+    // check, whose `--wait` branch returns early: the guard then believed nothing had started and
+    // waited its full 5 s for a pod whose other services were running as asked (reported: a job
+    // exiting 1 beside a service took 5.1 s to fail `up --wait`, Docker 0.8 s).
+    if let Some(g) = _pod_guard.as_ref() {
+        g.started.set(started.len());
+    }
     let dead = settle_and_collect_dead(&mine, &pod, &up_token, window);
     // UNDER `--abort-on-container-exit` AN EARLY EXIT IS THE RESULT, NOT A FAILED START. A test
     // service that pings its database and exits does so well inside the settle window, and this
@@ -4700,12 +4772,6 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         }
         eprintln!("kern: warning: compose: {msg}");
     }
-    // Told to the guard BEFORE the line is printed, so the two numbers come from one place: if the
-    // whole stack has exited by the time the guard runs, its message says how many services this
-    // invocation started rather than claiming none did.
-    if let Some(g) = _pod_guard.as_ref() {
-        g.started.set(started.len());
-    }
     // THE BRING-UP FAILED FOR SOME SERVICES, AND THE REST RUNS: said as Docker says it, with exit 1.
     if let Some((first, e)) = failed.first() {
         let short = |n: &str| short_service_name(&boxes, n, &pod);
@@ -4729,8 +4795,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         }
         return Err(Error::Compose(msg));
     }
-    println!("compose up: {total} box(es) started. track with `kern ps`.");
-    if use_pod {
+    println!("compose up: {total} box(es) started");
+    // THE POD'S SENTENCE WHEN IT IS NEWS: the pod was made by this `up`, or a service did not get its
+    // way out. On an `up` that only started a service in a pod already there it repeated, word for
+    // word, what the first `up` said (reported as noise on a real stack).
+    if use_pod && (pod_created_now || nat_failed > 0) {
         // SAY WHETHER THERE IS EGRESS, not only whether services can find each other. `pod create`
         // distinguishes five outbound states and prints the one you got; this line reported name
         // resolution alone, so a stack with no internet and a stack with internet printed the SAME
@@ -5304,8 +5373,12 @@ fn watch_and_abort(
 ///    7 s with status 0.
 ///  * a service WITHOUT a healthcheck only has to be RUNNING: that case returned in 1 second.
 ///  * a service that has already EXITED fails the wait, even with status 0 (measured: `command:
-///    ["true"]` and no healthcheck exits 1 after a second). "Ready" means still there, and a
-///    one-shot that finished is not something a CI job can run against.
+///    ["true"]` and no healthcheck exits 1 after a second, `container <name> exited (0)`), EXCEPT
+///    one that exited 0 while another service waits on it with `condition:
+///    service_completed_successfully`: the migration job of a stack. MEASURED on Compose v5.0.2, the
+///    same one-shot fails `--wait` alone, with a plain `depends_on`, and beside an unrelated
+///    service, and passes (exit 0, `Exited`) under that condition. kern applied only the first half
+///    and said Docker did the same, which a real stack (a migration before its app) disproved.
 ///  * `--wait-timeout 8` on a check that never passes exits 1 after 8 seconds.
 ///
 /// The default bound is kern's own condition timeout, the same one `depends_on: service_healthy`
@@ -5318,6 +5391,11 @@ fn wait_until_ready(
     use std::time::{Duration, Instant};
     let limit = timeout.unwrap_or(crate::commands::COMPOSE_CONDITION_TIMEOUT_SECS);
     let deadline = Instant::now() + Duration::from_secs(limit);
+    // The services another one waits on to COMPLETE: the only ones whose exit 0 is a success here.
+    let awaited: std::collections::HashSet<&str> = mine
+        .iter()
+        .flat_map(|b| b.depends_completed.iter().map(String::as_str))
+        .collect();
     for b in mine {
         let has_check = b.health_cmd.is_some() || !b.health_argv.is_empty();
         loop {
@@ -5325,11 +5403,21 @@ fn wait_until_ready(
             // seconds before it exited, so liveness is read FIRST and decides.
             let alive = registry::find_ref(&b.name).is_some();
             if !alive {
+                let code = registry::list_exited()
+                    .into_iter()
+                    .find(|e| e.name == b.name)
+                    .map(|e| e.code);
+                let completed = code == Some(0)
+                    && (awaited.contains(b.service_name()) || awaited.contains(b.name.as_str()));
+                if completed {
+                    break; // a job that ran to success for the service waiting on it
+                }
+                let status = code.map_or_else(|| "exited".to_string(), |c| format!("exited ({c})"));
                 return Err(Error::Compose(format!(
-                    "--wait: service '{}' is not running. A service that has exited is not ready, \
-                     which is Docker's reading too: `up --wait` on a service whose command simply \
-                     finished exits non-zero there as well.",
-                    b.service_name()
+                    "--wait: container {} {status}. A service that has exited is not ready, unless \
+                     it exited 0 for a service that depends on it with `condition: \
+                     service_completed_successfully`, as Docker reads it.",
+                    b.name
                 )));
             }
             if !has_check {

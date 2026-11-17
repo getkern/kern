@@ -297,6 +297,31 @@ txt, is_err = text_of(res[-1])
 check("KERN_MCP_KERNEL: lo stato persiste fra celle", not is_err and "42" in txt,
       f"isError={is_err} {txt.strip()[:60]!r}")
 
+# I CASI CHE MISURANO UN TETTO SI SALTANO DOVE NESSUN TETTO E' IN VIGORE, come nella batteria della
+# sandbox (`caps_in_force` in scripts/sandbox-battery.py): su un host senza delegazione dei cgroup un
+# OOM non arriva mai e il tetto del profilo non c'e', e quattro FAIL lo dicevano come se fosse kern
+# (riferito su WSL2). La sonda legge il cgroup DAL box, con il tetto chiesto da questa batteria.
+res, err = session("sonda tetti", [call(
+    "def v(f):\n"
+    "    try: return open('/sys/fs/cgroup/' + f).read().strip()\n"
+    "    except OSError: return 'absent'\n"
+    "print('MEM', v('memory.max'), 'PIDS', v('pids.max'))")],
+    env={"KERN_MCP_MEMORY_MB": "128"}, timeout=600)
+probe_txt, _ = text_of(res[-1]) if res else ("", True)
+probe_words = probe_txt.split()
+probe_mem = probe_words[probe_words.index("MEM") + 1] if "MEM" in probe_words else "absent"
+CAPPED = probe_mem == str(128 << 20)
+print(f"  tetti nel box: memory.max={probe_mem} -> {'in vigore' if CAPPED else 'NON in vigore: i casi OOM e tetto sono HOST'}")
+HOST_WHY = f"HOST: nessun tetto in vigore qui (memory.max={probe_mem}), il caso misurerebbe l'host"
+
+
+def check_capped(label, cond, detail):
+    if CAPPED:
+        check(label, cond, detail)
+    else:
+        skip(label, HOST_WHY)
+
+
 # 11. Un OOM: deve tornare un errore LEGGIBILE, non un silenzio.
 # ⛔ IL PREDICATO DEVE FORZARE IL SIGNIFICATO DEL NOME, e la prima versione non lo faceva.
 # Era `is_err or "oom" in txt or "kill" in txt`, cioe' soddisfatto da QUALUNQUE `isError: true`.
@@ -308,7 +333,7 @@ check("KERN_MCP_KERNEL: lo stato persiste fra celle", not is_err and "42" in txt
 res, err = session("oom", [call("x = bytearray(400*1024*1024); print(len(x))")],
                    env={"KERN_MCP_MEMORY_MB": "128"}, timeout=600)
 txt, is_err = text_of(res[-1])
-check("un OOM e riferito COME un OOM", is_err and "oom killer" in txt.lower(),
+check_capped("un OOM e riferito COME un OOM", is_err and "oom killer" in txt.lower(),
       f"isError={is_err} {txt.strip()[:90]!r}")
 # E il controllo che rende il caso sopra una misura: un errore di PROGRAMMAZIONE non deve
 # somigliargli. Senza questo, "pretende la riga del killer" resterebbe un'asserzione su una stringa.
@@ -343,9 +368,9 @@ res, err = session("kernel oom", [
 replies = [text_of(m) for m in res if "result" in m and "content" in (m.get("result") or {})]
 after_txt, after_err = replies[-1] if replies else ("", False)
 died_txt, died_err = replies[-2] if len(replies) > 1 else ("", False)
-check("un Kernel caldo che va in OOM lo dichiara", died_err,
+check_capped("un Kernel caldo che va in OOM lo dichiara", died_err,
       f"la cella che sfora: isError={died_err} {died_txt.strip()[:70]!r}")
-check("e lo stato in memoria e' PERSO, non finto continuo",
+check_capped("e lo stato in memoria e' PERSO, non finto continuo",
       "False" in after_txt or after_err,
       f"dopo: isError={after_err} {after_txt.strip()[:70]!r}")
 
@@ -365,7 +390,7 @@ with tempfile.TemporaryDirectory() as home:
     txt, is_err = text_of(res[-1])
     # 256 MiB = 268435456. Letto dal cgroup DAL MISURATO, non dalla riga di comando: e' il canale
     # indipendente che il progetto richiede.
-    check("un profilo col prewarm applica il SUO tetto",
+    check_capped("un profilo col prewarm applica il SUO tetto",
           not is_err and "268435456" in txt,
           f"isError={is_err} {txt.strip()[:70]!r}")
 

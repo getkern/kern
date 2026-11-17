@@ -311,7 +311,11 @@ fn announce(m: &PortMap) {
     if m.bind.is_unspecified() && !m.implicit {
         // `kern: warning:` and not a bare `warning:`, for the reason the images.rs note carries: the
         // SDK tells kern's lines from the workload's by that prefix and nothing else.
-        eprintln!("kern: warning: bound {ip} - box port {bp} is reachable from the network");
+        // Through the same channel as the cap notices: to the launcher when one is listening, so a
+        // detached service's LOG does not carry it (reported in every published service's log).
+        crate::cgroup::cap_notice(&format!(
+            "kern: warning: bound {ip} - box port {bp} is reachable from the network"
+        ));
     }
 }
 

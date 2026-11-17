@@ -2700,19 +2700,26 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // A JETSON GRANT'S SYSFS (the chip's identity), read-only beside any a vGPIO profile asked for.
     // AND A PCI CARD'S OWN SYSFS DIRECTORY, which NVML reads its PCI identity from: see
     // `gpu_grant::pci_sysfs_paths`. Only the cards this box was given.
+    // The PCI card's sysfs goes into its OWN list, reproduced read-only with its links and the
+    // bridges above it: see `kern_isolation::SandboxSpec::gpu_sysfs`.
+    let mut gpu_sysfs: Vec<String> = Vec::new();
     if let Some((grant, selection)) = &gpu_for_identity {
-        let pci = crate::gpu_grant::pci_addresses_of(grant, selection)
-            .map(|a| crate::gpu_grant::pci_sysfs_paths(std::path::Path::new("/"), &a))
-            .unwrap_or_default();
-        for p in grant
-            .sysfs
-            .iter()
-            .cloned()
-            .chain(pci.iter().map(|r| std::path::Path::new("/").join(r)))
-        {
+        for p in &grant.sysfs {
             let p = p.to_string_lossy().into_owned();
             if !vgpio_sysfs.contains(&p) {
                 vgpio_sysfs.push(p);
+            }
+        }
+        let pci = crate::gpu_grant::pci_addresses_of(grant, selection)
+            .map(|a| crate::gpu_grant::pci_sysfs_paths(std::path::Path::new("/"), &a))
+            .unwrap_or_default();
+        for r in pci {
+            let p = std::path::Path::new("/")
+                .join(r)
+                .to_string_lossy()
+                .into_owned();
+            if !gpu_sysfs.contains(&p) {
+                gpu_sysfs.push(p);
             }
         }
     }
@@ -2808,6 +2815,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         cpuset,
         vgpio_devs,
         vgpio_sysfs,
+        gpu_sysfs,
         gpu_enumeration,
         // A GPU GRANT REBUILDS THE BOX'S LOADER CACHE, as docker's and podman's NVIDIA hook does
         // (see `kern_isolation`'s `refresh_loader_cache` for the measurement and the confinement).
@@ -4970,7 +4978,10 @@ fn await_box_started(
             let reason = registry::logs_dir()
                 .ok()
                 .map(|d| d.join(format!("{n}-{child}.log")))
-                .and_then(|p| read_log_reason(&p));
+                .and_then(|p| read_log_reason(&p))
+                // A reason that is only whitespace (or scrubs to nothing) is no reason: it printed
+                // "exited before starting:" and then nothing (reported on WSL2 for a missing command).
+                .filter(|r| r.lines().any(|l| !crate::ui::scrub(l).trim().is_empty()));
             return Err(Error::Sandbox(match reason {
                 Some(r) => {
                     // The tail is the box's OWN log bytes rendered to the operator - scrub control
@@ -5033,10 +5044,15 @@ fn await_box_started(
     } else {
         String::new()
     };
-    let msg = format!(
-        "{notices}{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}\n  {}next: kern ps {} {logs_step}kern stop {n}{}\n",
-        p.g, gl.ok, p.z, p.b, p.z, p.d, p.z, p.d, gl.dot, p.z
-    );
+    // Started by `compose up`: the notices only, the stack's summary says the rest.
+    let msg = if crate::global_env("KERN_COMPOSE_LAUNCH").is_some() {
+        notices
+    } else {
+        format!(
+            "{notices}{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}\n  {}next: kern ps {} {logs_step}kern stop {n}{}\n",
+            p.g, gl.ok, p.z, p.b, p.z, p.d, p.z, p.d, gl.dot, p.z
+        )
+    };
     let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
     Ok(())
 }
@@ -5162,8 +5178,13 @@ fn should_restart(
     attempt: u32,
     max_restarts: u32,
 ) -> bool {
+    // A POLICY FIRST, THEN ITS BUDGET. The 125 rule was written to BOUND `always` (see the caller),
+    // and it also made a box with NO policy retry ten times with a backoff of up to 30 s, while
+    // `kern box -d` waited on the supervisor: a box whose setup failed hung the launcher for minutes
+    // where the foreground answered 125 in 18 ms (reported, and present since the rule was added).
+    // Docker does not retry a container it could not create unless a restart policy says so.
     if code == 125 {
-        return attempt <= max_restarts;
+        return (always || on_failure) && attempt <= max_restarts;
     }
     always || (on_failure && code != 0 && attempt <= max_restarts)
 }
@@ -5285,6 +5306,8 @@ fn supervise_box(
                 Option<(Option<u64>, std::path::PathBuf)>,
             > = std::cell::OnceCell::new();
             let mut held_nat = outbound_pod.and_then(|p| HeldNat::arm(p, name.as_str()));
+            // The exec witness: whether this attempt's workload ran, for the restart decision below.
+            kern_isolation::want_exec_witness();
             let code = match run_in_sandbox_with(
                 spec,
                 ready,
@@ -5445,6 +5468,7 @@ fn supervise_box(
                 let verdict = [
                     kern_isolation::box_workload_signal(),
                     u8::from(kern_isolation::box_was_oom_killed()),
+                    kern_isolation::box_workload_started(),
                 ];
                 // SAFETY: `latch[1]` is this process's own pipe end and `verdict` lives on this frame.
                 let _ = unsafe { libc::write(latch[1], verdict.as_ptr().cast(), verdict.len()) };
@@ -5497,12 +5521,17 @@ fn supervise_box(
         };
         // The runner has exited, so its end is closed and this read cannot block on it.
         last_verdict = (0, false);
+        // The third byte: whether the workload was exec'd (0 unknown, 1 ran, 2 never started).
+        let mut workload_started = 0u8;
         if have_latch {
-            let mut v = [0u8; 2];
+            let mut v = [0u8; 3];
             // SAFETY: `latch[0]` is this process's read end, `v` lives on this frame.
             let n = unsafe { libc::read(latch[0], v.as_mut_ptr().cast(), v.len()) };
-            if n == 2 {
+            if n >= 2 {
                 last_verdict = (v[0], v[1] != 0);
+            }
+            if n == 3 {
+                workload_started = v[2];
             }
             unsafe { libc::close(latch[0]) };
         }
@@ -5532,7 +5561,15 @@ fn supervise_box(
         // BOUNDED, NOT FORBIDDEN, because not every 125 is permanent: a bind source that appears a
         // second later, a peer that is still writing the pod's network. So the same budget `on-failure`
         // uses applies, and when it runs out the box says why instead of stopping silently.
-        let never_started = code == 125;
+        // FROM THE EXEC WITNESS WHEN THERE IS ONE, and from the code only when there is not (the
+        // first attempt, whose readiness pipe is the launcher's). 125 alone cannot tell a box that
+        // could not be built from a workload that exits 125 on purpose, and the second was being
+        // counted as the first (reported: `exit 125` from `sh -c` read as "never started").
+        let never_started = match workload_started {
+            1 => false,
+            2 => true,
+            _ => code == 125,
+        };
         // 125 is "the box was not built", 126/127 "its command could not be executed": in all
         // three the launcher explains the failure FROM the log. A workload exiting 126 or 127 on
         // its own keeps its log too, which costs space and never a reason.
@@ -5557,16 +5594,29 @@ fn supervise_box(
                  reason is in the lines above this one",
                 name.as_str()
             );
-        } else if never_started && !restart_now {
+        } else if never_started && !restart_now && (restart.always || restart.on_failure) {
+            // ONLY WHEN A POLICY RAN OUT. With no `--restart` there was ONE attempt and nothing to
+            // give up on, and this said "never started 10 times in a row" after it (reported). The
+            // count is the attempts actually made.
             eprintln!(
-                "kern: box '{}' never started {max_restarts} times in a row (exit 125); not \
-                 restarting it again. `restart: always` restarts a workload that exits, and no \
-                 workload ran here: the reason is in the lines above this one",
+                "kern: box '{}' exited 125 {attempt} times in a row; not restarting it again. 125 is \
+                 what a box that could not be built exits with, and a restart policy restarts a \
+                 workload that ran: the reason is in the lines above this one",
                 name.as_str()
             );
         }
         if restart_now {
-            if never_started {
+            if never_started && workload_started == 0 {
+                // NOT KNOWN WHICH: the first attempt's readiness pipe is the launcher's, so only the
+                // code speaks, and 125 is both kern's "could not be built" and a workload's own
+                // `exit 125`. Said as both rather than as the one it may not be. Later attempts
+                // carry the exec witness and say which.
+                eprintln!(
+                    "kern: box '{}' exited 125 (the box could not be built, or its workload exits 125); \
+                     retrying ({attempt}/{max_restarts})",
+                    name.as_str()
+                );
+            } else if never_started {
                 // NOT "(always)": that word promises forever, and this case is budgeted. The reader who
                 // sees attempt 3 of 10 knows the loop ends, which is the whole difference from the log
                 // a later pass watched go round 26 times.
@@ -6726,7 +6776,7 @@ mod image_defaults_tests {
         assert!(super::should_restart(125, true, false, 1, 10));
         assert!(super::should_restart(125, true, false, 10, 10));
         assert!(!super::should_restart(125, true, false, 11, 10));
-        // ...and it is the exit code that decides, not the policy: `on-failure` sees the same bound.
+        // ...and `on-failure` sees the same bound.
         assert!(!super::should_restart(125, false, true, 11, 10));
         // THE CONTROLS, or this would be "never restart anything". A workload that exits, for any
         // reason, keeps Docker's contract: `always` is uncapped, including a clean exit.
@@ -6737,8 +6787,10 @@ mod image_defaults_tests {
         assert!(super::should_restart(1, false, true, 10, 10));
         assert!(!super::should_restart(1, false, true, 11, 10));
         assert!(!super::should_restart(0, false, true, 1, 10));
-        // and no policy means no restart at all.
+        // and no policy means no restart at all, a box that never started included: it used to be
+        // retried ten times, and `kern box -d` waited for every one of them.
         assert!(!super::should_restart(1, false, false, 1, 10));
+        assert!(!super::should_restart(125, false, false, 1, 10));
     }
 
     /// The gate is asked whether a RETRY could still be released, and the pipe answers all four ways.

@@ -2446,6 +2446,60 @@ _REFUSED_MOUNT_PAIRS = {
 }
 
 
+# THE COMPONENTS ABOVE THAT A SOURCE'S CONTENTS ARE SCANNED FOR, and the three left out. Refusing a
+# source by its own name stopped `~/.ssh` and let its parent through: MEASURED by an external test,
+# `mounts={"/home": "/m"}` was accepted and the box read `/m/alex/.ssh` (3 files, all readable) and
+# `/m/alex/.bash_history`, and so did any directory with a `.ssh` or `.aws` inside it. A source is
+# therefore also refused when one of these names is among its first two levels of entries.
+# `.npmrc`, `.pypirc` and `.docker` are left out of the SCAN, not out of the refusal above: each is an
+# ordinary file or directory in a project (a repo's own registry config, a `.docker/` of compose
+# snippets), and refusing every project that carries one would turn the guard off for real work.
+_MOUNT_SCAN_EXEMPT = {".npmrc", ".pypirc", ".docker"}
+# How deep the scan looks. Two levels is a home (`.ssh` at one) and a directory of homes (`alex/.ssh`
+# at two). NO ENTRY BUDGET: one existed and a scan that hit it ACCEPTED the source unchecked, the
+# opposite of the deadline below (found by review: 10,000 files in `big/` scanned first hid `alex/.ssh`
+# beside it). The deadline is the only bound, and it refuses; a large data directory scans in well
+# under it (two levels of names, nothing read).
+_MOUNT_SCAN_DEPTH = 2
+# How long the scan may take before the source is REFUSED. A FUSE source whose READDIR never answers
+# held the constructor 170 s in an uninterruptible read (reported), and a scan that cannot finish is
+# a scan that did not look: refusing is the answer that cannot leak. Generous, so a slow network
+# filesystem with a few thousand entries is not refused for being slow.
+_MOUNT_SCAN_DEADLINE_S = 10.0
+
+
+def _credential_inside(real: str) -> "str | None":
+    """The first credential name found in the first `_MOUNT_SCAN_DEPTH` levels under `real`, as a
+    path relative to it, or ``None``. Entries are matched by NAME whatever their type, and nothing is
+    followed: a symlink in the source resolves inside the box, not on the host."""
+    names = _REFUSED_MOUNT_COMPONENTS - _MOUNT_SCAN_EXEMPT
+    pairs: "dict[str, list[str]]" = {}
+    for a, b in sorted(_REFUSED_MOUNT_PAIRS):  # several pairs share a parent (`.config`)
+        pairs.setdefault(a, []).append(b)
+    level = [(real, "")]
+    for _depth in range(_MOUNT_SCAN_DEPTH):
+        nxt = []
+        for path, rel in level:
+            try:
+                with os.scandir(path) as it:
+                    for e in it:
+                        here = f"{rel}{e.name}"
+                        if e.name in names:
+                            return here
+                        for child in pairs.get(e.name, ()):
+                            if os.path.lexists(os.path.join(e.path, child)):
+                                return f"{here}/{child}"
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                nxt.append((e.path, here + "/"))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        level = nxt
+    return None
+
+
 class SandboxError(RuntimeError):
     """A PROGRAMMER/config error, RAISED: bad argument, illegal mount, `kern` not installed, or the box
     FAILED TO START (kern exits 125 - a mount refused at runtime, an unmappable ``--user``, a seccomp or
@@ -3588,10 +3642,26 @@ def _validate_mount_lexical(source: str, target: str) -> tuple[str, str]:
     if not src.is_absolute():
         raise MountRefused(f"mount source must be an absolute host path, got {source!r}")
     real = os.path.realpath(source)  # resolve symlinks BEFORE the sensitive-set check
-    if real in _REFUSED_MOUNT_SOURCES or real == os.path.realpath(os.path.expanduser("~")):
+    home = os.path.realpath(os.path.expanduser("~"))
+    if real in _REFUSED_MOUNT_SOURCES or real == home:
         raise MountRefused(
             f"refusing to mount the sensitive host path {real!r} into a sandbox "
             "(this would defeat the isolation)"
+        )
+    # A PARENT OF A REFUSED PATH IS REFUSED, because it holds it: `/home` holds `$HOME`, `/run` the
+    # docker socket and kern's runtime state, `/etc/ssl` `/etc/ssl/private`. Every path that is
+    # refused itself is checked, so the two lists cannot drift apart.
+    protected = [(home, "your home directory")]
+    protected += [(t, "a host credential path") for t in _REFUSED_MOUNT_TREES]
+    protected += [(t, "a sensitive host path") for t in _REFUSED_MOUNT_SOURCES if t != "/"]
+    protected += [(os.path.realpath(d), w) for d, w in _kern_state_dirs().items()]
+    held = next(
+        ((t, w) for t, w in sorted(protected) if t != real and _is_inside(t, real)), None
+    )
+    if held is not None:
+        raise MountRefused(
+            f"refusing to mount {real!r}: it contains {held[0]!r}, {held[1]}, and code in the box "
+            f"would read it. Mount the subdirectory the job needs instead"
         )
     for state, what in _kern_state_dirs().items():
         if _is_inside(real, os.path.realpath(state)):
@@ -3627,10 +3697,35 @@ def _validate_mount_lexical(source: str, target: str) -> tuple[str, str]:
     return real, target
 
 def _validate_mount(source: str, target: str) -> tuple[str, str]:
-    """`_validate_mount_lexical` plus the one question that needs the filesystem: does the source exist?"""
+    """`_validate_mount_lexical` plus the questions that need the filesystem: does the source exist,
+    and does a directory source hold a credential directory (see `_credential_inside`)?"""
     real, target = _validate_mount_lexical(source, target)
     if not Path(real).exists():
         raise MountRefused(f"mount source does not exist: {source!r}")
+    if os.path.isdir(real):
+        # In a thread with a deadline: a read the kernel will not interrupt (a FUSE server that never
+        # answers) stays in its thread, and the caller gets a refusal instead of a hang. A daemon
+        # thread, so an interpreter exiting does not wait for it.
+        found: "list[str | None]" = []
+        worker = threading.Thread(
+            target=lambda: found.append(_credential_inside(real)), daemon=True,
+            name="kern-mount-scan",
+        )
+        worker.start()
+        worker.join(_MOUNT_SCAN_DEADLINE_S)
+        if not found:
+            raise MountRefused(
+                f"refusing to mount {real!r}: its contents could not be checked for credentials "
+                f"within {_MOUNT_SCAN_DEADLINE_S:g} s (a filesystem that does not answer), and an "
+                f"unchecked source is not mounted"
+            )
+        inside = found[0]
+        if inside is not None:
+            raise MountRefused(
+                f"refusing to mount {real!r}: it contains {inside!r}, which holds credentials, and "
+                f"code in the box would read them. Mount the subdirectory the job needs, or write the "
+                f"one file it needs into the workspace (sbx.write_file)"
+            )
     return real, target
 
 
@@ -8019,6 +8114,34 @@ class Kernel:
         # start byte is set; this path had no such guard, so the widened predicate gets it here.
         if not kern_wrote_payload and _looks_like_startup_failure(err):
             return "startup_failed", "the kernel box failed to start", rc
+        # NOBODY KILLED IT, AND THAT IS A FACT, SO IT IS DECIDED BEFORE THE INFERENCES BELOW. This test
+        # used to sit AFTER the `memory_mb` block, which made it unreachable for every caller that sets a
+        # memory cap - including `kern-mcp`, which always does. MEASURED through that server: a cell
+        # calling `os._exit(0)`, a deliberate and clean termination, was reported as
+        # `killed: an external kill (kern stop, a signal, or the host running out of memory)`, so an
+        # agent was told the host had run out of memory when its own code had asked to exit. The
+        # ordering was the whole defect: `workload_signal == 0` is kern's fourth byte saying NO SIGNAL
+        # ENDED THIS BOX, which is exact, while the branch that preempted it is an inference from the
+        # presence of a cap. Same discipline the SIGSYS test above already follows, and for the same
+        # stated reason: name the cause that can be named before reaching for the vague ones.
+        #
+        # AND BEFORE THE THREAD AND CAP BRANCHES TOO, which it was not: on a host without cgroup
+        # delegation kern writes `cap_signal == 2`, and that branch answered first, so `os._exit(3)`
+        # in a kernel was `killed` with exit -1 and kern's unrelated cgroup warning as its message
+        # (reported 6 of 6 on WSL2; Node already decided this first, so the two bindings disagreed).
+        if workload_signal == 0:
+            if exit_status is not None:
+                # NO SIGNAL AND A REAL EXIT STATUS: the cell ended the interpreter itself, `os._exit(N)`
+                # being the ordinary way (a `sys.exit` is caught by the driver and never gets here). That is
+                # the code's own exit, which the one-shot path reports as `exit_code=N` and no fault; this
+                # path called it `killed`, so the same cell was an exit cold and a kill here.
+                return None, "", exit_status
+            return (
+                "killed",
+                "the kernel box exited on its own (no signal killed it), so its interpreter is gone: a "
+                "crash inside the box, or something in the box ending PID 1",
+                rc,
+            )
         # THE ONE CAUSE THIS PATH CAN NAME EXACTLY, before the honest-but-vague ones below. kern arms
         # PDEATHSIG on a foreground box, that signal fires on the death of the creating THREAD on Linux,
         # and a kernel started inside a short-lived thread is therefore SIGKILLed when that thread
@@ -8038,29 +8161,6 @@ class Kernel:
                 "killed",
                 "the kernel box was killed, and its memory cap was not enforced here (no cgroup "
                 "delegation), so no memory limit was in force to attribute it to",
-                rc,
-            )
-        # NOBODY KILLED IT, AND THAT IS A FACT, SO IT IS DECIDED BEFORE THE INFERENCES BELOW. This test
-        # used to sit AFTER the `memory_mb` block, which made it unreachable for every caller that sets a
-        # memory cap - including `kern-mcp`, which always does. MEASURED through that server: a cell
-        # calling `os._exit(0)`, a deliberate and clean termination, was reported as
-        # `killed: an external kill (kern stop, a signal, or the host running out of memory)`, so an
-        # agent was told the host had run out of memory when its own code had asked to exit. The
-        # ordering was the whole defect: `workload_signal == 0` is kern's fourth byte saying NO SIGNAL
-        # ENDED THIS BOX, which is exact, while the branch that preempted it is an inference from the
-        # presence of a cap. Same discipline the SIGSYS test above already follows, and for the same
-        # stated reason: name the cause that can be named before reaching for the vague ones.
-        if workload_signal == 0:
-            if exit_status is not None:
-                # NO SIGNAL AND A REAL EXIT STATUS: the cell ended the interpreter itself, `os._exit(N)`
-                # being the ordinary way (a `sys.exit` is caught by the driver and never gets here). That is
-                # the code's own exit, which the one-shot path reports as `exit_code=N` and no fault; this
-                # path called it `killed`, so the same cell was an exit cold and a kill here.
-                return None, "", exit_status
-            return (
-                "killed",
-                "the kernel box exited on its own (no signal killed it), so its interpreter is gone: a "
-                "crash inside the box, or something in the box ending PID 1",
                 rc,
             )
         if self._sbx.memory_mb is not None:

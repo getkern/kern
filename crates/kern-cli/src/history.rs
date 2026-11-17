@@ -832,8 +832,9 @@ pub fn sandbox_cmd(cmd: &SandboxCmd) -> Result<(), crate::error::Error> {
             failed,
             all,
         } => {
-            let rows: Vec<Entry> = read_all()
-                .into_iter()
+            let held = read_all();
+            let rows: Vec<&Entry> = held
+                .iter()
                 .filter(|e| *all || e.is_sandbox())
                 .filter(|e| !*failed || e.outcome.failed())
                 .collect();
@@ -845,9 +846,25 @@ pub fn sandbox_cmd(cmd: &SandboxCmd) -> Result<(), crate::error::Error> {
                 return Ok(());
             }
             if rows.is_empty() {
-                println!(
-                    "no finished sandbox recorded yet (kern records one line per box that ends)"
-                );
+                // NOT "NOTHING RECORDED" WHEN SOMETHING IS: without `--all` only the SDKs'
+                // sandboxes are listed, and a history full of `kern box` rows used to answer "no
+                // finished sandbox recorded yet" (104 rows held, reported against 6d93b85).
+                let others = held
+                    .iter()
+                    .filter(|e| !*failed || e.outcome.failed())
+                    .count();
+                if !*all && others > 0 {
+                    println!(
+                        "no SDK sandbox {}recorded; {others} other box{} {}, see `kern sandbox history --all`",
+                        if *failed { "failure " } else { "" },
+                        if others == 1 { "" } else { "es" },
+                        if others == 1 { "is" } else { "are" },
+                    );
+                } else {
+                    println!(
+                        "no finished sandbox recorded yet (kern records one line per box that ends)"
+                    );
+                }
                 where_line();
                 return Ok(());
             }

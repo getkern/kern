@@ -3276,25 +3276,57 @@ pub fn pci_addresses_of(grant: &GpuGrant, selection: &GpuSelection) -> Option<Ve
     Some(out)
 }
 
-/// The sysfs a granted card needs read under `root`, RELATIVE to it: the card's own PCI device
-/// directory and its name under `sys/bus/pci/devices`, for every address that resolves to a
-/// directory under `sys/devices`.
+/// The sysfs a granted card needs read under `root`, RELATIVE to it, for the box to place it the way
+/// the host does: the card's own PCI device directory, its link under `sys/bus/pci/devices`, every
+/// PCI bridge above it as its ATTRIBUTE FILES and its link, and the host's CPU and NUMA topology
+/// directories. The box reproduces these read-only, links as links (`SandboxSpec::gpu_sysfs`).
 ///
-/// NVML READS A CARD'S PCI IDENTITY FROM SYSFS, and a box has no sysfs: MEASURED on this host with
-/// two RTX 5060 Ti, `nvidia-smi --query-gpu=pci.bus_id` (and `pci.domain`, `pci.device_id`) answered
-/// `[Unknown Error]` in a kern box and `00000000:06:00.0` under docker 29, which mounts the host's
-/// whole `/sys` read-only. The box gets the granted card's directory and nothing else: no other
-/// device, no other card. An address that is not a plain PCI address, or whose link leaves
-/// `sys/devices`, contributes nothing.
+/// NVML READS A CARD'S PCI IDENTITY FROM SYSFS: MEASURED on this host with two RTX 5060 Ti,
+/// `nvidia-smi --query-gpu=pci.bus_id` answered `[Unknown Error]` in a box with no sysfs and
+/// `00000000:06:00.0` under docker 29, which mounts the host's whole `/sys` read-only.
+///
+/// AND IT PLACES THE CARDS FROM THE TREE ABOVE THEM. With only the device directories, `nvidia-smi
+/// topo -m` said `NODE` for two cards the host and Docker report as `PHB` (one host bridge). MEASURED
+/// by hand in a box, one variable at a time: it took all three of the CPU/NUMA topology (without it
+/// hwloc says "failed to find sysfs cpu topology directory"), the bridges, and the `bus/pci/devices`
+/// entries as LINKS; any one alone left `NODE`. The bridges' attribute files were enough, so their
+/// directories, which list every other device behind them, are not given.
+///
+/// An address that is not a plain PCI address, or whose link leaves `sys/devices`, contributes
+/// nothing.
 pub fn pci_sysfs_paths(root: &Path, addresses: &[String]) -> Vec<PathBuf> {
-    let devices = root.join("sys/devices");
-    let mut out = Vec::new();
-    for a in addresses {
-        if a.is_empty()
-            || !a
-                .chars()
+    // What hwloc and NVML read of a bridge. `config` is the bridge's config space, read for its bus
+    // range; the rest are its identity, its link and where it sits.
+    const BRIDGE_ATTRS: &[&str] = &[
+        "class",
+        "vendor",
+        "device",
+        "subsystem_vendor",
+        "subsystem_device",
+        "revision",
+        "config",
+        "max_link_speed",
+        "max_link_width",
+        "current_link_speed",
+        "current_link_width",
+        "numa_node",
+        "local_cpulist",
+        "local_cpus",
+    ];
+    let is_pci_addr = |a: &str| {
+        !a.is_empty()
+            && a.chars()
                 .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
-        {
+    };
+    let devices = root.join("sys/devices");
+    let mut out: Vec<PathBuf> = Vec::new();
+    let push = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for a in addresses {
+        if !is_pci_addr(a) {
             continue;
         }
         let bus = PathBuf::from("sys/bus/pci/devices").join(a);
@@ -3307,8 +3339,50 @@ pub fn pci_sysfs_paths(root: &Path, addresses: &[String]) -> Vec<PathBuf> {
         if !real.starts_with(&devices) || !real.is_dir() {
             continue;
         }
-        out.push(rel.to_path_buf());
-        out.push(bus);
+        push(rel.to_path_buf(), &mut out);
+        push(bus, &mut out);
+        // The card's bus under `class/pci_bus`, which NCCL resolves to find the card's PCI path:
+        // without it NCCL took the class from NVML (`0x03`) where Docker's box reads `0x030000`.
+        // The link, and the `pci_bus/<bus>` directory it points to (affinity files and links only).
+        if let Some((domain_bus, _)) = a.rsplit_once(':') {
+            let class_link = PathBuf::from("sys/class/pci_bus").join(domain_bus);
+            if let Ok(bus_dir) = std::fs::canonicalize(root.join(&class_link)) {
+                if let Ok(bus_rel) = bus_dir.strip_prefix(root) {
+                    if bus_dir.starts_with(&devices) && bus_dir.is_dir() {
+                        push(bus_rel.to_path_buf(), &mut out);
+                        push(class_link, &mut out);
+                    }
+                }
+            }
+        }
+        // The bridges, from the card up to (not including) the host bridge `pciDDDD:BB`.
+        let mut up = rel.parent();
+        while let Some(dir) = up {
+            let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+                break;
+            };
+            if !is_pci_addr(name) || !name.contains(':') {
+                break;
+            }
+            for attr in BRIDGE_ATTRS {
+                let f = dir.join(attr);
+                if root.join(&f).is_file() {
+                    push(f, &mut out);
+                }
+            }
+            let link = PathBuf::from("sys/bus/pci/devices").join(name);
+            if root.join(&link).exists() {
+                push(link, &mut out);
+            }
+            up = dir.parent();
+        }
+    }
+    if !out.is_empty() {
+        for topo in ["sys/devices/system/cpu", "sys/devices/system/node"] {
+            if root.join(topo).is_dir() {
+                push(PathBuf::from(topo), &mut out);
+            }
+        }
     }
     out
 }
@@ -6837,6 +6911,61 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The tree above a card: its bridge's ATTRIBUTE FILES (never the bridge directory, which lists
+    /// the other devices behind it), the bridge's `bus/pci/devices` link, and the CPU and NUMA
+    /// topology, once. Measured as what `nvidia-smi topo -m` needs to say `PHB` (see the function).
+    #[test]
+    fn a_cards_sysfs_includes_its_bridges_attributes_and_the_cpu_topology() {
+        let root = std::env::temp_dir().join(format!("kern-pcisys-br-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let card = root.join("sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0");
+        std::fs::create_dir_all(&card).expect("card dir");
+        let bridge = root.join("sys/devices/pci0000:00/0000:00:01.0");
+        for f in ["class", "vendor", "max_link_width"] {
+            std::fs::write(bridge.join(f), "x\n").expect("attr");
+        }
+        // A sibling device behind the same bridge: must NOT be listed.
+        std::fs::create_dir_all(bridge.join("0000:01:00.1")).expect("sibling");
+        let devs = root.join("sys/bus/pci/devices");
+        std::fs::create_dir_all(&devs).expect("bus dir");
+        std::os::unix::fs::symlink(
+            "../../../devices/pci0000:00/0000:00:01.0/0000:01:00.0",
+            devs.join("0000:01:00.0"),
+        )
+        .expect("card link");
+        std::os::unix::fs::symlink(
+            "../../../devices/pci0000:00/0000:00:01.0",
+            devs.join("0000:00:01.0"),
+        )
+        .expect("bridge link");
+        std::fs::create_dir_all(root.join("sys/devices/system/cpu")).expect("cpu");
+        std::fs::create_dir_all(root.join("sys/devices/system/node")).expect("node");
+        let got = pci_sysfs_paths(&root, &["0000:01:00.0".into()]);
+        let _ = std::fs::remove_dir_all(&root);
+        let want: Vec<PathBuf> = [
+            "sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0",
+            "sys/bus/pci/devices/0000:01:00.0",
+            "sys/devices/pci0000:00/0000:00:01.0/class",
+            "sys/devices/pci0000:00/0000:00:01.0/vendor",
+            "sys/devices/pci0000:00/0000:00:01.0/max_link_width",
+            "sys/bus/pci/devices/0000:00:01.0",
+            "sys/devices/system/cpu",
+            "sys/devices/system/node",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(got, want);
+        assert!(
+            !got.iter().any(|p| p.ends_with("0000:01:00.1")),
+            "a sibling leaked"
+        );
+        assert!(
+            !got.contains(&PathBuf::from("sys/devices/pci0000:00/0000:00:01.0")),
+            "the bridge directory itself is not given"
+        );
     }
 
     /// A GATED NODE ON ANOTHER CARD MUST NOT REFUSE THIS ONE. The policy is a function of the

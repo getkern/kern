@@ -33,6 +33,67 @@ pub struct KernConfig {
     pub disk: Vec<DiskEntry>,
     /// `[[vdisk]]` - virtual disk profiles: size quota + I/O limits (`vdisk:<name>`).
     pub vdisk: Vec<VDiskEntry>,
+    /// The profiles' positions by name, built at the first lookup. See [`KernConfig::vcpu_named`].
+    names: std::sync::OnceLock<NameIndex>,
+}
+
+/// Where each profile of each family sits, by name, with the family's length when it was built so a
+/// family changed after the first lookup is never answered from a stale index.
+#[derive(Debug, Clone, Default)]
+struct NameIndex {
+    vcpu: (usize, std::collections::HashMap<String, usize>),
+    vgpio: (usize, std::collections::HashMap<String, usize>),
+    vdisk: (usize, std::collections::HashMap<String, usize>),
+}
+
+impl KernConfig {
+    fn names(&self) -> &NameIndex {
+        self.names.get_or_init(|| {
+            let index = |names: Vec<&str>| {
+                let len = names.len();
+                let mut m = std::collections::HashMap::with_capacity(len);
+                for (i, n) in names.into_iter().enumerate() {
+                    // The FIRST of a repeated name, as `.find` answered; `parse` refuses repeats.
+                    m.entry(n.to_string()).or_insert(i);
+                }
+                (len, m)
+            };
+            NameIndex {
+                vcpu: index(self.vcpu.iter().map(|e| e.name.as_str()).collect()),
+                vgpio: index(self.vgpio.iter().map(|e| e.name.as_str()).collect()),
+                vdisk: index(self.vdisk.iter().map(|e| e.name.as_str()).collect()),
+            }
+        })
+    }
+
+    /// The `[[vcpu]]` profile named `name`. BY INDEX, NOT A SCAN: every profile looked up by name
+    /// scanned the whole family, so `validate`, which looks up each profile, was quadratic (reported:
+    /// 36 s for 100,000 profiles, 289 ms for 10,000).
+    pub(crate) fn vcpu_named(&self, name: &str) -> Option<&VCpuEntry> {
+        let (len, m) = &self.names().vcpu;
+        if *len != self.vcpu.len() {
+            return self.vcpu.iter().find(|e| e.name == name);
+        }
+        m.get(name).and_then(|i| self.vcpu.get(*i))
+    }
+
+    /// The `[[vgpio]]` profile named `name`; see [`KernConfig::vcpu_named`].
+    pub(crate) fn vgpio_named(&self, name: &str) -> Option<&VGpioEntry> {
+        let (len, m) = &self.names().vgpio;
+        if *len != self.vgpio.len() {
+            return self.vgpio.iter().find(|e| e.name == name);
+        }
+        m.get(name).and_then(|i| self.vgpio.get(*i))
+    }
+
+    /// The `[[vdisk]]` profile named `name`; see [`KernConfig::vcpu_named`].
+    pub(crate) fn vdisk_named(&self, name: &str) -> Option<&VDiskEntry> {
+        let (len, m) = &self.names().vdisk;
+        if *len != self.vdisk.len() {
+            return self.vdisk.iter().find(|e| e.name == name);
+        }
+        m.get(name).and_then(|i| self.vdisk.get(*i))
+    }
 }
 
 /// `[kern]` - global settings.
@@ -520,10 +581,68 @@ enum Ctx {
 }
 
 /// Parse a `kern.toml` document. Errors carry the 1-based line of the offending token.
+///
+/// THE ONE READER. `validate`, `config set`, `config get` and every box start judge the file
+/// through this function, so they cannot disagree about it. They used to: `validate` stripped a
+/// UTF-8 BOM and refused a line that is neither a header nor `key = value`, and this function did
+/// neither. Measured on 6d93b85: a BOM before `[kern]` made every key of the section silently
+/// unread (`publish_bind = "127.0.0.1"` ignored, the port bound on `0.0.0.0`) while `validate` said
+/// "valid", and a `[kern` with no `]` let `config set` write into a file `validate` refused.
+///
+/// What it refuses, each one invalid TOML that an editor or a slip of the keyboard produces:
+/// - a line that is neither `[table]` / `[[array]]` nor `key = value` (outside a multi-line array);
+/// - a key written twice in one table: TOML forbids it, and the two halves of kern read different
+///   ones (`config get` the first, the settings the last);
+/// - `[kern]` opened twice, for the same reason one table level up;
+/// - a multi-line array that never closes, which used to swallow the rest of the file.
+///
+/// Unknown sections and unknown keys are still read past: that tolerance is for files shared with
+/// another kern edition, and none of the four cases above is valid in any edition.
 pub fn parse(text: &str) -> Result<KernConfig, String> {
+    parse_unclipped(text).map_err(|e| clip_error(&e))
+}
+
+/// The longest error `parse` returns, in bytes, before it is cut. An error QUOTES the value it
+/// refuses, and a 5 MB value was written whole to stderr by every `config get` and every box start
+/// (reported: 5,243,208 bytes). The line number and the reason come first, so the cut keeps them.
+const PARSE_ERROR_MAX: usize = 400;
+
+fn clip_error(e: &str) -> String {
+    if e.len() <= PARSE_ERROR_MAX {
+        return e.to_string();
+    }
+    let mut cut = PARSE_ERROR_MAX;
+    while !e.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}... ({} bytes in all)", &e[..cut], e.len())
+}
+
+/// [`parse`] before its error is clipped.
+fn parse_unclipped(text: &str) -> Result<KernConfig, String> {
+    // A UTF-8 BOM is a file marker editors on Windows add, not content.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut cfg = KernConfig::default();
     let mut ctx = Ctx::None;
     let lines: Vec<&str> = text.lines().collect();
+    // The keys of the table being read, with the line each was set on. Cleared at every header: a
+    // `[[vcpu]]` repeated is a NEW table, so its `name` is not a repeat of the previous one's.
+    // A MAP, NOT A LIST: a linear search made a table of N keys cost N^2 (reported: 40,000 keys in
+    // one table took 4.8 s for `config get` against 0.01 s before the check existed).
+    let mut keys_here: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut kern_opened_at: Option<usize> = None;
+    let not_toml = |n: usize, line: &str| {
+        // A BOM pasted mid-file is invisible in the echo, so it is named.
+        let bom = if line.contains('\u{feff}') {
+            " (the line holds a U+FEFF byte-order mark, invisible in most editors: delete it)"
+        } else {
+            ""
+        };
+        format!(
+            "line {n}: not valid TOML - expected `[section]` or `key = value`, got `{}`{bom}",
+            line.chars().take(40).collect::<String>()
+        )
+    };
     let mut i = 0;
     while i < lines.len() {
         let n = i + 1;
@@ -532,36 +651,121 @@ pub fn parse(text: &str) -> Result<KernConfig, String> {
             i += 1;
             continue;
         }
-        if let Some((_double, path)) = section_header(line) {
+        if line.starts_with('[') {
+            let Some((double, raw_path)) = section_header(line).filter(|(_, p)| !p.is_empty())
+            else {
+                return Err(not_toml(n, line));
+            };
+            // The header as TOML names it: `[ "kern" ]` and `["\u006bern"]` ARE `[kern]`.
+            let Some(path) = key_path(raw_path).map(|p| p.join(".")) else {
+                return Err(not_toml(n, line));
+            };
+            let path = path.as_str();
+            // `[kern]` IS ONE TABLE. `[[kern]]` declared an array of tables with that name, which
+            // this reader skipped without a word while `validate` said "valid", and `config set`
+            // then appended a `[kern]` that made the file invalid TOML (reported, with `tomllib` as
+            // the referee: "Cannot declare ('kern',) twice").
+            if double && path == "kern" {
+                return Err(format!(
+                    "line {n}: [[kern]] declares an array of tables; kern's settings are ONE table, \
+                     written [kern]"
+                ));
+            }
+            if !double && path == "kern" {
+                if let Some(first) = kern_opened_at {
+                    return Err(format!(
+                        "line {n}: [kern] is opened a second time (first at line {first}); TOML \
+                         allows a table once, so move these keys under the first [kern]"
+                    ));
+                }
+                kern_opened_at = Some(n);
+            }
+            keys_here.clear();
             ctx = enter_section(&mut cfg, path, n)?;
             i += 1;
             continue;
         }
-        // A line that is neither a `[section]` nor `key = value` is unsupported syntax - skip it
-        // rather than fail. A kern.toml can carry TOML this hand-rolled reader doesn't model (an
-        // inline table like `{bus=1, …}`); dropping those lines keeps the rest of the config usable.
         let Some((key, val)) = line.split_once('=') else {
-            i += 1;
-            continue;
+            return Err(not_toml(n, line));
         };
-        let key = key.trim();
+        let Some(segs) = key_path(key.trim()) else {
+            return Err(not_toml(n, line));
+        };
+        let top_kern = matches!(ctx, Ctx::None) && segs.first().is_some_and(|s| s == "kern");
+        let key_owned = if segs.len() == 1 {
+            segs.into_iter().next().unwrap_or_default()
+        } else {
+            segs.join(".")
+        };
+        let key: &str = &key_owned;
+        // `kern.log_max_size = ...` (or `kern = { ... }`) at the top level DEFINES the [kern] table
+        // through a dotted key or an inline table. This reader read it past without a word, and
+        // `config set` then appended a `[kern]`, which TOML refuses as a table defined twice
+        // (reported). Refused, with the spelling that works.
+        if top_kern {
+            return Err(format!(
+                "line {n}: `{}` defines the [kern] table outside a [kern] header; write the key \
+                 under [kern] instead",
+                clip_key(key)
+            ));
+        }
+        if let Some(first) = keys_here.get(key) {
+            return Err(format!(
+                "line {n}: `{}` is already set in this table at line {first}; TOML allows a \
+                 key once per table, so delete the one you did not mean",
+                clip_key(key)
+            ));
+        }
+        keys_here.insert(key.to_string(), n);
         // Multi-line array: `key = [` whose closing `]` is on a later line (as `kern setup -c` itself
         // writes for long device lists - e.g. a `[[gpio]]`'s `i2c`/`spi`). Gather the following
-        // comment-stripped lines up to the `]` into one array literal so the reader accepts it,
-        // instead of failing the whole config. The error still points at the array's opening line.
+        // comment-stripped lines up to the line that balances the brackets into one array literal.
+        // Brackets inside quotes do not count, so `["has ] in it",` does not end the array early.
+        // The error still points at the array's opening line.
         let first = val.trim();
         let joined;
-        let val: &str = if first.starts_with('[') && !first.contains(']') {
+        let (mut opens, mut closes) = brackets_outside_quotes(first);
+        // A MULTI-LINE STRING (`"""` or `'''`) runs to its closing delimiter, comment characters and
+        // all: valid TOML that the round-1 reader skipped line by line and the strict reader refused
+        // as stray lines (reported). kern's own keys take single-line strings, so one written this
+        // way is refused by that key's own rule; an unknown key is read past like any other.
+        let ml = ["\"\"\"", "'''"]
+            .into_iter()
+            .find(|d| first.starts_with(d) && !first[3..].contains(d));
+        let val: &str = if let Some(delim) = ml {
             let mut buf = String::from(first);
-            while i + 1 < lines.len() {
+            loop {
+                if i + 1 >= lines.len() {
+                    return Err(format!(
+                        "line {n}: the multi-line string of `{key}` is opened here and never closed \
+                         with {delim}"
+                    ));
+                }
+                i += 1;
+                buf.push('\n');
+                buf.push_str(lines[i]);
+                if lines[i].contains(delim) {
+                    break;
+                }
+            }
+            joined = buf;
+            joined.as_str()
+        } else if first.starts_with('[') && opens > closes {
+            let mut buf = String::from(first);
+            while opens > closes {
+                if i + 1 >= lines.len() {
+                    return Err(format!(
+                        "line {n}: the array of `{key}` is opened here and never closed with `]`"
+                    ));
+                }
                 i += 1;
                 let more = strip_comment(lines[i]).trim();
                 if !more.is_empty() {
+                    let (o, c) = brackets_outside_quotes(more);
+                    opens += o;
+                    closes += c;
                     buf.push(' ');
                     buf.push_str(more);
-                }
-                if more.contains(']') {
-                    break;
                 }
             }
             joined = buf;
@@ -664,14 +868,13 @@ pub fn parse(text: &str) -> Result<KernConfig, String> {
 
 /// Refuse a repeated `name` (or `id`) within one family of config entries.
 ///
-/// Quadratic on purpose. A `kern.toml` holds a handful of profiles, the comparison is a string
-/// equality, and a `BTreeSet` here would trade a measurable nothing for an allocation and a less
-/// obvious loop. The first repeat found is the one reported: naming them all would be a list an
-/// operator has to read, when fixing the first is what they will do either way.
+/// A set, not the quadratic scan it was: "a handful of profiles" was the assumption, and a file of
+/// 100,000 `[[vcpu]]` tables took 143 s to validate (reported). The first repeat found is the one
+/// reported: fixing the first is what an operator will do either way.
 fn dup<'a>(table: &str, field: &str, names: impl Iterator<Item = &'a str>) -> Result<(), String> {
-    let seen: Vec<&str> = names.collect();
-    for (i, a) in seen.iter().enumerate() {
-        if seen[..i].contains(a) {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for a in names {
+        if !seen.insert(a) {
             return Err(format!(
                 "two {table} entries share `{field} = \"{a}\"`. Only the first would ever be used \
                  and the other would be silently discarded, so one of them does nothing: give them \
@@ -743,6 +946,40 @@ fn enter_section(cfg: &mut KernConfig, path: &str, n: usize) -> Result<Ctx, Stri
 /// only the block they were looking at leaves two broken. The alternative - one line per occurrence -
 /// makes a config parsed several times per invocation print the same sentence a dozen times, which is
 /// how a reader learns to skip warnings. Naming the rule in the text is what makes the trade honest.
+/// A key as an error or warning shows it: whole when short, cut with its length when not. A 5 MB key
+/// under [kern] was written whole to stderr by every `config get` and box start (reported).
+fn clip_key(key: &str) -> std::borrow::Cow<'_, str> {
+    const MAX: usize = 80;
+    // A control character is shown escaped, never written raw: a key holding a NUL or an escape
+    // sequence wrote it to the terminal (reported: a raw NUL in `validate` and `get`).
+    if key.chars().any(char::is_control) {
+        let shown: String = key
+            .chars()
+            .take(MAX)
+            .flat_map(|c| {
+                if c.is_control() {
+                    c.escape_default().collect::<Vec<_>>()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
+        return std::borrow::Cow::Owned(if key.chars().count() > MAX {
+            format!("{shown}... ({} bytes)", key.len())
+        } else {
+            shown
+        });
+    }
+    if key.len() <= MAX {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    let mut cut = MAX;
+    while !key.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}... ({} bytes)", &key[..cut], key.len()))
+}
+
 fn warn_unknown_key(section: &str, key: &str) {
     use std::cell::RefCell;
     use std::collections::HashSet;
@@ -751,11 +988,18 @@ fn warn_unknown_key(section: &str, key: &str) {
     }
     let id = format!("{section}.{key}");
     let first = SEEN.with(|s| s.borrow_mut().insert(id));
+    let key = clip_key(key);
     if first {
+        // `[kern]` is a single table; every other section that warns is an array of tables.
+        let table = if section == "kern" {
+            "[kern]".to_string()
+        } else {
+            format!("[[{section}]]")
+        };
         eprintln!(
-            "kern: warning: kern.toml: [[{section}]] has no key '{key}' in this build - it is \
+            "kern: warning: kern.toml: {table} has no key '{key}' in this build - it is \
              ignored, so anything it was meant to set is not set (reported once per key: if you \
-             wrote it in several [[{section}]] blocks, every one of them is affected)"
+             wrote it in several {table} blocks, every one of them is affected)"
         );
     }
 }
@@ -1063,6 +1307,137 @@ fn strip_comment(line: &str) -> &str {
     kern_common::toml_lite::strip_comment(line)
 }
 
+/// How many `[` and `]` a line holds OUTSIDE quoted strings: the balance that says whether a
+/// multi-line array is still open, so a `name = "has ] bracket"` value neither opens nor closes one.
+///
+/// A BACKSLASH ESCAPES INSIDE A BASIC (`"`) STRING, as TOML says, and not inside a literal (`'`) one:
+/// `"a\"["` is one string holding a quote and a bracket, and reading its `\"` as the end of the string
+/// turned the `[` into an opener, so a valid array was "never closed" (reported).
+pub(crate) fn brackets_outside_quotes(line: &str) -> (usize, usize) {
+    let (mut opens, mut closes, mut q, mut esc) = (0usize, 0usize, 0u8, false);
+    for b in line.bytes() {
+        if q == b'"' && esc {
+            esc = false;
+            continue;
+        }
+        match b {
+            b'\\' if q == b'"' => esc = true,
+            b'"' | b'\'' if q == 0 => q = b,
+            _ if b == q => q = 0,
+            b'[' if q == 0 => opens += 1,
+            b']' if q == 0 => closes += 1,
+            _ => {}
+        }
+    }
+    (opens, closes)
+}
+
+/// The key of a `key = value` line as TOML names it, or `None` when it is not a key TOML allows.
+///
+/// `"log_max_size"` and `'log_max_size'` ARE `log_max_size`: a quoted key is the same key, so it is
+/// applied, and written twice with the bare one it is a duplicate (both reported missed). A bare key
+/// is letters, digits, `_` and `-`, with `.` for a dotted key: anything else, such as a BOM pasted in
+/// the middle of the file that became part of the name, is not TOML and is refused by line instead of
+/// being read as an unknown key nobody wrote. A dotted key with quoted parts is passed through whole:
+/// no kern key has that shape, so it is read past as unknown.
+pub(crate) fn toml_key(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let segs = key_path(raw)?;
+    Some(std::borrow::Cow::Owned(if segs.len() == 1 {
+        segs.into_iter().next().unwrap_or_default()
+    } else {
+        segs.join(".")
+    }))
+}
+
+/// A TOML key (or table header path) as its segments: bare (`A-Za-z0-9_-`), basic-quoted with its
+/// escapes decoded, or literal-quoted, separated by `.` with optional whitespace around each dot.
+/// `None` for anything TOML does not accept as a key.
+///
+/// THE SEGMENTS ARE WHAT IS COMPARED, never the spelling. The `kern.` refusal and the `[kern]`
+/// header were matched on how they were written, and every other spelling of the same key got past
+/// both (reported: `[ "kern" ]`, `"kern".log_max_size`, `kern . log_max_size`, `"\u006bern".x` all
+/// passed `validate` and were never applied, and `config set` then wrote a second `[kern]`), while
+/// the single quoted key `"kern.log_max_size"`, which is NOT the kern table, was refused.
+pub(crate) fn key_path(raw: &str) -> Option<Vec<String>> {
+    let bare = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let mut out = Vec::new();
+    let mut rest = raw.trim();
+    loop {
+        rest = rest.trim_start();
+        let (seg, after) = if let Some(r) = rest.strip_prefix('"') {
+            let mut end = None;
+            let mut esc = false;
+            for (i, c) in r.char_indices() {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    end = Some(i);
+                    break;
+                }
+            }
+            let e = end?;
+            (unescape_basic(&r[..e])?, &r[e + 1..])
+        } else if let Some(r) = rest.strip_prefix('\'') {
+            let e = r.find('\'')?;
+            (r[..e].to_string(), &r[e + 1..])
+        } else {
+            let e = rest
+                .find(|c: char| c == '.' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            let seg = &rest[..e];
+            if seg.is_empty() || !seg.chars().all(bare) {
+                return None;
+            }
+            (seg.to_string(), &rest[e..])
+        };
+        out.push(seg);
+        let after = after.trim_start();
+        if after.is_empty() {
+            return Some(out);
+        }
+        rest = after.strip_prefix('.')?;
+    }
+}
+
+/// The contents of a TOML basic string with its escapes decoded, or `None` for an escape TOML does
+/// not define (or an unescaped quote).
+fn unescape_basic(inner: &str) -> Option<String> {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return None,
+            '\\' => {
+                let e = chars.next()?;
+                match e {
+                    'b' => out.push('\u{8}'),
+                    't' => out.push('\t'),
+                    'n' => out.push('\n'),
+                    'f' => out.push('\u{c}'),
+                    'r' => out.push('\r'),
+                    'e' => out.push('\u{1b}'),
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    'u' | 'U' => {
+                        let n = if e == 'u' { 4 } else { 8 };
+                        let hex: String = (0..n).map_while(|_| chars.next()).collect();
+                        if hex.len() != n {
+                            return None;
+                        }
+                        let code = u32::from_str_radix(&hex, 16).ok()?;
+                        out.push(char::from_u32(code)?);
+                    }
+                    _ => return None,
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
 /// `[x]` → `(false, "x")`, `[[x]]` → `(true, "x")`; `None` if not a header. Inner is trimmed.
 fn section_header(line: &str) -> Option<(bool, &str)> {
     if let Some(inner) = line.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
@@ -1245,7 +1620,12 @@ fn load_impl(
     };
     match std::fs::read_to_string(&p) {
         Ok(text) => parse(&text).map_err(|e| format!("{}: {e}", p.display())),
-        Err(_) if !explicit => Ok(KernConfig::default()),
+        // Only ABSENCE is "no config": the default was seen to exist a moment ago, and a file that
+        // is there but unreadable (not UTF-8, no permission) is a config kern is not applying,
+        // which has to be said rather than read as empty.
+        Err(e) if !explicit && e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(KernConfig::default())
+        }
         Err(e) => Err(format!("{}: {e}", p.display())),
     }
 }
@@ -1298,7 +1678,7 @@ fn resolve_vcpu_seen(
         return Err(format!("[[vcpu]] 'extends' cycle: {}", seen.join(" -> ")));
     }
     seen.push(name.to_string());
-    let e = cfg.vcpu.iter().find(|e| e.name == name).ok_or_else(|| {
+    let e = cfg.vcpu_named(name).ok_or_else(|| {
         // NAME THE COMMAND, not just the file. A compose file that references a profile through
         // `x-kern-vcpu` is written by whoever wrote the service; the person reading this error
         // is the operator who has to create the grant, and sending them to a document to find out
@@ -1370,7 +1750,7 @@ pub struct ResolvedVgpio {
 /// `camera`/`audio`/…) are `/dev/*` paths, **canonicalized and re-checked to stay under `/dev/`** so
 /// a symlink can't redirect the bind outside `/dev`. Only paths that exist on this host are returned.
 pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, String> {
-    let e = cfg.vgpio.iter().find(|e| e.name == name).ok_or_else(|| {
+    let e = cfg.vgpio_named(name).ok_or_else(|| {
         // NAME THE COMMAND, not just the file. A compose file that references a profile through
         // `x-kern-vgpio` is written by whoever wrote the service; the person reading this error
         // is the operator who has to create the grant, and sending them to a document to find out
@@ -1873,7 +2253,7 @@ pub struct ResolvedVdisk {
 /// name) selects the physical disk pool the ext4 image is placed on; unknown/absent → a default is
 /// chosen at mount time.
 pub fn resolve_vdisk(cfg: &KernConfig, name: &str) -> Result<ResolvedVdisk, String> {
-    let e = cfg.vdisk.iter().find(|e| e.name == name).ok_or_else(|| {
+    let e = cfg.vdisk_named(name).ok_or_else(|| {
         // NAME THE COMMAND, not just the file. A compose file that references a profile through
         // `x-kern-vdisk` is written by whoever wrote the service; the person reading this error
         // is the operator who has to create the grant, and sending them to a document to find out
@@ -2324,7 +2704,7 @@ pub(crate) fn profile_pairs(cfg: &KernConfig, kind: &str, name: &str) -> Vec<(St
     let u32s = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     match kind {
         "vcpu" => {
-            if let Some(e) = cfg.vcpu.iter().find(|e| e.name == name) {
+            if let Some(e) = cfg.vcpu_named(name) {
                 if let Some(v) = e.cpus {
                     out.push(("cpus".into(), crate::ui::fmt_cpus(v)));
                 }
@@ -2349,7 +2729,7 @@ pub(crate) fn profile_pairs(cfg: &KernConfig, kind: &str, name: &str) -> Vec<(St
             }
         }
         "vgpio" => {
-            if let Some(e) = cfg.vgpio.iter().find(|e| e.name == name) {
+            if let Some(e) = cfg.vgpio_named(name) {
                 if !e.backend.is_empty() {
                     out.push(("backend".into(), e.backend.clone()));
                 }
@@ -2386,7 +2766,7 @@ pub(crate) fn profile_pairs(cfg: &KernConfig, kind: &str, name: &str) -> Vec<(St
             }
         }
         "vdisk" => {
-            if let Some(e) = cfg.vdisk.iter().find(|e| e.name == name) {
+            if let Some(e) = cfg.vdisk_named(name) {
                 if let Some(s) = &e.size {
                     out.push(("size".into(), s.clone()));
                 }
@@ -2433,12 +2813,44 @@ fn config_lock() -> Option<std::fs::File> {
 
 /// The default `kern.toml` path + its current contents (empty when absent), ensuring the parent dir
 /// exists so a later write succeeds.
+///
+/// The path returned is the one to WRITE: a `kern.toml` that is a symlink (a dotfiles repo) is
+/// written through to its target, because the atomic rename would otherwise replace the link with
+/// a regular file and leave the target, the file the user edits, stale (measured on 6d93b85).
+///
+/// Only a MISSING file reads as empty. A file that is there and cannot be read as text (not UTF-8,
+/// no permission) is an error: reading it as empty is what made `config set` replace a whole file
+/// with one key. A leading UTF-8 BOM is dropped, as [`parse`] drops it, so a key lands in the
+/// `[kern]` the reader sees instead of a second one appended below it.
 pub(crate) fn read_kern_toml() -> Result<(std::path::PathBuf, String), String> {
     let path = active_path().ok_or("no config path (is HOME set?)")?;
+    let path = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(&path).map_err(|e| {
+            format!(
+                "{} is a symlink whose target cannot be resolved ({e}); fix the link or replace \
+                 it with the file",
+                path.display()
+            )
+        })?,
+        _ => path,
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(format!(
+                "{}: {e}; refusing to write over a file kern cannot read",
+                path.display()
+            ))
+        }
+    };
+    let raw = match raw.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_string(),
+        None => raw,
+    };
     Ok((path, raw))
 }
 
@@ -2462,11 +2874,29 @@ pub(crate) fn write_atomic_bytes(path: &std::path::Path, content: &[u8]) -> std:
         .unwrap_or_default();
     let tmp = path.with_file_name(format!("{name}.tmp.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp); // clear a temp left by our own crashed write
+                                        // THE FILE KEEPS ITS MODE. A new file is private (0600); one that exists keeps what its owner gave
+                                        // it, because the rename replaces the inode and a fresh 0600 silently narrowed a dotfile kept at
+                                        // 0644 (reported, through a symlink into a dotfiles repo). A hard link to the old inode still
+                                        // keeps the old content: that is what an atomic replace is, as with `sed -i` or an editor's save.
+    let keep_mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
+    };
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
+    if let Some(mode) = keep_mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(mode)) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
     let res = f.write_all(content).and_then(|()| f.sync_all());
     if let Err(e) = res {
         let _ = std::fs::remove_file(&tmp);
@@ -2494,7 +2924,7 @@ pub(crate) fn validate_profile_refs(
 ) -> Result<(), String> {
     match section {
         "vcpu" => {
-            if let Some(e) = cfg.vcpu.iter().find(|e| e.name == name) {
+            if let Some(e) = cfg.vcpu_named(name) {
                 require_backend(
                     e.backend.as_deref().unwrap_or(""),
                     ProfileKind::Vcpu,
@@ -2508,7 +2938,7 @@ pub(crate) fn validate_profile_refs(
             }
         }
         "vgpio" => {
-            if let Some(e) = cfg.vgpio.iter().find(|e| e.name == name) {
+            if let Some(e) = cfg.vgpio_named(name) {
                 require_backend(
                     &e.backend,
                     ProfileKind::Vgpio,
@@ -2517,7 +2947,7 @@ pub(crate) fn validate_profile_refs(
             }
         }
         "vdisk" => {
-            if let Some(e) = cfg.vdisk.iter().find(|e| e.name == name) {
+            if let Some(e) = cfg.vdisk_named(name) {
                 require_backend(
                     &e.backend,
                     ProfileKind::Vdisk,
@@ -2784,6 +3214,7 @@ pub(crate) fn save_named_block(
 ) -> Result<(), String> {
     let _lock = config_lock(); // held until this function returns
     let (path, raw) = read_kern_toml()?;
+    refuse_unparsable(&path, &raw)?;
     if orig_name != Some(name) && crate::toml_surgery::block_exists(&raw, section, name) {
         return Err(format!("a {section} named '{name}' already exists"));
     }
@@ -2793,9 +3224,7 @@ pub(crate) fn save_named_block(
     // FAIL-CLOSED: never write a config we can't re-parse. If the merged output doesn't parse, writing
     // it would CORRUPT kern.toml (the next load/launch fails to read ANYTHING) - worse than the
     // pre-existing problem. Refuse instead, and tell the user their file needs fixing first.
-    let cfg = parse(&out).map_err(|e| {
-        format!("refusing to write: the resulting kern.toml would not parse ({e}) - your existing config may be malformed; fix it first")
-    })?;
+    let cfg = parse(&out).map_err(|e| format!("refusing to write the {section} '{name}': {e}"))?;
     // Whole-profile coherence: a field-valid profile whose backend/extends points at nothing is refused
     // here, before the write - so a save never produces a broken profile.
     validate_profile_refs(&cfg, section, name)?;
@@ -2822,12 +3251,35 @@ pub(crate) fn delete_named_block(section: &str, name: &str) -> Result<(), String
 pub(crate) fn set_kern_key(key: &str, value: Option<&str>) -> Result<(), String> {
     let _lock = config_lock();
     let (path, raw) = read_kern_toml()?;
+    // The FILE first, then the edit, so the error names the right culprit: a value that is wrong
+    // used to be reported as "your existing config may be malformed" over a file that was fine.
+    refuse_unparsable(&path, &raw)?;
     let line = value.map(|v| format!("{key} = {v}"));
     let out = crate::toml_surgery::set_table_key(&raw, "kern", key, line.as_deref());
-    parse(&out).map_err(|e| {
-        format!("refusing to write: the resulting kern.toml would not parse ({e}) - your existing config may be malformed; fix it first")
-    })?;
+    parse(&out).map_err(|e| format!("refusing to write {key}: {e}"))?;
     write_atomic(&path, &out).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Refuse to edit a `kern.toml` that does not parse as it stands.
+///
+/// An edit cannot repair it, and the line-based surgery on a file it does not understand can make
+/// it worse: measured on 6d93b85, `config set` on a file opening with `[kern` (no `]`) appended a
+/// second `[kern]` and wrote, leaving the file as broken as before with one more key in it.
+fn refuse_unparsable(path: &std::path::Path, raw: &str) -> Result<(), String> {
+    parse(raw).map(drop).map_err(|e| {
+        format!(
+            "{}: {e}; this file does not parse as it stands, so nothing is written to it: fix that \
+             line first (`kern validate` shows it)",
+            path.display()
+        )
+    })
+}
+
+/// Whether `value` (TOML, as `kern config set` would write it) is one the reader accepts for the
+/// `[kern]` key `key`. The reader's own rule, applied to the value alone, so a refused value is
+/// refused with the sentence the file would get, before anything is read or written.
+pub(crate) fn check_kern_value(key: &str, value: &str) -> Result<(), String> {
+    apply_kern(&mut KernSettings::default(), key, value)
 }
 
 #[cfg(test)]
@@ -4151,5 +4603,262 @@ mod retention_settings_tests {
                 "{key} changed nothing in KernSettings"
             );
         }
+    }
+}
+
+/// THE ONE READER: what `parse` refuses and accepts, so `validate`, `config set|get` and every box
+/// start agree. Each case was a disagreement measured on 6d93b85 (see [`parse`]).
+#[cfg(test)]
+mod one_reader_tests {
+    use super::*;
+
+    /// A UTF-8 BOM is a file marker: the `[kern]` after it is read, and its keys are in force. The
+    /// key chosen is the one the BOM made dangerous: `publish_bind` ignored meant ports on 0.0.0.0.
+    #[test]
+    fn a_bom_before_kern_is_read_past() {
+        let c = parse("\u{feff}[kern]\npublish_bind = \"127.0.0.1\"\n").expect("a BOM file parses");
+        assert_eq!(c.kern.publish_bind.as_deref(), Some("127.0.0.1"));
+        // The control: without the BOM the same file reads the same.
+        let c = parse("[kern]\npublish_bind = \"127.0.0.1\"\n").expect("parses");
+        assert_eq!(c.kern.publish_bind.as_deref(), Some("127.0.0.1"));
+    }
+
+    /// A key twice in one table is refused, naming both lines; the same key in two `[[vcpu]]`
+    /// tables is two tables and is not a repeat.
+    #[test]
+    fn a_key_twice_in_one_table_is_refused_and_two_tables_are_not_a_repeat() {
+        let e = parse("[kern]\nlog_max_size = \"10m\"\nlog_max_size = \"20m\"\n")
+            .expect_err("a duplicate key must not parse");
+        assert!(e.contains("line 3") && e.contains("line 2"), "{e}");
+        assert!(e.contains("log_max_size"), "{e}");
+        let c = parse(
+            "[[vcpu]]\nname = \"a\"\nbackend = \"host\"\n[[vcpu]]\nname = \"b\"\nbackend = \"host\"\n",
+        )
+        .expect("the same key in two array tables is not a duplicate");
+        assert_eq!(c.vcpu.len(), 2);
+    }
+
+    /// `[kern]` opened twice is refused: the line editors key on would see one, the reader both.
+    #[test]
+    fn kern_opened_twice_is_refused() {
+        let e = parse("[kern]\nlog_max_file = 2\n\n[kern]\nbuild_keep = 3\n")
+            .expect_err("two [kern] tables must not parse");
+        assert!(e.contains("line 4") && e.contains("first at line 1"), "{e}");
+    }
+
+    /// A broken header and a stray line are refused by line. `[kern` was skipped, which is how
+    /// `config set` wrote into a file `validate` refused, and how the keys under it attached to
+    /// whatever table came before.
+    #[test]
+    fn a_broken_header_and_a_stray_line_are_refused_by_line() {
+        for (text, line) in [
+            ("[kern\nlog_max_size = \"10m\"\n", "line 1"),
+            ("[kern]\nlog_max_file = 2\njust some words\n", "line 3"),
+            ("[]\n", "line 1"),
+            ("[kern] x = 1\n", "line 1"),
+            ("[kern]\n= orphan\n", "line 2"),
+        ] {
+            let e = parse(text).expect_err(text);
+            assert!(
+                e.contains(line) && e.contains("not valid TOML"),
+                "{text:?}: {e}"
+            );
+        }
+        // The control: comments, blanks, unknown sections and unknown keys still read.
+        parse("# c\n\n[kern] # c\nlog_max_file = 2 # c\n[future]\nwhatever = 1\n")
+            .expect("tolerance for other editions stays");
+    }
+
+    /// A multi-line array is gathered by bracket BALANCE outside quotes, and one that never closes
+    /// is refused at its opening line instead of swallowing the rest of the file.
+    #[test]
+    fn a_multi_line_array_closes_by_balance_and_an_open_one_is_refused() {
+        let c = parse(
+            "[[vgpio]]\nname = \"x\"\nbackend = \"gpio:0\"\nleds = [\n  \"a]b\",\n  \"c\",\n]\n[kern]\nlog_max_file = 2\n",
+        )
+        .expect("a bracket inside a quoted item does not close the array");
+        assert_eq!(
+            c.kern.log_max_file,
+            Some(2),
+            "the table after the array is read"
+        );
+        // The opening line itself holds a `]` inside quotes and is still open: judged by balance,
+        // not by "contains `]`", or the array is cut at its first line.
+        let c =
+            parse("[[vgpio]]\nname = \"x\"\nbackend = \"gpio:0\"\nleds = [\"a]b\",\n  \"c\"]\n")
+                .expect("an opening line with a quoted `]` continues");
+        assert_eq!(c.vgpio[0].leds, vec!["a]b".to_string(), "c".to_string()]);
+        let e = parse("[[vcpu]]\nname = \"a\"\ncpuset = [\n\"0\",\n")
+            .expect_err("an array that never closes must not parse");
+        assert!(e.contains("line 3") && e.contains("never closed"), "{e}");
+    }
+
+    /// `check_kern_value` is the reader's rule on the value alone, so `config set` refuses with the
+    /// file's own sentence and never blames a file that is fine.
+    #[test]
+    fn a_value_is_judged_by_the_readers_rule() {
+        assert!(check_kern_value("sandbox_history_max_size", "\"1m\"").is_ok());
+        let e = check_kern_value("sandbox_history_max_size", "\"1k\"").expect_err("below 4k");
+        assert!(e.contains("at least 4k"), "{e}");
+        assert!(!e.contains("malformed"), "{e}");
+    }
+}
+
+/// The second round of the one reader: the TOML shapes an external test showed it still misread,
+/// each checked against Python's `tomllib` when the report was written.
+#[cfg(test)]
+mod toml_alignment_tests {
+    use super::*;
+
+    /// `[[kern]]` is refused: skipped, it let `config set` append a `[kern]` that made the file
+    /// invalid TOML.
+    #[test]
+    fn an_array_named_kern_is_refused() {
+        for text in [
+            "[[kern]]\nlog_max_file = 2\n",
+            "[kern]\nlog_max_file = 2\n[[kern]]\n",
+        ] {
+            let e = parse(text).expect_err(text);
+            assert!(e.contains("[[kern]]"), "{e}");
+        }
+    }
+
+    /// A quoted key is the bare key: applied, and a duplicate of the bare one.
+    #[test]
+    fn a_quoted_key_is_the_same_key() {
+        let c = parse("[kern]\n\"log_max_size\" = \"10m\"\n").expect("parses");
+        assert_eq!(c.kern.log_max_size, Some(10 << 20));
+        let c = parse("[kern]\n'log_max_file' = 3\n").expect("parses");
+        assert_eq!(c.kern.log_max_file, Some(3));
+        let e = parse("[kern]\nlog_max_size = \"10m\"\n\"log_max_size\" = \"20m\"\n")
+            .expect_err("bare and quoted are one key");
+        assert!(e.contains("already set"), "{e}");
+        // Dotted and quoted-part keys are not kern's, and are read past.
+        parse("[kern]\na.b = 1\nsite.\"google.com\" = true\n\"x y\" = 2\n").expect("valid TOML");
+    }
+
+    /// Round 3: a top-level dotted `kern.` key or inline `kern = {..}` defines [kern] outside a header
+    /// and is refused; an escaped quoted key is decoded; a huge key is cut in what is printed.
+    #[test]
+    fn top_level_kern_keys_escaped_keys_and_huge_keys() {
+        for text in [
+            "kern.log_max_size = \"10m\"\n",
+            "kern = { log_max_file = 2 }\n",
+        ] {
+            let e = parse(text).expect_err(text);
+            assert!(e.contains("outside a [kern] header"), "{e}");
+        }
+        // Inside another table it is that table's key, and read past.
+        parse("[future]\nkern.x = 1\n").expect("future.kern.x is not [kern]");
+        let c = parse("[kern]\n\"log\\u005fmax_size\" = \"10m\"\n").expect("escaped key");
+        assert_eq!(c.kern.log_max_size, Some(10 << 20));
+        let e = parse("[kern]\nlog_max_size = \"10m\"\n\"log\\u005fmax_size\" = \"20m\"\n")
+            .expect_err("the escaped spelling is the same key");
+        assert!(e.contains("already set"), "{e}");
+        assert!(
+            parse("[kern]\n\"bad\\q\" = 1\n").is_err(),
+            "an undefined escape is not a key"
+        );
+        let big = "k".repeat(5 << 20);
+        let e = parse(&format!("kern.{big} = 1\n")).expect_err("top-level kern dotted key");
+        assert!(e.len() < 1000, "{} bytes", e.len());
+        assert!(clip_key(&big).len() < 200);
+    }
+
+    /// Round 4: the kern table is recognised by its SEGMENTS, however they are spelled, in headers and
+    /// dotted keys; a single quoted key that merely contains `kern.` is not the table; a control
+    /// character in a key is shown escaped.
+    #[test]
+    fn the_kern_table_is_recognised_by_segments_not_spelling() {
+        for text in [
+            "[ \"kern\" ]\nlog_max_size = \"10m\"\n",
+            "[ 'kern' ]\nlog_max_size = \"10m\"\n",
+            "[\"\\u006bern\"]\nlog_max_size = \"10m\"\n",
+        ] {
+            let c = parse(text).expect(text);
+            assert_eq!(c.kern.log_max_size, Some(10 << 20), "{text:?}");
+        }
+        for text in [
+            "\"kern\".log_max_size = \"10m\"\n",
+            "'kern'.log_max_size = \"10m\"\n",
+            "kern . log_max_size = \"10m\"\n",
+            "\"\\u006bern\".log_max_size = \"10m\"\n",
+        ] {
+            let e = parse(text).expect_err(text);
+            assert!(e.contains("outside a [kern] header"), "{text:?}: {e}");
+        }
+        parse("\"kern.log_max_size\" = \"10m\"\n").expect("one quoted key, not the kern table");
+        assert_eq!(
+            key_path("a . \"b.c\" . 'd'"),
+            Some(vec!["a".into(), "b.c".into(), "d".into()])
+        );
+        assert_eq!(key_path("a..b"), None);
+        assert!(!clip_key("log\u{0}x").contains('\u{0}'));
+    }
+
+    /// A BOM in the middle is refused by line, and the error says what the invisible thing is.
+    #[test]
+    fn a_bom_mid_file_is_refused_and_named() {
+        let e = parse("[kern]\nlog_max_file = 2\n\u{feff}log_max_size = \"10m\"\n")
+            .expect_err("a BOM inside a key is not a bare key");
+        assert!(e.contains("line 3") && e.contains("U+FEFF"), "{e}");
+    }
+
+    /// An escaped quote inside a basic string does not end it, so the bracket after it is content.
+    #[test]
+    fn an_escaped_quote_in_an_array_item_does_not_end_the_string() {
+        assert_eq!(brackets_outside_quotes(r#"leds = ["a\"[","#), (1, 0));
+        assert_eq!(
+            brackets_outside_quotes(r#"x = 'a\'"#),
+            (0, 0),
+            "no escapes in a literal string"
+        );
+        let c = parse("[[vgpio]]\nname = \"x\"\nbackend = \"host\"\nleds = [\n\"a\\\"[\",\n]\n")
+            .expect("a valid array with an escaped quote");
+        assert_eq!(c.vgpio.len(), 1);
+    }
+
+    /// A multi-line string runs to its delimiter: an unknown key holding one is read past, comment
+    /// and header look-alikes inside it included; an unclosed one is refused at its opening line.
+    #[test]
+    fn a_multi_line_string_is_read_to_its_delimiter() {
+        let c = parse(
+            "[future]\nnote = \"\"\"\nline # not a comment\n[not a header]\n\"\"\"\n[kern]\nlog_max_file = 2\n",
+        )
+        .expect("valid TOML");
+        assert_eq!(c.kern.log_max_file, Some(2));
+        parse("[future]\nnote = '''\nraw ''\n'''\n").expect("literal multi-line string");
+        let e = parse("[future]\nnote = \"\"\"\nnever closed\n").expect_err("unclosed");
+        assert!(e.contains("line 2") && e.contains("never closed"), "{e}");
+    }
+
+    /// An error quoting a huge value is cut, keeping the line and the reason in front.
+    #[test]
+    fn a_huge_value_is_not_echoed_whole() {
+        let big = "x".repeat(5 << 20);
+        let e = parse(&format!("[kern]\nlog_max_size = \"{big}\"\n")).expect_err("not a size");
+        assert!(e.len() < 1000, "{} bytes", e.len());
+        assert!(e.starts_with("line 2"), "{}", &e[..60]);
+        assert!(e.contains("bytes in all"), "{}", &e[e.len() - 60..]);
+    }
+
+    /// `write_atomic` keeps the mode of a file that exists, and a new file is private.
+    #[test]
+    fn write_atomic_keeps_an_existing_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("kern-wamode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let f = dir.join("kern.toml");
+        std::fs::write(&f, "a = 1\n").expect("write");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        write_atomic(&f, "b = 2\n").expect("atomic write");
+        let mode = std::fs::metadata(&f).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "an existing dotfile mode must be kept");
+        let g = dir.join("new.toml");
+        write_atomic(&g, "c = 3\n").expect("atomic write");
+        let mode = std::fs::metadata(&g).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a new config is private");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

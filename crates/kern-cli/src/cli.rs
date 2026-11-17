@@ -511,6 +511,8 @@ pub enum Command {
     /// left referenced by no other image.
     Rmi {
         images: Vec<String>,
+        /// `-f`: remove an image a box uses, as `docker rmi -f`.
+        force: bool,
     },
     /// `kern save <image> [-o file]`: export a cached image to a `docker load`-compatible tar.
     Save {
@@ -1421,9 +1423,15 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `rmi <image>...`: delete cached images (the counterpart to `pull`).
         Some("rmi") => {
-            reject_unknown_flags("rmi", &rest, &[])?;
+            reject_unknown_flags("rmi", &rest, &["-f", "--force"])?;
             Command::Rmi {
-                images: rest.iter().skip(1).map(|s| s.to_string()).collect(),
+                images: rest
+                    .iter()
+                    .skip(1)
+                    .filter(|s| !matches!(**s, "-f" | "--force"))
+                    .map(|s| s.to_string())
+                    .collect(),
+                force: rest.iter().skip(1).any(|s| matches!(*s, "-f" | "--force")),
             }
         }
         Some("save") => {
@@ -5032,6 +5040,16 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
              pass one of them, not both",
         ));
     }
+    // A SIZE FOR A LOG THAT IS NOT KEPT is refused, with the reference's words: MEASURED, `docker run
+    // --log-driver none --log-opt max-size=1m alpine true` answers `invalid logging opts for driver
+    // none` and exits 125. Accepting it would print nothing and apply nothing.
+    if log_none && (log_max_size.is_some() || log_max_file.is_some()) {
+        return Err(Error::Cli(
+            "invalid logging opts for driver none: --log-driver none keeps no log, so \
+             --log-max-size and --log-max-file have nothing to apply to; drop them, or the driver"
+                .to_string(),
+        ));
+    }
     // Always route to the real command; missing name → BoxName rejects it, missing rootfs/image
     // → box_run reports it. `--plan` wins (non-destructive preview).
     let cmd = if plan {
@@ -6540,7 +6558,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             filters,
             format,
         } => commands::images(json, &filters, format.as_deref()),
-        Command::Rmi { images } => commands::image_rm(&images),
+        Command::Rmi { images, force } => commands::image_rm_with(&images, force),
         Command::Save { image, out } => commands::save(&image, out.as_deref()),
         Command::Load { input } => commands::load(input.as_deref()),
         Command::Builds {

@@ -237,6 +237,11 @@ pub struct SandboxSpec {
     /// vGPIO sysfs directories (host `/sys/*` paths) to expose in the box's `/sys` (pwm/adc/1-wire/
     /// leds). Bound before pivot.
     pub vgpio_sysfs: Vec<String>,
+    /// A GPU grant's sysfs (host `/sys/*` paths): the granted cards' device directories, the
+    /// attribute files of the PCI bridges above them, the `bus/pci/devices` links to both, and the
+    /// host's CPU and NUMA topology. Reproduced READ-ONLY, symlinks as symlinks: what NVML, hwloc and
+    /// `nvidia-smi topo -m` read to place the cards, and nothing a box writes. See [`mirror_sysfs_ro`].
+    pub gpu_sysfs: Vec<String>,
     /// Which of the host's NVIDIA cards this box may see in the driver's own `/proc` enumeration.
     /// See [`GpuEnumeration`] and [`mask_nvidia_enumeration`], its only reader.
     pub gpu_enumeration: GpuEnumeration,
@@ -1886,7 +1891,12 @@ fn child_setup_and_exec(
     if let Some(sock) = spec.pty_sock {
         unsafe { libc::close(sock) };
     }
-    setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
+    setup_vgpio(
+        &spec.root,
+        &spec.vgpio_devs,
+        &spec.vgpio_sysfs,
+        &spec.gpu_sysfs,
+    )?;
     t.mark("dev");
     // BEFORE THE VOLUMES, AFTER `setup_vgpio`. The topology is a tmpfs over `sys/devices`, and it was
     // mounted after `setup_volumes`, so it covered every `-v` aimed under `/sys/devices` with no
@@ -1898,7 +1908,7 @@ fn child_setup_and_exec(
     setup_cpu_topology(
         &spec.root,
         spec.cpuset.as_deref(),
-        !spec.vgpio_sysfs.is_empty(),
+        !spec.vgpio_sysfs.is_empty() || !spec.gpu_sysfs.is_empty(),
     );
     // PARENT BEFORE CHILD, as Docker orders mounts by destination. A tmpfs that CONTAINS a volume's
     // target goes first, so the bind lands inside it; one inside a volume goes after, as before.
@@ -4329,13 +4339,18 @@ fn setup_dev(
 /// box-owned `/sys` tmpfs is created (shadowing any image `/sys`, deny-by-default) and only the
 /// requested directories are bound in. Runs BEFORE pivot while the host sources are reachable.
 /// Best-effort per entry: a device absent on this host is simply skipped.
-fn setup_vgpio(root: &str, devs: &[String], sysfs: &[String]) -> Result<(), Error> {
+fn setup_vgpio(
+    root: &str,
+    devs: &[String],
+    sysfs: &[String],
+    gpu_sysfs: &[String],
+) -> Result<(), Error> {
     for dev in devs {
         if let Some(rel) = dev.strip_prefix("/dev/") {
             bind_into(root, "dev", rel, dev, false);
         }
     }
-    if sysfs.is_empty() {
+    if sysfs.is_empty() && gpu_sysfs.is_empty() {
         return Ok(());
     }
     make_box_tmpfs(root, "sys")?;
@@ -4344,7 +4359,117 @@ fn setup_vgpio(root: &str, devs: &[String], sysfs: &[String]) -> Result<(), Erro
             bind_into(root, "sys", rel, s, true);
         }
     }
+    for s in gpu_sysfs {
+        mirror_sysfs_ro(root, s);
+    }
     Ok(())
+}
+
+/// Reproduce one host sysfs path in the box's `/sys` tmpfs, READ-ONLY: a symlink as the same symlink
+/// (its target text, which is relative inside `/sys`), a directory or a file as a bind remounted
+/// read-only. Best-effort: a path that is absent or cannot be mounted contributes nothing, and the
+/// box starts as it did before the path was asked for.
+///
+/// WHY ALL THREE AND NOT A BIND OF EACH. `/sys/bus/pci/devices/<bdf>` is a LINK on every host, and
+/// tools resolve it to walk up to the card's bridges and host bridge; a second bind of the device
+/// directory there resolves to itself, so the card hung off nothing and `nvidia-smi topo -m` said
+/// `NODE` where the host and Docker say `PHB` (measured with two RTX 5060 Ti under one host bridge).
+/// The bridges themselves are given as ATTRIBUTE FILES only (class, ids, link speed and width, NUMA
+/// node, config): their directories also list every other device behind them, which this box was
+/// not given. And READ-ONLY because these binds were writable: a box's uid cannot write a root-owned
+/// sysfs file, which is the only reason it was harmless.
+fn mirror_sysfs_ro(root: &str, src: &str) {
+    let Some(rel) = src.strip_prefix("/sys/") else {
+        return;
+    };
+    let comps: Vec<&str> = rel.split('/').collect();
+    if comps
+        .iter()
+        .any(|c| *c == ".." || c.is_empty() || *c == ".")
+    {
+        return;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(src) else {
+        return;
+    };
+    // The parents, inside the box-owned tmpfs.
+    let mut cur = format!("{root}/sys");
+    for c in &comps[..comps.len() - 1] {
+        cur.push('/');
+        cur.push_str(c);
+        if let Ok(cp) = cstr(&cur) {
+            unsafe { libc::mkdir(cp.as_ptr(), 0o755) };
+        }
+    }
+    let target = format!("{root}/sys/{rel}");
+    let Ok(t) = cstr(&target) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        // The link's own text, kept relative: `../../../devices/pci0000:00/...` resolves inside the
+        // box's `/sys` exactly as on the host. A target that would leave `/sys` is not reproduced.
+        let Ok(link) = std::fs::read_link(src) else {
+            return;
+        };
+        let up = link
+            .components()
+            .take_while(|c| matches!(c, std::path::Component::ParentDir))
+            .count();
+        if link.is_absolute() || up >= comps.len() {
+            return;
+        }
+        let Ok(l) = cstr(&link.to_string_lossy()) else {
+            return;
+        };
+        unsafe { libc::symlink(l.as_ptr(), t.as_ptr()) };
+        return;
+    }
+    let Ok(s) = cstr(src) else {
+        return;
+    };
+    if meta.is_dir() {
+        unsafe { libc::mkdir(t.as_ptr(), 0o755) };
+    } else {
+        let f = unsafe {
+            libc::open(
+                t.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o444,
+            )
+        };
+        if f < 0 {
+            return;
+        }
+        unsafe { libc::close(f) };
+    }
+    let bound = unsafe {
+        libc::mount(
+            s.as_ptr(),
+            t.as_ptr(),
+            ptr::null(),
+            (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+            ptr::null(),
+        )
+    } == 0;
+    if !bound {
+        return;
+    }
+    // READ-ONLY, keeping the flags sysfs is mounted with (`nosuid,nodev,noexec`): in a user namespace
+    // they are locked, and a remount that dropped one is refused.
+    unsafe {
+        libc::mount(
+            ptr::null(),
+            t.as_ptr(),
+            ptr::null(),
+            (libc::MS_REMOUNT
+                | libc::MS_BIND
+                | libc::MS_RDONLY
+                | libc::MS_NOSUID
+                | libc::MS_NODEV
+                | libc::MS_NOEXEC) as libc::c_ulong,
+            ptr::null(),
+        )
+    };
 }
 
 /// If `path` is a symlink, remove it - so a hostile image can't redirect a mkdir/mount we're about to
@@ -6083,6 +6208,56 @@ impl ReadyGuard {
     }
 }
 
+/// Set by a `--restart` supervisor's attempt before it runs the box: create the exec witness (see
+/// `run_in_sandbox_with`) and latch what it says, for the restart decision.
+static WANT_EXEC_WITNESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask `run_in_sandbox_with` for the exec witness in this process. See [`WANT_EXEC_WITNESS`].
+pub fn want_exec_witness() {
+    WANT_EXEC_WITNESS.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// The read end of the exec witness (see `run_in_sandbox_with`), closed on every return.
+struct WitnessRd(Option<i32>);
+
+impl Drop for WitnessRd {
+    fn drop(&mut self) {
+        if let Some(fd) = self.0.take() {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// What the exec witness says, read once the box is reaped (every writer is gone, so this never
+/// blocks): `Some(false)` for a setup-failure byte (`x`, or the cgroup refusal's `1`), `Some(true)`
+/// for EOF with nothing written (the workload's exec closed it), `None` for anything else - a gated
+/// box's `P` alone - which leaves the caller on the exit code.
+fn read_witness(fd: i32) -> Option<bool> {
+    let mut buf = [0u8; 8];
+    let mut seen: Vec<u8> = Vec::new();
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            seen.extend_from_slice(&buf[..n as usize]);
+            if seen.len() > 64 {
+                break;
+            }
+            continue;
+        }
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    if seen.iter().any(|b| *b == b'x' || *b == 1) {
+        Some(false)
+    } else if seen.is_empty() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 impl Drop for ReadyGuard {
     fn drop(&mut self) {
         if let Some(fd) = self.0 {
@@ -6169,6 +6344,27 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     ports: &[PortMap],
     die_with_parent: bool,
 ) -> Result<i32, Error> {
+    // THE EXEC WITNESS, for a caller that holds no readiness pipe of its own (a `--restart`
+    // attempt after the first). The same pipe the launcher reads, read HERE after the reap: a
+    // setup-failure byte means the workload never ran, EOF means it exec'd. Without it the
+    // supervisor could tell "never started" from "the workload exited 125" only by the code, and a
+    // workload that exits 125 on its own was counted as a box that could not be built (reported).
+    let mut witness = WitnessRd(None);
+    let ready_fd = match ready_fd {
+        Some(fd) => Some(fd),
+        // Only where it is read: a supervisor that asked (`want_exec_witness`). A foreground box and
+        // a build step pay nothing for it.
+        None if !WANT_EXEC_WITNESS.load(std::sync::atomic::Ordering::Acquire) => None,
+        None => {
+            let mut p = [-1i32; 2];
+            if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
+                witness.0 = Some(p[0]);
+                Some(p[1])
+            } else {
+                None
+            }
+        }
+    };
     // Armed until the box child takes ownership (post-fork) or the parent disarms it: a drop on
     // any error path before then writes the failure byte, so a pre-fork failure is never reported
     // as "started".
@@ -6812,6 +7008,9 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     // the kernel killed and one that called `exit(137)`: both leave kern exiting 137 normally. A caller
     // cannot recover that from the outside, so it is recorded here and handed over on the started-fd.
     crate::cgroup::latch_workload_signal(status);
+    if let Some(rd) = witness.0 {
+        crate::cgroup::latch_workload_started(read_witness(rd));
+    }
     // LATCH THE OOM VERDICT HERE, the one point where it can still be read: the box is reaped, so its
     // counter is final, and `cg`'s `Drop` (which removes that directory) has not run yet. The caller
     // decides what to print only after this function returns, by which time the directory is gone -

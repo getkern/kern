@@ -168,7 +168,7 @@ pub fn builds_list(
                 // ELAPSED, NOT `duration_ms`. That field is written at finalize, so a build in
                 // flight has zero in it, and `0ms` next to a live process is the same false report
                 // as calling it interrupted. `elapsed_ms` counts up while it runs.
-                fmt_dur(r.elapsed_ms(now)),
+                fmt_dur(r.shown_ms(now)),
                 human_bytes(r.size),
                 fmt_age(now.saturating_sub(r.started)),
             );
@@ -205,7 +205,7 @@ pub fn build_inspect(id: &str, json: bool) -> Result<(), Error> {
         println!("  status     {}", r.label());
         println!(
             "  duration   {}",
-            fmt_dur(r.elapsed_ms(crate::registry::now_unix()))
+            fmt_dur(r.shown_ms(crate::registry::now_unix()))
         );
         println!("  size       {}", human_bytes(r.size));
         println!("  warnings   {}", r.warnings);
@@ -557,6 +557,13 @@ fn build_one(args: BuildArgs) -> Result<(), Error> {
         strategy: String::new(),
     };
     let _ = crate::builds::write(&rec);
+    // A READER THAT GOES AWAY DOES NOT END THE BUILD HALFWAY. kern restores SIGPIPE's default
+    // (main.rs), so `kern build ... | head -1` used to die at its own `built` line, BEFORE the
+    // record was finalized: the image existed and `kern builds` said `interrupted` (measured).
+    // Ignored from here until the record is written; restored by the guard, so every line printed
+    // after it (an extra `-t`'s `tagged`) behaves as every Unix tool does. A RUN box is kern
+    // re-executed, and its `main` restores the default for the workload, so no RUN inherits this.
+    let _sigpipe = SigpipeIgnored::new();
     let capture = crate::builds::Capture::start(&id);
     for w in &warns {
         if !args.quiet {
@@ -593,6 +600,11 @@ fn build_one(args: BuildArgs) -> Result<(), Error> {
     }
     drop(capture);
     let _ = crate::builds::write(&rec);
+    // THE REASON A BUILD FAILED IS IN ITS LOG, not only in `kern build inspect`: it is printed by the
+    // caller after the capture has ended, so the transcript never held it (reported).
+    if let Err(e) = &result {
+        crate::builds::append_log(&id, &format!("error: {e}"));
+    }
     crate::builds::append_log(
         &id,
         &format!(
@@ -605,6 +617,7 @@ fn build_one(args: BuildArgs) -> Result<(), Error> {
     // `[kern] build_keep`: the record just written is the newest, so it is always among the kept.
     // After the summary line, so this build's own log is complete before anything is counted.
     let _ = crate::builds::prune_to_config();
+    drop(_sigpipe);
     result?;
     // EVERY OTHER `-t` IS APPLIED HERE, and only after the build has succeeded: naming an image that
     // does not exist is what `tag` refuses, and naming one that failed would be worse than losing the
@@ -2222,5 +2235,21 @@ mod mountpoint_tests {
             real_removed,
             "a real empty mountpoint and its directory were left in the layer"
         );
+    }
+}
+
+/// SIGPIPE ignored for the life of the value, its default restored on drop (see `build_one`).
+struct SigpipeIgnored;
+
+impl SigpipeIgnored {
+    fn new() -> Self {
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        SigpipeIgnored
+    }
+}
+
+impl Drop for SigpipeIgnored {
+    fn drop(&mut self) {
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
 }

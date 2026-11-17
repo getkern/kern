@@ -1084,9 +1084,12 @@ pub fn create_with_range(
         };
     }
     say!("created pod '{name}'");
-    say!(
-        "  add boxes: kern box <name> --pod {name} -d -- …  (publish a service with -p on its box)"
-    );
+    // How to add a box BY HAND is advice for `kern pod create`; a stack's pod is filled by its file.
+    if origin != PodOrigin::Derived {
+        say!(
+            "  add boxes: kern box <name> --pod {name} -d -- …  (publish a service with -p on its box)"
+        );
+    }
     // One line per CAUSE. This was one line for five different states, and the one it printed told
     // a user with pasta installed to install pasta.
     match outbound {

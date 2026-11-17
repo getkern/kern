@@ -223,6 +223,27 @@ pub fn latch_workload_signal(status: i32) {
     }
 }
 
+/// Whether the box's workload was exec'd: 0 not known, 1 it ran, 2 the box never started. Latched
+/// at the reap from the exec witness (see `run_in_sandbox_with`), for the supervisor's restart
+/// decision, which otherwise read "never started" off exit code 125 alone.
+static BOX_WORKLOAD_STARTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Latch what the exec witness said. `None` leaves it unknown.
+pub fn latch_workload_started(started: Option<bool>) {
+    let v = match started {
+        Some(true) => 1,
+        Some(false) => 2,
+        None => 0,
+    };
+    BOX_WORKLOAD_STARTED.store(v, std::sync::atomic::Ordering::Release);
+}
+
+/// See [`latch_workload_started`]: 0 not known, 1 the workload ran, 2 the box never started.
+#[must_use]
+pub fn box_workload_started() -> u8 {
+    BOX_WORKLOAD_STARTED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The signal that terminated the box's workload, or 0 if it exited on its own. See
 /// [`latch_workload_signal`]. Read once at teardown for the FOURTH byte of the `KERN_STARTED_FD`
 /// signal, which is the only place a caller can learn it: kern's own exit code cannot carry it.
@@ -2916,8 +2937,26 @@ pub enum ExecCgroupJoin {
 /// and the v2 ROOT, which is never something to "join".
 #[must_use]
 pub fn box_cgroup_dir_for_exec(pid1: i32) -> Option<PathBuf> {
-    let cg = proc_cgroup_dir(pid1)?;
-    (cg.as_path() != std::path::Path::new("/sys/fs/cgroup")).then_some(cg)
+    let own = i32::try_from(std::process::id())
+        .ok()
+        .and_then(proc_cgroup_dir);
+    box_cgroup_of(proc_cgroup_dir(pid1), own)
+}
+
+/// [`box_cgroup_dir_for_exec`]'s rule on the two paths it reads, so it is tested without `/proc`.
+///
+/// THE CALLER'S OWN CGROUP IS NOT THE BOX'S, even when the box's PID 1 sits in it. That is the shape
+/// of a host where nothing could be delegated: the box stays where it was started, and so does the
+/// shell that runs `kern exec`. Reported on WSL2 with `XDG_RUNTIME_DIR` away from the user manager:
+/// shell, box and workload all in `/init.scope` (root-owned, `pids.max=9518` set by systemd, not by
+/// kern), and every `exec` refused with 126 for "running outside the box's caps" while the command
+/// was born in exactly the box's cgroup and escaped nothing. Same for the root: no box of its own.
+fn box_cgroup_of(box_cg: Option<PathBuf>, own_cg: Option<PathBuf>) -> Option<PathBuf> {
+    let cg = box_cg?;
+    if cg.as_path() == std::path::Path::new("/sys/fs/cgroup") || own_cg.as_deref() == Some(&cg) {
+        return None;
+    }
+    Some(cg)
 }
 
 /// After a placement into `cg` failed: does that failure actually cost the caller a cap?
@@ -2943,6 +2982,43 @@ pub fn box_cgroup_dir_for_exec(pid1: i32) -> Option<PathBuf> {
 /// A pure function of two bools so all four combinations are asserted without a cgroup filesystem,
 /// which is the same treatment `supervisor_needs_leaf` and `caps_gate_satisfied` get for the same
 /// reason: the expression is trivial and the consequence of getting it backwards is not.
+#[cfg(test)]
+mod box_cgroup_of_tests {
+    use super::box_cgroup_of;
+    use std::path::PathBuf;
+
+    /// A box in the caller's own cgroup has no cgroup of its own for `exec` to miss (the WSL2
+    /// `/init.scope` shape), nor does one at the root; a box in a cgroup of its own does.
+    #[test]
+    fn a_box_in_the_callers_own_cgroup_has_none_of_its_own() {
+        let p = |s: &str| Some(PathBuf::from(s));
+        assert_eq!(
+            box_cgroup_of(
+                p("/sys/fs/cgroup/init.scope"),
+                p("/sys/fs/cgroup/init.scope")
+            ),
+            None
+        );
+        assert_eq!(
+            box_cgroup_of(p("/sys/fs/cgroup"), p("/sys/fs/cgroup/x")),
+            None
+        );
+        assert_eq!(box_cgroup_of(None, p("/sys/fs/cgroup/x")), None);
+        assert_eq!(
+            box_cgroup_of(
+                p("/sys/fs/cgroup/kern.slice/kern-box-1"),
+                p("/sys/fs/cgroup/init.scope")
+            ),
+            p("/sys/fs/cgroup/kern.slice/kern-box-1")
+        );
+        // An unreadable caller cgroup keeps the old answer: the box's own, refused if capped.
+        assert_eq!(
+            box_cgroup_of(p("/sys/fs/cgroup/a"), None),
+            p("/sys/fs/cgroup/a")
+        );
+    }
+}
+
 #[must_use]
 pub const fn placement_failure_costs_a_cap(box_has_own_cgroup: bool, cap_is_real: bool) -> bool {
     box_has_own_cgroup && cap_is_real
@@ -4472,12 +4548,20 @@ pub fn disarm_launcher_notice() {
     let fd = LAUNCHER_NOTICE_FD.swap(-1, std::sync::atomic::Ordering::AcqRel);
     if fd >= 0 {
         unsafe { libc::close(fd) };
+        NOTICES_HANDED_OFF.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
-/// Print one cap notice: always to this process's stderr (the box log on a detached start, the
-/// terminal otherwise), and additionally into the launcher's notice pipe while
-/// [`arm_launcher_notice`] holds it.
+/// Set once a launcher has held the notice channel: what this box had to say about how it runs has
+/// been said, on the terminal that started it. A `--restart` attempt after that is the same box with
+/// the same caps, and its notices went into the box's LOG once per attempt (reported: eleven
+/// `resource caps could not be enforced` lines for eleven attempts). Inherited by every attempt the
+/// supervisor forks, which is what makes them quiet.
+static NOTICES_HANDED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Print one notice about how the box runs: into the launcher's notice pipe while
+/// [`arm_launcher_notice`] holds it, and to this process's stderr only when nobody holds it.
 ///
 /// ONE TEXT, COMPUTED ONCE, DELIVERED TWICE. The verdict stays where it can be measured - the box's
 /// own cgroup, after `apply_limits` - and this only moves the sentence. A second place that decided
@@ -4489,9 +4573,18 @@ pub fn disarm_launcher_notice() {
 /// (`compose up` runs a level's services in parallel, each sharing that stderr; a fragmented write
 /// was measured interleaving into one unreadable line).
 pub(crate) fn cap_notice(line: &str) {
-    eprintln!("{line}");
     let fd = LAUNCHER_NOTICE_FD.load(std::sync::atomic::Ordering::Acquire);
+    // WITH A LAUNCHER LISTENING, ONLY TO THE LAUNCHER. A detached box's stderr is its LOG, and a
+    // notice written there too became part of the service's output: `kern compose logs worker` on a
+    // stack whose caps could not be applied held nothing but kern's own warnings (reported on a real
+    // stack). Docker writes nothing of its own into a container's log. The launcher prints what it
+    // drains, so the reader still sees it once, on the terminal that started the box. With nobody
+    // listening (a foreground box, a `--restart` attempt after the first) stderr is the only place.
     if fd < 0 {
+        // Already said to the launcher by the first attempt: a restart repeats nothing into the log.
+        if !NOTICES_HANDED_OFF.load(std::sync::atomic::Ordering::Acquire) {
+            eprintln!("{line}");
+        }
         return;
     }
     let mut buf = String::with_capacity(line.len() + 1);

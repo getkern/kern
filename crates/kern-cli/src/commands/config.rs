@@ -73,6 +73,10 @@ pub fn config_set(args: &[String]) -> Result<(), Error> {
     let (kind, _) = settable(key)?;
     let toml = crate::config::kern_value_toml(kind, value)
         .map_err(|e| Error::Config(format!("{key}: {e}")))?;
+    // And the READER's rule for this key, which is stricter than the shape for some (a history
+    // below 4k is a size, and is still refused): the value is judged alone, so its refusal names
+    // the value and not the file.
+    crate::config::check_kern_value(key, &toml).map_err(Error::Config)?;
     if key == "sandbox_history" {
         let keep = crate::history::Keep::parse(value.trim()).ok_or_else(|| {
             Error::Config(format!("{key}: {value:?}: expected memory, disk or off"))
@@ -125,10 +129,36 @@ pub fn config_unset(args: &[String]) -> Result<(), Error> {
 
 /// `kern config get [<key>] [--json]`: with a key, print its value as written and exit 0, or print
 /// nothing and exit 1 when it is not set (`git config --get`'s contract, so a script can branch on
-/// it). Without one, every settable key: its value or `-`, and what it does.
+/// it), and exit 3 when the file does not parse. Without one, every settable key: its value or `-`, and what it does.
+///
+/// WHAT IS PRINTED IS WHAT IS IN FORCE. A file that does not parse is applied by nobody (every
+/// reader falls back to the defaults, and published ports to loopback), so its values are not
+/// printed as if they were: the command fails with the parse error instead. Measured on 6d93b85,
+/// `get` printed `"10m` with exit 0 for an unterminated string, and the first of two duplicate keys
+/// while kern applied the second.
 pub fn config_get(args: &[String], json: bool) -> Result<(), Error> {
     let raw = match crate::config::active_path() {
-        Some(p) => std::fs::read_to_string(p).unwrap_or_default(),
+        Some(p) => match std::fs::read_to_string(&p) {
+            Ok(raw) => {
+                let raw = raw
+                    .strip_prefix('\u{feff}')
+                    .map_or(raw.clone(), str::to_string);
+                // EXIT 3, NOT 1: 1 is this command's "not set" (`git config --get`'s contract), and
+                // a script that branches on it must not read a broken file as an unset key. 3 is
+                // what `git config` answers for an invalid file, the same contract carried over.
+                if let Err(e) = crate::config::parse(&raw) {
+                    eprintln!(
+                        "error: config: {}: {e}; nothing in this file is in force until it parses \
+                         (kern runs on its defaults, and publishes ports on loopback only)",
+                        p.display()
+                    );
+                    return Err(Error::Workload(3));
+                }
+                raw
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(Error::Config(format!("{}: {e}", p.display()))),
+        },
         None => String::new(),
     };
     let value_of = |key: &str| crate::toml_surgery::get_table_key(&raw, "kern", key);
@@ -910,6 +940,8 @@ pub fn config_list() -> Result<(), Error> {
     Ok(())
 }
 
+/// `kern validate [path]` - parse a `kern.toml` (the given path, or the active one) and report
+/// success with profile counts, or the offending line. Exits non-zero on a parse error.
 pub fn validate(path: Option<&str>) -> Result<(), Error> {
     let target = match path {
         Some(p) => std::path::PathBuf::from(p),
@@ -919,52 +951,9 @@ pub fn validate(path: Option<&str>) -> Result<(), Error> {
     };
     let text = std::fs::read_to_string(&target)
         .map_err(|e| Error::Config(format!("{}: {e}", target.display())))?;
-    // Strip a UTF-8 BOM (editors on Windows add it): it's a legal file marker, not content, and would
-    // otherwise make the first line fail the strict check below.
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    // `validate` must be STRICTER than `load`: the config parser deliberately SKIPS lines it can't
-    // model (forward-compat with foreign TOML), so a garbage file would otherwise pass as "valid, 0
-    // profiles". A validator's whole job is to catch broken syntax, so here we reject any non-blank,
-    // non-comment line that is neither a `[section]` header nor a `key = value` - the same thing a real
-    // TOML parser (and `kern compose`) would flag. (Deep help/command audit.)
-    let mut in_array = false; // inside a multi-line `key = [ … ]` value (its continuation lines are ok)
-    for (i, raw) in text.lines().enumerate() {
-        let line = kern_common::toml_lite::strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        // Track a multi-line array by net bracket balance across lines: a `key = [` with more `[` than
-        // `]` opens it; a line that closes the balance ends it. While open, continuation lines (values,
-        // inline tables `{…}`, a closing `]`) are legitimate and not checked as top-level statements.
-        // Count only brackets OUTSIDE quotes, so a `name = "has ] bracket"` value doesn't spuriously
-        // open/close an array (which would make the validator silently skip the following lines).
-        let (opens, closes) = brackets_outside_quotes(line);
-        if in_array {
-            if closes >= opens && line.contains(']') {
-                in_array = false;
-            }
-            continue;
-        }
-        let is_section = line.starts_with('[') && line.ends_with(']') && !line.contains('=');
-        // A `key = value` line must have a NON-EMPTY key before the first `=`. `= orphan` (empty key)
-        // is not valid TOML - the bare `contains('=')` check let it slip through.
-        let is_kv = line
-            .split_once('=')
-            .is_some_and(|(k, _)| !k.trim().is_empty());
-        if is_kv && opens > closes {
-            in_array = true; // `key = [` (array not closed on this line)
-            continue;
-        }
-        if !is_section && !is_kv {
-            return Err(Error::Config(format!(
-                "{}: line {}: not valid TOML - expected `[section]` or `key = value`, got `{}`",
-                target.display(),
-                i + 1,
-                line.chars().take(40).collect::<String>()
-            )));
-        }
-    }
-    let cfg = crate::config::parse(text)
+    // Syntax is judged by `parse` itself, the reader every box start uses, so a file this command
+    // calls valid is a file kern reads the same way (a BOM, a stray line, a repeated key: see `parse`).
+    let cfg = crate::config::parse(&text)
         .map_err(|e| Error::Config(format!("{}: {e}", target.display())))?;
     // Every virtual profile's `backend` is MANDATORY and must resolve (a declared physical id, or the
     // reserved `host`/`ram`). Enforce it for ALL profiles here so `kern validate` rejects a

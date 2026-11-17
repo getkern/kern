@@ -428,7 +428,18 @@ pub fn info() -> Result<(), Error> {
     // directory read for the build count.
     let cfg = crate::config::load_cached(None).ok();
     let k = cfg.as_ref().map(|c| &c.kern);
-    let origin = |set: bool| if set { "kern.toml" } else { "default" };
+    // A file that does not parse is applied by nobody, and a bare "default" there would read as
+    // "you set nothing" to someone who set the key and is looking for why it does not hold.
+    let unparsed = cfg.is_none();
+    let origin = |set: bool| {
+        if unparsed {
+            "default: kern.toml does not parse, see `kern validate`"
+        } else if set {
+            "kern.toml"
+        } else {
+            "default"
+        }
+    };
     let cap = crate::commands::boxlog::LogCap::resolve(None, None, true);
     let size_set = k.and_then(|k| k.log_max_size).is_some();
     let files_set = k.and_then(|k| k.log_max_file).is_some();
@@ -480,7 +491,7 @@ pub fn info() -> Result<(), Error> {
 /// defect this repo keeps paying for, and the two would disagree on exactly the hosts where the
 /// answer matters.
 ///
-/// COSTS ONE DIRECTORY READ AND ONE FILE. The cards come from the same `/sys/class/drm` walk the
+/// COSTS ONE DIRECTORY READ AND ONE FILE (on WSL2, two ioctls on `/dev/dxg`). The cards come from the same `/sys/class/drm` walk the
 /// rest of this binary uses, and the version from `/sys/module/nvidia/version`, which is one small
 /// sysfs read. No CDI spec is parsed, no `/dev` node is probed and no module is loaded: `info` runs
 /// on every invocation a reader makes while orienting themselves, and it is not the place to pay
@@ -488,7 +499,12 @@ pub fn info() -> Result<(), Error> {
 fn gpu_inventory() -> String {
     let cards = crate::gpu::detect();
     if cards.is_empty() {
-        return "none".to_string();
+        // WSL2 exposes its GPU as `/dev/dxg`, never as a DRM card: the second place a GPU can be.
+        return match crate::gpu::wsl_nvidia_adapter_count(std::path::Path::new("/")) {
+            Some(n) if n > 0 => format!("{n} x NVIDIA (WSL2, /dev/dxg)"),
+            Some(_) => "none (WSL2: /dev/dxg lists no NVIDIA adapter)".to_string(),
+            None => "none".to_string(),
+        };
     }
     // Grouped by vendor so two cards of one make, which is the common shape, read as one fact.
     let mut by_vendor: std::collections::BTreeMap<String, usize> =

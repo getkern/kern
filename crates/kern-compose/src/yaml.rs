@@ -5325,6 +5325,10 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     // `none` IS DOCKER'S "KEEP NOTHING", and kern has it: the box's output goes
                     // nowhere and `kern logs` says so. It used to be one of the warnings below,
                     // with the output captured anyway, which is the opposite of what was asked.
+                    // OPTIONS WITH `none` ARE DROPPED, as Docker Compose drops them: MEASURED,
+                    // `docker compose up` with `driver: none` and `max-size`/`max-file` starts the
+                    // service, exit 0, where `docker run --log-driver none --log-opt max-size=1m`
+                    // is refused (125). `kern box` follows the second and a stack the first.
                     "none" => b.log_driver_none = true,
                     other_drv => warn(&format!(
                         "service '{name}': 'logging: {other_drv}' has no kern equivalent - output is \
@@ -10832,6 +10836,12 @@ mod tests {
             parse(&src).expect("parses").remove(0)
         };
         assert!(svc("    logging:\n      driver: none\n").log_driver_none);
+        // With sizes they are DROPPED, as Docker Compose drops them (measured: the service starts),
+        // so the box is not handed a pair `kern box` would refuse.
+        let none_sized = svc("    logging:\n      driver: none\n      options:\n        max-size: 256k\n        max-file: \"3\"\n");
+        assert!(none_sized.log_driver_none);
+        assert_eq!(none_sized.log_max_size, None);
+        assert_eq!(none_sized.log_max_file, None);
         assert!(!svc("    logging:\n      driver: json-file\n").log_driver_none);
         assert!(!svc("").log_driver_none);
     }

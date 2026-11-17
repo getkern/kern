@@ -875,6 +875,22 @@ fn host_cannot_build_a_box(stderr: &str) -> bool {
     stderr.contains("unprivileged user namespaces are restricted")
         || stderr.contains("sandbox setup failed")
         || stderr.contains("the box could not be BUILT")
+        // kern's own fail-closed `exec` refusal, the same marker `sandbox_run.rs` folds into its
+        // guard: a host that runs kern outside the cgroup tree it delegates cannot put an exec in a
+        // box, and a test of what an exec does there measures the host (reported on WSL2 with no
+        // user manager reachable: three exec tests failed on 126 while their siblings skipped).
+        || stderr.contains("could not be placed in the box's cgroup")
+}
+
+/// `Some(why)` when this host cannot `kern exec` into the box `name` at all, so a test of what an
+/// exec does would measure the host. One `true` run, read through [`host_cannot_build_a_box`].
+fn exec_refused_here(name: &str) -> Option<String> {
+    let probe = kern()
+        .args(["exec", name, "--", "true"])
+        .output()
+        .expect("run kern exec");
+    let said = String::from_utf8_lossy(&probe.stderr).into_owned();
+    (!probe.status.success() && host_cannot_build_a_box(&said)).then_some(said)
 }
 
 /// The guard above, against the message the runner ACTUALLY produced.
@@ -892,6 +908,11 @@ fn the_host_capability_guard_matches_what_the_runner_prints() {
                    `kern doctor` prints the AppArmor profile to install\nhint: the box could not be \
                    BUILT, which is a host capability rather than a wrong command";
     assert!(host_cannot_build_a_box(from_ci));
+    // kern's exec refusal on a host outside its delegated cgroup tree, verbatim from `real.rs`.
+    assert!(host_cannot_build_a_box(
+        "kern: exec: refusing: the command could not be placed in the box's cgroup, so it would \
+         run outside its --memory/--pids caps."
+    ));
     // POSITIVE CONTROL: the failures a test is SUPPOSED to catch must not be mistaken for a host that
     // cannot run one.
     assert!(!host_cannot_build_a_box(""));
@@ -1149,6 +1170,11 @@ fn an_exec_killed_with_its_box_by_the_oom_killer_says_so_on_the_started_signal()
             "SKIP: no detached box here: {}",
             String::from_utf8_lossy(&up.stderr)
         );
+        return;
+    }
+    if let Some(why) = exec_refused_here(&name) {
+        let _ = kern().args(["stop", &name]).output();
+        eprintln!("SKIP: this host cannot exec into a box: {why}");
         return;
     }
     let (code, sig) = started_bytes(&["exec", &name, "--", "sh", "-c", "exit 137"]);
@@ -1422,6 +1448,11 @@ fn exec_user_works_under_cap_drop_all_and_keeps_no_capability() {
         );
         return;
     }
+    if let Some(why) = exec_refused_here(&name) {
+        let _ = kern().args(["stop", &name]).output();
+        eprintln!("SKIP: this host cannot exec into a box: {why}");
+        return;
+    }
     let out = kern()
         .args([
             "exec",
@@ -1486,6 +1517,11 @@ fn exec_user_on_the_single_uid_map_refuses_by_name_and_root_hears_no_group_warni
             "SKIP: no detached box here: {}",
             String::from_utf8_lossy(&up.stderr)
         );
+        return;
+    }
+    if let Some(why) = exec_refused_here(&name) {
+        let _ = kern().args(["stop", &name]).output();
+        eprintln!("SKIP: this host cannot exec into a box: {why}");
         return;
     }
     let exec = |args: &[&str]| {
@@ -4943,9 +4979,11 @@ fn a_host_port_range_onto_one_box_port_picks_a_free_port_of_it() {
     }
     drop(held);
     let _ = std::fs::remove_dir_all(&xdg);
-    // A refusal of the SPEC is the defect this test is about, never a reason to skip.
+    // A refusal of the SPEC is the defect this test is about, never a reason to skip. A refusal is a
+    // FAILED start that talks about ports: a started box also says "port" now, in the `bound
+    // 0.0.0.0 - box port 80 is reachable` notice that reaches the launcher instead of the box's log.
     assert!(
-        !started[0].1.contains("port"),
+        !(started[0].0 != Some(0) && started[0].1.contains("port")),
         "the range spec is accepted: {:?}",
         started[0]
     );
@@ -6466,4 +6504,859 @@ fn a_file_docker_refuses_is_refused_with_docker_s_message() {
         assert!(success, "{args:?} R={r} refused: {err}");
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `kern config set|get` on the `kern.toml` shapes an editor or a slip produces, end to end through
+/// the binary, in a private `XDG_CONFIG_HOME`. Each was measured wrong on 6d93b85:
+/// - a BOM: `get` found nothing and `set` appended a second `[kern]`;
+/// - a file that is not UTF-8: `set` replaced it whole with one key;
+/// - `[kern` with no `]`: `set` wrote into it and left it as broken;
+/// - a symlink: `set` replaced the link with a regular file and left the target stale;
+/// - a comment on the line `set` replaced: dropped;
+/// - a key twice: `get` printed the first while kern applied the last.
+#[test]
+fn config_set_and_get_on_the_files_editors_and_slips_produce() {
+    let base = std::env::temp_dir().join(format!("kern-cfgset-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let cfg_home = base.join("config");
+    std::fs::create_dir_all(cfg_home.join("kern")).expect("config dir");
+    let cfg = cfg_home.join("kern/kern.toml");
+    let run = |args: &[&str]| {
+        let out = kern()
+            .env("XDG_CONFIG_HOME", &cfg_home)
+            .env_remove("KERN_CONFIG")
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // BOM: the key under it is found, and a set lands in the same [kern].
+    std::fs::write(&cfg, "\u{feff}[kern]\npublish_bind = \"127.0.0.1\"\n").expect("write");
+    let (code, out, err) = run(&["config", "get", "publish_bind"]);
+    assert_eq!((code, out.trim()), (Some(0), "127.0.0.1"), "{err}");
+    let (code, _, err) = run(&["config", "set", "log_max_file", "2"]);
+    assert_eq!(code, Some(0), "{err}");
+    let text = std::fs::read_to_string(&cfg).expect("read");
+    assert_eq!(text.matches("[kern]").count(), 1, "{text}");
+    assert!(text.contains("log_max_file = 2"), "{text}");
+
+    // Not UTF-8: refused, and every byte is still there.
+    let garbage = b"\x00\x01\x02garbage\xff\xfe\n";
+    std::fs::write(&cfg, garbage).expect("write");
+    let (code, _, err) = run(&["config", "set", "log_max_file", "2"]);
+    assert_ne!(
+        code,
+        Some(0),
+        "a file kern cannot read must not be written over"
+    );
+    assert!(err.contains("cannot read"), "{err}");
+    assert_eq!(std::fs::read(&cfg).expect("read"), garbage);
+
+    // `[kern` with no `]`: refused by line, the file untouched.
+    let broken = "[kern\nlog_max_size = \"10m\"\n";
+    std::fs::write(&cfg, broken).expect("write");
+    let (code, _, err) = run(&["config", "set", "log_max_file", "2"]);
+    assert_ne!(code, Some(0));
+    assert!(err.contains("line 1"), "{err}");
+    // The FILE is named as the culprit, not the value being set.
+    assert!(err.contains("does not parse as it stands"), "{err}");
+    assert_eq!(std::fs::read_to_string(&cfg).expect("read"), broken);
+
+    // A key twice: `get` refuses instead of printing a value that is not in force.
+    std::fs::write(
+        &cfg,
+        "[kern]\nlog_max_size = \"10m\"\nlog_max_size = \"20m\"\n",
+    )
+    .expect("write");
+    let (code, out, err) = run(&["config", "get", "log_max_size"]);
+    // 3, as `git config` answers for an invalid file: 1 is "not set", and must stay that alone.
+    assert_eq!(code, Some(3), "printed {out:?}");
+    assert!(
+        out.is_empty(),
+        "a value printed for a file that is not in force: {out:?}"
+    );
+    assert!(err.contains("already set"), "{err}");
+
+    // A comment on the replaced line stays.
+    std::fs::write(&cfg, "[kern]\nlog_max_size = \"16m\"   # my own note\n").expect("write");
+    let (code, _, err) = run(&["config", "set", "log_max_size", "10m"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&cfg).expect("read"),
+        "[kern]\nlog_max_size = \"10m\"   # my own note\n"
+    );
+
+    // A symlink: written through to its target, the link kept.
+    let real = base.join("dotfiles-kern.toml");
+    std::fs::write(&real, "[kern]\n").expect("write");
+    std::fs::remove_file(&cfg).expect("rm");
+    std::os::unix::fs::symlink(&real, &cfg).expect("symlink");
+    let (code, _, err) = run(&["config", "set", "log_max_file", "4"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        std::fs::symlink_metadata(&cfg)
+            .expect("stat")
+            .file_type()
+            .is_symlink(),
+        "the link was replaced by a regular file"
+    );
+    assert!(std::fs::read_to_string(&real)
+        .expect("read")
+        .contains("log_max_file = 4"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// `--log-driver none` with a log size is refused, as the reference refuses it (`invalid logging
+/// opts for driver none`, exit 125, measured); alone, it parses.
+#[test]
+fn log_driver_none_with_a_log_size_is_refused() {
+    for extra in [["--log-max-size", "1m"], ["--log-max-file", "3"]] {
+        let out = kern()
+            .args(["box", "x", "--rm", "--log-driver", "none"])
+            .args(extra)
+            .args(["--image", "alpine", "--", "true"])
+            .output()
+            .expect("run kern");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{extra:?} accepted");
+        assert!(
+            err.contains("invalid logging opts for driver none"),
+            "{err}"
+        );
+    }
+}
+
+/// `kern build logs` holds what a RUN printed on STDOUT, not only its stderr. Measured on 6d93b85:
+/// `RUN echo OUT-42-X` printed `OUT-42-X` and the record's log held only the trailer line, because
+/// the capture took fd 2 and a RUN box wrote its stdout straight to the terminal. The terminal half
+/// is checked too: the RUN's stdout still reaches the caller's stdout.
+#[test]
+fn build_logs_hold_a_runs_stdout_and_the_terminal_still_sees_it() {
+    let dir = std::env::temp_dir().join(format!("kern-blog-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("context dir");
+    std::fs::write(
+        dir.join("Containerfile"),
+        "FROM alpine:latest\nRUN echo OUT-$((6*7))-X && echo ERR-$((5*5))-Y >&2\n",
+    )
+    .expect("Containerfile");
+    let tag = format!("kern-smoke-blog:{}", std::process::id());
+    let built = kern()
+        .args(["build", "--no-cache", "-t", &tag, &dir.to_string_lossy()])
+        .output()
+        .expect("run kern build");
+    let _ = std::fs::remove_dir_all(&dir);
+    let said = String::from_utf8_lossy(&built.stderr);
+    if !built.status.success() {
+        if host_cannot_build_a_box(&said) || said.contains("pull") {
+            eprintln!("SKIP: no build here: {said}");
+            return;
+        }
+        panic!("the build failed: {said}");
+    }
+    assert!(
+        String::from_utf8_lossy(&built.stdout).contains("OUT-42-X"),
+        "the RUN's stdout no longer reaches the caller's stdout"
+    );
+    let listed = kern()
+        .args(["builds", &tag, "--json"])
+        .output()
+        .expect("run kern builds");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    let id = listed
+        .split("\"id\":\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .unwrap_or_default()
+        .to_string();
+    assert!(!id.is_empty(), "no record for {tag}: {listed}");
+    let logs = kern()
+        .args(["build", "logs", &id])
+        .output()
+        .expect("run kern build logs");
+    let _ = kern().args(["build", "rm", &id]).output();
+    let _ = kern().args(["rmi", &tag]).output();
+    let log = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        log.contains("OUT-42-X"),
+        "RUN stdout missing from the build log: {log:?}"
+    );
+    assert!(
+        log.contains("ERR-25-Y"),
+        "RUN stderr missing from the build log: {log:?}"
+    );
+}
+
+/// `kern build ... | head -1`: the reader going away ends what the terminal sees, not the build.
+/// Measured before the fix, the same on 2acff4c: the RUN died of SIGPIPE (`RUN failed (exit 141)`),
+/// and once that was fixed kern died at its own `built` line before the record was final, so the
+/// image existed and `kern builds` said `interrupted`. A RUN that pipes into `head` itself must still
+/// get SIGPIPE's default, or `yes | head` would never end.
+#[test]
+fn a_build_whose_reader_goes_away_still_finishes_and_records_ok() {
+    let dir = std::env::temp_dir().join(format!("kern-bhead-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("context dir");
+    std::fs::write(
+        dir.join("Containerfile"),
+        "FROM alpine:latest\nRUN seq 1 20000\nRUN yes | head -2 && echo PIPE-$((3*3))-OK\n",
+    )
+    .expect("Containerfile");
+    let tag = format!("kern-smoke-bhead:{}", std::process::id());
+    let sh = format!(
+        "'{}' build --no-cache -t '{}' '{}' 2>/dev/null | head -1 >/dev/null",
+        env!("CARGO_BIN_EXE_kern"),
+        tag,
+        dir.display()
+    );
+    let ran = Command::new("sh")
+        .args(["-c", &sh])
+        .output()
+        .expect("run sh");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(ran.status.success(), "the pipeline itself failed: {ran:?}");
+    let listed = kern()
+        .args(["builds", &tag, "--json"])
+        .output()
+        .expect("run kern builds");
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    if listed.trim() == "[]" || listed.trim().is_empty() {
+        eprintln!("SKIP: no build record here (no build ran): {listed}");
+        return;
+    }
+    let id = listed
+        .split("\"id\":\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .unwrap_or_default()
+        .to_string();
+    let logs = kern()
+        .args(["build", "logs", &id])
+        .output()
+        .expect("run kern build logs");
+    let _ = kern().args(["build", "rm", &id]).output();
+    let _ = kern().args(["rmi", &tag]).output();
+    let log = String::from_utf8_lossy(&logs.stdout);
+    // `warn` is a success too: the lint flags the unpinned `:latest` of this fixture.
+    let finished = listed.contains("\"status\":\"ok\"") || listed.contains("\"status\":\"warn\"");
+    if log.contains("pull") && !finished {
+        eprintln!("SKIP: the base image could not be pulled: {log}");
+        return;
+    }
+    assert!(
+        finished,
+        "the build did not finish once its reader left: {listed}\n{log}"
+    );
+    assert!(
+        log.contains("PIPE-9-OK"),
+        "the second RUN did not run to its end: {log:?}"
+    );
+}
+
+/// A failed build's log keeps its END: the first and last half MiB with a line naming what was left
+/// out, and the reason it failed. Reported: a 3 MB RUN before a failing one, and the log held 1 MiB of
+/// the noise and neither `THE-REAL-ERROR` nor `RUN failed`.
+#[test]
+fn a_build_log_keeps_the_failure_after_a_noisy_run() {
+    let dir = std::env::temp_dir().join(format!("kern-bnoise-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("context dir");
+    std::fs::write(
+        dir.join("Containerfile"),
+        "FROM alpine:latest\nRUN echo FIRST-LINE && head -c 3000000 /dev/zero | tr '\\0' a | fold -w 100\n\
+         RUN echo THE-REAL-ERROR-$((6*7)) >&2 && false\n",
+    )
+    .expect("Containerfile");
+    let tag = format!("kern-smoke-bnoise:{}", std::process::id());
+    let built = kern()
+        .args(["build", "--no-cache", "-t", &tag, &dir.to_string_lossy()])
+        .output()
+        .expect("run kern build");
+    let _ = std::fs::remove_dir_all(&dir);
+    let said = String::from_utf8_lossy(&built.stderr).into_owned();
+    if !said.contains("THE-REAL-ERROR-42") {
+        eprintln!("SKIP: the build did not reach the failing RUN here: {said:.300}");
+        return;
+    }
+    let listed = kern()
+        .args(["builds", &tag, "--json"])
+        .output()
+        .expect("run kern builds");
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let id = listed
+        .split("\"id\":\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .unwrap_or_default()
+        .to_string();
+    let logs = kern()
+        .args(["build", "logs", &id])
+        .output()
+        .expect("run kern build logs");
+    let _ = kern().args(["build", "rm", &id]).output();
+    let log = String::from_utf8_lossy(&logs.stdout);
+    assert!(log.contains("FIRST-LINE"), "the head is gone");
+    assert!(log.contains("are not kept here"), "no line names the cut");
+    assert!(
+        log.contains("THE-REAL-ERROR-42"),
+        "the failing RUN's output is not in the log"
+    );
+    assert!(
+        log.contains("error: ") && log.contains("RUN failed"),
+        "the failure is not in the log"
+    );
+    assert!(log.len() < 1_200_000, "{} bytes", log.len());
+}
+
+/// An interrupted build shows how long it ran, also when its RUN printed nothing. A terminal's Ctrl-C
+/// is a SIGINT to the whole foreground group, which is what this sends. Reported twice: `0ms`, and then
+/// 0.4 s for a RUN that slept silently for 4 s, when the time was read from the log's last write.
+#[test]
+fn an_interrupted_silent_build_shows_how_long_it_ran() {
+    use std::os::unix::process::CommandExt as _;
+    let dir = std::env::temp_dir().join(format!("kern-bint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("context dir");
+    std::fs::write(
+        dir.join("Containerfile"),
+        "FROM alpine:latest\nRUN echo START && sleep 30\n",
+    )
+    .expect("Containerfile");
+    let tag = format!("kern-smoke-bint:{}", std::process::id());
+    let mut child = kern()
+        .args(["build", "--no-cache", "-t", &tag, &dir.to_string_lossy()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn kern build");
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    let pgid = child.id() as i32;
+    unsafe { libc::kill(-pgid, libc::SIGINT) };
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    // The logger writes the end at its EOF, a moment after the group is gone.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let listed = kern()
+        .args(["builds", &tag])
+        .output()
+        .expect("run kern builds");
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let Some(row) = listed.lines().find(|l| l.contains(&tag)) else {
+        eprintln!("SKIP: no record for the build (no build ran here): {listed}");
+        return;
+    };
+    let id = row
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let _ = kern().args(["build", "rm", &id]).output();
+    if !row.contains("interrupted") {
+        eprintln!("SKIP: the build did not reach its RUN before the signal: {row}");
+        return;
+    }
+    // TIME is the fourth column (ID TAG STATUS TIME): `2.9s`-like, at least two seconds here.
+    let time = row.split_whitespace().nth(3).unwrap_or_default();
+    let secs: f64 = time
+        .strip_suffix('s')
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0.0);
+    assert!(
+        time.ends_with('s') && !time.ends_with("ms") && secs >= 2.0,
+        "an interrupted build that ran ~3 s shows {time:?}: {row}"
+    );
+}
+
+/// `compose up --wait` reads an exited one-shot as Docker does. MEASURED on Compose v5.0.2: a service
+/// that exited 0 fails `--wait` (`container ... exited (0)`, exit 1) alone, with a plain `depends_on`
+/// and beside an unrelated service, and passes (exit 0) when another service waits on it with
+/// `condition: service_completed_successfully`. kern failed the second case too (reported on a real
+/// stack with a migration job) and its message said Docker did the same.
+#[test]
+fn compose_wait_accepts_a_job_that_completed_for_its_dependent() {
+    let dir = std::env::temp_dir().join(format!("kern-cwait-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let run = |file: &str, project: &str| {
+        std::fs::write(dir.join("compose.yml"), file).expect("write compose");
+        let up = kern()
+            .current_dir(&dir)
+            .args([
+                "compose",
+                "-p",
+                project,
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "60",
+            ])
+            .output()
+            .expect("run kern compose up");
+        let _ = kern()
+            .current_dir(&dir)
+            .args(["compose", "-p", project, "down", "-t", "0"])
+            .output();
+        (
+            up.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&up.stdout),
+                String::from_utf8_lossy(&up.stderr)
+            ),
+        )
+    };
+    let tag = std::process::id();
+    let job = "services:\n  job:\n    image: alpine:latest\n    command: [\"true\"]\n";
+    let (code, said) = run(
+        &format!(
+            "{job}  app:\n    image: alpine:latest\n    command: [\"sleep\", \"60\"]\n    depends_on:\n      job:\n        condition: service_completed_successfully\n"
+        ),
+        &format!("kcwa{tag}"),
+    );
+    let _ = std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("dir");
+    if host_cannot_build_a_box(&said) || said.contains("could not") && said.contains("pull") {
+        eprintln!("SKIP: no stack here: {said:.300}");
+        return;
+    }
+    assert_eq!(
+        code,
+        Some(0),
+        "a completed job waited on by its dependent must pass --wait: {said}"
+    );
+    // The control: alone, the same job fails the wait, in Docker's words.
+    let (code, said) = run(job, &format!("kcwb{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_ne!(code, Some(0), "a lone one-shot passed --wait: {said}");
+    assert!(said.contains("exited (0)"), "{said}");
+}
+
+/// A `build:`-only service is built when its image is missing and left running by the next `up`;
+/// `up --build` recreates it only when the image changed. Each step measured against Docker Compose
+/// v5.0.2 (`Running`, `Running`, `Recreate` after a Dockerfile edit). kern rebuilt and recreated it on
+/// every `up` (reported on a real stack).
+#[test]
+fn compose_up_leaves_a_built_service_running_until_its_image_changes() {
+    let dir = std::env::temp_dir().join(format!("kern-cbuild-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("app")).expect("dir");
+    // The one-shot `job` is what makes a second `up` reach the builds at all, as a migration does on
+    // a real stack: with every service running, `up` returns before building anything.
+    std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  job:\n    image: alpine:latest\n    command: [\"true\"]\n  app:\n    build: ./app\n    restart: always\n",
+    )
+    .expect("compose");
+    let dockerfile = |v: &str| {
+        std::fs::write(
+            dir.join("app/Dockerfile"),
+            format!("FROM alpine:latest\nRUN echo {v} > /v\nCMD [\"sleep\", \"120\"]\n"),
+        )
+        .expect("Dockerfile");
+    };
+    let project = format!("kcb{}", std::process::id());
+    let up = |extra: &[&str]| {
+        let out = kern()
+            .current_dir(&dir)
+            .args(["compose", "-p", &project, "up", "-d"])
+            .args(extra)
+            .output()
+            .expect("run kern compose up");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    dockerfile("one");
+    let first = up(&[]);
+    if !first.contains("box(es) started") {
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("SKIP: no stack here: {first:.300}");
+        return;
+    }
+    let second = up(&[]);
+    let rebuild_same = up(&["--build"]);
+    dockerfile("two");
+    let edited_no_build = up(&[]);
+    let rebuild_changed = up(&["--build"]);
+    let v = kern()
+        .current_dir(&dir)
+        .args(["compose", "-p", &project, "exec", "app", "cat", "/v"])
+        .output()
+        .expect("run kern compose exec");
+    let _ = kern()
+        .current_dir(&dir)
+        .args([
+            "compose", "-p", &project, "down", "-t", "0", "--rmi", "local",
+        ])
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !second.contains("recreating") && !second.contains("built '"),
+        "{second}"
+    );
+    // And the narration a stack has no use for: the hint for running a hand-built image, the one for
+    // adding boxes to a hand-made pod, a box's own `next:` line (all reported as noise).
+    for noise in ["run: kern box myapp", "add boxes:", "next: kern ps"] {
+        assert!(
+            !first.contains(noise),
+            "{noise:?} in a compose `up`: {first}"
+        );
+    }
+    // The `restart:` paragraph is said when the pod is made, not on every `up` of a running stack.
+    assert!(
+        !second.contains("NOTHING brings it back"),
+        "the restart note repeated on a second `up`: {second}"
+    );
+    assert!(
+        rebuild_same.contains("image unchanged, left running"),
+        "{rebuild_same}"
+    );
+    assert!(
+        !edited_no_build.contains("recreating") && !edited_no_build.contains("built '"),
+        "a plain `up` must not rebuild: {edited_no_build}"
+    );
+    assert!(
+        rebuild_changed.contains("image rebuilt, recreating"),
+        "{rebuild_changed}"
+    );
+    assert_eq!(String::from_utf8_lossy(&v.stdout).trim(), "two");
+}
+
+/// `kern rmi` of an image a box uses is refused without `-f`, in Docker's words, and allowed once the
+/// box is gone. MEASURED on Docker 29: `conflict: unable to remove repository reference "<ref>" (must
+/// force) - container <id> is using its referenced image`, exit 1, running or stopped. kern removed it
+/// under a running compose service, which the next `up` then rebuilt (reported).
+#[test]
+fn rmi_refuses_an_image_a_box_uses_unless_forced() {
+    let dir = std::env::temp_dir().join(format!("kern-rmiuse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("Containerfile"),
+        format!("FROM alpine:latest\nRUN echo {} > /u\n", std::process::id()),
+    )
+    .expect("Containerfile");
+    let tag = format!("kern-smoke-rmiuse:{}", std::process::id());
+    let built = kern()
+        .args(["build", "-q", "-t", &tag, &dir.to_string_lossy()])
+        .output()
+        .expect("run kern build");
+    let _ = std::fs::remove_dir_all(&dir);
+    if !built.status.success() {
+        eprintln!(
+            "SKIP: no build here: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        return;
+    }
+    let name = format!("rmiuse-{}", std::process::id());
+    let up = kern()
+        .args(["box", &name, "-d", "--image", &tag, "--", "sleep", "60"])
+        .output()
+        .expect("run kern box");
+    if !up.status.success() {
+        let _ = kern().args(["rmi", "-f", &tag]).output();
+        eprintln!(
+            "SKIP: no detached box here: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    let refused = kern().args(["rmi", &tag]).output().expect("run kern rmi");
+    let _ = kern().args(["stop", &name, "-t", "0"]).output();
+    let after = kern().args(["rmi", &tag]).output().expect("run kern rmi");
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "an image in use was removed: {said}"
+    );
+    assert!(
+        said.contains("must force") && said.contains(&name),
+        "{said}"
+    );
+    assert!(!said.contains("check the image name"), "{said}");
+    assert!(
+        after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+}
+
+/// kern's own notices about how a detached box runs go to the command that started it, never into
+/// the box's LOG: `kern compose logs worker` on a real stack held nothing but kern's warnings
+/// (reported). The `bound 0.0.0.0` notice of a published port is the one every host produces.
+#[test]
+fn a_detached_box_log_holds_the_workload_and_not_kerns_notices() {
+    let name = format!("nolog-{}", std::process::id());
+    let port = 20000 + (std::process::id() % 20000) as u16;
+    let up = kern()
+        .args([
+            "box",
+            &name,
+            "-d",
+            "-p",
+            &format!("{port}:80"),
+            "--image",
+            "alpine:latest",
+            "--",
+            "sh",
+            "-c",
+            "echo WORKLOAD-LINE; sleep 30",
+        ])
+        .output()
+        .expect("run kern box");
+    if !up.status.success() {
+        eprintln!(
+            "SKIP: no detached box here: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let logs = kern()
+        .args(["logs", &name])
+        .output()
+        .expect("run kern logs");
+    let _ = kern().args(["stop", &name, "-t", "0"]).output();
+    let launcher = String::from_utf8_lossy(&up.stderr);
+    let log = String::from_utf8_lossy(&logs.stdout);
+    assert!(log.contains("WORKLOAD-LINE"), "{log}");
+    assert!(
+        !log.contains("kern: warning:") && !log.contains("NOT enforced"),
+        "kern's notice in the box's log: {log}"
+    );
+    assert!(
+        launcher.contains("is reachable from the network"),
+        "the notice no longer reaches the launcher: {launcher}"
+    );
+}
+
+/// A `--gpus` box's `/sys` places the card as the host does, and read-only: `bus/pci/devices/<bdf>`
+/// is a LINK into `devices/`, the bridge above the card holds its attribute files and not the other
+/// devices behind it, the CPU topology is there for hwloc, and nothing under it can be written.
+/// MEASURED as what `nvidia-smi topo -m` needs to say `PHB` where it said `NODE`, and NCCL's dumped
+/// topology then equals Docker's. Skips on a host with no NVIDIA PCI card.
+#[test]
+fn a_gpu_box_sees_its_cards_place_in_the_pci_tree_read_only() {
+    let Some(bdf) = std::fs::read_dir("/sys/bus/pci/drivers/nvidia")
+        .ok()
+        .and_then(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .find(|n| n.contains(':') && n.ends_with(".0"))
+        })
+    else {
+        eprintln!("SKIP: no NVIDIA PCI card here");
+        return;
+    };
+    let script = format!(
+        "l=$(readlink /sys/bus/pci/devices/{bdf}); echo LINK=$l; \
+         d=$(dirname /sys/bus/pci/devices/$l); echo BRIDGE_CLASS=$(cat $d/class 2>/dev/null); \
+         echo BRIDGE_ENTRIES=$(ls $d | grep -c ':'); \
+         ls /sys/devices/system/cpu/cpu0/topology >/dev/null 2>&1 && echo CPU_TOPOLOGY=yes; \
+         grep \" /sys/devices/[^ ]*{bdf} \" /proc/self/mounts | grep -q \" ro,\" && echo WRITABLE=no || echo WRITABLE=yes"
+    );
+    let out = kern()
+        .args([
+            "box",
+            "--rm",
+            "--gpus",
+            "all",
+            "--image",
+            "alpine:latest",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .output()
+        .expect("run kern box");
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success() {
+        eprintln!("SKIP: no GPU box here: {err:.300}");
+        return;
+    }
+    assert!(
+        said.contains("LINK=../../../devices/pci"),
+        "not a link into devices/: {said}"
+    );
+    assert!(
+        said.contains("BRIDGE_CLASS=0x06"),
+        "the bridge's class is missing: {said}"
+    );
+    // The bridge directory lists exactly ONE device: the granted card's function, not its siblings.
+    assert!(
+        said.contains("BRIDGE_ENTRIES=1"),
+        "other devices behind the bridge are visible: {said}"
+    );
+    assert!(
+        said.contains("CPU_TOPOLOGY=yes"),
+        "hwloc has no CPU topology: {said}"
+    );
+    assert!(
+        said.contains("WRITABLE=no"),
+        "the card's sysfs is writable: {said}"
+    );
+}
+
+/// A `--restart` box's later attempts do not repeat kern's notices into its log: the first start
+/// handed them to the launcher's terminal, and every restart wrote them again, once per attempt
+/// (reported: eleven `resource caps could not be enforced` lines for eleven attempts).
+#[test]
+fn restart_attempts_do_not_repeat_kerns_notices_into_the_log() {
+    let name = format!("rnote-{}", std::process::id());
+    let port = 20000 + (std::process::id() % 20000) as u16 + 1;
+    let up = kern()
+        .args([
+            "box",
+            &name,
+            "-d",
+            "--restart",
+            "on-failure",
+            "-p",
+            &format!("{port}:80"),
+            "--image",
+            "alpine:latest",
+            "--",
+            "sh",
+            "-c",
+            "echo RUN; exit 3",
+        ])
+        .output()
+        .expect("run kern box");
+    if !up.status.success() {
+        eprintln!(
+            "SKIP: no detached box here: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    // Backoff 1 s, 2 s, 4 s: three restarts inside eight seconds.
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    let logs = kern()
+        .args(["logs", &name])
+        .output()
+        .expect("run kern logs");
+    let _ = kern().args(["stop", &name, "-t", "0"]).output();
+    let log = String::from_utf8_lossy(&logs.stdout).into_owned();
+    let runs = log.lines().filter(|l| *l == "RUN").count();
+    assert!(
+        runs >= 2,
+        "the box did not restart, nothing measured: {log}"
+    );
+    assert!(
+        !log.contains("is reachable from the network"),
+        "a restart wrote kern's notice into the log ({runs} runs): {log}"
+    );
+}
+
+/// A `--restart` box whose WORKLOAD exits 125 is a workload that ran, not a box that could not be
+/// built: from the second attempt on, the supervisor reads the exec witness and says `exited 125;
+/// restarting`, where it said `never started` for every attempt (reported: `sh -c 'exit 125'`). A
+/// box whose setup fails still says `never started`. The first attempt cannot know (its readiness
+/// pipe is the launcher's) and says both.
+#[test]
+fn a_workload_that_exits_125_is_not_a_box_that_never_started() {
+    let id = std::process::id();
+    let run = |name: &str, args: &[&str]| {
+        let up = kern()
+            .args(["box", name, "-d", "--restart", "on-failure"])
+            .args(args)
+            .output()
+            .expect("run kern box");
+        (
+            up.status.success(),
+            String::from_utf8_lossy(&up.stderr).into_owned(),
+        )
+    };
+    let w = format!("w125-{id}");
+    let (ok, err) = run(
+        &w,
+        &[
+            "--image",
+            "alpine:latest",
+            "--",
+            "sh",
+            "-c",
+            "echo RAN; exit 125",
+        ],
+    );
+    if !ok {
+        eprintln!("SKIP: no detached box here: {err:.300}");
+        return;
+    }
+    let f = format!("f125-{id}");
+    let _ = run(
+        &f,
+        &[
+            "-v",
+            "/proc/sys:/f:ro",
+            "--image",
+            "alpine:latest",
+            "--",
+            "true",
+        ],
+    );
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let logs = |n: &str| {
+        let o = kern().args(["logs", n]).output().expect("run kern logs");
+        String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)
+    };
+    let (wl, fl) = (logs(&w), logs(&f));
+    let _ = kern().args(["stop", &w, &f, "-t", "0"]).output();
+    assert!(
+        wl.contains("exited 125; restarting"),
+        "a workload's exit 125 read as never started: {wl}"
+    );
+    assert!(!wl.contains("never started"), "{wl}");
+    if fl.contains("/proc/sys") || fl.contains("setup failed") {
+        assert!(
+            fl.contains("never started"),
+            "a setup failure lost its sentence: {fl}"
+        );
+    }
+}
+
+/// `up --wait` with a job that exits 1 beside a running service fails at once, as Docker does
+/// (measured: 0.8 s), not after waiting 5 s for a pod whose other service runs as asked (reported
+/// at 5.1 s: the pod's guard was told how many boxes started only after the early return).
+#[test]
+fn compose_wait_fails_fast_when_a_job_dies_beside_a_running_service() {
+    let dir = std::env::temp_dir().join(format!("kern-cwfast-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  job:\n    image: alpine:latest\n    command: [\"false\"]\n  app:\n    image: alpine:latest\n    command: [\"sleep\", \"60\"]\n",
+    )
+    .expect("compose");
+    let project = format!("kcwf{}", std::process::id());
+    let t0 = std::time::Instant::now();
+    let up = kern()
+        .current_dir(&dir)
+        .args(["compose", "-p", &project, "up", "-d", "--wait"])
+        .output()
+        .expect("run kern compose up");
+    let took = t0.elapsed();
+    let _ = kern()
+        .current_dir(&dir)
+        .args(["compose", "-p", &project, "down", "-t", "0"])
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let said = String::from_utf8_lossy(&up.stderr);
+    if host_cannot_build_a_box(&said) {
+        eprintln!("SKIP: no stack here: {said:.300}");
+        return;
+    }
+    assert!(!up.status.success(), "a dead job passed --wait: {said}");
+    assert!(
+        took < std::time::Duration::from_secs(3),
+        "took {took:?}: {said}"
+    );
 }

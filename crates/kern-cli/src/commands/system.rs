@@ -166,7 +166,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}images{z} [<repo>] [--json] [--filter K=V] [--format T]             List pulled (cached) images (<repo> = --filter reference=<repo>)
                                                                      --filter: reference=PAT (`*` allowed; no tag = any tag), dangling=BOOL, label=K or K=V, before=REF, since=REF
     {c}image{z} ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs grouped under `image` (one parser each, not a second)
-    {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)
+    {c}rmi{z} [-f] <image>...                                            Remove cached images (frees unshared layers); -f also one a box uses
     {c}save{z} <image> [-o file]                                         Export an image to a tar (the common image-archive format)
     {c}load{z} [-i file]                                                 Import an image from a tar (the common image-archive format)
     {c}builds{z} [<tag>] [--status S] [-n N] [--json]                    List past builds; S is ok|warn|failed|running|interrupted
@@ -246,7 +246,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}config add{z} <kind:name> [--flags]                               Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
     {c}config rm{z} <kind:name>                                          Delete a profile
     {c}config set{z} <key> <value>                                       Set a [kern] key, e.g. log_max_size 10m, build_keep 200, log_keep_ended 24h
-    {c}config get{z} [<key>] [--json]                                    The [kern] keys and their values; one key prints its value, exit 1 if unset
+    {c}config get{z} [<key>] [--json]                                    The [kern] keys and their values; one key prints its value, exit 1 if unset, 3 if kern.toml does not parse
     {c}config unset{z} <key>                                             Remove a [kern] key, back to kern's default
     {c}validate{z} [path]                                                Check a kern.toml
     {c}uninstall{z} [--yes] [--keep-images]                              Remove everything kern created (lists it first)
@@ -316,10 +316,11 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         flag (repeatable). Without it the image's own file is left untouched
     --dns-search DOM    Add a domain to the resolver's `search` line (repeatable)
     --dns-option OPT    Add a resolv.conf option, e.g. ndots:2 or timeout:2 (repeatable)
-    --log-max-size <sz> Rotate the box's captured log at this size (default 16m)
-    --log-max-file <n>  How many log files to keep, the active one included (default 2)
+    --log-max-size <sz> Rotate the box's captured log at this size (default: [kern] log_max_size, else 16m)
+    --log-max-file <n>  How many log files to keep, the active one included (default: [kern] log_max_file, else 2)
     --log-driver <d>    json-file or local (default: output kept for `kern logs`), or none (kept
-                        nowhere, as Docker's none); drivers that ship output elsewhere are refused
+                        nowhere, as Docker's none; with --log-max-size/--log-max-file it is
+                        refused, as Docker refuses it); drivers that ship output elsewhere are refused
     --memory-reservation <size>  Soft memory floor (cgroup memory.low): protected under pressure,
                         never a cap and never an OOM kill (compose mem_reservation)
     --cpu-weight <n>    Relative CPU share under contention (cgroup cpu.weight, 1-10000, 100 =
@@ -365,12 +366,11 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         per-card directory names only the cards you did get. The host's
                         PCI bus stays readable, so how many cards it has is discoverable.
                         One request: if any card named is missing or unreachable the whole
-                        grant is refused, never granted in part. Compute works on every
-                        card granted and NCCL COLLECTIVES DO NOT: the first all-reduce
-                        crashes the process, with one card as well as two, so multi-GPU
-                        training through NCCL is not available in a box. The topology
-                        does not report either: NVML answers 999 because it reads /sys/bus
-                        and a box has no sysfs
+                        grant is refused, never granted in part. Compute and NCCL
+                        collectives work on every card granted: ncclAllReduce returns the
+                        right answer with one card and with two (docs/FAQ.md). The
+                        topology reports as on the host: the box gets a read-only view
+                        of the cards' sysfs, their bridges and the CPU topology
     --device <ref>      ONE card, named as CDI names it: nvidia.com/gpu=0, or by UUID. An
                         alias over --gpus: the spec says which card the name means and the
                         mounts come from the driver's own layout. Several cards are asked

@@ -1,0 +1,5 @@
+# The self-hosted runner `differential-chaos.yml` runs on carries a `gpu` label actionlint does not
+# know; declared here so the lint job reads it as a runner label and not as a typo.
+self-hosted-runner:
+  labels:
+    - gpu

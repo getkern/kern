@@ -331,6 +331,18 @@ pub fn wsl_adapter_indices(root: &Path) -> Option<Vec<u32>> {
     }
 }
 
+/// How many NVIDIA adapters a WSL2 guest has, asked of `/dev/dxg` alone: `Some(0)` for a WSL2
+/// guest with none, `None` when this is not a WSL2 guest or the driver cannot be asked.
+///
+/// FOR `kern info`, which must not pay for the vendor's tool (53 to 69 ms) on every orientation:
+/// two ioctls on a node already open, no process. WSL2 has no `/sys/class/drm` card for the GPU,
+/// so the inventory that reads only that tree said `gpu none` on a guest where `--gpus all` runs
+/// `nvidia-smi` (reported on WSL2 against 6d93b85).
+pub fn wsl_nvidia_adapter_count(root: &Path) -> Option<u32> {
+    let shape = foreign_shape_in(root)?;
+    Some(dxg_nvidia_adapters(&shape.node).unwrap_or(0))
+}
+
 /// Is this a WSL2 guest whose adapters' UUIDs cannot be read? Only the vendor's `nvidia-smi` prints
 /// them, and on a musl guest it cannot start; `/dev/dxg` gives ids and a count, never a UUID.
 pub fn wsl_uuids_unreadable(root: &Path) -> bool {
