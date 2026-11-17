@@ -1,0 +1,66 @@
+# The macOS install path end to end: Lima, the VM, kern inside it, and the `kern` command on the Mac.
+#
+# On demand and weekly, never on a push: the VM job boots a full Ubuntu guest under QEMU, which takes
+# minutes and tests the installer's Darwin branch, not the code a push changes.
+#
+# WHY AN INTEL RUNNER FOR THE VM. GitHub's Apple Silicon runners are VMs with no nested
+# virtualization, so Lima cannot start a guest there; an Intel runner can, with QEMU. The label is
+# `macos-15-intel`, checked against actions/runner-images' README on 2026-11-17 (`macos-13` and the
+# macOS 14 images are retired). When GitHub retires it, move to the next `-intel` label or keep only
+# the `script` job. The default path on an Apple Silicon Mac (Lima's `vz`) is not covered here and
+# needs a real Mac.
+name: macos-install
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Saturday night, 22:30 UTC.
+    - cron: "30 22 * * 6"
+
+permissions:
+  contents: read
+
+jobs:
+  # No VM: the script parses as POSIX sh and shellcheck has nothing to say about it.
+  script:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: syntax
+        run: sh -n install.sh
+      - name: shellcheck
+        run: |
+          brew install shellcheck
+          shellcheck -s sh install.sh
+
+  # The whole path: Lima, the VM, kern in it, the shim, and boxes started from the Mac.
+  vm:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: QEMU (an Intel runner has no `vz` guest to offer)
+        run: brew install qemu
+      - name: install (the Darwin branch of install.sh)
+        env:
+          KERN_LIMA_ARGS: "--vm-type qemu"
+        run: sh install.sh
+      - name: a box from the Mac
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          kern --version
+          test "$(kern box --rm --image alpine -- echo hello)" = hello
+      - name: arguments with spaces arrive intact
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          test "$(kern box --rm --image alpine -- sh -c 'echo "$1"' sh "two words")" = "two words"
+      - name: a volume from the Mac home, written from the box
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p "$HOME/kern-ci" && cd "$HOME/kern-ci"
+          echo from-mac > in.txt
+          kern box --rm -v "$PWD:/w" --image alpine -- sh -c 'cat /w/in.txt && echo from-vm > /w/out.txt'
+          test "$(cat out.txt)" = from-vm
+      - name: Lima logs
+        if: failure()
+        run: cat "$HOME"/.lima/kern/*.log || true

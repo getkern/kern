@@ -1,4 +1,6 @@
 #!/bin/sh
+# The colour codes ARE the printf format, on purpose, everywhere below.
+# shellcheck disable=SC2059
 # kern installer - downloads the latest prebuilt static binary for this platform.
 #
 #   curl -fsSL https://getkern.dev/install.sh | sh
@@ -6,8 +8,11 @@
 # Honors:
 #   KERN_INSTALL_DIR   where to install (default: ~/.local/bin, or /usr/local/bin as root)
 #   KERN_VERSION       a specific tag, e.g. v0.3.0 (default: latest)
+#   KERN_VM            macOS only: the Lima VM's name (default: kern)
+#   KERN_LIMA_ARGS     macOS only: extra `limactl start` flags for a new VM, e.g. "--vm-type qemu"
 # No dependencies beyond a POSIX shell, curl (or wget), tar, and sha256sum (optional, for
-# integrity verification). Linux only - kern is a Linux sandbox.
+# integrity verification). kern is a Linux sandbox: on macOS this script sets up a small Lima VM
+# and installs kern inside it (kern_macos below).
 set -eu
 
 REPO="getkern/kern"
@@ -15,49 +20,129 @@ RED='\033[0;31m'; GRN='\033[0;32m'; DIM='\033[2m'; ZZ='\033[0m'
 err() { printf "${RED}error${ZZ}: %s\n" "$1" >&2; exit 1; }
 info() { printf "${GRN}==>${ZZ} %s\n" "$1"; }
 
+# --- macOS: kern in a small Lima VM ---
+# macOS has no namespaces and no cgroups, so there is nothing there for kern to build a box out of;
+# it runs in a Linux VM. This sets one up with Lima, without Docker and without containerd inside it,
+# installs kern there through the Linux path of this same script, and puts a `kern` command on the
+# Mac that starts the VM when it is stopped and runs kern in it, in the current directory. The rest
+# of this file is the Linux install and is not reached on a Mac.
+#
+# Checked against Lima 2.3.0's own source (cmd/limactl): `start` takes --tty, --name, --containerd
+# (user, system, user+system, none), --mount-writable and --vm-type; `shell` quotes every argument
+# with shellescape before the guest shell sees it, so `kern box ... -- echo "two words"` arrives as
+# two words, and --workdir cds into that directory or exits 1. The default template is Ubuntu, whose
+# kernel.apparmor_restrict_unprivileged_userns=1 stops rootless boxes: the profile kern carries is
+# installed in the VM, the step the Linux path only prints.
+kern_macos() {
+  vm="${KERN_VM:-kern}"
+  command -v curl >/dev/null 2>&1 || err "curl is required."
+  # Lima from Homebrew if it is there, else the latest Lima release, verified, in ~/.kern/lima.
+  PATH="$HOME/.kern/lima/bin:$PATH"
+  export PATH
+  if ! command -v limactl >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1; then
+      info "installing Lima (brew install lima)"
+      brew install lima || err "brew install lima failed."
+    else
+      case "$(uname -m)" in
+        arm64) larch="arm64" ;;
+        x86_64) larch="x86_64" ;;
+        *) err "unsupported Mac architecture: $(uname -m)." ;;
+      esac
+      ltag="$(curl -fsSL https://api.github.com/repos/lima-vm/lima/releases/latest |
+        sed -n 's/.*"tag_name": *"\(v[^"]*\)".*/\1/p' | head -n 1)"
+      [ -n "$ltag" ] || err "could not find the latest Lima release."
+      lfile="lima-${ltag#v}-Darwin-${larch}.tar.gz"
+      lurl="https://github.com/lima-vm/lima/releases/download/${ltag}"
+      ltmp="$(mktemp -d)"
+      info "installing Lima ${ltag} into ~/.kern/lima"
+      curl -fsSL -o "${ltmp}/${lfile}" "${lurl}/${lfile}" || err "Lima download failed: ${lurl}/${lfile}"
+      curl -fsSL -o "${ltmp}/SHA256SUMS" "${lurl}/SHA256SUMS" || err "Lima checksum download failed."
+      lwant="$(awk -v f="$lfile" '$2 == f { print $1 }' "${ltmp}/SHA256SUMS")"
+      lgot="$(shasum -a 256 "${ltmp}/${lfile}" | awk '{ print $1 }')"
+      { [ -n "$lwant" ] && [ "$lwant" = "$lgot" ]; } ||
+        err "Lima checksum mismatch (expected ${lwant:-none}, got ${lgot})."
+      mkdir -p "$HOME/.kern/lima"
+      tar -xzf "${ltmp}/${lfile}" -C "$HOME/.kern/lima" || err "could not unpack Lima into ~/.kern/lima."
+      rm -rf "$ltmp"
+    fi
+  fi
+  command -v limactl >/dev/null 2>&1 || err "limactl is not on PATH after installing Lima."
+
+  # The VM: created once, started when it is stopped.
+  if limactl list -q 2>/dev/null | grep -qx "$vm"; then
+    if [ "$(limactl list --format '{{.Status}}' "$vm" 2>/dev/null)" != "Running" ]; then
+      info "starting the Lima VM '${vm}'"
+      limactl start --tty=false "$vm" || err "could not start the Lima VM '${vm}'."
+    fi
+  else
+    info "creating the Lima VM '${vm}': Ubuntu, no Docker, no containerd (a few minutes, once)"
+    # KERN_LIMA_ARGS is split into flags on purpose, e.g. "--vm-type qemu".
+    # shellcheck disable=SC2086
+    limactl start --tty=false --name="$vm" --containerd=none --mount-writable \
+      ${KERN_LIMA_ARGS:-} template://default || err "could not create the Lima VM '${vm}'."
+  fi
+
+  # kern inside the VM, through this script's Linux path, as root so it lands in /usr/local/bin:
+  # on PATH in every shell, interactive or not, and named by the AppArmor profile kern carries.
+  info "installing kern inside the VM"
+  # shellcheck disable=SC2016
+  limactl shell "$vm" sh -c 'curl -fsSL "$1" | sudo env KERN_VERSION="$2" sh' \
+    sh "https://raw.githubusercontent.com/${REPO}/main/install.sh" "${KERN_VERSION:-latest}" ||
+    err "installing kern inside the VM failed."
+  # shellcheck disable=SC2016
+  limactl shell "$vm" sh -c '
+    if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+      /usr/local/bin/kern doctor --apparmor-profile | sudo tee /etc/apparmor.d/kern >/dev/null &&
+        sudo apparmor_parser -r /etc/apparmor.d/kern
+    fi' || err "installing the AppArmor profile inside the VM failed."
+
+  # The `kern` command on the Mac.
+  shimdir="$HOME/.local/bin"
+  mkdir -p "$shimdir"
+  # The shim's own `$` must reach the file unexpanded: single quotes on purpose.
+  # shellcheck disable=SC2016
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' "# kern on macOS: runs kern inside the Lima VM '${vm}' (set up by kern's install.sh), starting"
+    printf '%s\n' "# the VM when it is stopped. Under your home the current directory is the same path in the VM,"
+    printf '%s\n' "# mounted writable; elsewhere kern runs in the VM's home."
+    printf '%s\n' "# Remove: rm ~/.local/bin/kern && limactl delete --force ${vm}"
+    printf '%s\n' 'PATH="$HOME/.kern/lima/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"'
+    printf "vm='%s'\n" "$vm"
+    printf '%s\n' 'if [ "$(limactl list --format "{{.Status}}" "$vm" 2>/dev/null)" != "Running" ]; then'
+    printf '%s\n' '  limactl start --tty=false "$vm" >/dev/null 2>&1 ||'
+    printf '%s\n' '    { echo "kern: could not start the Lima VM $vm (run: limactl start $vm)" >&2; exit 125; }'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'case "$PWD" in'
+    printf '%s\n' '  "$HOME" | "$HOME"/*) exec limactl shell --workdir "$PWD" "$vm" /usr/local/bin/kern "$@" ;;'
+    printf '%s\n' '  *) exec limactl shell "$vm" /usr/local/bin/kern "$@" ;;'
+    printf '%s\n' 'esac'
+  } > "${shimdir}/kern"
+  chmod 755 "${shimdir}/kern"
+  info "installed $("${shimdir}/kern" --version) in the Lima VM '${vm}', called through ${shimdir}/kern"
+  case ":${PATH}:" in
+    *":${shimdir}:"*) ;;
+    *)
+      # shellcheck disable=SC2016
+      line='export PATH="$HOME/.local/bin:$PATH"'
+      if ! grep -qsxF "$line" "$HOME/.zshrc"; then
+        printf '%s\n' "$line" >> "$HOME/.zshrc"
+      fi
+      printf "${DIM}    added ~/.local/bin to PATH in ~/.zshrc: open a new terminal, or run: %s${ZZ}\n" "$line"
+      ;;
+  esac
+  printf "${DIM}    try: kern box --rm --image alpine -- echo hello${ZZ}\n"
+}
+
 # --- platform detection ---
 os="$(uname -s)"
-# Darwin gets its own message rather than the generic one: it is the single point where a Mac user
-# meets kern, and "Linux-only" alone reads as a dead end. There is no native port and there will not
-# be one (macOS has no namespaces or cgroups), but kern runs unchanged in any Linux VM, so the error
-# hands over the four commands that get there instead of just closing the door.
+# Darwin runs kern_macos above: kern in a Lima VM, and a `kern` command on the Mac.
 case "$os" in
   Linux) ;;
   Darwin)
-    # Look before prescribing. Telling a Mac that already runs OrbStack or Docker Desktop to install
-    # colima is asking for a second VM to do what the first one is doing right now, and it is the
-    # most common shape: someone who wants a container runtime usually has one running already. So
-    # name the Linux the machine ALREADY has, and keep the install line for a Mac that has none.
-    have=""
-    for vm in colima limactl orb docker; do
-      command -v "$vm" >/dev/null 2>&1 && have="$have $vm"
-    done
-    if [ -n "$have" ]; then
-      # Presence, not function, and deliberately: `docker info` on a Mac whose Docker Desktop is not
-      # running can take seconds, and this is an ERROR path that has already failed the user once.
-      # So the message never claims the VM is up, it says what to do in either case.
-      route="This Mac has a Linux VM installed (${have# }). Start it if it is not running, and use
-  it rather than installing a second one:
-
-      colima ssh            # colima. For Lima: limactl shell <instance>
-      docker run --rm -it --privileged --tmpfs /run ubuntu   # OrbStack / Docker Desktop
-
-  then run this installer again inside it. --privileged is privilege INSIDE that VM, which is
-  already a boundary against macOS, and it is needed because a box mounts its own /proc."
-    else
-      route="No Linux VM was found on this Mac. One way to get one:
-
-      brew install colima
-      colima start
-      colima ssh
-      curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh"
-    fi
-    err "kern is Linux-only (detected Darwin), and a native macOS port is a non-goal: macOS has no
-  namespaces and no cgroups, so there is nothing for kern to build a box out of.
-
-  $route
-
-  No GPU and no GPIO are reachable from a Linux guest on a Mac. See docs/INSTALL.md."
+    kern_macos
+    exit 0
     ;;
   *) err "kern is Linux-only (detected $os)." ;;
 esac

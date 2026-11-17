@@ -602,86 +602,72 @@ jobs:
     name: macOS guards
     # A macOS runner cannot RUN kern, and that is not the point. kern needs a Linux kernel, and a
     # hosted macOS runner has no nested virtualization, so colima or Lima cannot start a VM to hold
-    # one. What this runner can check is everything kern SAYS to a Mac user, which is the part that
-    # had never been executed on Darwin at all: the installer's refusal, and each SDK's error when
-    # no binary is on PATH. Those are the three doors a Mac user meets, and they were verified only
-    # by faking `uname` on a Linux box until this job existed.
+    # one. What this runner can check is everything kern does and SAYS on a Mac without a VM: the
+    # installer's Darwin branch (driven against a stub `limactl`), and each SDK's error when no
+    # binary is on PATH. Those are the doors a Mac user meets, and they were verified only by faking
+    # `uname` on a Linux box until this job existed.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-      - name: the installer refuses Darwin, and names the route for BOTH shapes of Mac
-        # TWO BRANCHES, AND THIS USED TO TEST NEITHER OF THEM ON PURPOSE. The installer looks for
-        # `colima limactl orb docker` and says something different when it finds one: a Mac that
-        # already runs a Linux VM must be told to USE it, not to install a second one. Which branch a
-        # bare run takes therefore depends on what the runner image happens to ship, so the old bare
-        # run could not assert which message it had seen. Its one content check, `grep -q colima`,
-        # passed in BOTH branches - `brew install colima` in one, `colima ssh` in the other - so it
-        # would have stayed green with the branches swapped. Both are driven from a controlled PATH
-        # now, and the assertion that separates them is the ABSENCE of `brew install` on the Mac that
-        # already has a VM, which is the entire point of that branch.
+      - name: the installer's Darwin branch drives Lima as it should, without a VM
+        # SINCE 2026-11-17 THE INSTALLER INSTALLS ON A MAC instead of refusing: Lima, a VM named
+        # `kern` without containerd, kern inside it, and a `kern` shim on the Mac. This runner cannot
+        # start the VM (no nested virtualization), so a stub `limactl` records what the installer and
+        # the shim ask of it, and the assertions read that record. The full path, with a real VM,
+        # is `.github/workflows/macos-install.yml` (weekly, on an Intel runner).
         run: |
           set -u
-          echo "what this runner image happens to ship (reported, not relied on):"
-          for vm in colima limactl orb docker; do
-            printf '  %-8s %s\n' "$vm" "$(command -v "$vm" 2>/dev/null || echo absent)"
-          done
+          # A stub `limactl`, placed where the installer AND the shim look first ($HOME/.kern/lima/bin), so a
+          # real Lima the runner image may ship is never reached and no VM is started.
+          home="$RUNNER_TEMP/home"
+          log="$RUNNER_TEMP/limactl.log"
+          mkdir -p "$home/.kern/lima/bin" "$home/my proj"
+          cat > "$home/.kern/lima/bin/limactl" <<'STUB'
+          #!/bin/sh
+          { printf 'CALL'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$STUB_LOG"
+          case "$1" in
+            list)
+              if [ "$2" = "-q" ]; then [ -f "$STUB_STATE" ] && echo kern; exit 0; fi
+              if [ -f "$STUB_STATE" ]; then echo Running; else echo Stopped; fi
+              exit 0 ;;
+            start) : > "$STUB_STATE"; exit 0 ;;
+            shell) echo "kern-stub"; exit 0 ;;
+          esac
+          exit 0
+          STUB
+          chmod +x "$home/.kern/lima/bin/limactl"
+          export STUB_LOG="$log" STUB_STATE="$RUNNER_TEMP/vm-up"
 
-          # THE "no VM" PATH IS BUILT, NOT ASSUMED. `PATH=/usr/bin:/bin` looks like it excludes a VM
-          # tool and does not: `docker` sits in `/usr/bin` on plenty of systems, and a runner image is
-          # free to put one there too. Whether this branch is reachable would then depend on the image
-          # of the day, which is not a test. On the Darwin path the installer needs `sh`, `uname` and
-          # shell builtins and nothing else, so two symlinks are the whole environment.
-          mkdir -p "$RUNNER_TEMP/novm" "$RUNNER_TEMP/hasvm"
-          ln -sf "$(command -v sh)" "$RUNNER_TEMP/novm/sh"
-          ln -sf "$(command -v uname)" "$RUNNER_TEMP/novm/uname"
-          for vm in colima limactl orb docker; do
-            if [ -e "$RUNNER_TEMP/novm/$vm" ]; then
-              echo "the no-VM environment is not empty: it holds $vm" >&2
-              exit 1
-            fi
-          done
-
-          # A Mac with a VM. A file named `colima` on PATH is enough: the installer tests PRESENCE,
-          # deliberately, because `docker info` on a stopped Docker Desktop takes seconds on a path
-          # that has already failed the user once.
-          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/hasvm/colima"
-          chmod +x "$RUNNER_TEMP/hasvm/colima"
-
-          if novm="$(PATH=$RUNNER_TEMP/novm sh install.sh 2>&1)"; then
-            printf 'the installer exited 0 on macOS; it must refuse:\n%s\n' "$novm" >&2
+          if ! out="$(HOME="$home" PATH="/usr/bin:/bin" sh install.sh 2>&1)"; then
+            printf 'the Darwin branch failed:\n%s\n' "$out" >&2
             exit 1
           fi
-          if hasvm="$(PATH=$RUNNER_TEMP/hasvm:$RUNNER_TEMP/novm sh install.sh 2>&1)"; then
-            printf 'the installer exited 0 on macOS; it must refuse:\n%s\n' "$hasvm" >&2
-            exit 1
-          fi
-          printf '===== no VM on PATH =====\n%s\n\n===== a VM on PATH =====\n%s\n' "$novm" "$hasvm"
+          printf '%s\n\n===== limactl calls =====\n' "$out"
+          cat "$log"
 
-          for out in "$novm" "$hasvm"; do
-            printf '%s' "$out" | grep -q 'Linux-only (detected Darwin)' || {
-              echo 'the refusal stopped naming Darwin' >&2; exit 1; }
-          done
+          grep -qF 'CALL [start] [--tty=false] [--name=kern] [--containerd=none] [--mount-writable] [template://default]' "$log" || {
+            echo 'the VM is not created with --containerd=none --mount-writable from the default template' >&2; exit 1; }
+          grep -qF '[sh] [-c] [curl -fsSL "$1" | sudo env KERN_VERSION="$2" sh]' "$log" || {
+            echo 'kern is not installed inside the VM through install.sh' >&2; exit 1; }
+          grep -qF 'apparmor_restrict_unprivileged_userns' "$log" || {
+            echo 'the VM no longer gets the AppArmor step' >&2; exit 1; }
+          [ -x "$home/.local/bin/kern" ] || { echo 'no kern shim on the Mac' >&2; exit 1; }
+          if grep -q 'brew' "$log"; then echo 'brew was reached with limactl present' >&2; exit 1; fi
 
-          printf '%s' "$novm" | grep -q 'No Linux VM was found on this Mac' || {
-            echo 'a Mac with no VM is no longer told it has none' >&2; exit 1; }
-          printf '%s' "$novm" | grep -q 'brew install colima' || {
-            echo 'a Mac with no VM is no longer told how to get one' >&2; exit 1; }
+          # The shim: from a directory under HOME with a space in it, an argument with a space in it.
+          : > "$log"
+          (cd "$home/my proj" && HOME="$home" PATH="/usr/bin:/bin" "$home/.local/bin/kern" box --rm --image alpine -- echo "two words") >/dev/null
+          cat "$log"
+          grep -qF "CALL [shell] [--workdir] [$home/my proj] [kern] [/usr/local/bin/kern] [box] [--rm] [--image] [alpine] [--] [echo] [two words]" "$log" || {
+            echo 'the shim does not pass the directory and the arguments through intact' >&2; exit 1; }
 
-          printf '%s' "$hasvm" | grep -q 'This Mac has a Linux VM installed (colima)' || {
-            echo 'a Mac that already has a VM is no longer told so, by name' >&2; exit 1; }
-          # `if`, not `grep ... && { exit 1; }`: a run step is `bash -e`, and in an AND-OR list only
-          # the LAST command is exempt from -e. A grep that finds nothing is the GOOD case here, and
-          # written as an `&&` it is also the list's exit status, so the step would have failed
-          # exactly when the product was correct.
-          if printf '%s' "$hasvm" | grep -q 'brew install'; then
-            echo 'a Mac that already has a VM is being told to install a second one' >&2
-            exit 1
-          fi
-
-          # THE CONTROL: the two runs must differ. If they do not, the PATH did not steer anything
-          # and every assertion above was reading the same output twice.
-          [ "$novm" != "$hasvm" ] || {
-            echo 'both runs produced the same text: the branch was never taken' >&2; exit 1; }
+          # A stopped VM is started first; outside HOME there is no --workdir.
+          rm -f "$STUB_STATE"
+          : > "$log"
+          (cd / && HOME="$home" PATH="/usr/bin:/bin" "$home/.local/bin/kern" ps) >/dev/null
+          grep -qF 'CALL [start] [--tty=false] [kern]' "$log" || { echo 'the shim did not start a stopped VM' >&2; exit 1; }
+          grep -qF 'CALL [shell] [kern] [/usr/local/bin/kern] [ps]' "$log" || {
+            echo 'outside HOME the shim must run without --workdir' >&2; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
