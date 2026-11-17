@@ -115,8 +115,9 @@ CASES: list[Case] = [
      # sabotaging the gate to sabotaging nothing. It said so and went red, which is the selftest
      # doing its job, and it is why the case names the string it edits. It happened again on
      # 2026-10-03: the sub-line became "Runs agent tool calls ...", and both card cases stopped
-     # finding their anchor, measured as a red CI run on the commit that changed the card.
-     lambda t: t.replace('SUBLINE = "Runs agent', 'SUBLINE = "Runs any workload, agent', 1)),
+     # finding their anchor, measured as a red CI run on the commit that changed the card. And on
+     # 2026-11-17: "Runs untrusted code ...", the same red, the same fix.
+     lambda t: t.replace('SUBLINE = "Runs untrusted', 'SUBLINE = "Runs any workload, untrusted', 1)),
     # --- progress-is-tty-gated: both crates, and the multi-line shape that escaped the manual pass ---
     ("progress-is-tty-gated", "a bare eprintln! progress line", "crates/kern-oci/src/pull.rs",
      lambda t: t + '\nfn _selftest() { eprintln!("\u2192 pulling something"); }\n'),
