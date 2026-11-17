@@ -55,7 +55,9 @@ SUBLINE = "Runs untrusted code and AI agent tool calls under kernel-enforced iso
 # the sub-line had one and the pill did not. It does now, and
 # scripts/og-card-matches-readme.py checks it against the BENCHMARKS.md row that stale-numbers.py
 # already treats as canonical.
-PILL = "3.6 ms  \u00b7  daemonless  \u00b7  rootless"
+# 2026-11-17: no figure on the pill any more (a number on a card goes stale with every new
+# measurement); the release's news is the GPU support.
+PILL = "rootless  \u00b7  daemonless  \u00b7  GPU"
 PILL_BG = (218, 251, 225)      # sampled inside the pill
 PILL_INK = (31, 105, 63)       # sampled from its text
 PILL_BOX = (611, 62, 1127, 123)   # MEASURED on the original: the pill's true bounding box

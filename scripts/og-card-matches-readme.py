@@ -104,8 +104,10 @@ def main() -> int:
     said = re.search(r"([\d.]+)\s*ms", pill)
     bench = (ROOT / "BENCHMARKS.md").read_text(encoding="utf-8")
     canonical = re.search(r"\|\s*\*\*kern\*\*\s*`box --image`\s*\|\s*\*\*~?([\d.]+)\s*ms\*\*", bench)
+    # A pill with NO figure is fine (2026-11-17: the pill reads "rootless · daemonless · GPU");
+    # a pill WITH one must still match BENCHMARKS.md, which is what this rule is for.
     if not said:
-        problems.append("the card's pill no longer states a figure this check can read")
+        pass
     elif not canonical:
         problems.append("BENCHMARKS.md no longer states the image cold start in its table")
     elif said.group(1) != canonical.group(1):
