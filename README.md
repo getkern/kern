@@ -27,12 +27,6 @@
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-```python
-# Python: pip install kern-sandbox (Node: npm install kern-sandbox)
-import kern_sandbox as kern
-print(kern.run_code("print(sum(range(100)))").stdout)   # 4950
-```
-
 ---
 
 ## What kern is
