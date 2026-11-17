@@ -49,8 +49,9 @@ release ships a pre-baked WSL rootfs and a small `kern.exe` shim.
 
 Not natively, and that is a non-goal rather than work left undone: macOS has no namespaces and no
 cgroups, so there is nothing there for kern to build a box out of. It does run **on a Mac inside a
-Linux VM** (Lima, colima, OrbStack, UTM, or the one Docker Desktop is already running), where it is
-the ordinary Linux kern, same binary and same CLI as your CI box.
+Linux VM**, where it is the ordinary Linux kern, same binary and same CLI as your CI box. The Linux
+install line sets one up on a Mac: a Lima VM with no Docker inside, kern in it, and a `kern` command
+on the Mac that runs it there ([docs/INSTALL.md](INSTALL.md#macos)). Any other Linux VM works too.
 
 **Which guest you pick changes how much of kern you get**, and the gap is bigger than it looks. Both
 options below have been observed rather than assumed, and they are not equivalent.
@@ -64,20 +65,14 @@ lingering on, unprivileged overlayfs, `newuidmap`, `pasta`, and Landlock ABI v7.
 was a missing `sshfs`. Nothing switched off. Their host, their output, reported rather than measured
 here, which is why it is attributed: Lima's own template list is the place to get a Fedora guest.
 
-**colima with its default Ubuntu guest works, with two things switched off.** Verified directly, on a
-MacBook with Apple Silicon, colima 0.10.3 and Ubuntu 24.04: kern installs, a box from an OCI image
-starts, and the Python SDK drives it.
-
-```sh
-brew install colima && colima start && colima ssh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
-```
-
-The second line is the normal installer, run from inside the VM. What you give up on that guest:
+**An Ubuntu guest works, with two things switched off.** Verified directly, on a MacBook with Apple
+Silicon and an Ubuntu 24.04 guest (colima 0.10.3): kern installs, a box from an OCI image starts,
+and the Python SDK drives it. What you give up on that guest:
 
 - **The first box fails on AppArmor**, because Ubuntu 23.10 and newer restrict unprivileged user
   namespaces. `kern doctor` names it first and prints the fix
-  (`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`), which a VM restart undoes.
+  (`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`), which a VM restart undoes. The
+  VM the installer creates gets kern's own AppArmor profile instead, which survives a restart.
 - **The resource caps do not bite**: no `systemd --user` manager and no delegated `memory`
   controller, so a box's `--memory` is accepted and never enforced. kern says so at every box start
   instead of pretending, `--require-limits` refuses to run uncapped, and `kern run --memory` refuses

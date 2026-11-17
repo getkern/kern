@@ -9,7 +9,7 @@
 [![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm%20kern-sandbox&color=blue)](https://www.npmjs.com/package/kern-sandbox)
 [![Runs on](https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20Windows%20via%20WSL2%20%C2%B7%20macOS%20via%20a%20Linux%20VM-informational.svg)](docs/INSTALL.md)
 
-**kern:** rootless container runtime and sandbox with no daemon. Runs agent tool calls and LLM-generated code in kernel-enforced containers.
+**kern:** fast, rootless container runtime and sandbox with no daemon. Runs agent tool calls and LLM-generated code in kernel-enforced containers.
 
 
 **A real, kernel-enforced container in a few milliseconds, out of one static binary with no daemon.**
@@ -23,7 +23,7 @@
 </div>
 
 ```sh
-# Linux. Windows and macOS below.
+# Linux and macOS. Windows below.
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
@@ -64,18 +64,12 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 <img src="assets/os/macos.svg" alt="macOS, in a Linux VM">
 
 ```sh
-brew install colima
-colima start
-colima ssh
-```
-
-Then, inside the VM:
-
-```sh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-Kern Sandbox goes in the VM too, with the code that calls it: `pip install kern-sandbox` there.
+On macOS kern runs in a small Lima VM, created automatically, with no Docker inside; `kern` on the
+Mac runs it there, in the current directory. Kern Sandbox goes in the VM, with the code that calls
+it: `limactl shell kern`, then `pip install kern-sandbox` there.
 
 Then `kern doctor` checks the host and says what to fix. Ubuntu 23.10 and newer need one root step
 first: [docs/INSTALL.md](docs/INSTALL.md#linux).
@@ -195,7 +189,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 ## Roadmap
 
 In development: a VM tier. Under consideration: a desktop for computer use,
-kern in a Kubernetes pod, snapshots, a `kern` command on macOS. Details: [ROADMAP.md](ROADMAP.md).
+kern in a Kubernetes pod, snapshots. Details: [ROADMAP.md](ROADMAP.md).
 
 ## Documentation
 

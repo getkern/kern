@@ -99,7 +99,7 @@ read, which on a slow machine is large enough to trip a short `timeoutS`.
 
 **On a Mac this package installs but cannot run**, and it says so rather than sending you after a
 download that does not exist: kern is Linux-only, because macOS has no namespaces and no cgroups. Run
-inside a Linux VM (colima, Lima, OrbStack, UTM), install `kern` and this package there, and it behaves
+inside a Linux VM (on a Mac the kern installer sets one up with Lima), install this package there, and it behaves
 as on Linux. Verified on Apple Silicon with an Ubuntu 24.04 guest.
 [Install notes for macOS](https://github.com/getkern/kern/blob/main/docs/INSTALL.md).
 

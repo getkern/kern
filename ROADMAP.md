@@ -14,4 +14,3 @@ Nothing here is a commitment or a date. Shipped work is in [CHANGELOG.md](CHANGE
 - **Kubernetes pod**: kern runs in a privileged container today; next is the least privilege it
   needs.
 - **Snapshot and warm start**: rootless CRIU, opt-in, same host.
-- **`kern` on macOS**: a shim to type `kern` in the Mac's shell; it still runs in a Linux VM.

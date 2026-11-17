@@ -110,23 +110,25 @@ anything you mount into a box, under the distro's own filesystem (`~/project`).
 
 ## macOS
 
-macOS has no containers of its own, so kern runs inside a Linux VM. With colima:
+macOS has no containers of its own, so kern runs inside a Linux VM, and the Linux line sets it up:
 
 ```sh
-brew install colima
-colima start
-colima ssh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-colima's default guest is Ubuntu, so run the Ubuntu step above once. In that guest, memory and
-process limits are not enforced, and kern says so when a box starts. More in the
-[FAQ](FAQ.md#does-it-run-on-macos).
+On a Mac it installs Lima (with Homebrew if you have it, else the latest Lima release, checked
+against its SHA256SUMS, in `~/.kern/lima`), creates a VM named `kern` from Lima's default Ubuntu
+template with no Docker and no containerd in it and your home mounted writable, installs kern inside
+it with this same script and kern's AppArmor profile, and puts `kern` in `~/.local/bin` on the Mac.
+That `kern` starts the VM when it is stopped and runs kern in it; under your home the current
+directory is the same path in the VM, so `-v "$PWD:/w"` works as on Linux. `KERN_VM` names the VM
+(default `kern`), `KERN_LIMA_ARGS` adds `limactl start` flags (`--vm-type qemu` on an Intel Mac
+without `vz`). To remove it: `rm ~/.local/bin/kern && limactl delete --force kern`.
 
 **Kern Sandbox runs where kern runs, so your code goes in the VM too.** `pip install kern-sandbox`
-on the Mac itself installs, and its first call stops with an error that says so. Inside the VM, in a
-venv, it brings kern with it. An MCP client on the Mac needs the `ssh` line in
-[docs/MCP.md](MCP.md).
+on the Mac itself installs, and its first call stops with an error that says so. Inside the VM
+(`limactl shell kern`), in a venv, it brings kern with it. An MCP client on the Mac needs the `ssh`
+line in [docs/MCP.md](MCP.md). More in the [FAQ](FAQ.md#does-it-run-on-macos).
 
 ## Uninstall
 
@@ -161,4 +163,4 @@ irm https://raw.githubusercontent.com/getkern/kern/main/uninstall.ps1 | iex
 | Linux x86_64 | automated CI |
 | Linux aarch64 | automated CI |
 | Windows 10 and 11 | through WSL2 |
-| macOS | inside a Linux VM, tested on colima |
+| macOS | inside the Lima VM the installer creates; weekly CI on an Intel runner |
