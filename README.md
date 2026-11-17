@@ -18,6 +18,8 @@
 
 <img src="assets/readme-windows.svg" width="880" alt="Two windows. Container: kern box dev --image alpine -it -- sh; kern compose up -d, for your compose.yaml; kern ps. Sandbox: import kern_sandbox as kern; r = kern.run_code(&quot;print(6 * 7)&quot;); print(r.stdout) prints 42.">
 
+<img src="assets/kern-top.gif" width="880" alt="kern top, recorded live on one machine: the Boxes tab with a GPU box, a dev box, a worker and a compose stack (app and postgres, healthy); the Sandboxes tab with SDK calls running and finishing, ok, exit codes and runs on the GPU; the Logs tab with every box's output in one stream.">
+
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
 
 </div>
