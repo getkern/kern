@@ -10887,7 +10887,8 @@ pub(crate) fn legacy_pod_name(file: &str) -> String {
 /// The verbs `kern config` takes. ONE definition, referenced by the parser that refuses an unknown one
 /// and by the dispatch below, because they were two lists and a verb added to one and not the other
 /// would have been accepted and then silently treated as `list`.
-pub(crate) const CONFIG_USAGE: &str = "config [list|add|rm|edit|setup|probe|clear]";
+pub(crate) const CONFIG_USAGE: &str =
+    "config [list|add|rm|edit|setup|probe|clear] | config set <key> <value> | config get [<key>] | config unset <key>";
 
 const CONFIG_ADD_USAGE: &str = "config add <vcpu|vgpio|vdisk>:<name> [--field value …] [--update]";
 const CONFIG_RM_USAGE: &str = "config rm <vcpu|vgpio|vdisk>:<name>";

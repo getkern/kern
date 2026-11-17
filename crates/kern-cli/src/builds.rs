@@ -686,6 +686,51 @@ pub fn prune(keep: usize) -> usize {
     removed
 }
 
+/// `[kern] build_keep`: keep that many newest records and remove the rest, as `kern build prune
+/// --keep N` would, but NEVER a build still running. Called when a build ends; returns how many
+/// records went, `0` with the key unset (one cached config lookup is then the whole cost).
+///
+/// WHY A RUNNING BUILD IS SPARED HERE AND NOT IN [`prune`]: `prune` is a command the operator typed,
+/// and the records it removes are the ones they asked about. This runs on its own, at the end of
+/// SOMEONE ELSE'S build, and a concurrent build older than the newest N is not past history: removing
+/// its record would take its log out from under the process still writing it.
+pub fn prune_to_config() -> usize {
+    let Some(keep) = crate::config::load_cached(None)
+        .ok()
+        .and_then(|c| c.kern.build_keep)
+    else {
+        return 0;
+    };
+    prune_sparing_live(
+        &record_ids_newest_first(),
+        keep as usize,
+        |id| get(id).is_some_and(|r| r.is_live()),
+        remove,
+    )
+}
+
+/// The retention rule of [`prune_to_config`] over a newest-first id list, with liveness and removal
+/// supplied, so the rule is testable without a running build or the real build store.
+fn prune_sparing_live(
+    ids_newest_first: &[String],
+    keep: usize,
+    live: impl Fn(&str) -> bool,
+    mut remove: impl FnMut(&str) -> std::io::Result<bool>,
+) -> usize {
+    let mut removed = 0;
+    for id in ids_newest_first.iter().skip(keep) {
+        if live(id) {
+            continue;
+        }
+        match remove(id) {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(e) => eprintln!("kern: build record '{id}' could NOT be removed: {e}"),
+        }
+    }
+    removed
+}
+
 // ── Transcript capture ────────────────────────────────────────────────────────────────────────────
 //
 // A build prints its step lines (and each RUN box's output) to stderr. To persist that for `kern build
@@ -1476,5 +1521,54 @@ mod tests {
             };
             assert!(write(&bad).is_err());
         });
+    }
+}
+
+#[cfg(test)]
+mod build_keep_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// `build_keep`: the newest N stay, older ones go, and a build still running is never removed
+    /// however old it is.
+    #[test]
+    fn the_newest_n_are_kept_and_a_running_build_is_spared() {
+        let ids: Vec<String> = (0..6).rev().map(|i| format!("170000000{i}-1")).collect();
+        let gone = RefCell::new(Vec::new());
+        let n = prune_sparing_live(
+            &ids,
+            2,
+            |id| id == "1700000001-1",
+            |id| {
+                gone.borrow_mut().push(id.to_string());
+                Ok(true)
+            },
+        );
+        assert_eq!(n, 3);
+        assert_eq!(
+            *gone.borrow(),
+            vec!["1700000003-1", "1700000002-1", "1700000000-1"],
+            "the two newest are kept and the running one is spared"
+        );
+    }
+
+    /// A removal that fails is not counted, so the number printed is never a claim about records
+    /// still on disk.
+    #[test]
+    fn a_failed_removal_is_not_counted() {
+        let ids: Vec<String> = vec!["2-1".into(), "1-1".into()];
+        let n = prune_sparing_live(
+            &ids,
+            0,
+            |_| false,
+            |id| {
+                if id == "1-1" {
+                    Err(std::io::Error::other("busy"))
+                } else {
+                    Ok(true)
+                }
+            },
+        );
+        assert_eq!(n, 1);
     }
 }

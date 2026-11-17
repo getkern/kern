@@ -30,7 +30,8 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-/// The size at which the current file is rotated: about 6000 lines.
+/// The size at which the current file is rotated when `[kern] sandbox_history_max_size` is unset:
+/// about 18 000 lines (MEASURED on 2026-11-17: 18 799 lines in a rotated 1 MiB file).
 const MAX_BYTES: u64 = 1 << 20;
 const CURRENT: &str = "boxes.tsv";
 const PREVIOUS: &str = "boxes.1.tsv";
@@ -296,11 +297,35 @@ fn keep_state() -> (Keep, Option<String>) {
 /// records once and the memo could never hit. NOT `load_cached`, whose answer is fixed for the
 /// process: a detached box's supervisor lives as long as its box and must write where the setting
 /// says NOW, and an SDK box loads no config before this anyway, so the cache saves no read.
-fn keep_for_record() -> Keep {
-    crate::config::load(None)
-        .ok()
-        .and_then(|c| c.kern.sandbox_history)
-        .unwrap_or(Keep::Memory)
+///
+/// Returns the rotation size too (`[kern] sandbox_history_max_size`, else [`MAX_BYTES`]): the same
+/// load answers both, so a box's end reads `kern.toml` once.
+fn keep_for_record() -> (Keep, u64) {
+    let cfg = crate::config::load(None).ok();
+    let k = cfg.as_ref().map(|c| &c.kern);
+    (
+        k.and_then(|k| k.sandbox_history).unwrap_or(Keep::Memory),
+        max_bytes_of(k.and_then(|k| k.sandbox_history_max_size)),
+    )
+}
+
+/// The rotation size a configured value means: the value, else [`MAX_BYTES`]. A value under the
+/// floor the config reader enforces cannot reach here from a parsed file; it is floored anyway, so
+/// no caller can make the history rotate on every line.
+fn max_bytes_of(configured: Option<u64>) -> u64 {
+    configured
+        .unwrap_or(MAX_BYTES)
+        .max(crate::config::HISTORY_MIN_BYTES)
+}
+
+/// The rotation size in force now, for the paths that rewrite the history outside a box's end
+/// (`kern sandbox keep` moving rows). A `kern.toml` that does not parse means the default.
+fn max_bytes() -> u64 {
+    max_bytes_of(
+        crate::config::load(None)
+            .ok()
+            .and_then(|c| c.kern.sandbox_history_max_size),
+    )
 }
 
 fn memory_dir() -> std::io::Result<PathBuf> {
@@ -368,14 +393,14 @@ pub fn current_file() -> Option<PathBuf> {
 /// Append one entry, unless the history is `off`. Best-effort and silent: a box's result must
 /// never depend on its history.
 fn record(e: &Entry) {
-    let k = keep_for_record();
+    let (k, max) = keep_for_record();
     if k == Keep::Off {
         return;
     }
     let Ok(d) = dir_of(k) else {
         return;
     };
-    record_in(&d, e);
+    record_in(&d, e, max);
 }
 
 /// What the OWNER of a box (its foreground launcher, or a detached box's supervisor) observed
@@ -445,10 +470,10 @@ pub fn record_stopped(b: &crate::registry::Instance, code: i32) {
     });
 }
 
-fn record_in(d: &std::path::Path, e: &Entry) {
+fn record_in(d: &std::path::Path, e: &Entry, max: u64) {
     use std::os::unix::fs::OpenOptionsExt;
     let cur = d.join(CURRENT);
-    if std::fs::metadata(&cur).is_ok_and(|m| m.len() >= MAX_BYTES) {
+    if std::fs::metadata(&cur).is_ok_and(|m| m.len() >= max) {
         // Two writers may both see the file full; the second rename moves a fresh, short file over
         // the previous one, which loses at most a handful of lines and never corrupts one.
         let _ = std::fs::rename(&cur, d.join(PREVIOUS));
@@ -481,7 +506,7 @@ fn read_in(d: &std::path::Path) -> Vec<Entry> {
 
 /// The sandbox entries, newest first, re-read only when either file changed.
 ///
-/// FOR `kern top`, which asks every second: the files hold up to about 12 000 lines and parsing them
+/// FOR `kern top`, which asks every second: the files hold up to about 37 000 lines at the default size and parsing them
 /// on every frame would be work for an answer that rarely changes. The key is each file's size and
 /// modification time, which an append always moves.
 ///
@@ -521,18 +546,18 @@ pub fn sandboxes_newest_first() -> std::sync::Arc<[Entry]> {
     v
 }
 
-/// Write `entries` (oldest first) as the whole history of `d`, newest [`MAX_BYTES`] in the current
-/// file and the [`MAX_BYTES`] before them in the previous one, the bound [`record_in`] keeps. Each
+/// Write `entries` (oldest first) as the whole history of `d`, newest `max` bytes in the current
+/// file and the `max` before them in the previous one, the bound [`record_in`] keeps. Each
 /// file is written to a private temporary and renamed over, so a reader sees the old file or the
 /// new one, never half of one.
-fn write_whole(d: &std::path::Path, entries: &[Entry]) -> std::io::Result<()> {
+fn write_whole(d: &std::path::Path, entries: &[Entry], max: u64) -> std::io::Result<()> {
     let lines: Vec<String> = entries.iter().map(Entry::line).collect();
     // From the newest end: the current file takes the lines that fit, the previous one the lines
     // before them that fit, and older ones go.
     let fit_before = |end: usize| -> usize {
         let mut start = end;
         let mut size = 0u64;
-        while start > 0 && size + lines[start - 1].len() as u64 <= MAX_BYTES {
+        while start > 0 && size + lines[start - 1].len() as u64 <= max {
             size += lines[start - 1].len() as u64;
             start -= 1;
         }
@@ -594,7 +619,7 @@ fn places() -> impl Iterator<Item = PathBuf> {
 /// and is read again if the history ever points back at `from`. The window is one read and two
 /// renames long, and the alternative, a lock every box end would take, is a cost on the hot path
 /// for a switch that happens once.
-fn move_rows(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<usize> {
+fn move_rows(from: &std::path::Path, to: &std::path::Path, max: u64) -> std::io::Result<usize> {
     if from == to {
         return Ok(0);
     }
@@ -605,7 +630,7 @@ fn move_rows(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<us
     let mut all = read_in(to);
     all.extend(moving.iter().cloned());
     all.sort_by_key(|e| e.ended_ms);
-    write_whole(to, &all)?;
+    write_whole(to, &all, max)?;
     remove_in(from)?;
     Ok(moving.len())
 }
@@ -622,8 +647,9 @@ pub fn set_keep(new: Keep) -> Result<usize, String> {
     // made fell back to memory, so rows can sit in either. `move_rows` merges by end time and is a
     // no-op on the target itself, so the order does not matter.
     let mut moved = 0;
+    let max = max_bytes();
     for from in places() {
-        moved += move_rows(&from, &to).map_err(|e| format!("moving the history: {e}"))?;
+        moved += move_rows(&from, &to, max).map_err(|e| format!("moving the history: {e}"))?;
     }
     Ok(moved)
 }
@@ -1097,8 +1123,8 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let mut forged = entry("evil\tname\nv1\t9\tx", Outcome::Exit(3));
         forged.code = 3;
-        record_in(&d, &forged);
-        record_in(&d, &entry("pysbx-0123456789ab", Outcome::Oom));
+        record_in(&d, &forged, MAX_BYTES);
+        record_in(&d, &entry("pysbx-0123456789ab", Outcome::Oom), MAX_BYTES);
         let got = read_in(&d);
         assert_eq!(got.len(), 2, "the forged newline added no line: {got:?}");
         assert_eq!(got[0].name, "evil name v1 9 x");
@@ -1111,7 +1137,7 @@ mod tests {
             format!("{}{pad}\n", entry("old", Outcome::Ok).line()),
         )
         .unwrap();
-        record_in(&d, &entry("new", Outcome::Ok));
+        record_in(&d, &entry("new", Outcome::Ok), MAX_BYTES);
         let names: Vec<String> = read_in(&d).into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["old", "new"]);
         let _ = std::fs::remove_dir_all(&d);
@@ -1167,6 +1193,37 @@ mod tests {
             ended_ms,
             ..entry(name, Outcome::Ok)
         }
+    }
+
+    /// `[kern] sandbox_history_max_size` is the bound a box's end applies: with 4 KiB configured,
+    /// two hundred finished boxes leave the current file under 4 KiB plus one line and the history
+    /// at most two files, end to end through `record`, the path every box takes.
+    #[test]
+    fn the_configured_history_size_is_the_bound_a_box_end_keeps() {
+        let _g = crate::env_guard();
+        let w = World::new("maxsize");
+        std::fs::create_dir_all(w.base.join("config/kern")).unwrap();
+        std::fs::write(
+            w.base.join("config/kern/kern.toml"),
+            "[kern]\nsandbox_history_max_size = \"4k\"\n",
+        )
+        .unwrap();
+        for i in 0..200 {
+            record(&named("pysbx-0123456789ab", 1_000_000_000_000 + i));
+        }
+        let d = memory_dir().unwrap();
+        let cur = std::fs::metadata(d.join(CURRENT)).unwrap().len();
+        let prev = std::fs::metadata(d.join(PREVIOUS)).unwrap().len();
+        let line = named("pysbx-0123456789ab", 1_000_000_000_000).line().len() as u64;
+        assert!(cur <= 4096 + line, "current {cur} bytes");
+        assert!(prev <= 4096 + line, "previous {prev} bytes");
+        let kept = read_in(&d);
+        assert!(kept.len() < 200, "rotation dropped the oldest");
+        assert_eq!(
+            kept.last().map(|e| e.ended_ms),
+            Some(1_000_000_000_000 + 199),
+            "the newest is kept"
+        );
     }
 
     /// The key is validated where the file is read: the three words load, anything else is refused
@@ -1300,15 +1357,15 @@ mod tests {
         let (a, b) = (base.join("a"), base.join("b"));
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        record_in(&a, &named("one", 1));
-        record_in(&a, &named("three", 3));
-        record_in(&b, &named("two", 2));
-        assert_eq!(move_rows(&a, &b).unwrap(), 2);
+        record_in(&a, &named("one", 1), MAX_BYTES);
+        record_in(&a, &named("three", 3), MAX_BYTES);
+        record_in(&b, &named("two", 2), MAX_BYTES);
+        assert_eq!(move_rows(&a, &b, MAX_BYTES).unwrap(), 2);
         let names: Vec<String> = read_in(&b).into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["one", "two", "three"]);
         assert!(read_in(&a).is_empty());
         assert_eq!(
-            move_rows(&b, &b).unwrap(),
+            move_rows(&b, &b, MAX_BYTES).unwrap(),
             0,
             "the same directory is a no-op"
         );
@@ -1319,7 +1376,7 @@ mod tests {
         let line = named("n", t0).line().len() as u64;
         let per_file = MAX_BYTES / line;
         let many: Vec<Entry> = (0..per_file * 3).map(|i| named("n", t0 + i)).collect();
-        write_whole(&b, &many).unwrap();
+        write_whole(&b, &many, MAX_BYTES).unwrap();
         let kept = read_in(&b);
         assert_eq!(kept.len() as u64, per_file * 2);
         assert_eq!(

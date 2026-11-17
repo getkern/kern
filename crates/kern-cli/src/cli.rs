@@ -871,6 +871,19 @@ pub enum Command {
     ConfigRm {
         args: Vec<String>,
     },
+    /// `kern config set <key> <value>`: write one `[kern]` setting.
+    ConfigSet {
+        args: Vec<String>,
+    },
+    /// `kern config get [<key>] [--json]`: read the `[kern]` settings.
+    ConfigGet {
+        args: Vec<String>,
+        json: bool,
+    },
+    /// `kern config unset <key>`: remove one `[kern]` setting, so kern's default applies again.
+    ConfigUnset {
+        args: Vec<String>,
+    },
     /// `kern validate [path]`: parse a `kern.toml` and report OK or the offending line.
     Validate {
         path: Option<String>,
@@ -2993,6 +3006,30 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 "rm" | "remove" | "delete" => Command::ConfigRm {
                     args: rest.iter().skip(2).map(|s| (*s).to_string()).collect(),
                 },
+                // The `[kern]` settings. `get` is the one read verb and the one that takes --json;
+                // any other flag is refused rather than taken as a key or a value, so `set
+                // log_max_size --force` cannot write "--force" anywhere.
+                "set" | "get" | "unset" => {
+                    let json = sub == "get" && rest.contains(&"--json");
+                    let mut args: Vec<String> = Vec::new();
+                    for a in rest.iter().skip(2) {
+                        let s: &str = a;
+                        if s == "--json" && sub == "get" {
+                            continue;
+                        }
+                        if s.starts_with('-') {
+                            return Err(Error::Cli(format!(
+                                "config {sub}: unknown flag {s:?} - only `config get` takes --json"
+                            )));
+                        }
+                        args.push(s.to_string());
+                    }
+                    match sub.as_str() {
+                        "set" => Command::ConfigSet { args },
+                        "get" => Command::ConfigGet { args, json },
+                        _ => Command::ConfigUnset { args },
+                    }
+                }
                 _ => return Err(Error::Usage(crate::commands::CONFIG_USAGE)),
             }
         }
@@ -6722,6 +6759,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Config { sub, force, json } => commands::config_cmd(&sub, force, json),
         Command::ConfigAdd { args } => commands::config_add(&args),
         Command::ConfigRm { args } => commands::config_rm(&args),
+        Command::ConfigSet { args } => commands::config_set(&args),
+        Command::ConfigGet { args, json } => commands::config_get(&args, json),
+        Command::ConfigUnset { args } => commands::config_unset(&args),
         Command::Validate { path } => commands::validate(path.as_deref()),
         Command::Uninstall { yes, keep_images } => commands::uninstall(yes, keep_images),
         Command::Examples => commands::examples(),

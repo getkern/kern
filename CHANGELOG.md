@@ -50,6 +50,16 @@ removed or re-pointed, or an `ld.so.conf` edit, makes it scan again. The box get
 Measured on that desktop, medians of 50 to 60: `--gpus device=0` 19.9 to 9.7 ms on `alpine:3.20`,
 17.6 to 7.7 ms on `ubuntu:24.04`.
 
+**Log sizes and retention are set once, in `kern.toml` or from the command line.** Five `[kern]`
+keys: `log_max_size` and `log_max_file` are every box's log cap unless the box sets its own (default
+16m and 2, as before); `log_keep_ended` removes the logs of boxes that ended longer ago than a period
+such as `24h`, each time a box starts with `-d`; `build_keep` keeps that many build records and
+removes older ones when a build ends, never one still running; `sandbox_history_max_size` is the
+history's rotation size (default 1m). `kern config set <key> <value>`, `kern config get [<key>]`
+and `kern config unset <key>` write and read them, checking a value before anything is written. With
+none set, nothing changes. Before this, build records were never removed on their own: measured on a
+desktop, 12,269 records and 145 MB.
+
 **`--log-driver none` keeps no log, as Docker's does.** `kern box --log-driver none` (and compose
 `logging: driver: none`, which used to warn "no kern equivalent" and capture anyway) sends the box's
 output nowhere: no log file is made, and `kern logs` answers that the box keeps none instead of an

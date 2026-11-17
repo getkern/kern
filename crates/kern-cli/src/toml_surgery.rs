@@ -262,6 +262,22 @@ pub fn set_table_key(raw: &str, table: &str, key: &str, line: Option<&str>) -> S
     with_trailing_newline(&out.join("\n"), raw)
 }
 
+/// The value of `key` in the single table `[table]`, as written (comment stripped, trimmed), or
+/// `None` when the table or the key is absent. The reader twin of [`set_table_key`]: the same table
+/// and key rules, so `kern config get` reports exactly the line `kern config set` wrote.
+pub fn get_table_key(raw: &str, table: &str, key: &str) -> Option<String> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| is_table_header(l.trim(), table))?;
+    lines[start + 1..]
+        .iter()
+        .take_while(|l| !starts_any_section(l.trim()))
+        .find(|l| line_key(l.trim()) == Some(key))
+        .and_then(|l| l.split_once('='))
+        .map(|(_, v)| kern_common::toml_lite::strip_comment(v).trim().to_string())
+}
+
 /// Preserve the input's trailing-newline convention on the rebuilt text (`lines()` drops it).
 fn with_trailing_newline(s: &str, original: &str) -> String {
     if original.ends_with('\n') && !s.ends_with('\n') {
@@ -535,5 +551,32 @@ nice = -5
         );
         assert!(out.contains("cpus = 9.0"));
         assert!(out.contains("size = \"2g\""), "vdisk:x untouched");
+    }
+}
+
+#[cfg(test)]
+mod get_table_key_tests {
+    use super::*;
+
+    #[test]
+    fn get_reads_the_value_set_wrote_and_nothing_outside_the_table() {
+        let raw = "# top\n[kern]\nlog_max_size = \"10m\"   # mine\n\n[[vcpu]]\nlog_max_size = 1\n";
+        assert_eq!(
+            get_table_key(raw, "kern", "log_max_size").as_deref(),
+            Some("\"10m\"")
+        );
+        assert_eq!(get_table_key(raw, "kern", "build_keep"), None);
+        assert_eq!(
+            get_table_key("[[vcpu]]\nbuild_keep = 3\n", "kern", "build_keep"),
+            None
+        );
+        let set = set_table_key(raw, "kern", "build_keep", Some("build_keep = 200"));
+        assert_eq!(
+            get_table_key(&set, "kern", "build_keep").as_deref(),
+            Some("200")
+        );
+        let unset = set_table_key(&set, "kern", "build_keep", None);
+        assert_eq!(get_table_key(&unset, "kern", "build_keep"), None);
+        assert_eq!(unset, raw, "set then unset leaves the file byte for byte");
     }
 }

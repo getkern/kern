@@ -423,6 +423,45 @@ pub fn info() -> Result<(), Error> {
         }
     }
     row("sandbox history", &crate::history::keep_line());
+    // THE RETENTION SETTINGS, each with where its value comes from, so `kern config set` has a
+    // place to be seen working. Facts only, like every other row: one cached config load and one
+    // directory read for the build count.
+    let cfg = crate::config::load_cached(None).ok();
+    let k = cfg.as_ref().map(|c| &c.kern);
+    let origin = |set: bool| if set { "kern.toml" } else { "default" };
+    let cap = crate::commands::boxlog::LogCap::resolve(None, None, true);
+    let size_set = k.and_then(|k| k.log_max_size).is_some();
+    let files_set = k.and_then(|k| k.log_max_file).is_some();
+    let ended = match k.and_then(|k| k.log_keep_ended_s) {
+        Some(s) => format!("ended boxes' logs removed after {}", period(s)),
+        None => "ended boxes' logs kept until `kern prune` or reboot".to_string(),
+    };
+    row(
+        "box logs",
+        &format!(
+            "{} x {} files per box ({}), {ended}",
+            crate::commands::human_bytes(cap.max_bytes),
+            cap.files,
+            origin(size_set || files_set)
+        ),
+    );
+    let records = std::fs::read_dir(crate::builds::builds_dir())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    let kept = match k.and_then(|k| k.build_keep) {
+        Some(n) => format!("the newest {n} kept (kern.toml)"),
+        None => "all kept (default; `kern config set build_keep N`)".to_string(),
+    };
+    row("builds", &format!("{records} records, {kept}"));
+    let hist = k.and_then(|k| k.sandbox_history_max_size);
+    row(
+        "history size",
+        &format!(
+            "rotates at {} ({}), two files kept",
+            crate::commands::human_bytes(hist.unwrap_or(1 << 20)),
+            origin(hist.is_some())
+        ),
+    );
     row(
         "config",
         crate::config::active_path()
@@ -3937,5 +3976,28 @@ mod nvmap_pool_row_tests {
         assert!(super::nvmap_pool_row(true, Some("N\n")).is_none());
         assert!(super::nvmap_pool_row(true, None).is_none());
         assert!(super::nvmap_pool_row(false, Some("Y\n")).is_none());
+    }
+}
+
+/// A retention period as an operator writes it: the largest whole unit (`7d`, `24h`, `30m`, `90s`).
+fn period(secs: u64) -> String {
+    for (unit, n) in [("d", 86_400), ("h", 3_600), ("m", 60)] {
+        if secs >= n && secs % n == 0 {
+            return format!("{}{unit}", secs / n);
+        }
+    }
+    format!("{secs}s")
+}
+
+#[cfg(test)]
+mod period_tests {
+    #[test]
+    fn a_period_prints_in_its_largest_whole_unit() {
+        assert_eq!(super::period(7 * 86_400), "7d");
+        assert_eq!(super::period(86_400), "1d");
+        assert_eq!(super::period(5_400), "90m");
+        assert_eq!(super::period(3_600), "1h");
+        assert_eq!(super::period(90), "90s");
+        assert_eq!(super::period(1), "1s");
     }
 }

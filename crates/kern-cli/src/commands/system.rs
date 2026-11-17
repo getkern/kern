@@ -245,6 +245,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}config{z} [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml (alias: cfg)
     {c}config add{z} <kind:name> [--flags]                               Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
     {c}config rm{z} <kind:name>                                          Delete a profile
+    {c}config set{z} <key> <value>                                       Set a [kern] key, e.g. log_max_size 10m, build_keep 200, log_keep_ended 24h
+    {c}config get{z} [<key>] [--json]                                    The [kern] keys and their values; one key prints its value, exit 1 if unset
+    {c}config unset{z} <key>                                             Remove a [kern] key, back to kern's default
     {c}validate{z} [path]                                                Check a kern.toml
     {c}uninstall{z} [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     {c}examples{z}                                                       Print an example kern.toml (alias: example)

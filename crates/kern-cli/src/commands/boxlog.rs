@@ -211,6 +211,64 @@ impl Default for LogCap {
     }
 }
 
+impl LogCap {
+    /// The cap a box gets: its own `--log-max-size` / `--log-max-file` first, then `[kern]
+    /// log_max_size` / `log_max_file` from the default `kern.toml`, then [`LogCap::default`].
+    ///
+    /// ONE RESOLVER, so the detached path and the systemd-managed path cannot read the precedence
+    /// two ways. The config is read only when a flag is missing, so a box that names both pays no
+    /// file read for it.
+    pub(crate) fn resolve(flag_size: Option<u64>, flag_files: Option<u32>, keep: bool) -> Self {
+        let base = LogCap::default();
+        let cfg = if flag_size.is_none() || flag_files.is_none() {
+            crate::config::load_cached(None).ok()
+        } else {
+            None
+        };
+        let k = cfg.as_ref().map(|c| &c.kern);
+        Self::pick(
+            flag_size,
+            flag_files,
+            k.and_then(|k| k.log_max_size),
+            k.and_then(|k| k.log_max_file),
+            keep,
+        )
+        .with_base(base)
+    }
+
+    /// The precedence alone, with no file read: flag, then config, then the built-in.
+    fn pick(
+        flag_size: Option<u64>,
+        flag_files: Option<u32>,
+        cfg_size: Option<u64>,
+        cfg_files: Option<u32>,
+        keep: bool,
+    ) -> PartialCap {
+        PartialCap {
+            max_bytes: flag_size.or(cfg_size).filter(|n| *n > 0),
+            files: flag_files.or(cfg_files).filter(|n| *n > 0),
+            keep,
+        }
+    }
+}
+
+/// A cap whose missing parts come from a base: what [`LogCap::pick`] returns.
+struct PartialCap {
+    max_bytes: Option<u64>,
+    files: Option<u32>,
+    keep: bool,
+}
+
+impl PartialCap {
+    fn with_base(self, base: LogCap) -> LogCap {
+        LogCap {
+            max_bytes: self.max_bytes.unwrap_or(base.max_bytes),
+            files: self.files.unwrap_or(base.files),
+            keep: self.keep,
+        }
+    }
+}
+
 /// `<log>.idx`, beside the log rather than inside it. Same directory, same rotation, same lifetime.
 pub(crate) fn idx_path(log: &std::path::Path) -> std::path::PathBuf {
     let mut p = log.to_path_buf().into_os_string();
@@ -2377,5 +2435,44 @@ mod run_log_tests {
         assert_eq!(super::last_lines(b"a\nb\nc", 2), b"b\nc");
         assert_eq!(super::last_lines(b"a\nb\n", 5), b"a\nb\n");
         assert_eq!(super::last_lines(b"a\n", 0), b"");
+    }
+}
+
+#[cfg(test)]
+mod log_cap_precedence_tests {
+    use super::*;
+
+    /// Docker's order: the box's own flag, then the host setting, then the built-in default.
+    #[test]
+    fn the_flag_wins_over_the_config_and_the_config_over_the_default() {
+        let base = LogCap::default();
+        let cap =
+            LogCap::pick(Some(1 << 20), Some(5), Some(10 << 20), Some(3), true).with_base(base);
+        assert_eq!((cap.max_bytes, cap.files), (1 << 20, 5), "flags win");
+        let cap = LogCap::pick(None, None, Some(10 << 20), Some(3), true).with_base(base);
+        assert_eq!(
+            (cap.max_bytes, cap.files),
+            (10 << 20, 3),
+            "config fills what flags left"
+        );
+        let cap = LogCap::pick(Some(1 << 20), None, None, Some(3), false).with_base(base);
+        assert_eq!(
+            (cap.max_bytes, cap.files, cap.keep),
+            (1 << 20, 3, false),
+            "mixed, per field"
+        );
+        let cap = LogCap::pick(None, None, None, None, true).with_base(base);
+        assert_eq!(
+            cap, base,
+            "nothing set is exactly the cap every box always had"
+        );
+    }
+
+    /// A zero from either source can never reach the pump, which would rotate on every byte.
+    #[test]
+    fn a_zero_from_any_source_falls_through_to_the_next() {
+        let base = LogCap::default();
+        let cap = LogCap::pick(Some(0), Some(0), Some(0), Some(0), true).with_base(base);
+        assert_eq!(cap, base);
     }
 }

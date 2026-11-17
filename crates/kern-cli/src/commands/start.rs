@@ -2980,13 +2980,15 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // ONE POLICY OBJECT, BUILT ONCE, and computed BEFORE the branch so the detached path and the
     // systemd-managed path cannot bound their logs differently. `LogCap::default()` is what every
     // box had before the flags existed, so an unset flag changes nothing.
-    let log_cap = crate::commands::boxlog::LogCap {
-        max_bytes: args
-            .log_max_size
-            .unwrap_or(crate::commands::boxlog::BOX_LOG_MAX_BYTES),
-        files: args.log_max_file.unwrap_or(2),
-        keep: !args.log_none,
-    };
+    //
+    // The box's own flag first, then `[kern] log_max_size` / `log_max_file`, then kern's default:
+    // Docker's order (`--log-opt` over `daemon.json` over the built-in). A `kern.toml` that does not
+    // parse leaves the built-in in force rather than failing a box over its log.
+    let log_cap = crate::commands::boxlog::LogCap::resolve(
+        args.log_max_size,
+        args.log_max_file,
+        !args.log_none,
+    );
     // THE RECORD IS WRITTEN HERE: past every argument-coherence refusal and immediately before the
     // box is launched.
     //
@@ -3078,6 +3080,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 .ok()
                 .map(|d| d.join(format!("{}-{}.log", name.as_str(), pid)));
             detach_stdio(log.as_deref(), log_cap);
+            // `[kern] log_keep_ended`: a new log is being made, so the old ones are bounded now.
+            let _ = registry::expire_ended_logs();
         }
         let (cap_drop_all, cap_drops, cap_adds) = registry::cap_fields(&spec.caps);
         let inst = registry::Instance {
@@ -5808,6 +5812,9 @@ fn run_detached(
         .ok()
         .map(|d| d.join(format!("{}-{}.log", name.as_str(), pid)));
     detach_stdio(log.as_deref(), log_cap);
+    // `[kern] log_keep_ended`: a new log is being made, so the old ones are bounded now. After the
+    // log is open, so this box's own file is the youngest in the store and never a candidate.
+    let _ = registry::expire_ended_logs();
     let (cap_drop_all, cap_drops, cap_adds) = registry::cap_fields(&spec.caps);
     let mut inst = registry::Instance {
         name: name.as_str().to_string(),

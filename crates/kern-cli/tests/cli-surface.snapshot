@@ -77,6 +77,9 @@ COMMANDS:
     config [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml (alias: cfg)
     config add <kind:name> [--flags]                               Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
     config rm <kind:name>                                          Delete a profile
+    config set <key> <value>                                       Set a [kern] key, e.g. log_max_size 10m, build_keep 200, log_keep_ended 24h
+    config get [<key>] [--json]                                    The [kern] keys and their values; one key prints its value, exit 1 if unset
+    config unset <key>                                             Remove a [kern] key, back to kern's default
     validate [path]                                                Check a kern.toml
     uninstall [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     examples                                                       Print an example kern.toml (alias: example)

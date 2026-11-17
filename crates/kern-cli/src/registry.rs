@@ -2819,6 +2819,107 @@ pub fn prune() -> (usize, u64) {
     (removed, freed)
 }
 
+/// `[kern] log_keep_ended`: remove the logs of boxes that ENDED and whose newest file was last
+/// written longer ago than that. Returns `(files_removed, bytes_freed)`; `(0, 0)` with the key unset,
+/// which is the cost of every box start that does not ask for this: one cached config lookup.
+///
+/// CALLED WHEN A DETACHED BOX STARTS, because that is the only moment a new log is made: a store
+/// nobody adds to is not growing, so no daemon and no timer are needed to bound it.
+///
+/// THE SAME LIVENESS RULE AS [`prune`] (the `<name>-<pid>` key against the live boxes, re-checked
+/// against the instances dir right before a removal), so a log this removes is one `kern prune`
+/// would have removed too, only later. A box is judged by its NEWEST file, so a rotated generation
+/// is never removed while the active log beside it is still young.
+pub fn expire_ended_logs() -> (usize, u64) {
+    let Some(keep_s) = crate::config::load_cached(None)
+        .ok()
+        .and_then(|c| c.kern.log_keep_ended_s)
+    else {
+        return (0, 0);
+    };
+    let Ok(d) = logs_dir() else {
+        return (0, 0);
+    };
+    let live: std::collections::HashSet<String> = list()
+        .iter()
+        .map(|i| format!("{}-{}", i.name, i.pid))
+        .collect();
+    let instances = dir().ok();
+    expire_ended_logs_in(
+        &d,
+        &live,
+        instances.as_deref(),
+        keep_s,
+        std::time::SystemTime::now(),
+    )
+}
+
+/// [`expire_ended_logs`] on a given directory, live set and clock, for the tests.
+fn expire_ended_logs_in(
+    d: &Path,
+    live: &std::collections::HashSet<String>,
+    instances: Option<&Path>,
+    keep_s: u64,
+    now: std::time::SystemTime,
+) -> (usize, u64) {
+    use std::collections::HashMap;
+    let Ok(rd) = fs::read_dir(d) else {
+        return (0, 0);
+    };
+    // Per box key: the newest modification time among its files, and the files themselves.
+    let mut by_key: HashMap<String, (std::time::SystemTime, Vec<(PathBuf, u64)>)> = HashMap::new();
+    for e in rd.flatten() {
+        let fname = e.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        let Some(key) = log_key(fname) else {
+            continue;
+        };
+        if live.contains(key) {
+            continue;
+        }
+        // `symlink_metadata`: a planted symlink is judged as itself and never followed.
+        let Ok(meta) = e.path().symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let slot = by_key
+            .entry(key.to_string())
+            .or_insert((std::time::UNIX_EPOCH, Vec::new()));
+        if mtime > slot.0 {
+            slot.0 = mtime;
+        }
+        slot.1.push((e.path(), meta.len()));
+    }
+    let keep = std::time::Duration::from_secs(keep_s);
+    let (mut removed, mut freed) = (0usize, 0u64);
+    for (key, (newest, files)) in by_key {
+        // A clock that went backwards reads as "not old yet": nothing is removed on a guess.
+        let old_enough = now.duration_since(newest).is_ok_and(|age| age >= keep);
+        if !old_enough {
+            continue;
+        }
+        // The race `sweep_orphans` closes, closed the same way: a box that registered after the
+        // live-set snapshot keeps its log.
+        if instances.is_some_and(|i| i.join(&key).exists()) {
+            continue;
+        }
+        for (path, size) in files {
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+                freed = freed.saturating_add(size);
+            }
+        }
+    }
+    (removed, freed)
+}
+
 /// The box key a file in the logs dir belongs to: `<key>.log`, its rotated generation `<key>.log.1`
 /// and either one's time index `<key>.log.idx`.
 ///
@@ -5068,5 +5169,80 @@ mod box_env_tests {
         super::clear_box_env(&name, pid);
         assert!(super::box_env(&name, pid).is_empty());
         assert!(super::box_env("kern-envtest-never-existed", 1).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod log_keep_ended_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn touch(d: &Path, name: &str, age_s: u64, now: SystemTime) {
+        let p = d.join(name);
+        fs::write(&p, b"line\n").expect("write a log");
+        let t = now - Duration::from_secs(age_s);
+        let f = fs::File::options()
+            .write(true)
+            .open(&p)
+            .expect("open the log");
+        f.set_modified(t).expect("set its mtime");
+    }
+
+    /// `log_keep_ended`: an ended box's log older than the period goes, a younger one stays, a live
+    /// box's log stays at any age, and a box is judged by its NEWEST file, so an old rotated
+    /// generation is kept while the active log beside it is young.
+    #[test]
+    fn only_the_logs_of_boxes_that_ended_longer_ago_than_the_period_are_removed() {
+        let d = std::env::temp_dir().join(format!("kern-keepended-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("make the logs dir");
+        let now = SystemTime::now();
+        let day = 86_400;
+        touch(&d, "old-1.log", 2 * day, now);
+        touch(&d, "old-1.log.1", 3 * day, now);
+        touch(&d, "old-1.log.idx", 2 * day, now);
+        touch(&d, "young-2.log", 60, now);
+        touch(&d, "rotated-3.log", 60, now);
+        touch(&d, "rotated-3.log.1", 5 * day, now);
+        touch(&d, "live-4.log", 9 * day, now);
+        touch(&d, "notalog.txt", 9 * day, now);
+        let live: std::collections::HashSet<String> = ["live-4".to_string()].into();
+        let (n, freed) = expire_ended_logs_in(&d, &live, None, day, now);
+        assert_eq!(n, 3, "the three files of the old box");
+        assert_eq!(freed, 15);
+        let mut left: Vec<String> = fs::read_dir(&d)
+            .expect("read the dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "live-4.log",
+                "notalog.txt",
+                "rotated-3.log",
+                "rotated-3.log.1",
+                "young-2.log"
+            ]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A box that registered after the live-set snapshot keeps its log, as in `kern prune`.
+    #[test]
+    fn a_box_registered_after_the_snapshot_keeps_its_log() {
+        let base = std::env::temp_dir().join(format!("kern-keepended-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (logs, inst) = (base.join("logs"), base.join("instances"));
+        fs::create_dir_all(&logs).expect("make logs");
+        fs::create_dir_all(&inst).expect("make instances");
+        let now = SystemTime::now();
+        touch(&logs, "late-7.log", 10 * 86_400, now);
+        fs::write(inst.join("late-7"), b"").expect("register the box");
+        let (n, _) = expire_ended_logs_in(&logs, &Default::default(), Some(&inst), 1, now);
+        assert_eq!(n, 0);
+        assert!(logs.join("late-7.log").exists());
+        let _ = fs::remove_dir_all(&base);
     }
 }

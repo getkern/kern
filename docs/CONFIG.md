@@ -94,6 +94,15 @@ allow_gpu_grants    = true         # compose stacks may take GPUs, and no other 
 sandbox_history     = "disk"       # keep the finished-sandbox lines across reboots
 ```
 
+Every one can be set from the command line, which writes the same line and checks the value first:
+
+```sh
+kern config set log_max_size 10m    # write one key; a bad value is refused, nothing written
+kern config get                     # every key, its value or -, and what it does (--json too)
+kern config get log_max_size        # one value; exit 1 if it is not set
+kern config unset log_max_size      # remove it: kern's default again
+```
+
 Without them, a port binds every interface, a compose service with no `mem_limit` gets the host's
 RAM, and a stack that names a device profile or asks for a GPU is refused. `allow_gpu_grants` is the
 narrow one: the GPU a stack asks for (`gpus:`, a `deploy` reservation, `runtime: nvidia`, an
@@ -115,6 +124,36 @@ code, outcome, GPU; never the output), which `kern sandbox history` and the Sand
 kept to the new place; `kern sandbox keep` and `kern info` say where they are and how many there are,
 and `kern sandbox clear` removes them. Each place holds about 33,000 lines, after which the oldest go.
 Neither directory can be mounted into a box.
+
+### Logs and retention
+
+```toml
+[kern]
+log_max_size             = "10m"  # every box's log rotates at this size (default 16m)
+log_max_file             = 2      # files each box keeps, the active one included (default 2)
+log_keep_ended           = "24h"  # the log of a box that ended goes after this long
+build_keep               = 200    # build records kept; older ones go when a build ends
+sandbox_history_max_size = "1m"   # the history rotates at this size, two files kept (default 1m)
+```
+
+A box's log holds at most `log_max_size` times `log_max_file`. A box's own `--log-max-size` and
+`--log-max-file`, compose `logging: options: max-size` and `max-file`, and a stack's `log_max_size`
+win over these two, as `--log-opt` wins over Docker's `daemon.json`; they apply to boxes started
+after the change.
+
+Without `log_keep_ended`, the log of a box that ended stays until `kern prune`, `kern gc` or a
+reboot (the logs are in `$XDG_RUNTIME_DIR`, in memory). With it, kern removes those older than the
+period each time a box starts with `-d`, the only moment a new log is made; a running box's log is
+never touched. `30m`, `24h` and `7d` are periods.
+
+Without `build_keep`, every build record and its log is kept (`kern build prune --keep N` removes
+them by hand). With it, the oldest go each time a build ends, never one still running.
+
+Sandbox calls through the SDKs and MCP write no log file: their output goes back to the caller. What
+they leave is the one-line history above, bounded at twice `sandbox_history_max_size`.
+
+`kern info` shows the values in force and where each comes from (`kern.toml` or the default), with
+the number of build records kept.
 
 ## Values
 

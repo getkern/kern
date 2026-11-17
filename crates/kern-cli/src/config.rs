@@ -152,7 +152,182 @@ pub struct KernSettings {
     /// `kern sandbox keep`, `kern top` (Sandboxes, `m`) and this key are three ways of making it in
     /// one place: the first two write this key.
     pub sandbox_history: Option<crate::history::Keep>,
+    /// `log_max_size` - the size at which a box's captured log rotates, for every box that does
+    /// not say otherwise (`--log-max-size`, compose `logging: options: max-size`, a stack's
+    /// `log_max_size`). Absent means kern's own default, 16 MiB.
+    ///
+    /// A DEFAULT, NOT A CEILING, unlike [`Self::compose_memory_max`]: a log cap protects the host
+    /// from the box, and the operator who asks one box for more on its own command line is the same
+    /// operator who wrote this file. Docker's `daemon.json` `log-opts` has the same precedence.
+    pub log_max_size: Option<u64>,
+    /// `log_max_file` - how many log files a box keeps IN TOTAL, the active one included (Docker's
+    /// `max-file` counting), for every box that does not say otherwise. Absent means 2.
+    pub log_max_file: Option<u32>,
+    /// `log_keep_ended` - how long the log of a box that ENDED is kept, in seconds, before kern
+    /// removes it on its own. Absent means until `kern prune`, `kern gc` or a reboot, which is what
+    /// kern always did.
+    ///
+    /// Applied when a detached box starts, because that is the only moment a new log is made: with
+    /// no box starting, the store is not growing, and no daemon is needed to bound it.
+    pub log_keep_ended_s: Option<u64>,
+    /// `build_keep` - how many build records `kern build` keeps; past that the oldest are removed
+    /// when a build ends, as `kern build prune --keep N` would. A build still running is never
+    /// removed. Absent means every record is kept, which is what kern always did.
+    pub build_keep: Option<u32>,
+    /// `sandbox_history_max_size` - the size at which the finished-sandbox history rotates. The
+    /// history holds this file and one rotated generation, so it is bounded at twice this. Absent
+    /// means 1 MiB, about 18 000 lines.
+    pub sandbox_history_max_size: Option<u64>,
 }
+
+/// The `[kern]` keys `kern config set|get|unset` reads and writes, with the shape of each value.
+///
+/// ONE TABLE, read by the setter, the getter and the help text, so a key cannot be settable in one
+/// place and unknown in another. The permission gates (`allow_device_grants`, `allow_gpu_grants`,
+/// `compose_privileged`) are in it on purpose: they are already one line in a file this user owns,
+/// and a command that writes the same line is no wider a door than the editor.
+pub(crate) const SETTABLE_KERN_KEYS: &[(&str, SettingKind, &str)] = &[
+    (
+        "log_max_size",
+        SettingKind::Size,
+        "rotate every box's log at this size (default 16m)",
+    ),
+    (
+        "log_max_file",
+        SettingKind::Count,
+        "log files each box keeps, active one included (default 2)",
+    ),
+    (
+        "log_keep_ended",
+        SettingKind::Duration,
+        "remove the log of a box that ended after this long (default: until `kern prune` or reboot)",
+    ),
+    (
+        "build_keep",
+        SettingKind::Count,
+        "build records to keep; older ones go when a build ends (default: all)",
+    ),
+    (
+        "sandbox_history_max_size",
+        SettingKind::Size,
+        "rotate the sandbox history at this size, two files kept (default 1m)",
+    ),
+    (
+        "sandbox_history",
+        SettingKind::Word(&["memory", "disk", "off"]),
+        "where finished sandboxes are recorded (default memory)",
+    ),
+    (
+        "publish_bind",
+        SettingKind::Word(&["0.0.0.0", "127.0.0.1"]),
+        "the address a port with no address binds",
+    ),
+    (
+        "privileged_port",
+        SettingKind::Word(&["shift", "refuse"]),
+        "what a port below 1024 kern cannot bind does",
+    ),
+    (
+        "compose_memory_max",
+        SettingKind::Size,
+        "memory ceiling per compose service",
+    ),
+    (
+        "allow_device_grants",
+        SettingKind::Bool,
+        "compose stacks may use device profiles",
+    ),
+    (
+        "allow_gpu_grants",
+        SettingKind::Bool,
+        "compose stacks may take GPUs, and no other device",
+    ),
+    (
+        "compose_privileged",
+        SettingKind::Bool,
+        "compose `privileged: true` is honoured",
+    ),
+    (
+        "log_level",
+        SettingKind::Word(&["trace", "debug", "info", "warn", "error"]),
+        "kern's own log level",
+    ),
+];
+
+/// The shape of a settable `[kern]` value: decides how `kern config set` writes it into TOML.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingKind {
+    /// A size (`10m`, `1g`), written as a TOML string.
+    Size,
+    /// A positive integer, written bare.
+    Count,
+    /// A duration (`30m`, `24h`, `7d`), written as a TOML string.
+    Duration,
+    /// `true` / `false`, written bare.
+    Bool,
+    /// One of a fixed set of words, written as a TOML string.
+    Word(&'static [&'static str]),
+}
+
+/// The TOML text `kern config set <key> <value>` writes for `value`, or why it is refused.
+///
+/// The value is checked HERE against its kind, and the written file is then parsed again by
+/// [`set_kern_key`], so a value reaches `kern.toml` only if the reader that applies it accepts it.
+/// A word or size is written quoted with nothing escaped, so a value carrying a quote, a backslash
+/// or a control character is refused rather than escaped: none of these kinds can contain one.
+pub(crate) fn kern_value_toml(kind: SettingKind, value: &str) -> Result<String, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err("empty value".into());
+    }
+    if v.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
+        return Err(format!(
+            "{v:?}: quotes, backslashes and control characters are not allowed"
+        ));
+    }
+    match kind {
+        SettingKind::Size => match kern_common::parse_binary_size(v) {
+            Some(n) if n > 0 => Ok(format!("\"{v}\"")),
+            _ => Err(format!("{v:?}: expected a size like 10m, 300m or 1g")),
+        },
+        SettingKind::Count => match v.parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n.to_string()),
+            _ => Err(format!("{v:?}: expected a whole number, 1 or more")),
+        },
+        SettingKind::Duration => match parse_keep_secs(v) {
+            Some(_) => Ok(format!("\"{v}\"")),
+            None => Err(format!("{v:?}: expected a duration like 30m, 24h or 7d")),
+        },
+        SettingKind::Bool => match v {
+            "true" | "false" => Ok(v.to_string()),
+            _ => Err(format!("{v:?}: expected true or false")),
+        },
+        SettingKind::Word(words) => {
+            if words.contains(&v) {
+                Ok(format!("\"{v}\""))
+            } else {
+                Err(format!("{v:?}: expected one of {}", words.join(", ")))
+            }
+        }
+    }
+}
+
+/// A retention period: `<n>d`, or a Go duration (`90s`, `30m`, `24h`, `1h30m`), in whole seconds,
+/// at least one second. `None` for anything else, so a typo is refused instead of read as zero,
+/// which would remove every ended box's log at the next start.
+pub(crate) fn parse_keep_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let secs = if let Some(days) = s.strip_suffix('d') {
+        days.parse::<u64>().ok()?.checked_mul(86_400)?
+    } else {
+        crate::dockerfile::parse_go_duration_ns(s)? / 1_000_000_000
+    };
+    (secs >= 1).then_some(secs)
+}
+
+/// The smallest `sandbox_history_max_size` accepted: a history line is under 1 KiB, so a smaller
+/// file would rotate on every box and keep almost nothing.
+pub(crate) const HISTORY_MIN_BYTES: u64 = 4 * 1024;
 
 // ─────────────────────────────── CPU (implemented) ───────────────────────────────
 
@@ -651,6 +826,68 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
                     choices.join(", ")
                 )
             })?);
+        }
+        // THE LOG AND RETENTION KEYS, VALIDATED HERE for `publish_bind`'s reason: a size or a
+        // period nobody parsed is a bound nobody is applying, and for `log_keep_ended` a misread
+        // zero would remove every ended box's log at the next start.
+        "log_max_size" => {
+            let raw = value_string(v)?;
+            k.log_max_size = Some(
+                kern_common::parse_binary_size(raw.trim())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "[kern] log_max_size = '{raw}': expected a size like \"10m\" or \
+                             \"300m\", more than zero. Every box's log rotates at it unless the \
+                             box sets --log-max-size"
+                        )
+                    })?,
+            );
+        }
+        "log_max_file" => {
+            let n = value_u32(v)?;
+            if n == 0 {
+                return Err(
+                    "[kern] log_max_file = 0: expected 1 or more (it counts the active file, as \
+                     Docker's max-file does)"
+                        .into(),
+                );
+            }
+            k.log_max_file = Some(n);
+        }
+        "log_keep_ended" => {
+            let raw = value_string(v)?;
+            k.log_keep_ended_s = Some(parse_keep_secs(&raw).ok_or_else(|| {
+                format!(
+                    "[kern] log_keep_ended = '{raw}': expected a duration like \"30m\", \"24h\" or \
+                     \"7d\", at least one second"
+                )
+            })?);
+        }
+        "build_keep" => {
+            let n = value_u32(v)?;
+            if n == 0 {
+                return Err(
+                    "[kern] build_keep = 0: expected 1 or more (to remove every record, run \
+                     `kern build prune --keep 0`)"
+                        .into(),
+                );
+            }
+            k.build_keep = Some(n);
+        }
+        "sandbox_history_max_size" => {
+            let raw = value_string(v)?;
+            k.sandbox_history_max_size = Some(
+                kern_common::parse_binary_size(raw.trim())
+                    .filter(|n| *n >= HISTORY_MIN_BYTES)
+                    .ok_or_else(|| {
+                        format!(
+                            "[kern] sandbox_history_max_size = '{raw}': expected a size like \
+                             \"1m\" or \"10m\", at least 4k. The history keeps this file and one \
+                             rotated generation"
+                        )
+                    })?,
+            );
         }
         _ => warn_unknown_key("kern", key),
     }
@@ -3785,5 +4022,134 @@ mod duplicate_names {
                     [[vcpu]]\nname = \"web\"\nbackend = \"host\"\nmemory = \"64m\"\n\
                     [[vdisk]]\nname = \"web\"\nbackend = \"ram\"\nsize = \"10m\"\n";
         assert!(parse(text).is_ok(), "one name per family must be allowed");
+    }
+}
+
+#[cfg(test)]
+mod retention_settings_tests {
+    use super::*;
+
+    /// The five keys parse to the numbers the code applies, from the spellings an operator writes.
+    #[test]
+    fn the_log_and_retention_keys_parse_to_bytes_counts_and_seconds() {
+        let c = parse(
+            "[kern]\nlog_max_size = \"10m\"\nlog_max_file = 3\nlog_keep_ended = \"24h\"\n\
+             build_keep = 200\nsandbox_history_max_size = \"2m\"\n",
+        )
+        .expect("a valid [kern] table parses");
+        assert_eq!(c.kern.log_max_size, Some(10 * 1024 * 1024));
+        assert_eq!(c.kern.log_max_file, Some(3));
+        assert_eq!(c.kern.log_keep_ended_s, Some(86_400));
+        assert_eq!(c.kern.build_keep, Some(200));
+        assert_eq!(c.kern.sandbox_history_max_size, Some(2 * 1024 * 1024));
+    }
+
+    /// Absent keys stay absent, so every box keeps the bound it had before these keys existed.
+    #[test]
+    fn an_empty_kern_table_leaves_every_retention_key_unset() {
+        let c = parse("[kern]\n").expect("an empty table parses");
+        assert_eq!(c.kern.log_max_size, None);
+        assert_eq!(c.kern.log_max_file, None);
+        assert_eq!(c.kern.log_keep_ended_s, None);
+        assert_eq!(c.kern.build_keep, None);
+        assert_eq!(c.kern.sandbox_history_max_size, None);
+    }
+
+    /// A value that would silently disable or misapply a bound is REFUSED at load, never read as
+    /// zero: a zero `log_keep_ended` would remove every ended box's log at the next start.
+    #[test]
+    fn a_value_that_would_misapply_a_bound_is_refused_at_load() {
+        for bad in [
+            "log_max_size = \"0\"",
+            "log_max_size = \"ten\"",
+            "log_max_file = 0",
+            "log_keep_ended = \"0s\"",
+            "log_keep_ended = \"soon\"",
+            "log_keep_ended = \"24\"",
+            "build_keep = 0",
+            "build_keep = -1",
+            "sandbox_history_max_size = \"1k\"",
+        ] {
+            assert!(
+                parse(&format!("[kern]\n{bad}\n")).is_err(),
+                "{bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retention_period_reads_days_and_go_durations_in_whole_seconds() {
+        assert_eq!(parse_keep_secs("7d"), Some(7 * 86_400));
+        assert_eq!(parse_keep_secs("24h"), Some(86_400));
+        assert_eq!(parse_keep_secs("1h30m"), Some(5_400));
+        assert_eq!(parse_keep_secs("90s"), Some(90));
+        assert_eq!(parse_keep_secs("500ms"), None, "under a second is refused");
+        assert_eq!(parse_keep_secs("0d"), None);
+        assert_eq!(parse_keep_secs("d"), None);
+        assert_eq!(parse_keep_secs("-1d"), None);
+        assert_eq!(parse_keep_secs(""), None);
+    }
+
+    /// What `kern config set` writes is exactly what the loader accepts back, for every kind, and a
+    /// value carrying a quote cannot break out of the TOML string it is written into.
+    #[test]
+    fn a_value_config_set_writes_parses_back_to_the_same_setting() {
+        for (key, kind, _) in SETTABLE_KERN_KEYS {
+            let sample = match kind {
+                SettingKind::Size => "10m",
+                SettingKind::Count => "5",
+                SettingKind::Duration => "24h",
+                SettingKind::Bool => "true",
+                SettingKind::Word(w) => w[0],
+            };
+            let toml = kern_value_toml(*kind, sample).expect("a sample value is accepted");
+            let text = crate::toml_surgery::set_table_key(
+                "",
+                "kern",
+                key,
+                Some(&format!("{key} = {toml}")),
+            );
+            assert!(
+                parse(&text).is_ok(),
+                "{key} = {toml} must parse back: {text}"
+            );
+            assert_eq!(
+                crate::toml_surgery::get_table_key(&text, "kern", key).as_deref(),
+                Some(toml.as_str())
+            );
+        }
+        for bad in ["10m\"\nallow_gpu_grants = true", "a\\b", "x\u{7}"] {
+            assert!(kern_value_toml(SettingKind::Size, bad).is_err(), "{bad:?}");
+            assert!(
+                kern_value_toml(SettingKind::Duration, bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(kern_value_toml(SettingKind::Count, "0").is_err());
+        assert!(kern_value_toml(SettingKind::Bool, "yes").is_err());
+        assert!(kern_value_toml(SettingKind::Word(&["memory", "disk"]), "tape").is_err());
+    }
+
+    /// Every settable key is one the loader knows: a key in the table that `apply_kern` ignored would
+    /// be written by `config set` and then do nothing, with only a warning to say so.
+    #[test]
+    fn every_settable_key_is_applied_by_the_loader() {
+        for (key, kind, _) in SETTABLE_KERN_KEYS {
+            let sample = match kind {
+                SettingKind::Size => "\"10m\"".to_string(),
+                SettingKind::Count => "5".to_string(),
+                SettingKind::Duration => "\"24h\"".to_string(),
+                SettingKind::Bool => "true".to_string(),
+                SettingKind::Word(w) => format!("\"{}\"", w[0]),
+            };
+            let mut k = KernSettings::default();
+            apply_kern(&mut k, key, &sample).expect("the sample value applies");
+            let before = format!("{:?}", KernSettings::default());
+            assert_ne!(
+                format!("{k:?}"),
+                before,
+                "{key} changed nothing in KernSettings"
+            );
+        }
     }
 }

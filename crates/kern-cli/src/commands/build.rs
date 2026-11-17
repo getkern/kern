@@ -602,6 +602,9 @@ fn build_one(args: BuildArgs) -> Result<(), Error> {
             rec.tag
         ),
     );
+    // `[kern] build_keep`: the record just written is the newest, so it is always among the kept.
+    // After the summary line, so this build's own log is complete before anything is counted.
+    let _ = crate::builds::prune_to_config();
     result?;
     // EVERY OTHER `-t` IS APPLIED HERE, and only after the build has succeeded: naming an image that
     // does not exist is what `tag` refuses, and naming one that failed would be worse than losing the

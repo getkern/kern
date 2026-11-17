@@ -26,6 +26,178 @@ pub fn config_cmd(sub: &str, force: bool, json: bool) -> Result<(), Error> {
     }
 }
 
+const CONFIG_SET_USAGE: &str = "config set <key> <value>   (`kern config get` lists the keys)";
+const CONFIG_UNSET_USAGE: &str = "config unset <key>   (`kern config get` lists the keys)";
+
+/// The settable `[kern]` key named `key`, or a refusal that lists them.
+fn settable(key: &str) -> Result<(crate::config::SettingKind, &'static str), Error> {
+    crate::config::SETTABLE_KERN_KEYS
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(_, kind, what)| (*kind, *what))
+        .ok_or_else(|| {
+            let keys: Vec<&str> = crate::config::SETTABLE_KERN_KEYS
+                .iter()
+                .map(|(k, _, _)| *k)
+                .collect();
+            Error::Config(format!(
+                "'{key}' is not a [kern] key this command sets - one of: {}",
+                keys.join(", ")
+            ))
+        })
+}
+
+/// What a newly set key changes, said once after the write so nobody expects a running box to
+/// shrink its log: each key is read at the moment it applies, never pushed into what already runs.
+fn applies_when(key: &str) -> &'static str {
+    match key {
+        "log_max_size" | "log_max_file" => "applies to boxes started from now on",
+        "log_keep_ended" => "applied each time a box starts with -d",
+        "build_keep" => "applied each time a build ends",
+        "sandbox_history_max_size" => "applied at the next finished sandbox",
+        _ => "applies from the next command",
+    }
+}
+
+/// `kern config set <key> <value>`: write one `[kern]` key, every other byte of `kern.toml` kept.
+///
+/// The value is checked against its kind first ([`crate::config::kern_value_toml`]), and the file
+/// that would result is parsed again before it replaces the old one ([`crate::config::set_kern_key`]),
+/// so a value reaches `kern.toml` only if the reader that applies it accepts it.
+/// `sandbox_history` goes through `kern sandbox keep`'s own path, which also moves the rows already
+/// recorded to the new place.
+pub fn config_set(args: &[String]) -> Result<(), Error> {
+    let [key, value] = args else {
+        return Err(Error::Usage(CONFIG_SET_USAGE));
+    };
+    let (kind, _) = settable(key)?;
+    let toml = crate::config::kern_value_toml(kind, value)
+        .map_err(|e| Error::Config(format!("{key}: {e}")))?;
+    if key == "sandbox_history" {
+        let keep = crate::history::Keep::parse(value.trim()).ok_or_else(|| {
+            Error::Config(format!("{key}: {value:?}: expected memory, disk or off"))
+        })?;
+        crate::history::set_keep(keep).map_err(Error::Config)?;
+    } else {
+        crate::config::set_kern_key(key, Some(&toml)).map_err(Error::Config)?;
+    }
+    let path = crate::config::active_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let p = crate::ui::Palette::detect();
+    println!(
+        "{}set{} {key} = {toml}  {}({} · {path}){}",
+        p.g,
+        p.z,
+        p.d,
+        applies_when(key),
+        p.z
+    );
+    Ok(())
+}
+
+/// `kern config unset <key>`: remove one `[kern]` key, so kern's default is in force again. A key
+/// that is not in the file is already unset, and says so instead of failing.
+pub fn config_unset(args: &[String]) -> Result<(), Error> {
+    let [key] = args else {
+        return Err(Error::Usage(CONFIG_UNSET_USAGE));
+    };
+    settable(key)?;
+    let raw = crate::config::read_kern_toml()
+        .map(|(_, raw)| raw)
+        .map_err(Error::Config)?;
+    let p = crate::ui::Palette::detect();
+    if crate::toml_surgery::get_table_key(&raw, "kern", key).is_none() {
+        println!("{}{key} is not set{}", p.d, p.z);
+        return Ok(());
+    }
+    if key == "sandbox_history" {
+        // Back to the default place FIRST, so the rows move with the setting.
+        crate::history::set_keep(crate::history::Keep::Memory).map_err(Error::Config)?;
+    }
+    crate::config::set_kern_key(key, None).map_err(Error::Config)?;
+    println!(
+        "{}unset{} {key}  {}(kern's default again){}",
+        p.g, p.z, p.d, p.z
+    );
+    Ok(())
+}
+
+/// `kern config get [<key>] [--json]`: with a key, print its value as written and exit 0, or print
+/// nothing and exit 1 when it is not set (`git config --get`'s contract, so a script can branch on
+/// it). Without one, every settable key: its value or `-`, and what it does.
+pub fn config_get(args: &[String], json: bool) -> Result<(), Error> {
+    let raw = match crate::config::active_path() {
+        Some(p) => std::fs::read_to_string(p).unwrap_or_default(),
+        None => String::new(),
+    };
+    let value_of = |key: &str| crate::toml_surgery::get_table_key(&raw, "kern", key);
+    // JSON keeps the TOML type: a count or a bool as written bare, everything else as a string.
+    // Bare only when it IS a number or a bool, so a hand-written value can never make the output
+    // something other than JSON.
+    let as_json = |v: String| -> String {
+        if v.parse::<u64>().is_ok() || v == "true" || v == "false" {
+            v
+        } else {
+            let inner = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .map_or(v.clone(), str::to_string);
+            json_str(&inner)
+        }
+    };
+    // A string is shown as its contents, the way it was typed to `config set`.
+    let shown = |v: String| -> String {
+        v.strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .map_or(v.clone(), str::to_string)
+    };
+    match args {
+        [key] => {
+            settable(key)?;
+            match value_of(key) {
+                Some(v) if json => println!("{}", as_json(v)),
+                Some(v) => println!("{}", shown(v)),
+                None if json => println!("null"),
+                None => return Err(Error::Workload(1)),
+            }
+            Ok(())
+        }
+        [] => {
+            if json {
+                let items: Vec<String> = crate::config::SETTABLE_KERN_KEYS
+                    .iter()
+                    .map(|(k, _, _)| {
+                        format!(
+                            "{}:{}",
+                            json_str(k),
+                            value_of(k).map_or_else(|| "null".to_string(), as_json)
+                        )
+                    })
+                    .collect();
+                println!("{{{}}}", items.join(","));
+                return Ok(());
+            }
+            let p = crate::ui::Palette::detect();
+            let width = crate::config::SETTABLE_KERN_KEYS
+                .iter()
+                .map(|(k, _, _)| k.len())
+                .max()
+                .unwrap_or(0);
+            for (k, _, what) in crate::config::SETTABLE_KERN_KEYS {
+                let v = value_of(k).map(shown);
+                let (vc, vtext) = match &v {
+                    Some(v) => (p.g, v.as_str()),
+                    None => (p.d, "-"),
+                };
+                println!("{k:<width$}  {vc}{vtext:<10}{}  {}{what}{}", p.z, p.d, p.z);
+            }
+            Ok(())
+        }
+        _ => Err(Error::Usage("config get [<key>] [--json]")),
+    }
+}
+
 /// `kern config add <kind:name> [--field value …] [--replace]` - the CLI twin of `kern top`'s profile
 /// forms. Builds the profile through the SAME `config` schema (validation + surgical, atomic write),
 /// so a profile made from the CLI is byte-for-byte what the TUI would write, and vice-versa.
