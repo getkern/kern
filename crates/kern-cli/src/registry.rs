@@ -1288,6 +1288,38 @@ pub(crate) fn instances_dir_for_display() -> String {
         )
 }
 
+/// Whether the kern process `pid` keeps its box records in the SAME directory this process does.
+///
+/// A box with no record here may belong to another runtime directory of the same user (a systemd
+/// unit with its own `XDG_RUNTIME_DIR`, a test world, a script), and stopping it by name from here
+/// would end a box this directory never started. The process's own `XDG_RUNTIME_DIR` decides, read
+/// from `/proc/<pid>/environ` (same user, so readable), resolved the way [`runtime_subdir_candidates`]
+/// resolves ours. `false` when it cannot be read: unknown is not permission to stop.
+pub(crate) fn same_runtime_dir_as(pid: u32) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(env) = fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    let uid = unsafe { libc::getuid() };
+    let theirs = env
+        .split(|b| *b == 0)
+        .find_map(|kv| kv.strip_prefix(b"XDG_RUNTIME_DIR="))
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            PathBuf::from(std::ffi::OsStr::from_bytes(v))
+                .join("kern")
+                .join("instances")
+        })
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}/kern/instances")));
+    let Some(ours) = existing_runtime_subdir("instances")
+        .or_else(|| runtime_subdir_candidates("instances").into_iter().next())
+    else {
+        return false;
+    };
+    let canon = |p: &std::path::Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(&ours) == canon(&theirs)
+}
+
 /// The cgroup v2 directory of `pid` under `/sys/fs/cgroup`, from `/proc/<pid>/cgroup`.
 fn cgroup_of(pid: i32) -> Option<PathBuf> {
     let s = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;

@@ -7191,6 +7191,86 @@ fn a_detached_box_log_holds_the_workload_and_not_kerns_notices() {
     );
 }
 
+/// `kern stop <name>` from one runtime directory leaves a same-named box of another one alone. The
+/// record-less stop (a box whose record here is gone) found its target among EVERY box of the user,
+/// so it also stopped a box another directory's world started under that name. Now that box is
+/// named, with its supervisor pid, and left running.
+#[test]
+fn stop_by_name_never_reaches_a_box_of_another_runtime_dir() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("kern-stopx-{}", std::process::id()));
+    let world = |w: &str| -> Vec<(String, std::path::PathBuf)> {
+        let d = root.join(w);
+        for sub in ["run", "data", "config"] {
+            std::fs::create_dir_all(d.join(sub)).expect("world dir");
+        }
+        let _ = Command::new("chmod").arg("700").arg(d.join("run")).status();
+        vec![
+            ("XDG_RUNTIME_DIR".into(), d.join("run")),
+            ("XDG_DATA_HOME".into(), d.join("data")),
+            ("XDG_CONFIG_HOME".into(), d.join("config")),
+        ]
+    };
+    let a = world("a");
+    let b = world("b");
+    let name = format!("stopx{}", std::process::id());
+    let started = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args([
+            "box",
+            &name,
+            "-d",
+            "--image",
+            "alpine:latest",
+            "--",
+            "sleep",
+            "60",
+        ])
+        .output()
+        .expect("start the box in world A");
+    if !started.status.success() {
+        eprintln!(
+            "SKIP: the box did not start: {:.300}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    let stop = kern()
+        .envs(b.iter().map(|(k, v)| (k, v)))
+        .args(["stop", &name, "-t", "0"])
+        .output()
+        .expect("stop from world B");
+    let said = String::from_utf8_lossy(&stop.stderr).into_owned();
+    let ps = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args(["ps", "-q"])
+        .output()
+        .expect("ps in world A");
+    let alive = String::from_utf8_lossy(&ps.stdout).contains(&name);
+    let _ = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args(["stop", &name, "-t", "0"])
+        .output();
+    let _ = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args(["rm", &name])
+        .output();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        alive,
+        "a stop from another runtime directory ended the box:\n{said}"
+    );
+    assert!(
+        !stop.status.success() && said.contains("another runtime directory"),
+        "the stop did not refuse by naming the other directory (rc {:?}):\n{said}",
+        stop.status.code()
+    );
+}
+
 /// `kern uninstall --yes` from one runtime directory never ends a box running from another. The
 /// boxes' systemd unit holds the boxes of every runtime directory, and uninstall stopped it whenever
 /// ITS OWN registry was empty: MEASURED on 2026-11-17, `readme-blocks.py` (which runs the install

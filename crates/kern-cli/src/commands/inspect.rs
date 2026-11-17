@@ -2938,6 +2938,27 @@ fn stop_unrecorded(name: &str, grace_s: u64) -> Result<Option<String>, Error> {
     }
     sups.sort_unstable();
     sups.dedup();
+    // ONLY A BOX OF THIS RUNTIME DIRECTORY. The cgroups and processes above are every box of this
+    // user, and a box with this name may belong to another directory's world (a systemd unit, a
+    // test, a script with its own XDG_RUNTIME_DIR); stopping it from here ended a box this directory
+    // never started. Such a box is named, not stopped: it is stopped from its own directory.
+    let (mine, elsewhere): (Vec<u32>, Vec<u32>) = sups
+        .into_iter()
+        .partition(|s| registry::same_runtime_dir_as(*s));
+    if mine.is_empty() && !elsewhere.is_empty() {
+        return Err(Error::Sandbox(format!(
+            "no box named '{name}' runs from {dir}; one does from another runtime directory \
+             (supervisor pid {}), and is left alone: stop it with the XDG_RUNTIME_DIR it was \
+             started with",
+            elsewhere
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            dir = crate::registry::instances_dir_for_display()
+        )));
+    }
+    let sups = mine;
     let sup = match sups.as_slice() {
         [] => return Ok(None),
         [one] => *one,
