@@ -19,7 +19,7 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
-## Unreleased
+## v0.51.1 - 2026-11-17
 
 **`kern stop <name>` no longer stops a box of another runtime directory.** A box whose record is
 gone is stopped by name (v0.51.0), and it was found among every box of the user, so a box another
