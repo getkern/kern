@@ -21,6 +21,12 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**`kern stop <name>` no longer stops a box of another runtime directory.** A box whose record is
+gone is stopped by name (v0.51.0), and it was found among every box of the user, so a box another
+directory's world started under that name was stopped too. It is now stopped only when its
+supervisor keeps its records in the same directory; otherwise kern names it, with its supervisor
+pid, and leaves it running.
+
 **`kern uninstall` no longer ends boxes started from another runtime directory.** It stopped the
 boxes' systemd unit, `kern-boxes.service`, whenever its own registry was empty, and that unit holds
 the boxes of every runtime directory the user runs kern from: a box started by a systemd unit, a
