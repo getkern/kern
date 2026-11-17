@@ -152,6 +152,16 @@ Ti: `PHB` in the box, NCCL's dumped topology equal to Docker's, the same all-red
 every write under it refused. It costs a `--gpus all` start on that host about 0.5 ms (+544 us,
 interval [+170, +1006], n=200, after an A/A that read zero); a box without `--gpus` is unchanged.
 
+**A box's `/sys` is read-only, as Docker mounts sysfs.** `touch /sys/x` succeeded in a box (into its
+own root; `/sys/devices` was a writable tmpfs) where Docker answers `Read-only file system`, so a
+script probing whether it can write sysfs took the other branch. `/sys` is now the box's own tmpfs,
+remounted read-only once kern has put in it what it puts there (the CPU topology, the cgroup view,
+granted sysfs paths). A `-v` under `/sys` keeps its own mode, a granted LED or PWM stays writable,
+and `--privileged` leaves `/sys` writable, as Docker's `--privileged` does. Anything an image ships
+under `/sys` is hidden, as under Docker. Measured: a box start is 73 us faster (interval [-112,
+-14], n=200, after an A/A that read zero), because those directories no longer land in the
+overlay's writable layer.
+
 **`kern exec` runs where the box runs on a host with no cgroup delegation.** It refused (126, "would
 run outside its caps") whenever the box's PID 1 was in the caller's OWN cgroup, which is where a box
 stays when nothing could be delegated: the command is born there already and escapes nothing

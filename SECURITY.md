@@ -347,7 +347,8 @@ everything else, and the source paths are canonicalized and re-checked to stay u
   that character device exposes *all* of the controller's lines via ioctl. The pin list is
   cooperative metadata, not a security boundary.
 
-- **`--read-only` keeps a vGPIO box's `/sys` writable**, because LED and PWM control are writes.
+- **`--read-only` keeps a vGPIO box's granted `/sys` paths writable**, because LED and PWM control
+  are writes. The rest of `/sys` is read-only in every box.
 
 Grant a `vgpio:` profile only to workloads you would trust with that hardware.
 
