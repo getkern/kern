@@ -6,6 +6,13 @@ on:
     # (`scripts/fast-check.sh --push`), so the runner's own failures show up at once. A side branch
     # that needs CI is added here in the push that creates it and removed in the one that merges it.
     branches: [main]
+    # A push that changes only Markdown or images starts nothing (owner, 2026-11-17: on one evening
+    # a dozen README and picture pushes each ran the whole matrix, ten minutes of runners apiece).
+    # `scripts/fast-check.sh` runs the documentation gates before every push, which is where a
+    # Markdown change is checked. GitHub skips the run only when EVERY changed file matches.
+    paths-ignore:
+      - "**.md"
+      - "assets/**"
   pull_request:
   workflow_dispatch: {}
 
