@@ -6,7 +6,6 @@ Nothing here is a commitment or a date. Shipped work is in [CHANGELOG.md](CHANGE
 
 - **VM tier**: a microVM boundary for hostile, multi-tenant code, as its own command
   ([SECURITY.md](SECURITY.md)).
-- **Full GPU support**.
 
 ## Under consideration
 

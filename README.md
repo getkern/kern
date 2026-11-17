@@ -41,6 +41,8 @@ agent's code runs in, called from Python, Node or any MCP client. kern calls a c
 - **No daemon, and root is never required.** Six namespaces, a read-only or overlay root, a seccomp
   allowlist by default, cgroup v2 limits.
 - **Your `docker-compose.yml`, unchanged**, or kern's own `stack.toml`.
+- **NVIDIA GPUs, granted as Docker grants them**: `--gpus all`, `--gpus 2`, `--gpus device=0,1`,
+  and compose's `deploy.resources.reservations.devices`, on Linux and WSL2.
 - **Limits without a sandbox.** `kern run` puts the same caps on a plain process on the host.
   [docs/RESOURCES.md](docs/RESOURCES.md)
 - **The tools you expect**: `ps`, `logs`, `exec`, `stats`, `inspect`, `top`, `doctor`.
@@ -192,7 +194,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Roadmap
 
-In development: a VM tier and full GPU support. Under consideration: a desktop for computer use,
+In development: a VM tier. Under consideration: a desktop for computer use,
 kern in a Kubernetes pod, snapshots, a `kern` command on macOS. Details: [ROADMAP.md](ROADMAP.md).
 
 ## Documentation

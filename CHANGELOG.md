@@ -19,7 +19,7 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
-## Unreleased
+## v0.51.0 - 2026-11-17
 
 **Minor bump: `--cpus` and `--cpuset-cpus` beyond the host are refused, as Docker refuses them.**
 They were clamped to what the host has, with a warning: `--cpus 64` on 28 CPUs ran with 28, and
@@ -162,6 +162,13 @@ under `/sys` is hidden, as under Docker. Measured: a box start is 73 us faster (
 -14], n=200, after an A/A that read zero), because those directories no longer land in the
 overlay's writable layer.
 
+**A box runs the command it was given on a newer systemd.** `systemd-run` expands `${VAR}` and
+`$VAR` in the command it starts, and since a recent release it does so for scopes too (Ubuntu
+26.04): a box started through kern's scope re-exec got `${#a[@]}` as nothing and `$$` as `$`. kern
+now passes `--expand-environment=no` where `systemd-run` knows it (systemd 254 and later), so the
+command reaches the box as written, as under Docker. Hosts where kern places boxes in its delegated
+cgroup never took that path.
+
 **`kern exec` runs where the box runs on a host with no cgroup delegation.** It refused (126, "would
 run outside its caps") whenever the box's PID 1 was in the caller's OWN cgroup, which is where a box
 stays when nothing could be delegated: the command is born there already and escapes nothing
@@ -186,31 +193,6 @@ probe truncating a pointer. The help now says what the FAQ says.
 **`kern info` names a WSL2 GPU**, from `/dev/dxg` (`1 x NVIDIA (WSL2, /dev/dxg)`), where it said
 `gpu none` because WSL2 has no DRM card. **`kern sandbox history`** with only `kern box` rows held
 says how many there are and points at `--all`, instead of "no finished sandbox recorded yet".
-
-**kern-sandbox refuses a mount source that holds a refused path or a credential directory.**
-`mounts={"/home": ...}` was accepted while `~` was refused, and the box read `/home/<you>/.ssh` and
-`.bash_history` (reported by an external test). A source is now refused when it contains your home,
-a host credential path, a refused host path (`/run` holds the docker socket) or kern's own state,
-and when a credential directory or file (`.ssh`, `.aws`, `.gnupg`, `.kube`, `.config/gh`, a shell
-history...) is among its first two levels. `.npmrc`, `.pypirc` and `.docker` are not scanned for,
-because projects carry their own; the scan reads one entry at a time and stops at the first hit,
-and a source whose listing does not come back within 10 s, or whose scan fails, is refused rather
-than accepted unchecked. A filesystem that never answers leaves the scan thread in the kernel's
-uninterruptible wait: the call returns refused, and the process cannot exit until that filesystem
-answers or is unmounted, which no code above the kernel can change. Python and Node the same. A
-`kernel()` cell calling `os._exit(N)` on a host without cgroup delegation read as `killed` with exit
--1 in Python (Node already said exit N); both now report the cell's own exit.
-
-**kern-sandbox refuses the host's credential files as mount sources, not only `/etc` whole.** A
-mount of `/etc/shadow` (or a link to it) was accepted while `/etc` itself was refused, and a box
-started by root printed the password hashes (found by an external test). Refused now in both
-bindings, with everything below them and through symlinks: `/etc/shadow`, `/etc/gshadow` and their
-`-` backups, `/etc/sudoers` and `sudoers.d`, `/etc/ssh`, `/etc/ssl/private`,
-`/etc/security/opasswd`, `/etc/krb5.keytab`, `/etc/wireguard`,
-`/etc/NetworkManager/system-connections`. The rest of `/etc` (`resolv.conf`, `hosts`, `localtime`)
-stays mountable. Shell and database-client histories (`.bash_history`, `.zsh_history`,
-`.psql_history` and the like) join the refused credential names: what was typed is where a password
-passed on a command line ends up.
 
 **`kern stop <name>` stops a running box whose registry record is gone.** `kern ps` already named
 such a box, found by its cgroup or its processes, and `kern stop` still answered "no running box
@@ -613,11 +595,6 @@ under Docker. With no file in the working directory, the nearest parent holding 
 names is used. A parent's file that belongs to another user, or is a link that does, is not run: a
 note names it and its owner, and `kern compose <file>` runs it.
 
-**`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
-raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
-before anything runs, where `""` first built a bytecode cache for an empty reference. An empty
-`KERN_MCP_IMAGE` is unset, as every other `KERN_MCP_*` variable reads it.
-
 **The `ssh` command `--ssh` prints works on every launch.** The box made a new host key each time,
 and the printed `accept-new` pinned the first one in `~/.ssh/known_hosts`, so the second box on the
 same port was refused with `Host key verification failed`. kern now makes the box's host key and a
@@ -652,11 +629,6 @@ namespace; the warning said the stack shared one network namespace, which is no 
 **A killed box no longer leaves its environment file behind.** A box ended by SIGKILL (as the SDKs and
 the MCP server end a prewarmed box) left its `env/` and `health/` files in the runtime directory;
 500 MCP calls left 99 of them. The record and its files now go together.
-
-**The SDKs re-extract an older cached image when the session opens.** An image cached by an older kern
-(without its setuid bits) was downloaded again by the first box, inside the first call's deadline: a
-first `kernel()` cell could time out at 30 s. The session's own image fetch now does it, on its 900 s
-budget, and the first cell runs at once.
 
 **A large layer downloads over eight connections at once.** A layer of 256 MiB or more is fetched in
 byte ranges in parallel, joined and checked against its digest; `ollama/ollama` (one 3.25 GB layer)
@@ -706,6 +678,45 @@ directory.** Named volumes, build records, kept boxes and the image cache were w
 `./kern/...` relative to wherever kern was started, while both SDKs, reading the empty variable as
 unset as the XDG spec says, refused `~/.local/share/kern` as a mount source and not that directory.
 An empty or relative value now means unset everywhere, through one resolver.
+
+## kern-sandbox 0.2.50 - 2026-11-17
+
+**It carries the kern v0.51.0 binary.** Both bindings move together.
+
+**kern-sandbox refuses a mount source that holds a refused path or a credential directory.**
+`mounts={"/home": ...}` was accepted while `~` was refused, and the box read `/home/<you>/.ssh` and
+`.bash_history` (reported by an external test). A source is now refused when it contains your home,
+a host credential path, a refused host path (`/run` holds the docker socket) or kern's own state,
+and when a credential directory or file (`.ssh`, `.aws`, `.gnupg`, `.kube`, `.config/gh`, a shell
+history...) is among its first two levels. `.npmrc`, `.pypirc` and `.docker` are not scanned for,
+because projects carry their own; the scan reads one entry at a time and stops at the first hit,
+and a source whose listing does not come back within 10 s, or whose scan fails, is refused rather
+than accepted unchecked. A filesystem that never answers leaves the scan thread in the kernel's
+uninterruptible wait: the call returns refused, and the process cannot exit until that filesystem
+answers or is unmounted, which no code above the kernel can change. Python and Node the same. A
+`kernel()` cell calling `os._exit(N)` on a host without cgroup delegation read as `killed` with exit
+-1 in Python (Node already said exit N); both now report the cell's own exit.
+
+**kern-sandbox refuses the host's credential files as mount sources, not only `/etc` whole.** A
+mount of `/etc/shadow` (or a link to it) was accepted while `/etc` itself was refused, and a box
+started by root printed the password hashes (found by an external test). Refused now in both
+bindings, with everything below them and through symlinks: `/etc/shadow`, `/etc/gshadow` and their
+`-` backups, `/etc/sudoers` and `sudoers.d`, `/etc/ssh`, `/etc/ssl/private`,
+`/etc/security/opasswd`, `/etc/krb5.keytab`, `/etc/wireguard`,
+`/etc/NetworkManager/system-connections`. The rest of `/etc` (`resolv.conf`, `hosts`, `localtime`)
+stays mountable. Shell and database-client histories (`.bash_history`, `.zsh_history`,
+`.psql_history` and the like) join the refused credential names: what was typed is where a password
+passed on a command line ends up.
+
+**`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
+raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
+before anything runs, where `""` first built a bytecode cache for an empty reference. An empty
+`KERN_MCP_IMAGE` is unset, as every other `KERN_MCP_*` variable reads it.
+
+**The SDKs re-extract an older cached image when the session opens.** An image cached by an older kern
+(without its setuid bits) was downloaded again by the first box, inside the first call's deadline: a
+first `kernel()` cell could time out at 30 s. The session's own image fetch now does it, on its 900 s
+budget, and the first cell runs at once.
 
 ## v0.33.0 - 2026-10-17
 
