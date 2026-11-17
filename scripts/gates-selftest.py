@@ -424,7 +424,31 @@ def check_no_gate_writes(failures: list[str], keep: Path) -> None:
         # damage, which would otherwise blame every gate that follows.
         before = content_state()
 
+def anchors_only() -> int:
+    """`--anchors`: only check that every case still finds the text it edits, in milliseconds and
+    without running a gate or writing a file. A case whose anchor moved is the red this script
+    reports as "the file changed shape", and it reached CI twice (2026-10-03, 2026-11-17) because
+    the full run takes minutes and was not run before a push; `fast-check.sh` runs this instead."""
+    bad = []
+    for gate, what, rel, mutate in CASES:
+        path = REPO / rel
+        if not path.is_file():
+            bad.append(f"{gate}: {rel} does not exist ('{what}')")
+            continue
+        original = path.read_text(encoding="utf-8")
+        mutated = mutate(original)
+        if mutated is None or mutated == original:
+            bad.append(f"{gate}: '{what}' no longer finds its text in {rel}")
+    for b in bad:
+        print(f"gates-selftest --anchors: {b}")
+    if not bad:
+        print(f"gates-selftest --anchors: all {len(CASES)} cases find their text")
+    return 1 if bad else 0
+
+
 def main(argv: list[str]) -> int:
+    if "--anchors" in argv:
+        return anchors_only()
     verbose = "-v" in argv
 
     # The tree may legitimately have work in progress, so the check is DIFFERENTIAL: record what is

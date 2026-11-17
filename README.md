@@ -206,8 +206,8 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Roadmap
 
-In development: a VM tier. Under consideration: a desktop for computer use,
-kern in a Kubernetes pod, snapshots. Details: [ROADMAP.md](ROADMAP.md).
+In development: a VM tier and kern desktop, for computer use. Under consideration: kern in a
+Kubernetes pod, snapshots. Details: [ROADMAP.md](ROADMAP.md).
 
 ## Documentation
 

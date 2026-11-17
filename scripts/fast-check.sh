@@ -77,6 +77,13 @@ if has '\.md$'; then
     ok "documentation gates"
 fi
 
+# Every gate's self-test case must still find the text it sabotages (milliseconds, writes nothing):
+# the full gates-selftest takes minutes, and a moved anchor turned CI red twice.
+python3 scripts/gates-selftest.py --anchors >/tmp/fast-check-anchors.$$ 2>&1 \
+    || { cat /tmp/fast-check-anchors.$$ >&2; rm -f /tmp/fast-check-anchors.$$; die "gates-selftest --anchors"; }
+rm -f /tmp/fast-check-anchors.$$
+ok "gates-selftest anchors"
+
 if has 'seccomp'; then
     python3 scripts/gen-seccomp-allowlist.py --check >/dev/null 2>&1 \
         || die "scripts/gen-seccomp-allowlist.py --check"
