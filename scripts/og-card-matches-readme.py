@@ -38,7 +38,10 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-BANNED = ("any workload", "untrusted")
+# "untrusted" was banned on 2026-09-20 and is allowed again since 2026-11-17, by the owner's decision:
+# the README's first line says "Runs untrusted code ... under kernel-enforced isolation", and the
+# card quotes it. "any workload" stays banned.
+BANNED = ("any workload",)
 
 
 def card_strings() -> tuple[str, str]:

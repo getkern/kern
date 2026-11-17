@@ -9,7 +9,7 @@
 [![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm%20kern-sandbox&color=blue)](https://www.npmjs.com/package/kern-sandbox)
 [![Runs on](https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20Windows%20via%20WSL2%20%C2%B7%20macOS%20via%20a%20Linux%20VM-informational.svg)](docs/INSTALL.md)
 
-**kern:** fast, rootless container runtime and sandbox with no daemon. Runs agent tool calls and LLM-generated code in kernel-enforced containers.
+**kern:** fast, rootless container runtime and sandbox with no daemon. Runs untrusted code and AI agent tool calls under kernel-enforced isolation.
 
 
 **A real, kernel-enforced container in a few milliseconds, out of one static binary with no daemon.**
@@ -25,6 +25,12 @@
 ```sh
 # Linux and macOS. Windows below.
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
+```python
+# Python: pip install kern-sandbox (Node: npm install kern-sandbox)
+import kern_sandbox as kern
+print(kern.run_code("print(sum(range(100)))").stdout)   # 4950
 ```
 
 ---
@@ -110,6 +116,24 @@ print(r.stdout, r.fault)   # 4950  None
 Your code runs in a container of its own, for one call or for a whole session, and a timeout or an
 out-of-memory comes back as a typed `fault`. On Linux, pip brings kern with it, and so does
 `npm install kern-sandbox` for Node.
+
+**On a GPU.** `gpus="all"` (or `"2"`, or `"device=0,1"`) hands the sandbox NVIDIA cards, with the
+host's driver:
+
+```python
+r = kern.run_code(
+    "import ctypes; cuda = ctypes.CDLL('libcuda.so.1'); n = ctypes.c_int()\n"
+    "cuda.cuInit(0); cuda.cuDeviceGetCount(ctypes.byref(n)); print(n.value)",
+    gpus="all",
+)
+print(r.stdout)   # 2, on a host with two NVIDIA cards
+```
+
+The same from a terminal:
+
+```sh
+kern box --rm --gpus all --image nvidia/cuda:12.9.0-base-ubuntu24.04 -- nvidia-smi -L
+```
 
 <img src="assets/readme-basics.svg" width="880" alt="Three windows. files.py: a Sandbox writes in.csv, runs a job, reads out.txt back. state.py: a kernel keeps x = 40 between calls and prints x + 2. package.py: a Sandbox with setup pip install numpy imports numpy.">
 
