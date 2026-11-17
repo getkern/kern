@@ -1297,6 +1297,7 @@ pub(crate) fn instances_dir_for_display() -> String {
 /// resolves ours. `false` when it cannot be read: unknown is not permission to stop.
 pub(crate) fn same_runtime_dir_as(pid: u32) -> bool {
     use std::os::unix::ffi::OsStrExt;
+    assert_registry_child("instances");
     let Ok(env) = fs::read(format!("/proc/{pid}/environ")) else {
         return false;
     };

@@ -59,6 +59,11 @@ if has '\.rs$\|Cargo\.toml$\|Cargo\.lock$'; then
         ok "unit tests -p $pkg"
     done
     rm -f /tmp/fast-check-clippy.$$ /tmp/fast-check-test.$$
+    # The registry-path chokepoint gate: milliseconds, and cut-release refused v0.51.1 on it.
+    python3 scripts/registry-classified.py >/tmp/fast-check-reg.$$ 2>&1 \
+        || { cat /tmp/fast-check-reg.$$ >&2; rm -f /tmp/fast-check-reg.$$; die "registry-classified"; }
+    rm -f /tmp/fast-check-reg.$$
+    ok "registry-classified"
 fi
 
 # Integration tests, by name, when asked: the binary they run must be the one this tree builds.
