@@ -7504,6 +7504,65 @@ fn copy_chown_owns_the_copied_files() {
     }
 }
 
+/// `COPY` INTO a directory a box user owns (`RUN adduser -D app` then `COPY f /home/app/`) works,
+/// with and without `--chown`, by `cp` (a file) and by the `.dockerignore` walk (a directory).
+/// MEASURED 2026-11-18 after the v0.51.2 release: "cp: cannot create regular file
+/// '.../home/app/f': Permission denied", because the layer's `/home/app` belongs to a subordinate
+/// uid the builder cannot write as.
+#[test]
+fn copy_into_a_directory_a_box_user_owns() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-copyowned-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("ctx/sub")).expect("context");
+    std::fs::write(dir.join("ctx/f"), "x").expect("file");
+    std::fs::write(dir.join("ctx/sub/g"), "y").expect("file");
+    std::fs::write(dir.join("ctx/sub/ignored"), "z").expect("file");
+    std::fs::write(dir.join("ctx/.dockerignore"), "sub/ignored\n").expect("ignore");
+    std::fs::write(
+        dir.join("Dockerfile"),
+        "FROM alpine:latest\nRUN adduser -D app\nCOPY f /home/app/\nCOPY --chown=app:app f /home/app/owned\nCOPY sub /home/app/sub/\nUSER app\nRUN stat -c '%n %U:%G' /home/app/f /home/app/owned /home/app/sub/g && ls /home/app/sub && touch /home/app/new && echo WRITE-OK\n",
+    )
+    .expect("Dockerfile");
+    let tag = format!("kern-copyowned:{}", std::process::id());
+    let out = kern()
+        .args(["build", "--no-cache", "-t", &tag, "-f"])
+        .arg(dir.join("Dockerfile"))
+        .arg(dir.join("ctx"))
+        .output()
+        .expect("run kern build");
+    let _ = kern().args(["rmi", &tag]).output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if said.contains("subordinate uid range") {
+        eprintln!("SKIP: no subordinate uid range here: {said:.300}");
+        return;
+    }
+    assert!(out.status.success(), "the build failed: {said}");
+    for want in [
+        "/home/app/f root:root",
+        "/home/app/owned app:app",
+        "/home/app/sub/g root:root",
+        "WRITE-OK",
+    ] {
+        assert!(said.contains(want), "missing {want:?}: {said}");
+    }
+    assert!(
+        !said.contains("ignored"),
+        "the ignore file was not honoured: {said}"
+    );
+    assert!(
+        !said.contains("Permission denied") && !said.contains("Permesso negato"),
+        "a failed first attempt was shown: {said}"
+    );
+}
+
 /// `FROM <stage>` over a stage with a directory a subordinate uid owns at 0700 (python:*-slim ships
 /// `/var/lib/apt/lists/partial` so) builds rootless, keeps the directory's owner and mode, and keeps
 /// setuid bits. MEASURED 2026-11-18: it failed with "extract stage 114" (or "COPY --from source does not

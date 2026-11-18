@@ -1946,9 +1946,7 @@ pub(crate) fn copy_into_rootfs(
     // the destination when this copy makes it. A directory that was already there keeps its owner,
     // as under Docker, which owns only what the instruction adds.
     let chown_ids = chown.map(|c| resolve_chown(c, rootfs, chain)).transpose()?;
-    let copied: Vec<std::path::PathBuf> = if chown_ids.is_none() {
-        Vec::new()
-    } else if src.is_dir() {
+    let copied: Vec<std::path::PathBuf> = if src.is_dir() {
         let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(&src)
             .map(|rd| rd.flatten().map(|e| target.join(e.file_name())).collect())
             .unwrap_or_default();
@@ -1982,8 +1980,16 @@ pub(crate) fn copy_into_rootfs(
             // that would leak the very secrets the ignore file exists to keep out. Falls back to raw
             // `ctx` only if canonicalize fails (then the walk fails CLOSED on any un-strippable entry).
             let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
-            copy_dir_filtered(&src, &target, &ctx_root, &ig)
-                .map_err(|e| Error::Sandbox(format!("COPY '{src_rel}' → '{dst}': {e}")))?;
+            if let Err(e) = copy_dir_filtered(&src, &target, &ctx_root, &ig) {
+                if !retried_as_ranged_root(&copied, || {
+                    // The destination too: as the builder it could not be made under a directory
+                    // a box user owns.
+                    materialize_dst_dirs(rootfs, chain, &target_rel);
+                    copy_dir_filtered(&src, &target, &ctx_root, &ig).is_ok()
+                }) {
+                    return Err(Error::Sandbox(format!("COPY '{src_rel}' → '{dst}': {e}")));
+                }
+            }
             return finish(apply_chmod_tree(&target, chmod));
         }
     }
@@ -2001,36 +2007,86 @@ pub(crate) fn copy_into_rootfs(
     // target is never read at build time. If this `cp -a` is ever replaced (e.g. a Rust `walkdir` copy
     // for portability), that replacement MUST be no-follow too, or a `leak -> /host/secret` inside a
     // build context would leak the host file into the image. Verified live: it does not, today.
-    let out = std::process::Command::new("cp")
-        .arg("-a")
-        .arg("--") // src/target are absolute, but never let cp parse them as flags
-        .arg(&arg)
-        .arg(&target)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output();
+    let run = || {
+        std::process::Command::new("cp")
+            .arg("-a")
+            .arg("--") // src/target are absolute, but never let cp parse them as flags
+            .arg(&arg)
+            .arg(&target)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+    };
+    let out = run();
     // `cp -a` TRIES TO KEEP THE SOURCE'S OWNER, and the builder is not root: a context whose files
     // belong to someone else (every file under WSL's `/mnt/c` shows uid 0) makes BusyBox's `cp` say
     // "can't preserve ownership" for each one. MEASURED on a real build from kern.exe on 2026-11-18,
     // one line per COPY. The copy is right regardless (a COPY's files belong to the box's root, as
     // under Docker, unless `--chown` says otherwise), so those lines are dropped and every other line
     // `cp` writes is passed on.
-    let ok = match out {
-        Ok(o) => {
-            for line in String::from_utf8_lossy(&o.stderr).lines() {
-                if !is_ownership_notice(line) {
-                    eprintln!("{line}");
-                }
-            }
-            o.status.success()
-        }
-        Err(_) => false,
+    let (first_ok, said) = match &out {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        ),
+        Err(_) => (false, String::new()),
     };
+    // A DESTINATION A BOX USER OWNS: `RUN adduser -D app` then `COPY f /home/app/` (MEASURED
+    // 2026-11-18: "cannot create regular file '.../home/app/f': Permission denied"). The layer's
+    // `/home/app` belongs to a subordinate uid, which the builder cannot write as; root of the range
+    // can. What the first attempt printed is shown only when the second one fails too.
+    let ok = first_ok
+        || retried_as_ranged_root(&copied, || {
+            if src.is_dir() {
+                materialize_dst_dirs(rootfs, chain, &target_rel);
+            }
+            run().map(|o| o.status.success()).unwrap_or(false)
+        });
+    if first_ok || !ok {
+        for line in said.lines() {
+            if !is_ownership_notice(line) {
+                eprintln!("{line}");
+            }
+        }
+    }
     if ok {
         finish(apply_chmod_tree(&target, chmod))
     } else {
         Err(Error::Sandbox(format!("COPY '{src_rel}' → '{dst}' failed")))
     }
+}
+
+/// Run `attempt` again as root of the subordinate uid range, then give what it `copied` to the box's
+/// root (`0:0`): `cp -a` there keeps the owner it sees, and a context file of another host user is
+/// seen as `nobody`, where the first attempt, as the builder, makes every file the box root's, as a
+/// COPY without `--chown` is under Docker. `false` when there is no range or the attempt fails again.
+fn retried_as_ranged_root(copied: &[std::path::PathBuf], attempt: impl FnOnce() -> bool) -> bool {
+    matches!(
+        kern_isolation::with_id_mapped_userns(|ranged| {
+            if !ranged || !attempt() {
+                return 1;
+            }
+            i32::from(!copied.iter().all(|p| lchown_tree(p, 0, 0)))
+        }),
+        Ok(0)
+    )
+}
+
+/// `lchown` `p` and, for a directory, everything under it, never following a symlink. `true` when
+/// every entry took the owner (a path that is not there counts as done: excluded by an ignore file).
+fn lchown_tree(p: &std::path::Path, uid: u32, gid: u32) -> bool {
+    let Ok(m) = std::fs::symlink_metadata(p) else {
+        return true;
+    };
+    let mut ok = std::os::unix::fs::lchown(p, Some(uid), Some(gid)).is_ok();
+    if m.file_type().is_dir() {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                ok &= lchown_tree(&e.path(), uid, gid);
+            }
+        }
+    }
+    ok
 }
 
 /// A `cp` line that only says it could not keep a source file's owner (BusyBox: "can't preserve
@@ -2100,25 +2156,11 @@ pub(crate) fn chown_copied(
     if paths.is_empty() || (uid == 0 && gid == 0) {
         return Ok(());
     }
-    fn walk(p: &std::path::Path, uid: u32, gid: u32) -> bool {
-        let Ok(m) = std::fs::symlink_metadata(p) else {
-            return true; // excluded by an ignore file, or never created
-        };
-        let mut ok = std::os::unix::fs::lchown(p, Some(uid), Some(gid)).is_ok();
-        if m.file_type().is_dir() {
-            if let Ok(rd) = std::fs::read_dir(p) {
-                for e in rd.flatten() {
-                    ok &= walk(&e.path(), uid, gid);
-                }
-            }
-        }
-        ok
-    }
     let code = kern_isolation::with_id_mapped_userns(|ranged| {
         if !ranged {
             return 2;
         }
-        i32::from(!paths.iter().all(|p| walk(p, uid, gid)))
+        i32::from(!paths.iter().all(|p| lchown_tree(p, uid, gid)))
     });
     match code {
         Ok(0) => Ok(()),

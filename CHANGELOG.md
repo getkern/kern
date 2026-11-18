@@ -25,6 +25,9 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 **`kern` with no arguments lists `kern self-update`.**
 
+**`COPY` into a directory a box user owns builds** (`RUN adduser -D app` then `COPY f /home/app/`), with
+or without `--chown`.
+
 ## kern-sandbox 0.2.52 - 2026-11-18
 
 **It carries the kern v0.51.2 binary.** Both bindings move together; nothing else in them changed.
