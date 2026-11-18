@@ -21,6 +21,15 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**`--progress auto|tty|plain|json|quiet` on `kern build` and `kern compose`** (or `KERN_PROGRESS`).
+`compose up` on a terminal draws one row per service, redrawn in place under a header that counts
+them: pulling, building with the step it is on, waiting for its dependencies, started, exited,
+failed, skipped; every line written meanwhile is printed above it. `json` writes one event per line
+on stdout (`schema` 1: `build_step`, `heartbeat`, `build_done`, `service`, `service_log`, `up_done`)
+and nothing else there; `quiet` prints no progress. A service that dies during the bring-up is
+followed by the last ten lines it wrote. Each build step says how long it took last time; an
+interrupted `up` says what may be left and how to remove it.
+
 **`kern sandbox show`: the code SDK sandboxes ran and their output.** The SDKs record each call
 (`kern sandbox record`); transcripts are kept where `sandbox_history` keeps the history (in memory by
 default), mode 0600, up to 64 KiB of code and 256 KiB of each stream per call and

@@ -159,6 +159,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}commit{z} <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
     {c}build{z} -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
     {c}build{z} --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that file, and build NOTHING
+                                                                     --progress auto|tty|plain|json|quiet (also on compose, before the verb or after up/build/pull):
+                                                                     plain = the step lines, json = one event per line on stdout, quiet = none;
+                                                                     each step says how long it took last time; KERN_PROGRESS sets the default
                                                                      Exit 0 if it builds here; the lines kern does not act on are marked `dropped`
                                                                      -t is repeatable: one build, every name applied (layers shared, not copied)
                                                                      --secret id=X,src=FILE|env=VAR and --ssh default|ID=KEY: what RUN --mount=type=secret|ssh read
@@ -207,6 +210,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}compose{z} [<file>] [{cv}]  Run a stack (kern TOML or a compose file); [--profile P] selects optional services
                                                                      With no file the directory is searched for docker-compose.yml, docker-compose.yaml, compose.yml, compose.yaml, kern.toml
                                                                      up: [--force-recreate|--no-recreate] [-V|--renew-anon-volumes]; logs: [-t] [--since T] [--until T] [--no-log-prefix] (each line is `service-1  | text`)
+                                                                     up on a terminal draws one row per service (pulling, building step n/N, waiting, started, exited)
                                                                      wait/events/images/push/rm/top/version scope the box-level verb to this stack; kill is an alias of stop
                                                                      images takes --format json, as ps does; wait exits with the status of the first service to stop
                                                                      -f FILE repeats (merged left to right, `!reset`/`!override` honoured); -p NAME; --profile P; --env-file F

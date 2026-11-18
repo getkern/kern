@@ -7504,6 +7504,157 @@ fn copy_chown_owns_the_copied_files() {
     }
 }
 
+/// `--progress json`: stdout carries the events and nothing else (a RUN's own output goes to
+/// stderr), every line is an object with `schema` 1, a build ends in `build_done`, and a second
+/// build of the same steps carries `last_ms`; a compose `up` reports each service and ends in
+/// `up_done`, on stdout although compose narrates on stderr.
+#[test]
+fn progress_json_is_events_on_stdout_and_nothing_else() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-progress-json-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app")).expect("dir");
+    std::fs::write(
+        dir.join("app/Dockerfile"),
+        "FROM alpine:latest\nRUN sleep 0.3 && echo RUN-OUTPUT\nCMD [\"sleep\", \"30\"]\n",
+    )
+    .expect("Dockerfile");
+    let tag = format!("kern-progress-json:{}", std::process::id());
+    let build = |ctx: &std::path::Path| {
+        kern()
+            .args(["build", "--progress", "json", "--no-cache", "-t", &tag])
+            .arg(ctx)
+            .output()
+            .expect("build")
+    };
+    let first = build(&dir.join("app"));
+    let second = build(&dir.join("app"));
+    let _ = kern().args(["rmi", &tag]).output();
+    for out in [&first, &second] {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.lines().all(|l| l.starts_with("{\"schema\":1,")),
+            "not only events: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"type\":\"build_done\"") && stdout.contains("\"ok\":true"),
+            "{stdout}"
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("RUN-OUTPUT"));
+    }
+    let second_out = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        second_out
+            .lines()
+            .any(|l| l.contains("RUN sleep 0.3") && !l.contains("\"last_ms\":null")),
+        "the second build has no last time for its RUN: {second_out}"
+    );
+    std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  one:\n    image: alpine:latest\n    command: sleep 30\n  two:\n    image: alpine:latest\n    command: sleep 30\n    depends_on: [one]\n",
+    )
+    .expect("compose file");
+    let up = kern()
+        .args(["compose", "--progress", "json", "-f"])
+        .arg(dir.join("compose.yml"))
+        .args(["up", "-d"])
+        .output()
+        .expect("up");
+    let _ = kern()
+        .args(["compose", "-f"])
+        .arg(dir.join("compose.yml"))
+        .arg("down")
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&up.stdout);
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(
+        stdout.lines().all(|l| l.starts_with("{\"schema\":1,")),
+        "not only events: {stdout}"
+    );
+    assert!(stdout.contains("\"state\":\"running\""), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .is_some_and(|l| l.contains("\"type\":\"up_done\"")),
+        "{stdout}"
+    );
+}
+
+/// On a terminal, `compose up` draws its view: a header that counts the services, one row each,
+/// and lines written meanwhile printed above it. The terminal comes from `script(1)`.
+#[test]
+fn compose_up_on_a_terminal_draws_one_row_per_service() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    if Command::new("script").arg("--version").output().is_err() {
+        eprintln!("SKIP: no script(1) to give `up` a terminal");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-progress-tty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let file = dir.join("compose.yml");
+    std::fs::write(
+        &file,
+        "services:\n  alpha:\n    image: alpine:latest\n    command: sleep 30\n  beta:\n    image: alpine:latest\n    command: sh -c 'exit 4'\n",
+    )
+    .expect("compose file");
+    let line = format!(
+        "{} compose -f {} up -d",
+        env!("CARGO_BIN_EXE_kern"),
+        file.display()
+    );
+    let out = Command::new("script")
+        .args(["-qec", &line, "/dev/null"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("script");
+    let _ = kern()
+        .args(["compose", "-f"])
+        .arg(&file)
+        .arg("down")
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let screen = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(screen.contains("kern compose up · "), "no view: {screen}");
+    assert!(
+        screen.contains("\x1b[") && screen.contains("F\x1b[J"),
+        "never redrawn: {screen}"
+    );
+    let last_frame = screen
+        .rsplit("F\x1b[J")
+        .next()
+        .unwrap_or("")
+        .split("compose up:")
+        .next()
+        .unwrap_or("");
+    // `up -d` does not wait: a service it released reads `started`, as Docker's `Started`; one seen
+    // to have exited reads `exited`. The rows name the service, not the project.
+    assert!(
+        last_frame.contains("✔ alpha-1") && last_frame.contains("started"),
+        "{last_frame}"
+    );
+    assert!(last_frame.contains("beta-1"), "{last_frame}");
+    assert!(
+        !last_frame.contains("kern-progress-tty-"),
+        "the project prefix stayed: {last_frame}"
+    );
+}
+
 /// `kern sandbox record` keeps a call's code and output where the history is, 0600, and `kern
 /// sandbox show` prints it without the escapes the output carried; `clear` removes it.
 #[test]

@@ -239,7 +239,7 @@ pub struct Board {
 impl Board {
     /// Start the view, or `None` (the command prints its plain lines) when the mode is not `tty`,
     /// stderr is not a terminal, or this process already runs threads.
-    pub fn start(title: &str) -> Option<Board> {
+    pub fn start(title: &str, project: &str) -> Option<Board> {
         if kern_common::progress_mode_resolved() != ProgressMode::Tty {
             return None;
         }
@@ -306,7 +306,7 @@ impl Board {
                 libc::close(ev_wr);
                 libc::close(ack_rd);
             }
-            draw_loop(title, err_rd, ev_rd, ack_wr, saved_err);
+            draw_loop(title, project, err_rd, ev_rd, ack_wr, saved_err);
             // SAFETY: never return into the parent's logic.
             unsafe { libc::_exit(0) };
         }
@@ -365,7 +365,7 @@ struct Row {
 
 fn state_class(state: &str) -> u8 {
     match state {
-        "running" | "healthy" | "completed" | "built" | "pulled" => 0,
+        "started" | "running" | "healthy" | "completed" | "built" | "pulled" => 0,
         "failed" | "exited" | "skipped" => 2,
         _ => 1,
     }
@@ -409,6 +409,7 @@ fn dur(d: std::time::Duration) -> String {
 /// The view's lines: a header that counts, then one row per service.
 fn board_lines(
     title: &str,
+    project: &str,
     rows: &[Row],
     started: std::time::Instant,
     tick: usize,
@@ -431,12 +432,22 @@ fn board_lines(
         head.push_str(&format!(" · {bad} failed"));
     }
     head.push_str(&format!(" · {}", dur(started.elapsed())));
+    // A ROW SAYS THE SERVICE, not the project every row shares: `<project>-` comes off for display
+    // (the events keep the box name, which is unique).
+    let prefix = format!("{project}-");
+    let shown = |n: &str| -> String {
+        n.strip_prefix(prefix.as_str())
+            .filter(|rest| !project.is_empty() && !rest.is_empty())
+            .unwrap_or(n)
+            .chars()
+            .take(32)
+            .collect()
+    };
     let w = rows
         .iter()
-        .map(|r| r.name.chars().count())
+        .map(|r| shown(&r.name).chars().count())
         .max()
-        .unwrap_or(4)
-        .min(32);
+        .unwrap_or(4);
     let mut out = vec![fit(&head, cols)];
     for r in rows {
         let icon = match state_class(&r.state) {
@@ -451,7 +462,7 @@ fn board_lines(
         };
         let line = format!(
             "  {icon} {:<w$} {:<9}{when}  {}",
-            r.name.chars().take(32).collect::<String>(),
+            shown(&r.name),
             r.state,
             r.detail
         );
@@ -463,7 +474,7 @@ fn board_lines(
 /// The drawing process: read lines from fd 2's pipe and row updates from the event pipe, redraw
 /// four times a second, draw a last time when the event pipe closes, acknowledge, then pass the
 /// rest through until no one writes.
-fn draw_loop(title: &str, err_rd: i32, ev_rd: i32, ack_wr: i32, out: i32) {
+fn draw_loop(title: &str, project: &str, err_rd: i32, ev_rd: i32, ack_wr: i32, out: i32) {
     let started = std::time::Instant::now();
     let mut rows: Vec<Row> = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
@@ -480,7 +491,7 @@ fn draw_loop(title: &str, err_rd: i32, ev_rd: i32, ack_wr: i32, out: i32) {
             frame.extend_from_slice(format!("\x1b[{}F\x1b[J", *drawn).as_bytes());
         }
         frame.extend_from_slice(above);
-        let lines = board_lines(title, rows, started, tick, cols);
+        let lines = board_lines(title, project, rows, started, tick, cols);
         for l in &lines {
             frame.extend_from_slice(l.as_bytes());
             frame.push(b'\n');
@@ -661,13 +672,35 @@ mod tests {
                 since: std::time::Instant::now(),
             },
         ];
-        let wide = board_lines("kern compose up", &rows, std::time::Instant::now(), 0, 120);
+        let wide = board_lines(
+            "kern compose up",
+            "",
+            &rows,
+            std::time::Instant::now(),
+            0,
+            120,
+        );
         assert!(
             wide[0].starts_with("kern compose up · 1/3 ready · 1 in progress · 1 failed"),
             "{}",
             wide[0]
         );
-        let lines = board_lines("kern compose up", &rows, std::time::Instant::now(), 0, 40);
+        let lines = board_lines(
+            "kern compose up",
+            "",
+            &rows,
+            std::time::Instant::now(),
+            0,
+            40,
+        );
+        let named = vec![Row {
+            name: "proj-web-1".into(),
+            state: "started".into(),
+            detail: String::new(),
+            since: std::time::Instant::now(),
+        }];
+        let shown = board_lines("t", "proj", &named, std::time::Instant::now(), 0, 80);
+        assert!(shown[1].contains("✔ web-1 "), "{}", shown[1]);
         assert_eq!(lines.len(), 4);
 
         assert!(

@@ -2256,7 +2256,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             "\nkern: interrupted: what this `up` created may be left behind; `kern compose {file} \
              ps` lists it, `kern compose {file} down` removes it\n"
         ));
-        crate::progress::Board::start("kern compose up")
+        crate::progress::Board::start("kern compose up", &pod)
     } else {
         None
     };
@@ -4417,7 +4417,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         crate::progress::service(&n, "failed", &e.to_string());
                         failed.push((n, e));
                     }
-                    Ok(()) if !gate_active => crate::progress::service(&n, "running", ""),
+                    Ok(()) if !gate_active => crate::progress::service(&n, "started", ""),
                     Ok(()) => crate::progress::service(&n, "created", ""),
                 }
             }
@@ -4785,7 +4785,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                     crate::progress::service(&b.name, "waiting", &format!("for {deps}"));
                 }
                 wait_for_conditions(b, &pod, &up_token, wait_timeout, no_deps, &will_start)?;
-                crate::progress::service(&b.name, "running", "");
+                crate::progress::service(&b.name, "started", "");
                 if !gate_release(fd) {
                     return Err(Error::Compose(format!(
                         "service '{}': the box was prepared but could not be released (it is no \
