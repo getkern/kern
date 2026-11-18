@@ -5,9 +5,9 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-**Sandbox result stability.** In kern-sandbox (Python, Node and `kern-mcp`), the `fault.type` and
+**Sandbox result stability.** In kern sandbox (Python, Node and `kern-mcp`), the `fault.type` and
 `exit_code` an outcome reports change only to correct one that was reported wrong, and such a change
-leads that release's entry, naming the outcomes it moves. kern-sandbox 0.2.45 is the example:
+leads that release's entry, naming the outcomes it moves. kern sandbox 0.2.45 is the example:
 `os._exit(N)` in a prewarmed box or a kernel stopped reading as `killed`, and a kernel timeout went from
 -1 to 137. New `fault.type` values are additive, so code must treat a value it does not know as a fault
 of the sandbox. A test fails the build when the set of values changes in one binding and not the other.
@@ -28,7 +28,7 @@ both halves of that rule, so removing one from the parser fails the build by nam
 **`COPY` into a directory a box user owns builds** (`RUN adduser -D app` then `COPY f /home/app/`), with
 or without `--chown`.
 
-## kern-sandbox 0.2.52 - 2026-11-18
+## kern sandbox 0.2.52 - 2026-11-18
 
 **It carries the kern v0.51.2 binary.** Both bindings move together; nothing else in them changed.
 
@@ -85,7 +85,7 @@ as a box gets them; SELinux counts only when selinuxfs is mounted; `sshfs` is op
 
 **`FROM <stage>` no longer warns about an unpinned tag.**
 
-## kern-sandbox 0.2.51 - 2026-11-18
+## kern sandbox 0.2.51 - 2026-11-18
 
 **It carries the kern v0.51.1 binary.** Both bindings move together; nothing else in them changed.
 
@@ -774,11 +774,11 @@ directory.** Named volumes, build records, kept boxes and the image cache were w
 unset as the XDG spec says, refused `~/.local/share/kern` as a mount source and not that directory.
 An empty or relative value now means unset everywhere, through one resolver.
 
-## kern-sandbox 0.2.50 - 2026-11-17
+## kern sandbox 0.2.50 - 2026-11-17
 
 **It carries the kern v0.51.0 binary.** Both bindings move together.
 
-**kern-sandbox refuses a mount source that holds a refused path or a credential directory.**
+**kern sandbox refuses a mount source that holds a refused path or a credential directory.**
 `mounts={"/home": ...}` was accepted while `~` was refused, and the box read `/home/<you>/.ssh` and
 `.bash_history` (reported by an external test). A source is now refused when it contains your home,
 a host credential path, a refused host path (`/run` holds the docker socket) or kern's own state,
@@ -792,7 +792,7 @@ answers or is unmounted, which no code above the kernel can change. Python and N
 `kernel()` cell calling `os._exit(N)` on a host without cgroup delegation read as `killed` with exit
 -1 in Python (Node already said exit N); both now report the cell's own exit.
 
-**kern-sandbox refuses the host's credential files as mount sources, not only `/etc` whole.** A
+**kern sandbox refuses the host's credential files as mount sources, not only `/etc` whole.** A
 mount of `/etc/shadow` (or a link to it) was accepted while `/etc` itself was refused, and a box
 started by root printed the password hashes (found by an external test). Refused now in both
 bindings, with everything below them and through symlinks: `/etc/shadow`, `/etc/gshadow` and their
@@ -866,7 +866,7 @@ your machine" while `workspace=` is a host directory the box writes; an allowlis
 despite `KERN_SECCOMP=denylist`; credentials "never in it" three lines above "only what you pass
 with `env=`". `scripts/retired-claims.py` refuses retired strings in user-facing text, each dated.
 
-## kern-sandbox 0.2.49 - 2026-10-17
+## kern sandbox 0.2.49 - 2026-10-17
 
 **It carries the kern v0.33.0 binary.** Both bindings move together.
 
@@ -901,7 +901,7 @@ restored - it is not ours (a `user=` session's box account owns it)", wrong in s
 `/proc` hint; `write_file` too. Both now report file, mode, owner and whether the owner is this
 process; kern keeps a mode-0 file as written, since mode can be data. A closed DIRECTORY
 keeps `snapshot`'s wording, which lists causes, now shared by every surface.
-## kern-sandbox 0.2.48 - 2026-10-13
+## kern sandbox 0.2.48 - 2026-10-13
 
 **Carries kern v0.32.0** (`--egress-allow` `Host:` check, below); binding code unchanged since
 0.2.47. Package descriptions no longer say the workspace cannot be bounded (two sentences, false
@@ -914,7 +914,7 @@ plain-HTTP head whose `Host:` is not the vetted request-target, or is doubled, g
 escape). The check follows the allowlist, so refusals cannot probe it. Over HTTPS (header inside
 TLS) a shared CDN still allows it (`docs/EGRESS.md`). Binary otherwise unchanged since v0.31.0.
 
-## kern-sandbox 0.2.47 - 2026-10-13
+## kern sandbox 0.2.47 - 2026-10-13
 
 **A call that filled the workspace used to succeed.** `workspace_max_bytes` was checked between
 calls only (one call wrote 8,115 MB in ten seconds past a 50 MiB cap; the NEXT call was refused).
@@ -951,14 +951,14 @@ UNCAPPED" and running; a command that worked yesterday may stop. The verb govern
 - `kern images` says whether "no images cached yet" is the whole truth.
 - A box no longer inherits the supplementary groups of whoever typed `kern box`, nor keeps kern's
   when refusing the image group list (one gid outside the uid range).
-- kern-sandbox: `user=` (Node `user`, `kern-mcp` `KERN_MCP_USER`) runs every box, `persist`
+- kern sandbox: `user=` (Node `user`, `kern-mcp` `KERN_MCP_USER`) runs every box, `persist`
   included, as an image account; both bindings reach every path by descriptor in listings
   (`result.files`, `list_files`), `snapshot`, `restore` and `write_file`'s new directories.
 - Compose stacks on an `external:` network no longer write outside the other project's box.
 
 36 more entries: `git log v0.30.2..v0.31.0`.
 
-## kern-sandbox 0.2.45 - 2026-10-05
+## kern sandbox 0.2.45 - 2026-10-05
 
 **Both packages carry kern v0.30.2**: a `persist=True` call `kern exec` refused (below) is
 `startup_failed` with kern's message, not a faultless exit 126 (126 with an older kern).
@@ -993,7 +993,7 @@ writes nothing, like `kern box` for a never-started box.
   `history` entry buildah requires).
 - `kern box --help` documents `--user` taking an image `/etc/passwd` name (always worked).
 
-## kern-sandbox 0.2.44 - 2026-10-04
+## kern sandbox 0.2.44 - 2026-10-04
 
 **Both packages carry kern v0.30.1**: a resident sandbox (`persist=True`, Node `persist: true`)
 reports an OOM as `oom` (was `killed`) and a cell's own `exit(137)` as an exit, not an external
@@ -1010,7 +1010,7 @@ failed on `python:3.12-slim` and derivatives (`/var/cache/apt/archives/partial` 
 subordinate uid; Alpine unaffected). `kern gc` also removes copies `--pull always` retired there.
 
 **`kern exec` tells an SDK how the command ended** (`fault.type == "oom"`, a cell's own
-`exit(137)` as an exit; see kern-sandbox 0.2.44).
+`exit(137)` as an exit; see kern sandbox 0.2.44).
 
 **A `-v` under `/sys/devices` reaches the box** (kern's CPU topology covered it).
 
@@ -1023,7 +1023,7 @@ overlay unavailable").
 **Three messages fixed:** compose `gpus:` is Docker's GPU request, not a typo for `cpus:`;
 `kern pull` names `kern box … --pull always` to refresh; a cached-image read failure no longer says
 to check the name.
-## kern-sandbox 0.2.43 - 2026-10-04
+## kern sandbox 0.2.43 - 2026-10-04
 
 **`npm install kern-sandbox` brings kern; both packages carry kern v0.30.0**, realigning Python and
 Node. On Linux x64/arm64 npm ships kern's static release binary (`install.sh`'s file), used after
@@ -1080,14 +1080,14 @@ kerns with differing versions.
 session** (later stderr writes became terminating errors).
 
 SDK/MCP changes (named resident sandboxes, workspace cap, MCP answering every readable id) ship in
-kern-sandbox, Linux wheels carrying this kern.
+kern sandbox, Linux wheels carrying this kern.
 
-## kern-sandbox 0.2.42 (Python) - 2026-09-29
+## kern sandbox 0.2.42 (Python) - 2026-09-29
 
 **Linux wheels carry kern v0.25.1**: a stalled image download ends after 30 s and retries, not ten
 minutes.
 
-## kern-sandbox 0.2.41 (Python) - 2026-09-29
+## kern sandbox 0.2.41 (Python) - 2026-09-29
 
 **`pip install kern-sandbox` is the whole Linux install.** `x86_64`/`aarch64` wheels carry kern's
 static release binary v0.25.0 (`install.sh`'s file, checked against its published sha256) as `kern`
@@ -1097,7 +1097,7 @@ beside `python`, like ruff and uv; the venv gets `kern doctor`.
 
 **On a Mac, error and pages point to the Linux VM**, where `pip install` brings kern.
 
-## kern-sandbox 0.2.40 - 2026-09-26
+## kern sandbox 0.2.40 - 2026-09-26
 
 **The page names its clients:** Claude Code, Cursor, Claude Desktop, LM Studio, not "MCP clients".
 
@@ -1126,7 +1126,7 @@ not the column summed; before, only per-image sizes (sum by hand or `du`).
 
 ## v0.25.0 - 2026-09-24
 
-SDK halves (incl. the bytecode cache) shipped in kern-sandbox 0.2.36 through 0.2.39.
+SDK halves (incl. the bytecode cache) shipped in kern sandbox 0.2.36 through 0.2.39.
 
 **The cache keyed on the tag NAME, which a moved tag keeps.** Now: the completion sentinel's mtime
 and length (rewritten on re-pull), plus a built image's layer manifest.
@@ -1167,7 +1167,7 @@ non-empty lines: 141 were `OPTIONS for box` and `OPTIONS for run`, byte for byte
 **Two help gates counted lines**, reading "a per-verb page as long as `kern --help`" as "the whole
 page": once `kern --help` got shorter than `box --help`, a correct binary would fail.
 
-## kern-sandbox 0.2.35 - 2026-09-23
+## kern sandbox 0.2.35 - 2026-09-23
 
 **One fix, and the page.** Both SDKs drop kern's diagnostic lines before cutting. Pages since
 0.2.34 add: the price of "one container per call" (a hundred calls, 1.4 s, nothing left behind),
@@ -1176,18 +1176,18 @@ fails), a seven-call demo, a six-row fault table, and that it needs `--privilege
 container. **The description leads with the slogan**, not "one per call", still conceding a
 kernel boundary is not a microVM.
 
-## kern-sandbox 0.2.34 - 2026-09-22
+## kern sandbox 0.2.34 - 2026-09-22
 
 **Documentation only, published like 0.2.33: a registry page is an imprint of when it was
 published.** Pages add the slogan, an animated demo of the three verdicts, a table against a venv,
 docker per call, bubblewrap, a microVM and cloud services, and limitations led by what this is not
 a boundary against. **Description: 198 characters, was 343.**
 
-## kern-sandbox 0.2.33 - 2026-09-22
+## kern sandbox 0.2.33 - 2026-09-22
 
 **Documentation only: no code changed since 0.2.32.** Republishing alone moves the imprint.
 
-## kern-sandbox 0.2.32 - 2026-09-21
+## kern sandbox 0.2.32 - 2026-09-21
 
 Bindings release on their own clock: package version, not runtime tag.
 
@@ -1216,7 +1216,7 @@ project's name). Six of the twelve commits fix defects found in it; one was live
 
 ### The SDK
 
-**kern-sandbox 0.2.31.** Constructor guards, once only for `setup` and `cap_drop`, now cover
+**kern sandbox 0.2.31.** Constructor guards, once only for `setup` and `cap_drop`, now cover
 `mounts` and `env`, naming the argument and wanted shape. Before: an `AttributeError` in Python; in
 Node an index key at the mount validator (`Object.entries` does not throw on an array), reporting a
 source `"0"` the caller never wrote. Exposed by the mount guard refusing AWS and Azure, accepting
