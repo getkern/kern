@@ -472,6 +472,12 @@ pub enum Command {
     RelayHolder {
         dir: String,
     },
+    /// Hidden: inotify on a sandbox workspace directory for an SDK (`crate::dirwatch`).
+    WatchDir {
+        root: String,
+        rel: String,
+        recursive: bool,
+    },
     /// Hidden: the re-exec'd egress filtering proxy (spawned by `--egress-allow`, not user-facing).
     EgressProxy {
         sock: String,
@@ -1244,6 +1250,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // Hidden: the relay holder (spawned by `compose up --no-pod`).
         Some("__relay-holder") => Command::RelayHolder {
             dir: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
+        },
+        // Hidden: `__watch-dir <root> <rel> <0|1>` (spawned by the Node SDK's `watchDir`).
+        Some("__watch-dir") => Command::WatchDir {
+            root: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
+            rel: rest.get(2).map(|s| s.to_string()).unwrap_or_default(),
+            recursive: rest.get(3).is_some_and(|s| *s == "1"),
         },
         Some("__build-ssh-proxy") => Command::BuildSshProxy {
             listen: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
@@ -6644,6 +6656,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         // A hidden verb whose exit status IS its answer, and which has already cleaned up after itself.
         Command::PastaProbe => std::process::exit(crate::pod::pasta_probe_verb()),
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
+        Command::WatchDir {
+            root,
+            rel,
+            recursive,
+        } => crate::dirwatch::run(&root, &rel, recursive),
         Command::EgressProxy { sock, allow, deny } => {
             crate::egress::proxy_reexec(&sock, &allow, &deny)
         }
