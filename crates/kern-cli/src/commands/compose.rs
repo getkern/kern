@@ -1318,9 +1318,11 @@ fn ensure_images_for_wiring(
             continue;
         }
         done.push(img);
+        crate::progress::service(&b.name, "pulling", img);
         if let Err(e) =
             crate::commands::resolve_image_depth(img, 0, crate::commands::PullPolicy::Missing)
         {
+            crate::progress::service(&b.name, "failed", "image could not be pulled");
             failed.push((
                 img.to_string(),
                 vec![b.service_name().to_string()],
@@ -2245,6 +2247,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // What could not be fetched is KEPT, not acted on here: `up` refuses on it after the create
     // phase below, so a file the create phase refuses is refused for its own reason first (the
     // order Compose has: the file, then the images, then the containers).
+    // THE LIVE VIEW of an `up` on a terminal (`--progress tty`, or `auto` on one), started before
+    // the pulls and builds while this process has no thread yet, and dropped before the result
+    // lines, or by any early return.
+    let mut up_board = if action == ComposeAction::Up {
+        // AN INTERRUPTED `up` SAYS WHAT MAY BE LEFT, and how to see it and take it down.
+        crate::progress::say_on_interrupt(format!(
+            "\nkern: interrupted: what this `up` created may be left behind; `kern compose {file} \
+             ps` lists it, `kern compose {file} down` removes it\n"
+        ));
+        crate::progress::Board::start("kern compose up")
+    } else {
+        None
+    };
     let unpulled = if matches!(
         action,
         ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart | ComposeAction::Run
@@ -4057,6 +4072,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                     .chain(&b.depends_completed)
                     .any(|d| failed.iter().any(|(f, _)| f == d) || not_started.contains(d));
                 if blocked {
+                    crate::progress::service(n, "skipped", "a dependency failed to start");
                     not_started.push((*n).clone());
                 }
                 !blocked
@@ -4119,6 +4135,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                 // is performed in the release loop, in dependency order, which is where
                                 // "start only after the dependency is healthy" actually means something.
                                 if !gate_active {
+                                    let deps = crate::progress::deps_of(b);
+                                    if !deps.is_empty() {
+                                        crate::progress::service(
+                                            &b.name,
+                                            "waiting",
+                                            &format!("for {deps}"),
+                                        );
+                                    }
                                     wait_for_conditions(
                                         b,
                                         pod,
@@ -4144,6 +4168,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                     "→ [{n}/{total}] starting '{}'  {src}{dep}",
                                     b.name
                                 );
+                                crate::progress::service(&b.name, "starting", src);
                                 let mut cmd = std::process::Command::new(self_exe);
                                 // Anchor the box's relative paths (env_file/-v/rootfs) to the project dir.
                                 cmd.current_dir(project_dir);
@@ -4387,8 +4412,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                     .collect()
             });
             for (n, r) in results {
-                if let Err(e) = r {
-                    failed.push((n, e));
+                match r {
+                    Err(e) => {
+                        crate::progress::service(&n, "failed", &e.to_string());
+                        failed.push((n, e));
+                    }
+                    Ok(()) if !gate_active => crate::progress::service(&n, "running", ""),
+                    Ok(()) => crate::progress::service(&n, "created", ""),
                 }
             }
         }
@@ -4750,7 +4780,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 // reads EOF and refuses to exec. The stack does not come up half-released.
                 // Every NAT was attached above, before this loop, and the ordering argument that
                 // used to live here is made there instead.
+                let deps = crate::progress::deps_of(b);
+                if !deps.is_empty() {
+                    crate::progress::service(&b.name, "waiting", &format!("for {deps}"));
+                }
                 wait_for_conditions(b, &pod, &up_token, wait_timeout, no_deps, &will_start)?;
+                crate::progress::service(&b.name, "running", "");
                 if !gate_release(fd) {
                     return Err(Error::Compose(format!(
                         "service '{}': the box was prepared but could not be released (it is no \
@@ -4800,6 +4835,18 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // the stack running for the next CI job to find "up to date". MEASURED with a two-service file
     // (`redis` + a `redis-cli ping` test). [`watch_and_abort`] already reads who ended first, tears
     // the stack down and returns that service's own status, which is Docker's contract.
+    for d in &dead {
+        // `dead` names services as the reader knows them; the rows are keyed by box name.
+        let row = boxes
+            .iter()
+            .find(|b| b.name == *d || short_service_name(&boxes, &b.name, &pod) == *d)
+            .map_or(d.as_str(), |b| b.name.as_str());
+        crate::progress::service(
+            row,
+            "exited",
+            "within the bring-up: `kern compose logs` says why",
+        );
+    }
     if !dead.is_empty() && !abort_on_exit {
         // WHY IT DIED, WHEN KERN CAN SEE WHY. A service that binds a port another service in the same
         // network namespace already holds fails with `Address already in use` in its OWN logs, and
@@ -4833,6 +4880,34 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             return Err(Error::Compose(msg));
         }
         eprintln!("kern: warning: compose: {msg}");
+        // WHY, ON THE SPOT: the last lines each one wrote, so the reader does not need the next
+        // command to learn what the service said before it stopped.
+        for d in &dead {
+            let Some(b) = boxes
+                .iter()
+                .find(|b| b.name == *d || short_service_name(&boxes, &b.name, &pod) == *d)
+            else {
+                continue;
+            };
+            let tail = crate::commands::boxlog::tail_lines_of(&b.name, 10);
+            if kern_common::progress_mode() == kern_common::ProgressMode::Json {
+                let lines: Vec<String> = tail.iter().map(|l| kern_common::json_str(l)).collect();
+                kern_common::progress_event(
+                    "service_log",
+                    &format!(
+                        "\"service\":{},\"lines\":[{}]",
+                        kern_common::json_str(&b.name),
+                        lines.join(",")
+                    ),
+                );
+            } else if !tail.is_empty() {
+                eprintln!("  {d}, its last {} line(s):", tail.len());
+                for l in &tail {
+                    eprintln!("    {l}");
+                }
+                eprintln!("  the rest: kern compose {file} logs {d}");
+            }
+        }
     }
     // THE BRING-UP FAILED FOR SOME SERVICES, AND THE REST RUNS: said as Docker says it, with exit 1.
     if let Some((first, e)) = failed.first() {
@@ -4857,47 +4932,55 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         }
         return Err(Error::Compose(msg));
     }
-    println!("compose up: {total} box(es) started");
-    // THE POD'S SENTENCE WHEN IT IS NEWS: the pod was made by this `up`, or a service did not get its
-    // way out. On an `up` that only started a service in a pod already there it repeated, word for
-    // word, what the first `up` said (reported as noise on a real stack).
-    if use_pod && (pod_created_now || nat_failed > 0) {
-        // SAY WHETHER THERE IS EGRESS, not only whether services can find each other. `pod create`
-        // distinguishes five outbound states and prints the one you got; this line reported name
-        // resolution alone, so a stack with no internet and a stack with internet printed the SAME
-        // sentence. On a REUSED pod there is no `create` line above this one, so this was the only
-        // thing the operator saw. `DOCKER-COMPAT.md` promised "the bring-up line says which of the
-        // two you got" and for compose it did not.
-        // The SENTENCE comes from `pod`, not a flag decided here. This read `has_outbound()` and
-        // printed "install `passt`/`pasta`" on every false, so a pod whose pasta was installed and
-        // refused to start told its owner to install it (#6), two lines under kern's own correct
-        // "pasta IS installed but did not start". Five states, one bool, wrong branch.
-        // A BRIDGE MEMBER IS NOT IN THE POD'S NAMESPACE, so the pod's outbound is not its outbound.
-        // `network_summary` answers about the namespace pasta runs in - the holder's - and printing
-        // it here told the operator "services reach each other by name + outbound to the internet
-        // (pasta)" about a stack whose members have NO default route at all. MEASURED inside a
-        // bridge member of a 56-service stack: `ip route` shows the on-link `10.89.0.0/24` and
-        // nothing else, and there is no `/etc/resolv.conf` - pgbouncer died in libevent's
-        // `evdns_base_new` because of it. Saying what is true is the least this can do until a
-        // member gets a route out.
-        let net = if want_bridge {
-            let egress = if nat_tried == 0 {
-                "and has no NAT: no service in it is given one (internal networks only)"
-            } else if nat_failed == 0 {
-                "and reaches the internet through its own NAT (pasta)"
-            } else if nat_failed >= nat_tried {
-                "and has NO route to the internet: no service got its NAT (the warnings above say why)"
-            } else {
-                "and reaches the internet through its own NAT (pasta), except the services named above"
-            };
-            format!(
+    drop(up_board.take());
+    if kern_common::progress_mode() == kern_common::ProgressMode::Json {
+        kern_common::progress_event(
+            "up_done",
+            &format!("\"ok\":true,\"started\":{total},\"exited\":{}", dead.len()),
+        );
+    } else {
+        println!("compose up: {total} box(es) started");
+        // THE POD'S SENTENCE WHEN IT IS NEWS: the pod was made by this `up`, or a service did not get its
+        // way out. On an `up` that only started a service in a pod already there it repeated, word for
+        // word, what the first `up` said (reported as noise on a real stack).
+        if use_pod && (pod_created_now || nat_failed > 0) {
+            // SAY WHETHER THERE IS EGRESS, not only whether services can find each other. `pod create`
+            // distinguishes five outbound states and prints the one you got; this line reported name
+            // resolution alone, so a stack with no internet and a stack with internet printed the SAME
+            // sentence. On a REUSED pod there is no `create` line above this one, so this was the only
+            // thing the operator saw. `DOCKER-COMPAT.md` promised "the bring-up line says which of the
+            // two you got" and for compose it did not.
+            // The SENTENCE comes from `pod`, not a flag decided here. This read `has_outbound()` and
+            // printed "install `passt`/`pasta`" on every false, so a pod whose pasta was installed and
+            // refused to start told its owner to install it (#6), two lines under kern's own correct
+            // "pasta IS installed but did not start". Five states, one bool, wrong branch.
+            // A BRIDGE MEMBER IS NOT IN THE POD'S NAMESPACE, so the pod's outbound is not its outbound.
+            // `network_summary` answers about the namespace pasta runs in - the holder's - and printing
+            // it here told the operator "services reach each other by name + outbound to the internet
+            // (pasta)" about a stack whose members have NO default route at all. MEASURED inside a
+            // bridge member of a 56-service stack: `ip route` shows the on-link `10.89.0.0/24` and
+            // nothing else, and there is no `/etc/resolv.conf` - pgbouncer died in libevent's
+            // `evdns_base_new` because of it. Saying what is true is the least this can do until a
+            // member gets a route out.
+            let net = if want_bridge {
+                let egress = if nat_tried == 0 {
+                    "and has no NAT: no service in it is given one (internal networks only)"
+                } else if nat_failed == 0 {
+                    "and reaches the internet through its own NAT (pasta)"
+                } else if nat_failed >= nat_tried {
+                    "and has NO route to the internet: no service got its NAT (the warnings above say why)"
+                } else {
+                    "and reaches the internet through its own NAT (pasta), except the services named above"
+                };
+                format!(
                 "each service has its own namespace and its own 127.0.0.1, meets its peers on the \
                  pod's bridge, {egress}"
             )
-        } else {
-            crate::pod::network_summary(&pod)
-        };
-        println!("  pod '{pod}': {net}. tear down with `kern compose {file} down`.");
+            } else {
+                crate::pod::network_summary(&pod)
+            };
+            println!("  pod '{pod}': {net}. tear down with `kern compose {file} down`.");
+        }
     }
     // ATTACHED `up`. Everything above is unchanged; this is the part `docker compose up` does next.
     // `--wait` BEFORE the attach decision: both spellings of `up` mean the same thing by it, and a

@@ -466,7 +466,8 @@ static PROGRESS_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8:
 /// The mode in force: what [`set_progress_mode`] set, else `KERN_PROGRESS`, else `auto`. A value
 /// `KERN_PROGRESS` does not name is `auto`: a narrator setting must never stop a command.
 pub fn progress_mode() -> ProgressMode {
-    if let Some(m) = ProgressMode::of_code(PROGRESS_MODE.load(std::sync::atomic::Ordering::Acquire)) {
+    if let Some(m) = ProgressMode::of_code(PROGRESS_MODE.load(std::sync::atomic::Ordering::Acquire))
+    {
         return m;
     }
     let m = std::env::var("KERN_PROGRESS")
@@ -505,6 +506,15 @@ pub fn progress_mode_resolved() -> ProgressMode {
 /// Write one progress EVENT as a JSON line on stdout, in `json` mode only (`body` is the object's
 /// fields after `"type"`, already JSON, e.g. `"step":1`). Every event carries `"schema":1`, its type
 /// and the time in ms; one `write` per line, so events from threads never interleave.
+/// Where [`progress_event`] writes: the process's ORIGINAL stdout, which a command that moves its
+/// narration onto stderr (compose's `narration_to_stderr`) records here; `-1` means fd 1.
+static PROGRESS_EVENT_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Record the descriptor events go to (the original stdout), see [`PROGRESS_EVENT_FD`].
+pub fn set_progress_event_fd(fd: i32) {
+    PROGRESS_EVENT_FD.store(fd, std::sync::atomic::Ordering::Release);
+}
+
 pub fn progress_event(kind: &str, body: &str) {
     use std::io::Write;
     if progress_mode() != ProgressMode::Json {
@@ -518,6 +528,15 @@ pub fn progress_event(kind: &str, body: &str) {
         "{{\"schema\":1,\"type\":{},\"t\":{ms}{sep}{body}}}\n",
         json_str(kind)
     );
+    let fd = PROGRESS_EVENT_FD.load(std::sync::atomic::Ordering::Acquire);
+    if fd >= 0 {
+        use std::os::fd::FromRawFd;
+        // SAFETY: `fd` is the descriptor `set_progress_event_fd` was given, owned elsewhere for the
+        // life of the process; `ManuallyDrop` keeps this temporary `File` from closing it.
+        let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        let _ = f.write_all(line.as_bytes());
+        return;
+    }
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(line.as_bytes());
     let _ = out.flush();

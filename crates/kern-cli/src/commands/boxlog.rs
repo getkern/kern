@@ -1245,6 +1245,27 @@ fn last_lines(bytes: &[u8], n: usize) -> &[u8] {
     bytes
 }
 
+/// The last `n` lines of the newest run log of box `name`, made safe for a terminal (control
+/// characters dropped); empty when it has none. For the summary `compose up` prints for a service
+/// that died during the bring-up.
+pub(crate) fn tail_lines_of(name: &str, n: usize) -> Vec<String> {
+    let Some(newest) = logs_oldest_first(name)
+        .ok()
+        .and_then(|v| v.into_iter().last())
+    else {
+        return Vec::new();
+    };
+    // The end of the file is enough for ten lines; reading a whole multi-megabyte log is not needed.
+    let Ok(bytes) = std::fs::read(&newest) else {
+        return Vec::new();
+    };
+    let tail = last_lines(&bytes, n);
+    String::from_utf8_lossy(tail)
+        .lines()
+        .map(crate::ui::scrub)
+        .collect()
+}
+
 /// Is `file` one of `name`'s run logs, `<name>-<digits>.log`? Exactly that shape, so box `foo` never
 /// matches `foo-bar`'s logs (box names may contain `-`).
 fn is_run_log_of(file: &str, name: &str) -> bool {

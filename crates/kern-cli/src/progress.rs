@@ -96,6 +96,107 @@ pub fn service(name: &str, state: &str, detail: &str) {
     unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
 }
 
+/// What a compose service waits for, as its row says it: every dependency, started, healthy or
+/// completed.
+pub fn deps_of(b: &crate::compose::ComposeBox) -> String {
+    let mut all: Vec<String> = b.depends_on.clone();
+    for d in b.depends_healthy.iter().chain(&b.depends_completed) {
+        if !all.contains(d) {
+            all.push(d.clone());
+        }
+    }
+    all.join(", ")
+}
+
+/// The sentence an interrupted command leaves, prepared before the signal (see [`say_on_interrupt`]).
+static INTERRUPT_NOTE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+extern "C" fn on_interrupt(sig: libc::c_int) {
+    if let Some(note) = INTERRUPT_NOTE.get() {
+        // SAFETY: `write` on a static buffer is async-signal-safe.
+        unsafe { libc::write(2, note.as_ptr().cast(), note.len()) };
+    }
+    // SAFETY: back to the default action and raised again, so the command ends as it would have.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// On Ctrl-C (or SIGTERM) from here on, print `note` before the command ends as it would have. The
+/// note is built now: a signal handler may only `write` what already exists. Once per process.
+pub fn say_on_interrupt(note: String) {
+    if INTERRUPT_NOTE.set(note.into_bytes()).is_err() {
+        return;
+    }
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: installing a handler that only calls async-signal-safe functions.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_interrupt as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Is a live view drawing in this process?
+pub fn board_active() -> bool {
+    BOARD_EVENTS.load(std::sync::atomic::Ordering::Acquire) >= 0
+}
+
+/// Read a child `kern build`'s `--progress json` events from its stdout until EOF and turn each into
+/// a row update of `service`; a line that is not an event is passed to stderr as it came.
+pub fn follow_build_events(service_name: &str, out: impl std::io::Read) {
+    use std::io::{BufRead, Write};
+    let field = |line: &str, key: &str| -> Option<String> {
+        let start = line.find(&format!("\"{key}\":"))? + key.len() + 3;
+        let rest = line.get(start..)?;
+        if let Some(r) = rest.strip_prefix('"') {
+            let end = r.find('"')?;
+            Some(r.get(..end)?.replace("\\\"", "\""))
+        } else {
+            let end = rest.find([',', '}']).unwrap_or(rest.len());
+            Some(rest.get(..end)?.to_string())
+        }
+    };
+    for line in std::io::BufReader::new(out).lines() {
+        let Ok(line) = line else { break };
+        if !line.starts_with("{\"schema\":1,") {
+            let _ = writeln!(std::io::stderr(), "{line}");
+            continue;
+        }
+        match field(&line, "type").as_deref() {
+            Some("build_step") => {
+                let detail = format!(
+                    "step {}/{} {}",
+                    field(&line, "step").unwrap_or_default(),
+                    field(&line, "total").unwrap_or_default(),
+                    field(&line, "instruction").unwrap_or_default()
+                );
+                service(service_name, "building", &detail);
+            }
+            Some("heartbeat") => {
+                let ms: u64 = field(&line, "elapsed_ms")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                service(
+                    service_name,
+                    "building",
+                    &format!(
+                        "{} ({}m{:02}s, {})",
+                        field(&line, "what").unwrap_or_default(),
+                        ms / 60_000,
+                        (ms / 1000) % 60,
+                        field(&line, "usage").unwrap_or_default()
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Is this process running one thread? The view is a forked process, and a fork of a threaded
 /// process is not one this code makes.
 fn single_threaded() -> bool {

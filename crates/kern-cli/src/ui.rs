@@ -453,6 +453,8 @@ pub fn narration_to_stderr() {
         return;
     }
     DATA_FD.store(saved, std::sync::atomic::Ordering::Release);
+    // `--progress json` events are data too: they go where the data goes.
+    kern_common::set_progress_event_fd(saved);
 }
 
 /// The stdout for DATA: the original one after [`narration_to_stderr`], fd 1 otherwise. What an

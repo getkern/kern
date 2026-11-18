@@ -5950,6 +5950,7 @@ pub(crate) fn resolve_builds_for(
             .unwrap_or_else(|| synthesized_build_tag(&b.name));
 
         kern_common::progress!("→ building '{}' from {}", b.name, bd.context);
+        crate::progress::service(&b.name, "building", &bd.context);
         let mut cmd = std::process::Command::new(self_exe);
         cmd.env("KERN_BUILD_FOR_COMPOSE", "1");
         cmd.arg("build").arg("-t").arg(&tag);
@@ -6064,10 +6065,33 @@ pub(crate) fn resolve_builds_for(
                 });
             }
         }
+        // A LIVE VIEW OR `--progress json` READS THE BUILD'S STEPS: the child reports them as events
+        // on its stdout, and each becomes this service's row ("step 3/7 RUN npm ci"); its RUN output
+        // goes to stderr, which the view prints above itself.
+        let follow_steps = crate::progress::board_active()
+            || kern_common::progress_mode() == kern_common::ProgressMode::Json;
+        if follow_steps {
+            cmd.env("KERN_PROGRESS", "json");
+            cmd.stdout(std::process::Stdio::piped());
+        }
         // Guard 3 - a build failure fails the whole `up` with a linked, service-named message.
-        let status = cmd.status().map_err(|e| {
-            Error::Compose(format!("service '{}': running `kern build`: {e}", b.name))
-        })?;
+        let status = if follow_steps {
+            let mut child = cmd.spawn().map_err(|e| {
+                Error::Compose(format!("service '{}': running `kern build`: {e}", b.name))
+            })?;
+            if let Some(out) = child.stdout.take() {
+                crate::progress::follow_build_events(&b.name, out);
+            }
+            child.wait()
+        } else {
+            cmd.status()
+        }
+        .map_err(|e| Error::Compose(format!("service '{}': running `kern build`: {e}", b.name)))?;
+        crate::progress::service(
+            &b.name,
+            if status.success() { "built" } else { "failed" },
+            if status.success() { "" } else { "build failed" },
+        );
         if !status.success() {
             return Err(Error::Compose(format!(
                 "service '{}': build failed - run `kern build -t {tag} {}` to see why",
