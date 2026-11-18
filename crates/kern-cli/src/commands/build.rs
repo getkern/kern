@@ -337,21 +337,161 @@ fn build_arg_map(args: &BuildArgs) -> Result<std::collections::HashMap<String, S
 /// name to this machine's variant (else the first), and record the set in `<name>.platforms` for
 /// `kern push`, which publishes a manifest list: what `docker buildx build --platform a,b --push`
 /// publishes. Measured first that an arm64 rootfs runs here through qemu-user.
-/// A `build_step` event (`--progress json`): step `s` of `total` starts.
-fn step_event(s: usize, total: usize, what: &str) {
+/// A `build_step` event (`--progress json`): step `s` of `total` starts, with how long the same
+/// step took last time when there was a last time.
+/// Whether a step is timed on its own (`together` steps run as one box: a batch of RUNs is timed
+/// once, on its first step) or not at all (the batch's other steps have no time of their own).
+#[derive(Clone, Copy)]
+enum Clock {
+    Timed { together: usize },
+    Untimed,
+}
+
+fn step_event(s: usize, total: usize, what: &str, clock: Clock) -> Option<u64> {
+    let last = match clock {
+        Clock::Timed { together } => step_clock::start(s, &format!("{what}\u{1}{together}")),
+        Clock::Untimed => None,
+    };
     kern_common::progress_event(
         "build_step",
         &format!(
-            "\"step\":{s},\"total\":{total},\"instruction\":{}",
-            kern_common::json_str(what)
+            "\"step\":{s},\"total\":{total},\"instruction\":{},\"last_ms\":{}",
+            kern_common::json_str(what),
+            last.map_or("null".to_string(), |ms| ms.to_string())
         ),
     );
+    last
+}
+
+/// How long each build step took the last time it really ran, so a step can say "last time 1m02s"
+/// instead of an estimate nobody measured.
+///
+/// One line per step in `<cache>/build-steps.tsv`: `<image>\t<step>\t<instruction hash>\t<ms>`,
+/// the newest last, the file cut to its newest half past [`MAX`]. A step under [`FLOOR_MS`] is not
+/// recorded: that is a cache hit, and recording it would replace the real duration with nothing.
+pub(crate) mod step_clock {
+    use std::io::Write;
+
+    const MAX: u64 = 256 * 1024;
+    const FLOOR_MS: u128 = 100;
+
+    struct Clock {
+        image: String,
+        running: Option<(String, std::time::Instant)>,
+    }
+
+    static CLOCK: std::sync::Mutex<Option<Clock>> = std::sync::Mutex::new(None);
+
+    fn file() -> std::path::PathBuf {
+        crate::commands::imagecache::cache_dir().join("build-steps.tsv")
+    }
+
+    fn key(image: &str, step: usize, what: &str) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in what.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("{image}\t{step}\t{h:016x}")
+    }
+
+    /// The build of `image` begins.
+    pub fn begin(image: &str) {
+        let mut g = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(Clock {
+            image: image.to_string(),
+            running: None,
+        });
+    }
+
+    /// Step `step` (`what`) starts: the previous one ends here. Returns the step's last duration.
+    pub fn start(step: usize, what: &str) -> Option<u64> {
+        let mut g = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let c = g.as_mut()?;
+        if let Some((k, t)) = c.running.take() {
+            record(&k, t.elapsed().as_millis());
+        }
+        let k = key(&c.image, step, what);
+        let last = lookup(&k);
+        c.running = Some((k, std::time::Instant::now()));
+        last
+    }
+
+    /// The build ended: the running step ends here, and only a finished build's step is kept.
+    pub fn end(ok: bool) {
+        let mut g = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.take() {
+            if let (true, Some((k, t))) = (ok, c.running) {
+                record(&k, t.elapsed().as_millis());
+            }
+        }
+    }
+
+    fn lookup(k: &str) -> Option<u64> {
+        let text = std::fs::read_to_string(file()).ok()?;
+        text.lines()
+            .rev()
+            .find_map(|l| {
+                l.rsplit_once('\t')
+                    .filter(|(head, _)| *head == k)
+                    .map(|(_, ms)| ms)
+            })
+            .and_then(|ms| ms.parse().ok())
+    }
+
+    fn record(k: &str, ms: u128) {
+        if ms < FLOOR_MS {
+            return;
+        }
+        let path = file();
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let lines: Vec<&str> = text.lines().collect();
+                let keep = lines[lines.len() / 2..].join("\n") + "\n";
+                let tmp = path.with_extension("tsv.tmp");
+                if std::fs::write(&tmp, keep).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
+                }
+            }
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "{k}\t{ms}");
+        }
+    }
+
+    /// `  (last time 1m02s)`, `  (last time 1m02s, with the next 2)` for a batch, or nothing
+    /// without a last time.
+    pub fn said(last: Option<u64>, together: usize) -> String {
+        last.map_or(String::new(), |ms| {
+            let with = if together > 1 {
+                format!(", with the next {}", together - 1)
+            } else {
+                String::new()
+            };
+            format!("  (last time {}{with})", short_ms(ms))
+        })
+    }
+
+    /// `0.5s`, `12.3s`, `1m02s`: a tenth of a second under a minute, whole seconds above.
+    pub fn short_ms(ms: u64) -> String {
+        if ms < 60_000 {
+            format!("{}.{}s", ms / 1000, (ms % 1000) / 100)
+        } else {
+            format!("{}m{:02}s", ms / 60_000, (ms / 1000) % 60)
+        }
+    }
 }
 
 pub fn build(args: BuildArgs) -> Result<(), Error> {
     let tag = args.tag.unwrap_or_default().to_string();
     let started = std::time::Instant::now();
+    step_clock::begin(&tag);
     let result = build_inner(args);
+    step_clock::end(result.is_ok());
     // A FAILED BUILD IS AN EVENT TOO: the stream must end in an answer either way.
     if let Err(e) = &result {
         kern_common::progress_event(
@@ -1098,10 +1238,15 @@ fn build_run(
     };
     // `build_run` builds ONE stage. A multi-stage Dockerfile is orchestrated by `build_multi_stage`,
     // which calls us once per stage with a single-stage slice - so we never see a second FROM here.
+    let last = step_event(
+        1,
+        total,
+        &format!("FROM {base_ref}"),
+        Clock::Timed { together: 1 },
+    );
     if !quiet {
-        kern_common::progress!("[1/{total}] FROM {base_ref}");
+        kern_common::progress!("[1/{total}] FROM {base_ref}{}", step_clock::said(last, 1));
     }
-    step_event(1, total, &format!("FROM {base_ref}"));
     let (base_lower, base_cfg) = resolve_image(base_ref)?;
     let mut config = base_cfg;
 
@@ -1259,12 +1404,17 @@ fn build_run(
     // before finalize (if we created it) so the host's DNS servers aren't baked into the image.
     let seeded_resolv = seed_resolv_conf(&write_dir);
 
-    let announce = |s: usize, what: String| {
+    let announce_as = |s: usize, what: String, clock: Clock| {
+        let last = step_event(s, total, &what, clock);
+        let together = match clock {
+            Clock::Timed { together } => together,
+            Clock::Untimed => 1,
+        };
         if !quiet {
-            kern_common::progress!("[{s}/{total}] {what}");
+            kern_common::progress!("[{s}/{total}] {what}{}", step_clock::said(last, together));
         }
-        step_event(s, total, &what);
     };
+    let announce = |s: usize, what: String| announce_as(s, what, Clock::Timed { together: 1 });
     let mut cmd_from_dockerfile = false;
     let mut run_mounts: Vec<crate::dockerfile::RunMount> = Vec::new();
     let mut i = 1; // instrs[0] is the FROM handled above
@@ -1291,12 +1441,21 @@ fn build_run(
                     }
                     match run_shell_script(a) {
                         Some(s) => {
-                            announce(j + 1, format!("RUN {s}"));
                             scripts.push(s);
                             j += 1;
                         }
                         None => break,
                     }
+                }
+                // ONE BOX, ONE TIME: the batch is timed on its first step, the others say nothing.
+                let together = scripts.len();
+                for (k, s) in scripts.iter().enumerate() {
+                    let clock = if k == 0 {
+                        Clock::Timed { together }
+                    } else {
+                        Clock::Untimed
+                    };
+                    announce_as(i + 1 + k, format!("RUN {s}"), clock);
                 }
                 let (run_argv, next) = if scripts.is_empty() {
                     announce(step, format!("RUN {}", display_run(argv))); // exec-form: run alone
@@ -1546,12 +1705,17 @@ fn build_layered_cached(
     let lc = layer_cache_dir();
     own_only_dir(&lc).map_err(|e| Error::Sandbox(format!("layer cache: {e}")))?;
     let total = instrs.len();
-    let announce = |s: usize, what: String| {
+    let announce_as = |s: usize, what: String, clock: Clock| {
+        let last = step_event(s, total, &what, clock);
+        let together = match clock {
+            Clock::Timed { together } => together,
+            Clock::Untimed => 1,
+        };
         if !quiet {
-            kern_common::progress!("[{s}/{total}] {what}");
+            kern_common::progress!("[{s}/{total}] {what}{}", step_clock::said(last, together));
         }
-        step_event(s, total, &what);
     };
+    let announce = |s: usize, what: String| announce_as(s, what, Clock::Timed { together: 1 });
     // Overlay lower chain (base first); a layer dir is appended per fs-unit. `key` is the running
     // chained key; `layer_keys` are the produced layers in order (→ the tag's `.layers` manifest).
     // The base arrives TOP first, so reversing it gives this chain's base-first order, one path each.
@@ -1651,8 +1815,14 @@ fn build_layered_cached(
                 if scripts.is_empty() {
                     announce(step, format!("RUN {}{mark}", display_run(argv)));
                 } else {
+                    let together = scripts.len();
                     for (k, s) in scripts.iter().enumerate() {
-                        announce(i + 1 + k, format!("RUN {s}{mark}"));
+                        let clock = if k == 0 {
+                            Clock::Timed { together }
+                        } else {
+                            Clock::Untimed
+                        };
+                        announce_as(i + 1 + k, format!("RUN {s}{mark}"), clock);
                     }
                 }
                 if !hit {

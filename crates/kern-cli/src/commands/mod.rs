@@ -11815,7 +11815,7 @@ pub use compose::*;
 mod system;
 pub use system::*;
 
-mod build;
+pub(crate) mod build;
 
 /// `RUN --mount=type=secret|ssh|cache|tmpfs|bind`: the build's inputs and each step's mounts.
 mod buildmounts;

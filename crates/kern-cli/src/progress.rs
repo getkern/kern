@@ -168,8 +168,16 @@ pub fn follow_build_events(service_name: &str, out: impl std::io::Read) {
         }
         match field(&line, "type").as_deref() {
             Some("build_step") => {
+                let last = field(&line, "last_ms")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map_or(String::new(), |ms| {
+                        format!(
+                            " (last time {})",
+                            crate::commands::build::step_clock::short_ms(ms)
+                        )
+                    });
                 let detail = format!(
-                    "step {}/{} {}",
+                    "step {}/{} {}{last}",
                     field(&line, "step").unwrap_or_default(),
                     field(&line, "total").unwrap_or_default(),
                     field(&line, "instruction").unwrap_or_default()
