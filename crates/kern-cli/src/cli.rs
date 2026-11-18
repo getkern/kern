@@ -472,6 +472,8 @@ pub enum Command {
     RelayHolder {
         dir: String,
     },
+    /// Hidden: the local router behind `<service>.<project>.localhost` (`crate::localrouter`).
+    LocalRouter,
     /// Hidden: inotify on a sandbox workspace directory for an SDK (`crate::dirwatch`).
     WatchDir {
         root: String,
@@ -1248,6 +1250,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("__volume-sizes") => Command::VolumeSizes,
         Some("__pasta-probe") => Command::PastaProbe,
         // Hidden: the relay holder (spawned by `compose up --no-pod`).
+        // Hidden: the local router (spawned by `compose up`).
+        Some("__local-router") => Command::LocalRouter,
         Some("__relay-holder") => Command::RelayHolder {
             dir: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
         },
@@ -6656,6 +6660,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         // A hidden verb whose exit status IS its answer, and which has already cleaned up after itself.
         Command::PastaProbe => std::process::exit(crate::pod::pasta_probe_verb()),
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
+        Command::LocalRouter => crate::localrouter::run(),
         Command::WatchDir {
             root,
             rel,

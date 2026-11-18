@@ -125,6 +125,32 @@ kept to the new place; `kern sandbox keep` and `kern info` say where they are an
 and `kern sandbox clear` removes them. Each place holds about 33,000 lines, after which the oldest go.
 Neither directory can be mounted into a box.
 
+### Local names for compose services
+
+```toml
+[kern]
+local_domains      = true  # compose up answers http://<service>.<project>.localhost (default true)
+local_domains_port = 8080  # the port of those names (default 80 where allowed, else 8080)
+```
+
+When a compose service publishes a TCP port, `compose up` prints a name for it, e.g.
+`web: http://web.shop.localhost:8080/`, and a router of your user answers it on the loopback
+addresses, forwarding by the request's `Host` to the port the service published. `.localhost`
+resolves to this machine with nothing to install (curl, browsers, systemd-resolved).
+
+| name | goes to |
+|---|---|
+| `<service>.<project>.localhost` | the service's published port: container port 80, else 8080, 3000, 8000, 5000, else the first |
+| `<port>.<service>.<project>.localhost` | the published port of that container port |
+| `<service>-2.<project>.localhost` | replica 2 |
+| `<service>.kern.localhost` | the one running project that has that service; several are refused by name |
+
+The router listens on port 80 where the system lets an ordinary user bind it
+(`net.ipv4.ip_unprivileged_port_start` at 80 or below), otherwise on the first free port from 8080 to
+8089; `local_domains_port` fixes it. It reaches only ports your boxes already published, and leaves by
+itself about a minute after the last box with a published port. HTTP only. A service with a
+`container_name` gets no name. `local_domains = false` starts no router.
+
 ### Logs and retention
 
 ```toml

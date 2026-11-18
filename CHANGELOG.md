@@ -21,6 +21,13 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**`compose up` names each published service: `http://<service>.<project>.localhost`.** A router of
+your user, on the loopback addresses, forwards by `Host` to the port the service published;
+`<port>.<service>.<project>.localhost` picks a container port and `<service>.kern.localhost` the one
+project that has the service. Port 80 where an ordinary user may bind it, else 8080;
+`[kern] local_domains_port` sets it and `local_domains = false` turns it off. In `--progress json`,
+one `local_url` event per service.
+
 **`--progress auto|tty|plain|json|quiet` on `kern build` and `kern compose`** (or `KERN_PROGRESS`).
 `compose up` on a terminal draws one row per service, redrawn in place under a header that counts
 them: pulling, building with the step it is on, waiting for its dependencies, started, exited,

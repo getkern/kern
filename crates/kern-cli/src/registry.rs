@@ -557,7 +557,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 15] = [
+const AUTHORITATIVE_DIRS: [&str; 16] = [
     "instances",
     "claims",
     "exit",
@@ -591,6 +591,10 @@ const AUTHORITATIVE_DIRS: [&str; 15] = [
     // it alive past its timeout, or name another process for `update --timeout` to signal (the pid is
     // only signalled when its start-time matches, but the deadline itself is taken as written).
     "deadline",
+    // `router/` holds the local router's pid and port (`localrouter.rs`): kern prints URLs on that
+    // port and signals nothing from it, but a box able to write it would point those URLs at a port
+    // of its choosing, so it is kern's to write.
+    "router",
     // `gpu/` remembers which directories of the WSL2 driver store hold the NVIDIA driver, and kern
     // binds what it lists into every `--gpus` box. A box able to write it would choose host
     // directories other boxes get, so it is authoritative; the reader also re-checks every line.

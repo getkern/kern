@@ -7655,6 +7655,108 @@ fn compose_up_on_a_terminal_draws_one_row_per_service() {
     );
 }
 
+/// `compose up` prints `http://<service>.<project>.localhost[:port]/` for a service that publishes
+/// a port, and the router behind it answers by the request's `Host`: the service's page for its
+/// name, a sentence for a name nothing runs under, 400 for a bare-LF head.
+#[test]
+fn compose_up_names_a_published_service_under_localhost() {
+    use std::io::{Read, Write};
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let project = format!("lr{}", std::process::id());
+    let dir = std::env::temp_dir().join(format!("kern-localrouter-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let file = dir.join("compose.yml");
+    std::fs::write(
+        &file,
+        "services:\n  web:\n    image: busybox:1.36\n    command: [\"sh\", \"-c\", \"mkdir -p /w && echo page-of-web > /w/index.html && exec httpd -f -p 80 -h /w\"]\n    ports: [\"127.0.0.1::80\"]\n    stop_grace_period: 1s\n",
+    )
+    .expect("compose file");
+    let up = kern()
+        .args(["compose", "-p", &project, "-f"])
+        .arg(&file)
+        .args(["up", "-d"])
+        .output()
+        .expect("up");
+    let ask = |host: &str, raw: Option<&[u8]>, port: u16| -> String {
+        let mut last = String::new();
+        // The service's httpd may need a moment after `up -d` returns.
+        for _ in 0..50 {
+            let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            };
+            let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let req = raw.map(<[u8]>::to_vec).unwrap_or_else(|| {
+                format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").into_bytes()
+            });
+            let _ = c.write_all(&req);
+            let mut out = Vec::new();
+            let _ = c.read_to_end(&mut out);
+            last = String::from_utf8_lossy(&out).into_owned();
+            // Empty: the published port took the connection before the service listened in the
+            // box, and closed it.
+            if !last.is_empty() && !last.contains("502 Bad Gateway") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        last
+    };
+    // `compose` narrates on stderr (its stdout is moved there for the run), so both are read.
+    let stdout = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    let url_line = stdout
+        .lines()
+        .find(|l| l.contains(&format!("web.{project}.localhost")))
+        .map(str::to_string);
+    let port: Option<u16> = url_line.as_deref().map(|l| {
+        l.rsplit_once("localhost")
+            .and_then(|(_, rest)| rest.strip_prefix(':'))
+            .and_then(|r| r.trim_end_matches('/').parse().ok())
+            .unwrap_or(80)
+    });
+    let page = port.map(|p| ask(&format!("web.{project}.localhost:{p}"), None, p));
+    let missing = port.map(|p| ask(&format!("nope.{project}.localhost"), None, p));
+    let bare = port.map(|p| {
+        ask(
+            "",
+            Some(format!("GET / HTTP/1.1\nHost: web.{project}.localhost\n\n").as_bytes()),
+            p,
+        )
+    });
+    let _ = kern()
+        .args(["compose", "-p", &project, "-f"])
+        .arg(&file)
+        .arg("down")
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        up.status.success(),
+        "up: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(
+        url_line.is_some(),
+        "no URL line: {stdout}\n{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    let page = page.unwrap_or_default();
+    assert!(page.contains("page-of-web"), "{page}");
+    let missing = missing.unwrap_or_default();
+    assert!(
+        missing.starts_with("HTTP/1.1 404") && missing.contains("no running service 'nope'"),
+        "{missing}"
+    );
+    let bare = bare.unwrap_or_default();
+    assert!(bare.starts_with("HTTP/1.1 400"), "{bare}");
+}
+
 /// `kern sandbox record` keeps a call's code and output where the history is, 0600, and `kern
 /// sandbox show` prints it without the escapes the output carried; `clear` removes it.
 #[test]

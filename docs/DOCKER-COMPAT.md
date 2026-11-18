@@ -243,6 +243,11 @@ cannot defeat it by writing an address:
 publish_bind = "127.0.0.1"
 ```
 
+**A published service also gets a name on this machine**: `compose up` prints
+`http://<service>.<project>.localhost[:port]/` beside it, answered by a router of your user on the
+loopback addresses. See [CONFIG.md](CONFIG.md#local-names-for-compose-services) for the names, the
+port and `[kern] local_domains = false`.
+
 **A service with no `mem_limit:` gets the host's RAM**, as under Docker. It is not uncapped: the box
 carries a `memory.max` and `oom.group = 1`, so a failure stays attributable to its own cgroup.
 `[kern] compose_memory_max` restores a strict ceiling; see [CONFIG.md](CONFIG.md).

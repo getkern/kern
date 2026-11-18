@@ -4935,13 +4935,27 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         return Err(Error::Compose(msg));
     }
     drop(up_board.take());
+    let local_urls = local_urls_for(&mine, &pod);
     if kern_common::progress_mode() == kern_common::ProgressMode::Json {
+        for (service, url) in &local_urls {
+            kern_common::progress_event(
+                "local_url",
+                &format!(
+                    "\"service\":{},\"url\":{}",
+                    kern_common::json_str(service),
+                    kern_common::json_str(url)
+                ),
+            );
+        }
         kern_common::progress_event(
             "up_done",
             &format!("\"ok\":true,\"started\":{total},\"exited\":{}", dead.len()),
         );
     } else {
         println!("compose up: {total} box(es) started");
+        for (service, url) in &local_urls {
+            println!("  {service}: {url}");
+        }
         // THE POD'S SENTENCE WHEN IT IS NEWS: the pod was made by this `up`, or a service did not get its
         // way out. On an `up` that only started a service in a pod already there it repeated, word for
         // word, what the first `up` said (reported as noise on a real stack).
@@ -5017,6 +5031,46 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+/// `(service, URL)` for each started service with a published TCP port, starting the local router
+/// that answers those names (`localrouter.rs`). Empty when none publishes one, when
+/// `[kern] local_domains = false`, or when the router could not listen (said once on stderr).
+fn local_urls_for(mine: &[&crate::compose::ComposeBox], project: &str) -> Vec<(String, String)> {
+    // A `container_name` box has no `<project>-<service>` name to be found by, so it gets no URL.
+    let routable: Vec<(String, String)> = mine
+        .iter()
+        .filter_map(|b| {
+            let short = b.name.strip_prefix(&format!("{project}-"))?;
+            let inst = crate::registry::find(&b.name)?;
+            if !crate::localrouter::has_tcp_port(&inst.ports) {
+                return None;
+            }
+            let label = match short.strip_suffix("-1") {
+                Some(s) if s == b.service => s.to_string(),
+                _ => short.to_string(),
+            };
+            Some((b.service.clone(), label))
+        })
+        .collect();
+    if routable.is_empty() || !crate::localrouter::enabled() {
+        return Vec::new();
+    }
+    let Some(port) = crate::localrouter::ensure() else {
+        eprintln!(
+            "kern: note: the local router did not start, so <service>.{project}.localhost names \
+             do not answer; the published ports above still do. `[kern] local_domains_port` picks \
+             its port, `local_domains = false` turns it off"
+        );
+        return Vec::new();
+    };
+    routable
+        .into_iter()
+        .map(|(service, label)| {
+            let url = crate::localrouter::url(&label, project, port);
+            (service, url)
+        })
+        .collect()
 }
 
 /// The `kern box --ipc` value for a service's `ipc:`, with `service:<name>` resolved to that

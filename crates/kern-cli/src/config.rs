@@ -246,6 +246,13 @@ pub struct KernSettings {
     /// `sandbox_transcripts_max_size` - the most the transcripts may occupy together; past it the
     /// oldest go. Absent means 16 MiB.
     pub sandbox_transcripts_max_size: Option<u64>,
+    /// `local_domains` - whether `compose up` starts the local router that answers
+    /// `http://<service>.<project>.localhost` for each service with a published port. Absent means
+    /// on; `false` starts none (see `localrouter.rs`).
+    pub local_domains: Option<bool>,
+    /// `local_domains_port` - the port that router listens on, on the loopback addresses only.
+    /// Absent means 80 where an ordinary user may bind it, else the first free of 8080-8089.
+    pub local_domains_port: Option<u16>,
 }
 
 /// The `[kern]` keys `kern config set|get|unset` reads and writes, with the shape of each value.
@@ -294,6 +301,16 @@ pub(crate) const SETTABLE_KERN_KEYS: &[(&str, SettingKind, &str)] = &[
         "sandbox_transcripts_max_size",
         SettingKind::Size,
         "the most the sandbox transcripts occupy; the oldest go past it (default 16m)",
+    ),
+    (
+        "local_domains",
+        SettingKind::Bool,
+        "compose up answers http://<service>.<project>.localhost (default true)",
+    ),
+    (
+        "local_domains_port",
+        SettingKind::Count,
+        "the port of those names (default 80 if allowed, else 8080)",
     ),
     (
         "publish_bind",
@@ -1140,6 +1157,14 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
             k.build_keep = Some(n);
         }
         "sandbox_transcripts" => k.sandbox_transcripts = Some(value_bool(v)?),
+        "local_domains" => k.local_domains = Some(value_bool(v)?),
+        "local_domains_port" => {
+            let n = value_u32(v)?;
+            k.local_domains_port =
+                Some(u16::try_from(n).ok().filter(|p| *p > 0).ok_or_else(|| {
+                    format!("[kern] local_domains_port = {n}: expected a port, 1 to 65535")
+                })?);
+        }
         "sandbox_transcripts_max_size" => {
             let raw = value_string(v)?;
             k.sandbox_transcripts_max_size = Some(
