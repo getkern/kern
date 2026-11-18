@@ -552,13 +552,15 @@ mod tests {
                 since: std::time::Instant::now(),
             },
         ];
+        let wide = board_lines("kern compose up", &rows, std::time::Instant::now(), 0, 120);
+        assert!(
+            wide[0].starts_with("kern compose up · 1/3 ready · 1 in progress · 1 failed"),
+            "{}",
+            wide[0]
+        );
         let lines = board_lines("kern compose up", &rows, std::time::Instant::now(), 0, 40);
         assert_eq!(lines.len(), 4);
-        assert!(
-            lines[0].starts_with("kern compose up · 1/3 ready · 1 in progress · 1 failed"),
-            "{}",
-            lines[0]
-        );
+
         assert!(
             lines.iter().all(|l| l.chars().count() < 40),
             "a line wider than the terminal wraps and breaks the redraw"
