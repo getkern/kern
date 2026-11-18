@@ -21,7 +21,7 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## v0.51.2 - 2026-11-18
 
-**Windows (WSL): boxes run as the distro's user `kern` (uid 1000), not root.** A box's root is
+**Windows (WSL): boxes run as the distro's user `kern` (uid 1000).** A box's root is
 uid 1000 of the distro. `install.ps1` converts an existing distro: images pulled again for the user,
 volumes and settings moved with their modes kept; an account already on uid 1000 becomes the user. Each distro has its own cgroup subtree. The distro
 ships `passt`; root's password is locked. Started from a root terminal, kern runs as the user on a
