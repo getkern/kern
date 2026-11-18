@@ -452,6 +452,7 @@ pub fn pull(
             }
             return Err(e);
         }
+        kern_common::pull_layer_done(image, i + 1, total);
     }
     kern_common::progress!("✓ pulled {image} → {} ({total} layers)", dest.display());
     Ok(config)

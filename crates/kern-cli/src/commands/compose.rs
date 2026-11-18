@@ -1319,9 +1319,11 @@ fn ensure_images_for_wiring(
         }
         done.push(img);
         crate::progress::service(&b.name, "pulling", img);
-        if let Err(e) =
-            crate::commands::resolve_image_depth(img, 0, crate::commands::PullPolicy::Missing)
-        {
+        crate::progress::pulling_for(&b.name);
+        let fetched =
+            crate::commands::resolve_image_depth(img, 0, crate::commands::PullPolicy::Missing);
+        crate::progress::pulled();
+        if let Err(e) = fetched {
             crate::progress::service(&b.name, "failed", "image could not be pulled");
             failed.push((
                 img.to_string(),

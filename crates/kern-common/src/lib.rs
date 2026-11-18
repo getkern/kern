@@ -506,6 +506,24 @@ pub fn progress_mode_resolved() -> ProgressMode {
 /// Write one progress EVENT as a JSON line on stdout, in `json` mode only (`body` is the object's
 /// fields after `"type"`, already JSON, e.g. `"step":1`). Every event carries `"schema":1`, its type
 /// and the time in ms; one `write` per line, so events from threads never interleave.
+/// Called by the image pull after each layer is in place: `(image, layers done, layers in all)`.
+/// kern-cli registers one to update a service's row; nothing is called before that.
+pub type PullLayerHook = fn(&str, usize, usize);
+
+static PULL_LAYER_HOOK: std::sync::OnceLock<PullLayerHook> = std::sync::OnceLock::new();
+
+/// Register the [`PullLayerHook`] (once per process).
+pub fn set_pull_layer_hook(f: PullLayerHook) {
+    let _ = PULL_LAYER_HOOK.set(f);
+}
+
+/// The pull finished layer `done` of `total` of `image`: tell the hook, when one is registered.
+pub fn pull_layer_done(image: &str, done: usize, total: usize) {
+    if let Some(f) = PULL_LAYER_HOOK.get() {
+        f(image, done, total);
+    }
+}
+
 /// Where [`progress_event`] writes: the process's ORIGINAL stdout, which a command that moves its
 /// narration onto stderr (compose's `narration_to_stderr`) records here; `-1` means fd 1.
 static PROGRESS_EVENT_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);

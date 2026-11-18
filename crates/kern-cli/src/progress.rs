@@ -140,6 +140,34 @@ pub fn say_on_interrupt(note: String) {
     }
 }
 
+/// The service whose image this thread is pulling now, for the layer hook's row update.
+static PULLING_FOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn on_pull_layer(image: &str, done: usize, total: usize) {
+    let who = PULLING_FOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(service_name) = who {
+        service(
+            &service_name,
+            "pulling",
+            &format!("{image} (layer {done}/{total})"),
+        );
+    }
+}
+
+/// From here until [`pulled`], a layer the pull finishes updates `service_name`'s row.
+pub fn pulling_for(service_name: &str) {
+    kern_common::set_pull_layer_hook(on_pull_layer);
+    *PULLING_FOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(service_name.to_string());
+}
+
+/// The pull [`pulling_for`] named is over.
+pub fn pulled() {
+    *PULLING_FOR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Is a live view drawing in this process?
 pub fn board_active() -> bool {
     BOARD_EVENTS.load(std::sync::atomic::Ordering::Acquire) >= 0
