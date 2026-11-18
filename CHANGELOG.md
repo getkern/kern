@@ -23,6 +23,8 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 **`install.sh` installs a signed release when `minisign` is installed**; it refused every one.
 
+**`kern` with no arguments lists `kern self-update`.**
+
 ## kern-sandbox 0.2.52 - 2026-11-18
 
 **It carries the kern v0.51.2 binary.** Both bindings move together; nothing else in them changed.

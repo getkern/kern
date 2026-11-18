@@ -85,6 +85,7 @@ pub fn banner() -> Result<(), Error> {
     {b}kern sandbox{z} ls {d}·{z} {b}history{z} {d}·{z} {b}stats{z}       {d}SDK and MCP sandboxes: running, finished, outcomes{z}
     {b}kern sandbox keep{z} disk                  {d}keep their history across reboots (default: until reboot){z}
     {b}kern top{z}                                {d}live: host, GPUs, boxes, sandboxes{z}
+    {b}kern self-update{z}                        {d}update kern to the newest signed release{z}
 
   {b}kern --help{z} {d}all commands{z} {d}·{z} {b}kern doctor{z} {d}check this host{z}
   {d}{z}{c}https://github.com/getkern/kern{z}",
