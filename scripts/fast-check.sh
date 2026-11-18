@@ -102,6 +102,14 @@ if has '^\.github/workflows/'; then
             || die "$w does not parse as YAML"
     done
     ok "workflow YAML"
+    # NO AUTOMATIC JOB ON AN ARM64 MAC. On 2026-11-18 GitHub assigned no arm64 macOS runner for 15
+    # minutes, three times, and cancelled the job: a red X on main with nothing wrong in the code.
+    # `-intel` labels were assigned every time. The one exception is the probe that exists to ask
+    # what an arm64 runner can do, and it only runs by hand.
+    arm=$(grep -nE '^[[:space:]]*runs-on:[[:space:]]*macos-' .github/workflows/*.yml \
+        | grep -v -- '-intel' | grep -v '^\.github/workflows/macos-vm-probe\.yml:' || true)
+    [ -z "$arm" ] || die "a workflow job on an arm64 macOS runner (use macos-15-intel): $arm"
+    ok "macOS jobs on Intel runners"
     # The CI's own `workflow syntax` job runs actionlint WITH shellcheck over every `run:` script;
     # a YAML parse alone missed two shellcheck infos that turned main red (2026-11-17). Same here,
     # through uvx, when it is installed.
