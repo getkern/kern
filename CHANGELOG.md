@@ -28,6 +28,11 @@ default), mode 0600, up to 64 KiB of code and 256 KiB of each stream per call an
 `kern sandbox clear` and `kern sandbox keep` remove and move them with the history.
 kern sandbox (Python) records each call that way; `transcripts=False` keeps none for one sandbox.
 
+**`kern box -it` and `kern exec -it` with stdin a pipe take the terminal size from the caller.**
+`KERN_TTY_SIZE=COLSxROWS` sets it; `KERN_TTY_SIZE_FILE=<path>` names a file holding it, read at start
+and again on every `SIGWINCH`. Without either the box terminal was 0x0 (`stty size` said `0 0`). A
+terminal on stdin works as before.
+
 **`--egress-deny` and ranges in `--egress-allow`.** The allowlist takes addresses and ranges
 (`10.1.2.0/24`, private ones included), and `*` for any public host; `--egress-deny` refuses domains,
 addresses and ranges even when the allowlist covers them, and alone means `*` minus these. A list

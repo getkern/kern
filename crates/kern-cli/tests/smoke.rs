@@ -8541,3 +8541,112 @@ fn compose_wait_fails_fast_when_a_job_dies_beside_a_running_service() {
         "took {took:?}: {said}"
     );
 }
+
+/// `-it` with stdin a PIPE (an SDK with no openpty drives the box this way): `KERN_TTY_SIZE_FILE`
+/// gives the box terminal its size at start and again on every `SIGWINCH`, for `box -it` and
+/// `exec -it`. Without it the box terminal is 0x0 (`stty size` answers "0 0").
+#[test]
+fn a_piped_it_box_takes_its_size_from_kern_tty_size_file() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-it-ttysize-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("size");
+    let set = |cols: u16, rows: u16| {
+        let tmp = dir.join("size.tmp");
+        std::fs::write(&tmp, format!("{cols}x{rows}\n")).expect("write size");
+        std::fs::rename(&tmp, &file).expect("rename size");
+    };
+    let held = format!("ttysize-held-{}", std::process::id());
+    let _ = kern()
+        .args([
+            "box",
+            &held,
+            "--image",
+            "alpine:latest",
+            "-d",
+            "--timeout",
+            "120",
+        ])
+        .args(["--", "sleep", "120"])
+        .output();
+    for argv in [
+        vec!["box", "--rm", "--image", "alpine:latest", "-it", "--", "sh"],
+        vec!["exec", held.as_str(), "-it", "--", "sh"],
+    ] {
+        set(100, 30);
+        let mut child = kern()
+            .args(&argv)
+            .env("KERN_TTY_SIZE_FILE", &file)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn kern -it");
+        let screen = Arc::new(Mutex::new(String::new()));
+        let mut out = child.stdout.take().expect("stdout");
+        let sink = Arc::clone(&screen);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = out.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut s) = sink.lock() {
+                    s.push_str(&String::from_utf8_lossy(&buf[..n]).replace('\r', ""));
+                }
+            }
+        });
+        let wait_for = |mark: &str| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while std::time::Instant::now() < end {
+                if screen.lock().map(|s| s.contains(mark)).unwrap_or(false) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        let mut stdin = child.stdin.take().expect("stdin");
+        let _ = stdin.write_all(b"stty size; echo first-$((6*7))\n");
+        let first = wait_for("first-42");
+        set(120, 40);
+        let pid = i32::try_from(child.id()).unwrap_or(0);
+        unsafe { libc::kill(pid, libc::SIGWINCH) };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = stdin.write_all(b"stty size; echo second-$((1+1))\n");
+        let second = wait_for("second-2");
+        let _ = stdin.write_all(b"exit 5\n");
+        drop(stdin);
+        let status = child.wait().expect("wait kern");
+        let _ = reader.join();
+        let seen = screen.lock().map(|s| s.clone()).unwrap_or_default();
+        let mut err = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut err);
+        }
+        if !first && host_cannot_build_a_box(&err) {
+            eprintln!("SKIP: {argv:?} could not run here: {err:.300}");
+            continue;
+        }
+        assert!(
+            first && second,
+            "{argv:?}: markers missing:\n{seen}\nstderr: {err}"
+        );
+        assert!(
+            seen.contains("30 100\n"),
+            "{argv:?}: initial size not applied:\n{seen}"
+        );
+        assert!(
+            seen.contains("40 120\n"),
+            "{argv:?}: resize not applied:\n{seen}"
+        );
+        assert_eq!(status.code(), Some(5), "{argv:?}: {seen}");
+    }
+    let _ = kern().args(["stop", &held]).output();
+    let _ = std::fs::remove_dir_all(&dir);
+}
