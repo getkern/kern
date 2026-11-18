@@ -225,9 +225,15 @@ if dl "${base}/${asset}.minisig" "${tmp}/${asset}.minisig" 2>/dev/null; then
     done
     [ -n "$signed" ] || err "the signature of ${asset} does not check out with the kern release keys - not installing."
     comment="$(sed -n 's/^trusted comment: //p' "${tmp}/${asset}.minisig")"
+    # Each field on its own: one pattern for both needed TWO spaces between them (the first match
+    # consumes the one space there is), and refused every release.
     case " $comment " in
-      *" target=${arch} "*" file=${asset} "*) info "signature verified" ;;
-      *) err "the signature of ${asset} is valid but names another file or machine (${comment}) - not installing." ;;
+      *" target=${arch} "*) ;;
+      *) err "the signature of ${asset} is valid but names another machine (${comment}) - not installing." ;;
+    esac
+    case " $comment " in
+      *" file=${asset} "*) info "signature verified" ;;
+      *) err "the signature of ${asset} is valid but names another file (${comment}) - not installing." ;;
     esac
   else
     printf "${DIM}    (signature not checked: install minisign to check it)${ZZ}\n"
