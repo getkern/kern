@@ -30,7 +30,7 @@ one `local_url` event per service.
 
 **`--progress auto|tty|plain|json|quiet` on `kern build` and `kern compose`** (or `KERN_PROGRESS`).
 `compose up` on a terminal draws one row per service, redrawn in place under a header that counts
-them: pulling, building with the step it is on, waiting for its dependencies, started, exited,
+them: pulling, pulled, building with the step it is on, built, waiting for its dependencies, started, exited,
 failed, skipped; every line written meanwhile is printed above it. `json` writes one event per line
 on stdout (`schema` 1: `build_step`, `heartbeat`, `build_done`, `service`, `service_log`, `up_done`)
 and nothing else there; `quiet` prints no progress. A service that dies during the bring-up is

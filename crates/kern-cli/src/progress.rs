@@ -393,7 +393,7 @@ struct Row {
 
 fn state_class(state: &str) -> u8 {
     match state {
-        "started" | "running" | "healthy" | "completed" | "built" | "pulled" => 0,
+        "started" | "running" | "healthy" | "completed" => 0,
         "failed" | "exited" | "skipped" => 2,
         _ => 1,
     }

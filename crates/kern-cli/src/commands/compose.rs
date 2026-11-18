@@ -1323,6 +1323,11 @@ fn ensure_images_for_wiring(
         let fetched =
             crate::commands::resolve_image_depth(img, 0, crate::commands::PullPolicy::Missing);
         crate::progress::pulled();
+        // THE ROW MOVES ON WHEN THE IMAGE IS IN PLACE: it otherwise read `pulling` until the box
+        // started, which on a stack with a build is the whole build (measured: 4 s on a cached image).
+        if fetched.is_ok() {
+            crate::progress::service(&b.name, "pulled", img);
+        }
         if let Err(e) = fetched {
             crate::progress::service(&b.name, "failed", "image could not be pulled");
             failed.push((
@@ -1505,7 +1510,34 @@ impl Drop for EmptyPodGuard<'_> {
     }
 }
 
+/// Set once `up_done` is written, so a failure after it does not write a second.
+static UP_DONE_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
+    let brings_up = matches!(
+        o.action,
+        ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart
+    );
+    let result = compose_inner(o);
+    // A FAILED `up` IS AN EVENT TOO: a reader of `--progress json` gets an answer either way.
+    if let Err(e) = &result {
+        if brings_up
+            && kern_common::progress_mode() == kern_common::ProgressMode::Json
+            && !UP_DONE_SENT.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            kern_common::progress_event(
+                "up_done",
+                &format!(
+                    "\"ok\":false,\"error\":{}",
+                    kern_common::json_str(&e.to_string())
+                ),
+            );
+        }
+    }
+    result
+}
+
+fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
     // `run`'s STDOUT IS THE WORKLOAD'S, and this has to be decided BEFORE anything narrates - the
     // pod is created (and announced) further down this same function. A caller doing
     // `state=$(docker compose run --rm -T svc sh -c 'printf skipped')` was getting three lines of
@@ -4420,7 +4452,20 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         failed.push((n, e));
                     }
                     Ok(()) if !gate_active => crate::progress::service(&n, "started", ""),
-                    Ok(()) => crate::progress::service(&n, "created", ""),
+                    // UNDER THE GATE a box with dependencies waits from here until its release,
+                    // so that is what its row says, before those dependencies are released.
+                    Ok(()) => {
+                        let deps = boxes
+                            .iter()
+                            .find(|b| b.name == n)
+                            .map(crate::progress::deps_of)
+                            .unwrap_or_default();
+                        if deps.is_empty() {
+                            crate::progress::service(&n, "created", "");
+                        } else {
+                            crate::progress::service(&n, "waiting", &format!("for {deps}"));
+                        }
+                    }
                 }
             }
         }
@@ -4782,10 +4827,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 // reads EOF and refuses to exec. The stack does not come up half-released.
                 // Every NAT was attached above, before this loop, and the ordering argument that
                 // used to live here is made there instead.
-                let deps = crate::progress::deps_of(b);
-                if !deps.is_empty() {
-                    crate::progress::service(&b.name, "waiting", &format!("for {deps}"));
-                }
+                // Its row has said `waiting` since it was prepared (above).
                 wait_for_conditions(b, &pod, &up_token, wait_timeout, no_deps, &will_start)?;
                 crate::progress::service(&b.name, "started", "");
                 if !gate_release(fd) {
@@ -4873,15 +4915,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             dead.len(),
             dead.join(", ")
         );
-        // ⛔ DOCKER'S EXIT CODE: `up` started what it was asked to start, and a container that then
-        // exits is a fact about the container, not a failed `up`. MEASURED on Docker Compose
-        // 5.3.1: `up -d` with a service that dies at once exits 0, and `up -d --wait` exits 1. kern
-        // exited 1 for both. The sentence is still printed, on stderr, where Docker prints its
-        // progress; `--wait` still fails, as it asked for running services.
-        if wait_ready {
-            return Err(Error::Compose(msg));
+        if !wait_ready {
+            eprintln!("kern: warning: compose: {msg}");
         }
-        eprintln!("kern: warning: compose: {msg}");
         // WHY, ON THE SPOT: the last lines each one wrote, so the reader does not need the next
         // command to learn what the service said before it stopped.
         for d in &dead {
@@ -4909,6 +4945,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 }
                 eprintln!("  the rest: kern compose {file} logs {d}");
             }
+        }
+        // ⛔ DOCKER'S EXIT CODE: `up` started what it was asked to start, and a container that then
+        // exits is a fact about the container, not a failed `up`. MEASURED on Docker Compose
+        // 5.3.1: `up -d` with a service that dies at once exits 0, and `up -d --wait` exits 1. kern
+        // exited 1 for both. The sentence is still printed, on stderr, where Docker prints its
+        // progress; `--wait` still fails, as it asked for running services.
+        if wait_ready {
+            return Err(Error::Compose(msg));
         }
     }
     // THE BRING-UP FAILED FOR SOME SERVICES, AND THE REST RUNS: said as Docker says it, with exit 1.
@@ -4947,6 +4991,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 ),
             );
         }
+        UP_DONE_SENT.store(true, std::sync::atomic::Ordering::Relaxed);
         kern_common::progress_event(
             "up_done",
             &format!("\"ok\":true,\"started\":{total},\"exited\":{}", dead.len()),
