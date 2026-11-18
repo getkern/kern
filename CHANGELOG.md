@@ -21,6 +21,16 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**kern sandbox: labels, `Sandbox.list()`, `get_metrics()`, `set_timeout()`, `watch_dir()`.** `labels={...}`
+goes on every box a sandbox starts and `Sandbox.list(labels=...)` finds the running ones;
+`get_metrics()` (also on a `Kernel`) reads CPU, memory, tasks, workspace disk and the deadline;
+`set_timeout(s)` moves a `persist` sandbox's deadline (`0`: none); `watch_dir(path, on_event)` reports
+create, write, rename, chmod and remove in the workspace, never through a symlink.
+
+**kern sandbox: a `persist` sandbox's resident box is made in one shape**, without the bytecode-cache
+mount, whenever it is created, so the process that made it, another process and a recreation all
+agree on its fingerprint.
+
 **`kern update --timeout S <box>`**: a running detached box ends S seconds from now; `0` removes its
 deadline. A box started without `--timeout` gets one.
 

@@ -71,6 +71,10 @@ __all__ = [
     "FileInfo",
     "SandboxError",
     "MountRefused",
+    "SandboxInfo",
+    "SandboxMetrics",
+    "WatchEvent",
+    "DirWatch",
     "run_code",
 ]
 
@@ -3984,6 +3988,401 @@ _CRASH_SIGNALS = frozenset({signal.SIGILL, signal.SIGABRT, signal.SIGBUS, signal
 _EXIT_SIGTERM = 143  # 128 + 15 - SIGTERM: kern's --timeout backstop reaping the box (SIGTERM→SIGKILL)
 
 
+# ---- labels, listing, metrics and directory watches -------------------------------------------------
+#
+# A label is METADATA on every box a sandbox starts (`kern box --label k=v`), which is how a caller
+# finds its sandboxes again (`Sandbox.list(labels=...)`) and how `kern ps --filter label=k=v` shows
+# them. It is not posture: it is left out of the resident fingerprint, so two processes that meet on
+# one `persist` sandbox with different labels still meet.
+#
+# ⚠️ A LABEL IS VISIBLE TO LOCAL USERS: it is in the box's command line and in `kern ps`. A secret
+# belongs in `env=`, which travels in a private file.
+_LABEL_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
+_LABEL_MAX = 64
+_LABEL_VALUE_MAX = 1024
+#: Label keys kern and this binding use for themselves (`kern.sbx.cfg`, the resident fingerprint).
+_RESERVED_LABEL_PREFIX = "kern."
+#: The box-name prefixes the SDKs use: `pysbx-` (Python and kern-mcp, one box per call, a Kernel, a
+#: prewarmed box), `jssbx-` (Node), `kern-sbx-` (a `persist` sandbox's resident box). The same table
+#: `kern sandbox ls` classifies by.
+_SANDBOX_BOX_PREFIXES = ("pysbx-", "jssbx-", "kern-sbx-")
+
+
+def _validate_labels(labels: object) -> "list[str]":
+    """The ``--label`` arguments for ``labels``, or a refusal naming the entry that cannot be one."""
+    if labels is None:
+        return []
+    if not isinstance(labels, Mapping):
+        raise SandboxError("labels must be a mapping of str to str, e.g. {'run': 'r-42'}")
+    if len(labels) > _LABEL_MAX:
+        raise SandboxError(f"labels: at most {_LABEL_MAX} entries, got {len(labels)}")
+    out: "list[str]" = []
+    for k, v in labels.items():
+        if not isinstance(k, str) or not _LABEL_KEY.match(k):
+            raise SandboxError(
+                f"label key {k!r}: letters, digits and . _ / - only, starting with a letter or digit, "
+                f"at most 128 characters"
+            )
+        if k.startswith(_RESERVED_LABEL_PREFIX):
+            raise SandboxError(f"label key {k!r}: keys starting with 'kern.' are kern's own")
+        if not isinstance(v, str):
+            raise SandboxError(f"label {k!r}: the value must be a str, got {type(v).__name__}")
+        if len(v) > _LABEL_VALUE_MAX or any(c in v for c in "\n\r\0"):
+            raise SandboxError(
+                f"label {k!r}: the value must be one line of at most {_LABEL_VALUE_MAX} characters"
+            )
+        out += ["--label", f"{k}={v}"]
+    return out
+
+
+@dataclass(frozen=True)
+class SandboxInfo:
+    """A running sandbox box, as :meth:`Sandbox.list` reports it."""
+
+    #: The kern box name (`kern ps`, `kern logs`, `kern stop` take it).
+    box: str
+    #: The sandbox's ``name=`` for a ``persist=True`` sandbox, ``None`` for a box of one call.
+    name: "str | None"
+    #: ``"persist"`` for a resident box, ``"call"`` for a box serving a call, a Kernel or a prewarm.
+    kind: str
+    #: The caller's labels (kern's own ``kern.*`` keys are left out).
+    labels: "dict[str, str]"
+    #: The box's supervisor pid.
+    pid: int
+    #: When the box started, Unix seconds.
+    started: int
+
+
+@dataclass(frozen=True)
+class SandboxMetrics:
+    """A sandbox's resource use at one moment. Box fields are ``None`` when no box is running (a
+    one-shot sandbox between calls, an expired resident box) or when the host does not account them
+    (no delegated cgroup)."""
+
+    #: CPU time the box has used, in seconds.
+    cpu_seconds: "float | None"
+    #: CPU use over the sampling interval, percent of ONE core (two busy cores read 200).
+    cpu_percent: "float | None"
+    memory_bytes: "int | None"
+    #: The memory cap the kernel enforces on the box, ``None`` when nothing does.
+    memory_limit_bytes: "int | None"
+    #: Tasks (processes and threads) in the box.
+    pids: "int | None"
+    pids_limit: "int | None"
+    #: What the workspace occupies on disk.
+    disk_bytes: int
+    #: When the box's deadline ends it, Unix seconds; ``None`` for no deadline or no box.
+    ends_at: "int | None"
+
+
+def _inspect_box(kern: str, box: str) -> "dict | None":
+    """`kern inspect <box> --json`, or None when the box is not running or the answer is unreadable."""
+    try:
+        out = subprocess.run(  # noqa: S603 - argv list, no shell
+            [kern, "inspect", box, "--json"], capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        doc = json.loads(out.stdout)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or doc.get("status") not in ("running", "paused"):
+        return None
+    return doc
+
+
+def _int_or_none(v: object) -> "int | None":
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _box_metrics(kern: str, box: "str | None", interval_s: float, disk_bytes: int) -> SandboxMetrics:
+    """Metrics of ``box`` read twice ``interval_s`` apart for the CPU rate (once when 0), or the
+    workspace alone when there is no box or it is not running."""
+    if interval_s < 0:
+        raise SandboxError("interval_s must be zero or positive")
+    first = _inspect_box(kern, box) if box else None
+    if first is None:
+        return SandboxMetrics(None, None, None, None, None, None, disk_bytes, None)
+    doc = first
+    rate: "float | None" = None
+    if interval_s > 0:
+        t0 = time.monotonic()
+        time.sleep(interval_s)
+        second = _inspect_box(kern, box) if box else None
+        elapsed = time.monotonic() - t0
+        if second is not None:
+            a, b = _int_or_none(first.get("cpu_usec")), _int_or_none(second.get("cpu_usec"))
+            if a is not None and b is not None and elapsed > 0:
+                rate = max(0.0, (b - a) / 1e6 / elapsed * 100.0)
+            doc = second
+    usec = _int_or_none(doc.get("cpu_usec"))
+    enforced = _int_or_none(doc.get("memory_max_enforced"))
+    return SandboxMetrics(
+        cpu_seconds=None if usec is None else usec / 1e6,
+        cpu_percent=rate,
+        memory_bytes=_int_or_none(doc.get("mem_bytes")),
+        memory_limit_bytes=enforced,
+        pids=_int_or_none(doc.get("tasks")),
+        pids_limit=_int_or_none(doc.get("pids_max")),
+        disk_bytes=disk_bytes,
+        ends_at=_int_or_none(doc.get("ends_at")),
+    )
+
+
+@dataclass(frozen=True)
+class WatchEvent:
+    """One change in a watched workspace directory.
+
+    ``type`` is ``"create"``, ``"write"`` (a file closed after writing), ``"remove"``, ``"rename"``
+    (``path`` is the new name, ``old_path`` the old one), ``"chmod"`` (mode, owner or times), or
+    ``"overflow"`` (the kernel dropped events: re-read the directory). A move into the watched tree
+    arrives as ``"create"`` and a move out of it as ``"remove"``."""
+
+    type: str
+    #: Workspace-relative path.
+    path: str
+    is_dir: bool
+    old_path: "str | None" = None
+
+
+# inotify(7), from <sys/inotify.h>; stable kernel ABI.
+_IN_MODIFY = 0x00000002
+_IN_ATTRIB = 0x00000004
+_IN_CLOSE_WRITE = 0x00000008
+_IN_MOVED_FROM = 0x00000040
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_IN_Q_OVERFLOW = 0x00004000
+_IN_IGNORED = 0x00008000
+_IN_ONLYDIR = 0x01000000
+_IN_ISDIR = 0x40000000
+_IN_NONBLOCK = os.O_NONBLOCK
+_IN_CLOEXEC = os.O_CLOEXEC
+_WATCH_MASK = (
+    _IN_ATTRIB | _IN_CLOSE_WRITE | _IN_MOVED_FROM | _IN_MOVED_TO | _IN_CREATE | _IN_DELETE
+    | _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_ONLYDIR
+)
+_EVENT_HEADER = struct.Struct("iIII")
+#: At most this many directories are watched by one `watch_dir`, so a box that creates a million
+#: directories cannot make the host spend a million kernel watches; past it, `"overflow"` is reported.
+_WATCH_MAX_DIRS = 8192
+
+
+def _libc_inotify() -> "object":
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.inotify_init1.argtypes = [ctypes.c_int]
+    libc.inotify_init1.restype = ctypes.c_int
+    libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    libc.inotify_add_watch.restype = ctypes.c_int
+    libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+    libc.inotify_rm_watch.restype = ctypes.c_int
+    return libc
+
+
+class DirWatch:
+    """A running :meth:`Sandbox.watch_dir`. ``stop()`` (or leaving the ``with`` block) ends it; the
+    callback is called from one background thread, in event order, never concurrently with itself.
+
+    NEVER THROUGH A SYMLINK. The workspace is box-controlled, so every directory is opened one
+    component at a time with ``O_NOFOLLOW`` from the workspace root and watched through that
+    descriptor: a directory the box swaps for a link to a host path is not followed onto the host."""
+
+    def __init__(self, sbx: "Sandbox", rel: str, on_event: "Callable[[WatchEvent], None]",
+                 recursive: bool) -> None:
+        import ctypes
+
+        self._ctypes = ctypes
+        self._sbx = sbx
+        self._on_event = on_event
+        self._recursive = recursive
+        self._libc = _libc_inotify()
+        fd = self._libc.inotify_init1(_IN_NONBLOCK | _IN_CLOEXEC)
+        if fd < 0:
+            e = ctypes.get_errno()
+            raise SandboxError(f"watch_dir: inotify_init1 failed: {os.strerror(e)}")
+        self._fd = fd
+        self._wake_r, self._wake_w = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+        self._dirs: "dict[int, str]" = {}
+        self._full = False
+        self._stopped = threading.Event()
+        try:
+            self._add_tree(rel)
+        except BaseException:
+            self._close_fds()
+            raise
+        if not self._dirs:
+            self._close_fds()
+            raise SandboxError(f"watch_dir: {rel or '.'!r} is not a directory in the workspace")
+        self._thread = threading.Thread(target=self._run, name="kern-sandbox-watch", daemon=True)
+        self._thread.start()
+
+    def __enter__(self) -> "DirWatch":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+    def stop(self) -> None:
+        """End the watch and wait for its thread. Idempotent."""
+        if self._stopped.is_set():
+            return
+        self._stopped.set()
+        with contextlib.suppress(OSError):
+            os.write(self._wake_w, b"x")
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=5)
+        self._close_fds()
+
+    def _close_fds(self) -> None:
+        for name in ("_fd", "_wake_r", "_wake_w"):
+            fd = getattr(self, name, -1)
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                setattr(self, name, -1)
+
+    def _watch_one(self, rel: str) -> bool:
+        """Watch the directory ``rel`` names, reached without following a symlink. False when it is
+        not a directory there (or vanished), or the directory budget is spent."""
+        if len(self._dirs) >= _WATCH_MAX_DIRS:
+            self._full = True
+            return False
+        parts = [p for p in rel.split("/") if p] if rel else []
+        root = self._sbx._ws_fd()
+        try:
+            try:
+                dfd = self._sbx._descend_dirs(root, parts, create=False)
+            except (OSError, SandboxError):
+                return False
+            try:
+                wd = self._libc.inotify_add_watch(
+                    self._fd, f"/proc/self/fd/{dfd}".encode(), _WATCH_MASK
+                )
+            finally:
+                if dfd != root:
+                    os.close(dfd)
+        finally:
+            os.close(root)
+        if wd < 0:
+            return False
+        self._dirs[wd] = rel
+        return True
+
+    def _add_tree(self, rel: str, found: "list[WatchEvent] | None" = None) -> None:
+        """Watch ``rel`` and, when recursive, every directory under it, walked without following a
+        symlink (an entry is descended into only when ``lstat`` says directory).
+
+        ``found`` collects a ``"create"`` for every entry already inside: a directory that appears
+        while being watched is watched only after it exists, and what the box put in it before that
+        moment would otherwise never be reported (MEASURED: ``makedirs("d/e")`` then a write in it
+        reported ``d`` and nothing under it). The initial tree passes none: it is the starting state."""
+        stack = [rel]
+        while stack:
+            cur = stack.pop()
+            if not self._watch_one(cur) or not self._recursive:
+                continue
+            try:
+                full = self._sbx._ws_path(cur) if cur else self._sbx._ws
+                with os.scandir(full) as it:
+                    for entry in it:
+                        child = f"{cur}/{entry.name}" if cur else entry.name
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        if found is not None:
+                            found.append(WatchEvent("create", child, is_dir))
+                        if is_dir:
+                            stack.append(child)
+            except (OSError, SandboxError):
+                continue
+
+    def _emit(self, ev: WatchEvent) -> None:
+        if ev.type != "overflow" and self._sbx._is_ours(ev.path):
+            return
+        try:
+            self._on_event(ev)
+        except Exception as e:  # noqa: BLE001 - a callback's error must not end the watch
+            warnings.warn(f"watch_dir: the callback raised {type(e).__name__}: {e}", stacklevel=1)
+
+    def _run(self) -> None:
+        buf_size = 64 * 1024
+        while not self._stopped.is_set():
+            try:
+                ready, _, _ = select.select([self._fd, self._wake_r], [], [])
+            except (OSError, ValueError):
+                return
+            if self._wake_r in ready or self._stopped.is_set():
+                return
+            try:
+                data = os.read(self._fd, buf_size)
+            except BlockingIOError:
+                continue
+            except OSError:
+                return
+            self._dispatch(data)
+            if self._full:
+                self._full = False
+                self._emit(WatchEvent("overflow", "", False))
+
+    def _dispatch(self, data: bytes) -> None:
+        moved_from: "dict[int, tuple[str, bool]]" = {}
+        off = 0
+        out: "list[WatchEvent]" = []
+        while off + _EVENT_HEADER.size <= len(data):
+            wd, mask, cookie, length = _EVENT_HEADER.unpack_from(data, off)
+            off += _EVENT_HEADER.size
+            raw = data[off:off + length]
+            off += length
+            name = raw.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+            if mask & _IN_Q_OVERFLOW:
+                out.append(WatchEvent("overflow", "", False))
+                continue
+            base = self._dirs.get(wd)
+            if mask & _IN_IGNORED:
+                self._dirs.pop(wd, None)
+                continue
+            if base is None:
+                continue
+            is_dir = bool(mask & _IN_ISDIR)
+            path = f"{base}/{name}" if base and name else (name or base)
+            if mask & (_IN_DELETE_SELF | _IN_MOVE_SELF):
+                if not name and base == "" and not self._dirs:
+                    self._stopped.set()
+                continue
+            if mask & _IN_CREATE:
+                out.append(WatchEvent("create", path, is_dir))
+                if is_dir and self._recursive:
+                    self._add_tree(path, out)
+            elif mask & _IN_CLOSE_WRITE:
+                out.append(WatchEvent("write", path, False))
+            elif mask & _IN_DELETE:
+                out.append(WatchEvent("remove", path, is_dir))
+            elif mask & _IN_ATTRIB:
+                out.append(WatchEvent("chmod", path, is_dir))
+            elif mask & _IN_MOVED_FROM:
+                moved_from[cookie] = (path, is_dir)
+                out.append(WatchEvent("remove", path, is_dir))
+            elif mask & _IN_MOVED_TO:
+                old = moved_from.pop(cookie, None)
+                if old is not None:
+                    # A move inside the watched tree: the "remove" emitted for its first half becomes
+                    # the rename it was.
+                    out = [e for e in out if not (e.type == "remove" and e.path == old[0])]
+                    out.append(WatchEvent("rename", path, is_dir, old_path=old[0]))
+                else:
+                    out.append(WatchEvent("create", path, is_dir))
+                if is_dir and self._recursive:
+                    self._add_tree(path, out)
+        for ev in out:
+            self._emit(ev)
+
+
 @dataclass
 class Sandbox:
     """A configured kernel sandbox. FILE state persists across ``run_code``/``run`` in a workspace on
@@ -4270,8 +4669,15 @@ class Sandbox:
     #: LAST AMONG THE FIELDS, after ``prewarm``: the dataclass takes positional arguments, and a field
     #: added in the middle would have moved every one after it.
     user: str | None = None
+    #: Labels on every box this sandbox starts, ``{"key": "value"}`` (``kern box --label``):
+    #: :meth:`list` finds sandboxes by them and ``kern ps --filter label=key=value`` shows them. Not
+    #: posture: two processes meeting on one ``persist`` sandbox may carry different labels. Keys are
+    #: letters, digits and ``. _ / -`` (``kern.`` is reserved); a value is one line. ⚠️ Visible to local
+    #: users (process list, ``kern ps``): a secret belongs in ``env=``.
+    labels: "Mapping[str, str] | None" = None
 
     _kern: str = field(default="", repr=False)
+    _label_args: list = field(default_factory=list, init=False, repr=False)
     _mount_args: list = field(default_factory=list, init=False, repr=False)
     _tmpfs_args: list = field(default_factory=list, init=False, repr=False)
     _tmpfs_default: bool = field(default=True, init=False, repr=False)
@@ -4302,6 +4708,7 @@ class Sandbox:
     def __post_init__(self) -> None:
         if self.timeout_s is None or self.timeout_s <= 0:
             raise SandboxError("timeout_s must be a positive number of seconds")
+        self._label_args = _validate_labels(self.labels)
         if self.max_output_bytes <= 0:
             raise SandboxError("max_output_bytes must be positive")
         # SHAPE GUARDS FIRST, BEFORE ANYTHING CONSUMES THESE ARGUMENTS, and the position is the whole
@@ -4536,11 +4943,11 @@ class Sandbox:
         """
         return hashlib.sha256(
             self._posture_material(
-                network=self.network, timeout_s=int(self.persist_ttl_s)
+                network=self.network, timeout_s=int(self.persist_ttl_s), resident=True
             ).encode()
         ).hexdigest()[:16]
 
-    def _posture_material(self, *, network: bool, timeout_s: int) -> str:
+    def _posture_material(self, *, network: bool, timeout_s: int, resident: bool = False) -> str:
         """EVERYTHING THAT DETERMINES WHAT A BOX IS, as one string, spelled ONCE.
 
         🚨 THIS FUNCTION EXISTS BECAUSE THE SAME HOLE WAS FOUND TWICE. First the resident
@@ -4552,7 +4959,7 @@ class Sandbox:
         `1d5657772d173be5` both times while the resident fingerprint correctly differed. A pool is
         adoption under another name: it hands a call a box that was built earlier.
         """
-        argv = self._base_argv("", network=network, timeout_s=timeout_s, dry=True)
+        argv = self._base_argv("", network=network, timeout_s=timeout_s, dry=True, resident=resident)
         # Spelled as a pseudo-flag so it reads like the rest of the material being hashed, and so a
         # future out-of-argv control is added in the same obvious way.
         argv = argv + [f"--enforce-limits={int(bool(self.enforce_limits))}"]
@@ -4709,8 +5116,17 @@ class Sandbox:
         # does nothing. `sleep` for exactly the TTL: the box must OUTLIVE the command that created it
         # and every workload arrives later through `exec`, so a PID 1 that did anything else would be
         # a second thing to reason about.
+        # `resident=True`: NO BYTECODE-CACHE MOUNT, whenever the box is made. `__enter__` creates it
+        # before the cache is decided and a recreation happens after, so the two used to differ: the
+        # fingerprint taken in the same process after `__enter__` carried the mount and the box's
+        # label did not (MEASURED: computed `c5d08fb98ac817ad`, on the box `8911bb358ced7572`, on
+        # 0.2.53), a box recreated mid-session carried it and another process could no longer adopt
+        # it, and `set_timeout` refused the box it had just made. One shape for every creator.
         argv = self._base_argv(
-            self._resident_name(), network=self.network, timeout_s=int(self.persist_ttl_s)
+            self._resident_name(),
+            network=self.network,
+            timeout_s=int(self.persist_ttl_s),
+            resident=True,
         )
         # `--init` AND NOT A BARE `sleep` AS PID 1, and the difference is measured. A resident box
         # outlives many calls, and a call that detaches a process (`start_new_session=True`) leaves it
@@ -4718,9 +5134,13 @@ class Sandbox:
         # of those became a ZOMBIE: observed as `3 [sleep]` in the box's own `ps`, accumulating one
         # entry per detached process until `pids.max` refused the next fork. kern ships a reaping init
         # for exactly this, and a resident box is the first thing in this binding that needs one.
+        # PID 1 SLEEPS FOR GOOD AND kern's `--timeout` IS THE ONLY DEADLINE. It slept for exactly the
+        # TTL, which made the box's life a second deadline nothing could move: `set_timeout` extends
+        # kern's (`kern update --timeout`) and the box would still have ended when `sleep` did.
+        # 2147483647 s and not `infinity`, which BusyBox's `sleep` does not take.
         argv += [
             "-d", "--init", "--label", f"{self._CFG_LABEL}={want}",
-            "--", "sleep", str(int(self.persist_ttl_s)),
+            "--", "sleep", "2147483647",
         ]
         # 🚨 THE ENVIRONMENT IS BUILT, NOT INHERITED, because `enforce_limits` lives in it.
         #
@@ -4755,6 +5175,70 @@ class Sandbox:
                 f"{(made.stderr or made.stdout or '').strip()[:400]}"
             )
         return self._resident_name()
+
+    def set_timeout(self, timeout_s: int) -> None:
+        """End this ``persist=True`` sandbox's resident box ``timeout_s`` seconds from NOW, longer or
+        shorter than it had; ``0`` removes the deadline (the box then lives until :meth:`destroy`).
+        The box is created first when it is not running. A one-shot sandbox has no box between calls
+        (each call is bounded by ``timeout_s``), so this is refused there. Needs kern 0.51.4 or newer
+        (``kern update --timeout``)."""
+        if not self.persist:
+            raise SandboxError(
+                "set_timeout() moves the deadline of a persist=True sandbox's resident box; a "
+                "one-shot sandbox starts a fresh box per call, bounded by its timeout_s"
+            )
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s < 0:
+            raise SandboxError("set_timeout: timeout_s must be a whole number of seconds, 0 or more")
+        self._require_entered()
+        box = self._resident_ensure()
+        try:
+            out = subprocess.run(  # noqa: S603 - argv list, no shell
+                [self._kern, "update", "--timeout", str(timeout_s), box],
+                capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            raise SandboxError(f"set_timeout: could not run kern: {e}") from e
+        if out.returncode != 0:
+            said = (out.stderr or out.stdout or "").strip()
+            if "unknown flag" in said or "--timeout" in said and "expects" not in said:
+                raise SandboxError(
+                    f"set_timeout needs kern 0.51.4 or newer (`kern update --timeout`); "
+                    f"{self._kern_version or self._kern} said: {said[:300]}"
+                )
+            raise SandboxError(f"set_timeout: {said[:400]}")
+
+    def get_metrics(self, *, interval_s: float = 0.2) -> SandboxMetrics:
+        """CPU, memory, tasks and workspace disk now. The CPU rate is measured over ``interval_s``
+        (the call takes that long; ``0`` skips the rate). Box fields are ``None`` for a one-shot
+        sandbox, which has no box between calls, and for a resident box that is not running: the
+        resident box is NOT created to be measured."""
+        self._require_entered()
+        disk = _workspace_usage(self._ws, blind=[])
+        box = None
+        if self.persist and self._resident_lookup() is not None:
+            box = self._resident_name()
+        return _box_metrics(self._kern, box, interval_s, disk)
+
+    def watch_dir(
+        self,
+        path: str = "",
+        on_event: "Callable[[WatchEvent], None] | None" = None,
+        *,
+        recursive: bool = True,
+    ) -> DirWatch:
+        """Watch a workspace directory (``""``: the whole workspace) and call ``on_event`` with each
+        :class:`WatchEvent`, from a background thread, until ``stop()``. The workspace is a host
+        directory, so this is inotify on the host: changes made by the box, by this process and by
+        anyone else are all reported. Directories created later are watched too when ``recursive``.
+
+        A directory created and filled faster than its watch is added can miss its first entries
+        (inotify cannot watch what it has not seen yet); ``"overflow"`` says the kernel dropped
+        events, or the budget of watched directories is spent, and the directory should be re-read."""
+        self._require_entered()
+        if on_event is None or not callable(on_event):
+            raise SandboxError("watch_dir needs on_event, a callable taking a WatchEvent")
+        rel = os.path.relpath(self._ws_path(path), self._ws) if path else ""
+        return DirWatch(self, "" if rel == "." else rel.replace(os.sep, "/"), on_event, recursive)
 
     def destroy(self) -> None:
         """Stop the resident box. The ONLY way a `persist=True` sandbox goes away before its TTL.
@@ -5206,7 +5690,14 @@ class Sandbox:
     # -- the box invocation --------------------------------------------------------------------------
 
     def _base_argv(
-        self, name: str, *, network: bool, timeout_s: int, is_setup: bool = False, dry: bool = False
+        self,
+        name: str,
+        *,
+        network: bool,
+        timeout_s: int,
+        is_setup: bool = False,
+        dry: bool = False,
+        resident: bool = False,
     ) -> list[str]:
         """Build the `kern box` argv for one call. NOT a pure function: it also WRITES the private
         `--env-file` this box will read, so it must be called once per box that is actually started.
@@ -5247,7 +5738,7 @@ class Sandbox:
         # The image's precompiled stdlib, read-only. Not on the setup box: that one installs deps and
         # then compiles them into `.deps/__pycache__`, which the prefix would redirect into a mount it
         # cannot write. `__enter__` already excluded a session that has deps at all.
-        if self._pyc_dir and not is_setup:
+        if self._pyc_dir and not is_setup and not resident:
             # CHECKED AGAIN HERE, not only at adoption: the sweep in another process can discard
             # this tree between the two, and `--mount` refuses a source that is not there. Dropping
             # the mount for this one call degrades to compiling from source, which is what the
@@ -5308,7 +5799,7 @@ class Sandbox:
         # `setdefault`, so a caller who sets `PYTHONPYCACHEPREFIX` in `env=` keeps their own: this is an
         # optimisation and must never overrule an explicit choice. Set only when the mount above exists,
         # or the interpreter would look for bytecode in a directory that is not there.
-        if self._pyc_dir and not is_setup:
+        if self._pyc_dir and not is_setup and not resident:
             merged_env.setdefault("PYTHONPYCACHEPREFIX", _PYC_MOUNT)
         # Pass the workload env via a private --env-file, NOT `--env K=V` on argv: an argv value is
         # visible in `ps` / /proc/<pid>/cmdline to any local user for the box's lifetime, and this
@@ -5362,6 +5853,10 @@ class Sandbox:
             finally:
                 os.close(fd)
             argv += ["--env-file", env_path]
+        # Labels on the box that RUNS, never in a dry argv: they are metadata, not posture, so they
+        # stay out of the resident fingerprint and the prewarm key.
+        if not dry:
+            argv += self._label_args
         return argv
 
     def _scratch_note(self) -> str:
@@ -7739,6 +8234,52 @@ class Sandbox:
         self._require_entered()
         return Kernel(self, self._eff_timeout(timeout_s))
 
+    @classmethod
+    def list(cls, labels: "Mapping[str, str] | None" = None) -> "list[SandboxInfo]":  # noqa: A003
+        """The sandbox boxes running now (this user's, every process's), optionally only those
+        carrying every ``labels`` entry. A ``persist`` sandbox shows as its resident box (``name`` set);
+        a one-shot sandbox only while a call, a Kernel or a prewarmed box of it is running."""
+        want = dict(labels or {})
+        for k, v in want.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise SandboxError("list(labels=...) takes a mapping of str to str")
+        kern = _find_kern()
+        try:
+            out = subprocess.run(  # noqa: S603 - argv list, no shell
+                [kern, "ps", "--json"], capture_output=True, text=True, timeout=30
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            raise SandboxError(f"list: could not run kern ps: {e}") from e
+        if out.returncode != 0:
+            raise SandboxError(f"list: kern ps failed: {(out.stderr or out.stdout).strip()[:300]}")
+        try:
+            rows = json.loads(out.stdout or "[]")
+        except ValueError as e:
+            raise SandboxError(f"list: kern ps --json did not answer JSON: {e}") from e
+        found: "list[SandboxInfo]" = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("status") not in ("running", "paused"):
+                continue
+            box = row.get("name")
+            if not isinstance(box, str) or not box.startswith(_SANDBOX_BOX_PREFIXES):
+                continue
+            raw = row.get("labels") if isinstance(row.get("labels"), dict) else {}
+            mine = {
+                str(k): str(v) for k, v in raw.items() if not str(k).startswith(_RESERVED_LABEL_PREFIX)
+            }
+            if any(mine.get(k) != v for k, v in want.items()):
+                continue
+            resident = box.startswith(cls._RESIDENT_PREFIX)
+            found.append(SandboxInfo(
+                box=box,
+                name=box[len(cls._RESIDENT_PREFIX):] if resident else None,
+                kind="persist" if resident else "call",
+                labels=mine,
+                pid=_int_or_none(row.get("pid")) or 0,
+                started=_int_or_none(row.get("started")) or 0,
+            ))
+        return found
+
 
 # Sentinel: the box declared (or streamed) a reply frame larger than the cap. The box is UNTRUSTED and
 # controls the length prefix + body, so an uncapped reader would let it stream a multi-GB frame and OOM
@@ -7957,6 +8498,12 @@ class Kernel:
         self._err = _CappedReader(self._proc.stderr, sbx.max_output_bytes)
         self._err.start()
         return self
+
+    def get_metrics(self, *, interval_s: float = 0.2) -> SandboxMetrics:
+        """This kernel's box: CPU (rate over ``interval_s``), memory, tasks, and the workspace disk."""
+        sbx = self._sbx
+        disk = _workspace_usage(sbx._ws, blind=[])
+        return _box_metrics(sbx._kern, getattr(self, "_name", None), interval_s, disk)
 
     def run_code(self, code: str, *, timeout_s: "int | float | None" = None) -> ExecutionResult:
         """Execute ``code`` in the warm interpreter; in-memory state persists from the previous cell. A
