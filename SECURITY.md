@@ -33,6 +33,19 @@ section is the summary; the rest of this file is the per-mechanism detail behind
 
 - seccomp must block the dangerous syscall set unconditionally.
 
+**On Windows, kern runs in its own WSL2 distro as that distro's ordinary user `kern` (uid 1000),
+never as root.** Started as root, which is the distro's login and what `kern.exe` runs, kern places
+itself in a cgroup subtree it delegates to that user and becomes the user before it does anything
+else, so a box's root is uid 1000 of the distro, as a box's root on Linux is the user who started
+it. Root's terminal stays root's: kern goes on as the user on a terminal and in a session of its
+own, with none of the descriptors root's shell left open, while a root process relays, so a process
+of uid 1000 cannot push input into root's shell. A process that escaped a box would have no
+capability and no access to the other
+distributions' disks, but it would reach the logged-in Windows user's files under `/mnt/c`: kern
+itself must read and write them to run a project from `C:\`, and Docker Desktop's file sharing
+reaches the same files. WSL2 distributions share one VM and one kernel, and Microsoft does not treat
+them as a security boundary between each other.
+
 **Out of scope, by design: the GPU.** A box can be given the host's GPU as a device, the whole card,
 and kern does not split or cap it, so there is no GPU limit here to attack.
 
@@ -262,9 +275,8 @@ any of these paths.
 
 - **`--security-opt no-new-privileges`** (compose `security_opt`) stops a setuid or file-capability
   program from raising its caller, as in docker. Without it a box behaves as a docker container does:
-  `sudo` works, and the most it can reach is the bounding set, which equals the box's own `CapEff`
-  (measured: uid 1000 runs a setuid-root program and gets EUID 0 with `CapEff` = `CapBnd` =
-  `00000110bd84efff`). The sandbox SDKs always pass it.
+  `sudo` works, and the most it can reach is the bounding set, which equals the box's own `CapEff`:
+  Docker's default set, `00000000a80425fb`. The sandbox SDKs always pass it.
 
 - **`--apparmor <profile>`** enters a pre-loaded AppArmor (LSM) profile on the box's `exec`,
   layering kernel-enforced file/capability confinement over namespaces + seccomp - Docker's

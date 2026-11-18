@@ -70,6 +70,10 @@ much faster:
 wsl -d kern
 ```
 
+In the distro kern runs boxes as its user `kern` (uid 1000), not root: a box's root is that user.
+Running `install.ps1` again updates kern and converts a distro installed before this, keeping its
+images and volumes.
+
 ### Which WSL2 distro kern uses
 
 `kern.exe` is a forwarder: it runs the real kern inside one WSL2 distro. If you have more than one,
@@ -129,6 +133,17 @@ without `vz`). To remove it: `rm ~/.local/bin/kern && limactl delete --force ker
 on the Mac itself installs, and its first call stops with an error that says so. Inside the VM
 (`limactl shell kern`), in a venv, it brings kern with it. An MCP client on the Mac needs the `ssh`
 line in [docs/MCP.md](MCP.md). More in the [FAQ](FAQ.md#does-it-run-on-macos).
+
+## Update
+
+```sh
+kern self-update              # the newest release; its signature is checked before anything is replaced
+kern self-update --check      # only say whether a newer release exists
+kern self-update --rollback   # put back the binary the last update replaced
+```
+
+A kern that pip, npm, cargo or a package manager installed is updated by that tool, and
+`self-update` says which command to run. On Windows, run `install.ps1` again.
 
 ## Uninstall
 

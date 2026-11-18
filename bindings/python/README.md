@@ -202,7 +202,10 @@ relaxation is a named argument.
   `.npmrc`, `.git-credentials` and the rest), plus `~/.config/gh` and `~/.config/gcloud`. A parent
   of any of these is refused too (`/home` holds your home), and so is a directory with a credential
   directory or a shell history in its first two levels (`.npmrc`, `.pypirc` and `.docker` excepted,
-  since projects carry their own). Mount a copy.
+  since projects carry their own). Mount a copy. A source whose listing does not come back within
+  10 s is refused unchecked; if it is a network or FUSE filesystem that never answers, the scan's
+  thread stays in the kernel's uninterruptible wait, and the process cannot exit until that
+  filesystem answers or is unmounted.
 - **`network=True` includes the host's loopback**, where unauthenticated services live: a test read
   the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the route-level middle setting.
 

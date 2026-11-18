@@ -19,6 +19,59 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
+## v0.51.2 - 2026-11-18
+
+**Windows (WSL): boxes run as the distro's user `kern` (uid 1000), not root.** A box's root is
+uid 1000 of the distro. `install.ps1` converts an existing distro: images pulled again for the user,
+volumes and settings moved with their modes kept. Each distro has its own cgroup subtree. The distro
+ships `passt`; root's password is locked. Started from a root terminal, kern runs as the user on a
+terminal and in a session of its own, relayed by a root process the user cannot trace or signal: the
+user's processes hold no descriptor of root's terminal and none of the descriptors root's shell left
+open.
+
+**A kern in one WSL distro no longer stops the boxes of another.**
+
+**A box keeps Docker's default capability set** (`CapEff` `00000000a80425fb`). `--cap-add` adds one
+back.
+
+**`kern self-update`**: installs the newest signed release; `--check [--json]`, `--to X.Y.Z`,
+`--rollback`. `install.sh` checks the release signature when `minisign` is installed.
+
+**Compose: `.env` values reach the box as written.** Interpolation runs on parsed values; `{...}`,
+`[...]`, `*x`, `&x`, `a #b` were changed or refused.
+
+**`compose up` starts nothing when an image cannot be pulled or a host port is taken**, and names
+each service, image, port and holder.
+
+**`COPY --chown` and `ADD --chown` set the owner**, by number or by the image's own user and group
+names.
+
+**A build step or a compose wait longer than 30 s is reported** with its elapsed time, and a build
+step with its pids and memory.
+
+**Pull: credentials a registry refuses are retried anonymously**, with a line naming `kern login`
+and `kern logout`.
+
+**Caps apply when `XDG_RUNTIME_DIR` points outside `/run/user`.**
+
+**Box scratch never goes under a runtime directory owned by another user** (WSLg's
+`/mnt/wslg/runtime-dir`).
+
+**`kern doctor`**: a first line says who kern runs as, and in which WSL distro; limits are reported
+as a box gets them; SELinux counts only when selinuxfs is mounted; `sshfs` is optional.
+
+**The published-port warning names the host port** and how to keep it on `127.0.0.1`.
+
+**A box can no longer push input into the terminal it was started from**: `ioctl` `TIOCSTI` and
+`TIOCLINUX` return `EPERM`.
+
+**`FROM <stage>` and `COPY --from` build rootless over a directory a subordinate uid owns** (the
+`python:*-slim` apt directories), and keep setuid bits.
+
+**On a bridge, a box's own names resolve to its own address**: `hostname -i` answers one address.
+
+**`FROM <stage>` no longer warns about an unpinned tag.**
+
 ## kern-sandbox 0.2.51 - 2026-11-18
 
 **It carries the kern v0.51.1 binary.** Both bindings move together; nothing else in them changed.
