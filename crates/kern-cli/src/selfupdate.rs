@@ -365,11 +365,31 @@ fn verify_file(path: &Path, sig: &Signature, keys: &[PublicKey]) -> Result<(), S
 /// `https://` only, redirects included. A debug build also takes `file://`, which is how the tests
 /// serve a release without a network.
 fn fetch(url: &str, out: &Path, cap: u64, max_seconds: &str) -> Result<(), Error> {
+    fetch_as(url, out, cap, max_seconds).map_err(|f| match f {
+        Fetched::Missing(e) | Fetched::Failed(e) => e,
+    })
+}
+
+/// Why a download failed: the server ANSWERED that the file is not there (HTTP error, or a missing
+/// `file://` in the tests), or the download never completed (no DNS, no route, a timeout, TLS).
+/// Only the first may be read as "this release is not signed yet". MEASURED 2026-11-18 on a WSL
+/// distro whose resolver failed: "could not resolve host" was followed by "no signature was found
+/// for this release", and the release was signed.
+enum Fetched {
+    Missing(Error),
+    Failed(Error),
+}
+
+/// curl's exit for "the server answered with an error" under `--fail` (22), and for a `file://`
+/// that is not there (37).
+const CURL_MISSING: [i32; 2] = [22, 37];
+
+fn fetch_as(url: &str, out: &Path, cap: u64, max_seconds: &str) -> Result<(), Fetched> {
     let local = cfg!(debug_assertions) && url.starts_with("file://");
     if !local && !url.starts_with("https://") {
-        return Err(Error::SelfUpdate(format!(
+        return Err(Fetched::Failed(Error::SelfUpdate(format!(
             "refusing to download over anything but https: {url}"
-        )));
+        ))));
     }
     let proto = if local { "=file" } else { "=https" };
     let cap_arg = cap.to_string();
@@ -391,29 +411,38 @@ fn fetch(url: &str, out: &Path, cap: u64, max_seconds: &str) -> Result<(), Error
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+            Fetched::Failed(if e.kind() == std::io::ErrorKind::NotFound {
                 Error::SelfUpdate(
                     "self-update downloads with curl, and curl is not installed".into(),
                 )
             } else {
                 Error::SelfUpdate(format!("cannot run curl: {e}"))
-            }
+            })
         })?;
     if !done.status.success() {
         let said = String::from_utf8_lossy(&done.stderr);
         let said = said.lines().last().unwrap_or("").trim();
-        return Err(Error::SelfUpdate(format!(
-            "could not download {url}: {said}"
-        )));
+        let e = Error::SelfUpdate(format!("could not download {url}: {said}"));
+        return Err(match done.status.code() {
+            Some(c) if CURL_MISSING.contains(&c) => Fetched::Missing(e),
+            _ => Fetched::Failed(Error::SelfUpdate(format!(
+                "could not download {url}: {said}\nthe download did not complete, so nothing \
+                 was replaced: check the network (DNS, a proxy) and run it again"
+            ))),
+        });
     }
     // `--max-filesize` cannot stop a body whose size the server did not announce, so look.
     let size = std::fs::metadata(out)
-        .map_err(|e| Error::SelfUpdate(format!("the download of {url} left no file: {e}")))?
+        .map_err(|e| {
+            Fetched::Failed(Error::SelfUpdate(format!(
+                "the download of {url} left no file: {e}"
+            )))
+        })?
         .len();
     if size > cap {
-        return Err(Error::SelfUpdate(format!(
+        return Err(Fetched::Failed(Error::SelfUpdate(format!(
             "{url} is {size} bytes, over the {cap} a release asset may be: nothing replaced"
-        )));
+        ))));
     }
     Ok(())
 }
@@ -597,18 +626,18 @@ fn install(to: Option<Version>, check: Option<bool>) -> Result<(), Error> {
     let work = WorkDir::create(&place.dir)?;
     let tarball = work.0.join(&file);
     let sigfile = work.0.join(format!("{file}.minisig"));
-    fetch(
+    fetch_as(
         &format!("{base}/{file}.minisig"),
         &sigfile,
         MAX_SIG_BYTES,
         SIG_MAX_SECONDS,
     )
-    .map_err(|e| match e {
-        Error::SelfUpdate(m) => Error::SelfUpdate(format!(
+    .map_err(|f| match f {
+        Fetched::Missing(Error::SelfUpdate(m)) => Error::SelfUpdate(format!(
             "{m}\nno signature was found for this release: a release is installable once \
                  it is signed, try again later"
         )),
-        other => other,
+        Fetched::Missing(other) | Fetched::Failed(other) => other,
     })?;
     let sig_text = std::fs::read_to_string(&sigfile)
         .map_err(|e| Error::SelfUpdate(format!("the signature is not text: {e}")))?;

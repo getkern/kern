@@ -378,6 +378,38 @@ fn a_release_with_no_signature_is_refused() {
     assert_refused(&w, &key, "no signature was found");
 }
 
+/// A download that never completes is a network failure, not an unsigned release. MEASURED
+/// 2026-11-18 on a WSL distro whose resolver failed: "could not resolve host" was followed by "no
+/// signature was found for this release", and the release was signed.
+#[test]
+fn a_network_failure_is_not_called_a_missing_signature() {
+    let w = World::new("offline");
+    let key = Signer::new(7);
+    let original = std::fs::read(w.bin()).expect("read kern");
+    let out = Command::new(w.bin())
+        .arg("self-update")
+        .env("KERN_SELF_UPDATE_URL", "https://127.0.0.1:1/rel")
+        .env("KERN_SELF_UPDATE_TEST_PUBKEY", key.public())
+        .env("KERN_SELF_UPDATE_TEST_VERSION", "0.51.1")
+        .output()
+        .expect("run kern self-update");
+    let text = said(&out);
+    assert!(!out.status.success(), "accepted:\n{text}");
+    assert!(
+        !text.contains("no signature was found"),
+        "a failed download was called a missing signature:\n{text}"
+    );
+    assert!(
+        text.contains("check the network"),
+        "no network hint:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read(w.bin()).expect("read kern"),
+        original,
+        "the binary changed"
+    );
+}
+
 #[test]
 fn the_current_release_is_nothing_to_do() {
     let w = World::new("current");

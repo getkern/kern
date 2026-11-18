@@ -23,6 +23,9 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 **`compose up` on a terminal shows a service that exited before it attached** (`command: echo ...`).
 
+**`kern self-update` tells a failed download from an unsigned release**: a network that does not answer
+is named as such, not as a missing signature.
+
 ## kern sandbox 0.2.53 - 2026-11-18
 
 **It carries the kern v0.51.3 binary.** Both bindings move together; nothing else in them changed.
