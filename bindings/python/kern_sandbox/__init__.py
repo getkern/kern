@@ -4184,6 +4184,32 @@ def _host_of(kern: str, box: str, port: int, published: "Sequence[int] | None") 
     )
 
 
+#: The box the current thread's call ran in, set by the paths that start or enter one (`_spawn`, a
+#: prewarmed box) and read by the call that records the transcript: thread-local, so concurrent calls
+#: on one Sandbox from different threads never trade names.
+_CALL_BOX = threading.local()
+
+
+def _record_transcript(kern: str, box: str, language: str, code: str, result: "ExecutionResult") -> None:
+    """Hand one call's code and output to ``kern sandbox record``, from a thread of its own so the call
+    returns as fast as before. NOT a daemon thread: a script that makes one call and exits still gets
+    it recorded. Any failure (a kern without ``record``, a full disk) is dropped: a call's result
+    never depends on its transcript."""
+    code_b = code.encode("utf-8", "surrogateescape")
+    out_b = (result.stdout or "").encode("utf-8", "surrogateescape")
+    err_b = (result.stderr or "").encode("utf-8", "surrogateescape")
+    frame = f"v1 {len(code_b)} {len(out_b)} {len(err_b)}\n".encode() + code_b + out_b + err_b
+    argv = [kern, "sandbox", "record", box, "--exit", str(int(result.exit_code)), "--language", language]
+
+    def send() -> None:
+        with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
+            subprocess.run(  # noqa: S603 - argv list, no shell
+                argv, input=frame, capture_output=True, timeout=15
+            )
+
+    threading.Thread(target=send, name="kern-sandbox-transcript", daemon=False).start()
+
+
 class Pty:
     """An interactive terminal in a sandbox, from :meth:`Sandbox.pty`. Output arrives as raw bytes
     (escape sequences included) to ``on_data``, from one background thread, in order; ``send_input``
@@ -4868,6 +4894,10 @@ class Sandbox:
     #: bounds the wait and a box that never gets ready is a ``SandboxError`` naming its last output.
     ready_cmd: "str | None" = None
     ready_timeout_s: float = 60
+    #: Hand each call's code and output to kern (``kern sandbox show``), kept where kern keeps the
+    #: sandbox history (in memory by default, mode 0600) and bounded there. ``False`` keeps none for
+    #: this sandbox; ``[kern] sandbox_transcripts = false`` keeps none for every one.
+    transcripts: bool = True
 
     _kern: str = field(default="", repr=False)
     _port_args: list = field(default_factory=list, init=False, repr=False)
@@ -6420,6 +6450,7 @@ class Sandbox:
                 )
         before = self._snapshot() if self.track_files else None  # skip the O(N) walk when not tracked
         name = _unique_name()
+        _CALL_BOX.name = name
         # The env file is named after THIS box, and removed in the `finally` below. It used to be one
         # fixed `.kern-env` per workspace, which two concurrent calls on the same Sandbox raced for:
         # both `unlink`ed it, both re-created it with `O_EXCL`, and the loser got a bare
@@ -6459,6 +6490,7 @@ class Sandbox:
             # there: it would trade the 2 ms this feature exists for. So the exec runs, and only a
             # failure that says the box is missing triggers one recreate and one retry.
             self._resident_calls += 1
+            _CALL_BOX.name = self._resident
             # `-u`: `kern exec` enters as box root whatever the box runs as, so a call on a non-root
             # session names the account, or it would run as root where the one-shot path does not.
             argv = [self._kern, "exec", self._resident, "-w", _WORKSPACE]
@@ -8481,8 +8513,13 @@ class Sandbox:
                 f"language='python'."
             )
         eff = self._eff_timeout(timeout_s)
+        _CALL_BOX.name = None
         if language == "python":
-            return self._run_python_cell(code, timeout_s=eff, on_stdout=on_stdout, on_stderr=on_stderr)
+            return self._transcribe(
+                language,
+                code,
+                self._run_python_cell(code, timeout_s=eff, on_stdout=on_stdout, on_stderr=on_stderr),
+            )
         cell = ""
         if len(code.encode()) > self._INLINE_CODE_MAX:
             # Write to a per-call cell file in the workspace and run it by path (no argv-size limit).
@@ -8492,8 +8529,12 @@ class Sandbox:
         else:
             command = [runner, inline_flag, code]
         try:
-            return self._spawn(
-                command, network=self.network, timeout_s=eff, on_stdout=on_stdout, on_stderr=on_stderr
+            return self._transcribe(
+                language,
+                code,
+                self._spawn(
+                    command, network=self.network, timeout_s=eff, on_stdout=on_stdout, on_stderr=on_stderr
+                ),
             )
         finally:
             # The Python path has always deleted its scratch; this one never did, so every oversized
@@ -8590,6 +8631,14 @@ class Sandbox:
                     pass
             self._release(cell, resf, runf)
 
+    def _transcribe(self, language: str, code: str, result: "ExecutionResult") -> "ExecutionResult":
+        """Record ``result``'s call when transcripts are on and its box is known; return ``result``."""
+        box = getattr(_CALL_BOX, "name", None)
+        _CALL_BOX.name = None
+        if self.transcripts and box:
+            _record_transcript(self._kern, box, language, code, result)
+        return result
+
     def run(
         self,
         command: Sequence[str],
@@ -8605,13 +8654,17 @@ class Sandbox:
             raise SandboxError('run() takes an argv LIST, not a string. Use run(["sh","-c","..."]).')
         if not command:
             raise SandboxError("run() needs a non-empty command")
-        return self._spawn(
+        _CALL_BOX.name = None
+        result = self._spawn(
             command,
             network=self.network,
             timeout_s=self._eff_timeout(timeout_s),
             on_stdout=on_stdout,
             on_stderr=on_stderr,
         )
+        import shlex
+
+        return self._transcribe("command", shlex.join(list(command)), result)
 
     def kernel(self, *, timeout_s: "int | float | None" = None) -> "Kernel":
         """Open a persistent, WARM Python interpreter in a long-lived box (warm-start). Returns a
@@ -8946,7 +8999,10 @@ class Kernel:
             )
         if reply is None:
             return self._death_result(started, out)
-        return self._result_from_reply(reply, started, out)
+        result = self._result_from_reply(reply, started, out)
+        if self._sbx.transcripts and getattr(self, "_name", None):
+            _record_transcript(self._sbx._kern, self._name, "python", code, result)
+        return result
 
     def _death_result(self, started: float, out: "_CellOutput") -> ExecutionResult:
         """The box went away mid-cell: classify why from what kern wrote, keeping what the cell printed."""
@@ -9467,6 +9523,7 @@ class _WarmBox:
         if self._spent:
             raise SandboxError("a prewarmed box serves exactly one cell")
         self._spent = True
+        _CALL_BOX.name = self._name
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise SandboxError("prewarmed box was never started")

@@ -470,3 +470,50 @@ def test_a_persist_fork_has_its_own_name_and_keeps_its_workspace(tmp_path):
             shutil.rmtree(c.workspace, ignore_errors=True)
         finally:
             sb.destroy()
+
+
+# ------------------------------------------------------------------------------------------ transcripts
+
+
+def _shown(kern_bin: str, env: dict) -> "list[dict]":
+    import json
+    import subprocess
+
+    out = subprocess.run([kern_bin, "sandbox", "show", "-n", "50", "--json"], capture_output=True, text=True, env=env)
+    return [json.loads(line) for line in out.stdout.splitlines() if line.strip()]
+
+
+@integration
+def test_each_call_is_handed_to_kern_as_a_transcript(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir(mode=0o700)
+    env = dict(os.environ, XDG_RUNTIME_DIR=str(run), XDG_CONFIG_HOME=str(tmp_path / "cfg"), XDG_DATA_HOME=str(tmp_path / "data"))
+    old = {k: os.environ.get(k) for k in ("XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME")}
+    os.environ.update({k: env[k] for k in old})
+    try:
+        with Sandbox() as sb:
+            sb.run_code("print('tr-python')")
+            sb.run(["sh", "-c", "echo tr-run; exit 3"])
+            with sb.kernel() as k:
+                k.run_code("print('tr-kernel')")
+        with Sandbox(transcripts=False) as sb:
+            sb.run_code("print('tr-not-kept')")
+        kern_bin = os.environ.get("KERN_BIN") or shutil.which("kern")
+        deadline = time.monotonic() + 10
+        rows: "list[dict]" = []
+        while time.monotonic() < deadline:
+            rows = _shown(kern_bin, env)
+            if len(rows) >= 3:
+                break
+            time.sleep(0.1)
+        by_out = {r["stdout"].strip(): r for r in rows}
+        assert by_out["tr-python"]["language"] == "python" and by_out["tr-python"]["code"] == "print('tr-python')"
+        assert by_out["tr-run"]["exit"] == 3 and by_out["tr-run"]["language"] == "command"
+        assert by_out["tr-kernel"]["box"].startswith("pysbx-")
+        assert "tr-not-kept" not in by_out
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
