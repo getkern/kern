@@ -387,6 +387,9 @@ const CURL_MISSING: [i32; 2] = [22, 37];
 /// curl's exit for "could not resolve host".
 const CURL_RESOLVE: i32 = 6;
 
+/// curl's exit for "operation timed out", which covers a name lookup that never answered.
+const CURL_TIMEOUT: i32 = 28;
+
 fn fetch_as(url: &str, out: &Path, cap: u64, max_seconds: &str) -> Result<(), Fetched> {
     let local = cfg!(debug_assertions) && url.starts_with("file://");
     if !local && !url.starts_with("https://") {
@@ -431,7 +434,12 @@ fn fetch_as(url: &str, out: &Path, cap: u64, max_seconds: &str) -> Result<(), Fe
     // WSL distro (Alpine curl with c-ares, WSL's DNS proxy): following the redirect from github.com
     // to release-assets.githubusercontent.com failed 5 of 5 times with "Could not resolve host",
     // and 5 of 5 succeeded with `--ipv4`; so every `kern self-update` there failed.
-    if done.status.code() == Some(CURL_RESOLVE) {
+    // The same resolver can also time out instead (curl 28, "Resolving timed out", MEASURED on the
+    // same distro): a timeout that happened while resolving is the same failure.
+    let resolving = done.status.code() == Some(CURL_RESOLVE)
+        || (done.status.code() == Some(CURL_TIMEOUT)
+            && String::from_utf8_lossy(&done.stderr).contains("Resolving timed out"));
+    if resolving {
         done = run(true)?;
     }
     if !done.status.success() {
