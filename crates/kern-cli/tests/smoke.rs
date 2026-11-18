@@ -7191,6 +7191,524 @@ fn a_detached_box_log_holds_the_workload_and_not_kerns_notices() {
     );
 }
 
+/// What `kern doctor` says about resource caps is what a box gets, for every shape of
+/// `XDG_RUNTIME_DIR` a user has: outside `/run/user`, the standard one with a trailing slash, and
+/// WSLg's `/mnt/wslg/runtime-dir` where it exists. MEASURED on WSL2 on 2026-11-18: with the variable
+/// outside `/run/user`, doctor said "caps enforced on a transient scope" while a `--memory 64m` box
+/// read `memory.max=max`, because doctor's probe reached the user manager over the session bus and a
+/// box looks for it under `XDG_RUNTIME_DIR`. The property is checked on the real host, whatever it
+/// is: a box capped at 64 MiB must come with doctor's cgroup row in the green, an uncapped one with
+/// a row that does not claim caps.
+#[test]
+fn doctor_says_what_a_box_gets_for_every_runtime_dir_shape() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let uid = unsafe { libc::getuid() };
+    let outside = std::env::temp_dir().join(format!("kern-xdgshape-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).expect("runtime dir");
+    let _ = Command::new("chmod").arg("700").arg(&outside).status();
+    let mut shapes: Vec<(&str, String)> =
+        vec![("outside /run/user", outside.display().to_string())];
+    let standard = format!("/run/user/{uid}");
+    if std::path::Path::new(&standard).is_dir() {
+        shapes.push(("standard, trailing slash", format!("{standard}/")));
+    }
+    if std::path::Path::new("/mnt/wslg/runtime-dir").is_dir() {
+        shapes.push(("WSLg", "/mnt/wslg/runtime-dir".to_string()));
+    }
+    let mut checked = 0;
+    for (label, xdg) in &shapes {
+        let boxed = kern()
+            .env("XDG_RUNTIME_DIR", xdg)
+            .args([
+                "box",
+                "--rm",
+                "--memory",
+                "64m",
+                "--image",
+                "alpine:latest",
+                "--",
+                "cat",
+                "/sys/fs/cgroup/memory.max",
+            ])
+            .output()
+            .expect("run kern box");
+        let said = String::from_utf8_lossy(&boxed.stdout).trim().to_string();
+        if !boxed.status.success() || said.is_empty() {
+            eprintln!(
+                "SKIP {label}: the box did not run: {:.300}",
+                String::from_utf8_lossy(&boxed.stderr)
+            );
+            continue;
+        }
+        let capped = said == "67108864";
+        let doc = kern()
+            .env("XDG_RUNTIME_DIR", xdg)
+            .arg("doctor")
+            .output()
+            .expect("run kern doctor");
+        let doc = String::from_utf8_lossy(&doc.stdout).into_owned();
+        let Some(row) = doc.lines().find(|l| l.contains("cgroup v2")) else {
+            panic!("{label}: doctor printed no cgroup row:\n{doc}");
+        };
+        let claims = row.trim_start().starts_with('\u{2714}')
+            && row.contains("enforced")
+            && !row.contains("NOT")
+            && !row.contains("UNCAPPED");
+        assert_eq!(
+            claims, capped,
+            "{label} (XDG_RUNTIME_DIR={xdg}): the box read memory.max={said}, doctor said: {row}"
+        );
+        checked += 1;
+    }
+    let _ = std::fs::remove_dir_all(&outside);
+    assert!(checked > 0, "no runtime-dir shape could start a box");
+}
+
+/// A box started with `XDG_RUNTIME_DIR` pointing away from a live user manager still gets its caps:
+/// kern reaches the manager through `/run/user/<uid>` and keeps the box in the world that started it
+/// (its record lands under the caller's runtime dir). MEASURED on WSL2 on 2026-11-18 before this:
+/// such a box ran in `/init.scope` with `memory.max=max`. Skips where no manager lives at the
+/// standard directory.
+#[test]
+fn a_box_is_capped_when_its_runtime_dir_points_away_from_the_manager() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let uid = unsafe { libc::getuid() };
+    if !std::path::Path::new(&format!("/run/user/{uid}/systemd")).exists() {
+        eprintln!("SKIP: no user manager at /run/user/{uid}");
+        return;
+    }
+    let world = std::env::temp_dir().join(format!("kern-xdgaway-{}", std::process::id()));
+    std::fs::create_dir_all(&world).expect("runtime dir");
+    let _ = Command::new("chmod").arg("700").arg(&world).status();
+    let name = format!("xdgaway{}", std::process::id());
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &world)
+        .args([
+            "box",
+            &name,
+            "--rm",
+            "--memory",
+            "64m",
+            "--pids-limit",
+            "50",
+            "--image",
+            "alpine:latest",
+            "--",
+            "sh",
+            "-c",
+            "cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/pids.max",
+        ])
+        .output()
+        .expect("run kern box");
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let kept_world = world.join("kern").is_dir();
+    let _ = std::fs::remove_dir_all(&world);
+    assert!(out.status.success(), "the box did not run: {err}");
+    let caps: Vec<&str> = said.split_whitespace().collect();
+    assert_eq!(
+        caps,
+        ["67108864", "50"],
+        "the box is not capped with XDG_RUNTIME_DIR pointing away: {said}\n{err}"
+    );
+    assert!(
+        kept_world,
+        "the box's state did not land under its own runtime dir"
+    );
+}
+
+/// `compose up` with one image it cannot fetch starts NOTHING, and says which service and why.
+/// MEASURED on a real ten-service stack (2026-11-18): five services were started before `up`
+/// stopped on the sixth's pull, leaving the stack half up. The bad image is on a registry that
+/// refuses the connection at once (`localhost:1`), so the test needs no network.
+#[test]
+fn compose_up_with_an_unpullable_image_starts_nothing() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("kern-unpulled-{}", std::process::id()));
+    for sub in ["run", "data", "config", "proj"] {
+        std::fs::create_dir_all(root.join(sub)).expect("world dir");
+    }
+    let _ = Command::new("chmod")
+        .arg("700")
+        .arg(root.join("run"))
+        .status();
+    let file = root.join("proj/compose.yml");
+    std::fs::write(
+        &file,
+        "services:\n  good:\n    image: alpine:latest\n    command: sleep 30\n  bad:\n    image: localhost:1/nope/missing:1\n    command: sleep 30\n",
+    )
+    .expect("write compose file");
+    let world = [
+        ("XDG_RUNTIME_DIR", root.join("run")),
+        ("XDG_DATA_HOME", root.join("data")),
+        ("XDG_CONFIG_HOME", root.join("config")),
+    ];
+    let up = kern()
+        .envs(world.iter().map(|(k, v)| (k, v)))
+        .arg("compose")
+        .arg(&file)
+        .args(["up", "-d"])
+        .output()
+        .expect("run compose up");
+    let ps = kern()
+        .envs(world.iter().map(|(k, v)| (k, v)))
+        .args(["ps", "-q"])
+        .output()
+        .expect("run ps");
+    let _ = kern()
+        .envs(world.iter().map(|(k, v)| (k, v)))
+        .arg("compose")
+        .arg(&file)
+        .arg("down")
+        .output();
+    let _ = std::fs::remove_dir_all(&root);
+    let err = String::from_utf8_lossy(&up.stderr).into_owned();
+    assert!(
+        !up.status.success(),
+        "up succeeded with an unpullable image: {err}"
+    );
+    assert!(
+        err.contains("no service was started") && err.contains("(service bad)"),
+        "the refusal does not say what and why: {err}"
+    );
+    let running = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    assert!(running.is_empty(), "boxes were started anyway: {running}");
+}
+
+/// `compose up` with a published port another process holds starts NOTHING, and names the holder
+/// when it is this user's process. MEASURED 2026-11-18: the first service started, the second was
+/// refused, the stack stayed half up, and the hint under it talked about box names.
+#[test]
+fn compose_up_with_a_taken_port_starts_nothing_and_names_the_holder() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let Ok(listener) = std::net::TcpListener::bind("0.0.0.0:0") else {
+        eprintln!("SKIP: cannot listen on a host port here");
+        return;
+    };
+    let Ok(port) = listener.local_addr().map(|a| a.port()) else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("kern-taken-{}", std::process::id()));
+    for sub in ["run", "data", "config", "proj"] {
+        std::fs::create_dir_all(root.join(sub)).expect("world dir");
+    }
+    let _ = Command::new("chmod")
+        .arg("700")
+        .arg(root.join("run"))
+        .status();
+    let file = root.join("proj/compose.yml");
+    std::fs::write(
+        &file,
+        format!(
+            "services:\n  a:\n    image: alpine:latest\n    command: sleep 30\n  b:\n    image: alpine:latest\n    command: sleep 30\n    ports:\n      - \"{port}:80\"\n"
+        ),
+    )
+    .expect("write compose file");
+    let world = [
+        ("XDG_RUNTIME_DIR", root.join("run")),
+        ("XDG_DATA_HOME", root.join("data")),
+        ("XDG_CONFIG_HOME", root.join("config")),
+    ];
+    let up = kern()
+        .envs(world.iter().map(|(k, v)| (k, v)))
+        .arg("compose")
+        .arg(&file)
+        .args(["up", "-d"])
+        .output()
+        .expect("run compose up");
+    let ps = kern()
+        .envs(world.iter().map(|(k, v)| (k, v)))
+        .args(["ps", "-q"])
+        .output()
+        .expect("run ps");
+    let _ = kern()
+        .envs(world.iter().map(|(k, v)| (k, v)))
+        .arg("compose")
+        .arg(&file)
+        .arg("down")
+        .output();
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&root);
+    let err = String::from_utf8_lossy(&up.stderr).into_owned();
+    assert!(!up.status.success(), "up succeeded on a taken port: {err}");
+    let me = format!("(pid {})", std::process::id());
+    assert!(
+        err.contains("no service was started") && err.contains(&me) && err.contains("service b"),
+        "the refusal does not name the service and this test as the holder: {err}"
+    );
+    assert!(
+        !err.contains("frees the name"),
+        "a hint about names under a port refusal: {err}"
+    );
+    let running = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    assert!(running.is_empty(), "boxes were started anyway: {running}");
+}
+
+/// `COPY --chown` owns what it copies, by number or by the image's own names, as under Docker.
+/// MEASURED 2026-11-18: the flag was parsed and dropped, every file stayed 0:0, and a
+/// `COPY --chown=node:node` followed by `USER node` left the process unable to write its own files.
+#[test]
+fn copy_chown_owns_the_copied_files() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-copychown-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("ctx/sub")).expect("context");
+    std::fs::write(dir.join("ctx/f"), "x").expect("file");
+    std::fs::write(dir.join("ctx/sub/g"), "y").expect("file");
+    std::fs::write(
+        dir.join("Dockerfile"),
+        "FROM alpine:latest\nRUN adduser -D -u 1500 node\nCOPY f /plain\nCOPY --chown=1000:1001 f /num\nCOPY --chown=nobody f /name\nCOPY --chown=node:node sub /app/\nUSER node\nRUN stat -c '%n %u:%g' /plain /num /name /app/g && touch /app/new && echo WRITE-OK\n",
+    )
+    .expect("Dockerfile");
+    let tag = format!("kern-copychown:{}", std::process::id());
+    let out = kern()
+        .args(["build", "-t", &tag, "-f"])
+        .arg(dir.join("Dockerfile"))
+        .arg(dir.join("ctx"))
+        .output()
+        .expect("run kern build");
+    let _ = kern().args(["rmi", &tag]).output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if said.contains("subordinate uid range") {
+        eprintln!("SKIP: no subordinate uid range here: {said:.300}");
+        return;
+    }
+    assert!(out.status.success(), "the build failed: {said}");
+    for want in [
+        "/plain 0:0",
+        "/num 1000:1001",
+        "/name 65534:65534",
+        "/app/g 1500:1500",
+        "WRITE-OK",
+    ] {
+        assert!(said.contains(want), "missing {want:?}: {said}");
+    }
+}
+
+/// `FROM <stage>` over a stage with a directory a subordinate uid owns at 0700 (python:*-slim ships
+/// `/var/lib/apt/lists/partial` so) builds rootless, keeps the directory's owner and mode, and keeps
+/// setuid bits. MEASURED 2026-11-18: it failed with "extract stage 114" (or "COPY --from source does not
+/// exist"), and a stage copy left `su` at 755.
+#[test]
+fn from_stage_reads_a_subordinate_owned_directory_and_keeps_setuid() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-fromstage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("context");
+    std::fs::write(
+        dir.join("Dockerfile"),
+        "FROM alpine:latest AS base\nRUN mkdir -p /x/partial && chown 42:0 /x/partial && chmod 700 /x/partial && cp /bin/busybox /suidbin && chmod 4755 /suidbin\nFROM base AS dev\nRUN echo dev > /dev.txt\n",
+    )
+    .expect("Dockerfile");
+    let tag = format!("kern-fromstage:{}", std::process::id());
+    let build = kern()
+        .args(["build", "--no-cache", "-t", &tag])
+        .arg(&dir)
+        .output()
+        .expect("build");
+    let said = String::from_utf8_lossy(&build.stderr).into_owned();
+    if !build.status.success() && said.contains("subordinate uid range") {
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("SKIP: no subordinate uid range here: {said:.300}");
+        return;
+    }
+    let run = kern()
+        .args([
+            "box",
+            "--rm",
+            "--image",
+            &tag,
+            "--",
+            "stat",
+            "-c",
+            "%u %a %n",
+            "/x/partial",
+            "/suidbin",
+            "/dev.txt",
+        ])
+        .output()
+        .expect("box");
+    let _ = kern().args(["rmi", &tag]).output();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(build.status.success(), "the build failed: {said}");
+    let out = String::from_utf8_lossy(&run.stdout).into_owned();
+    for want in ["42 700 /x/partial", "0 4755 /suidbin", "/dev.txt"] {
+        assert!(
+            out.contains(want),
+            "missing {want:?}: {out}{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+/// On a bridge, a box's own names resolve to its own bridge address only, so `hostname -i` answers ONE
+/// address, as under Docker. MEASURED 2026-11-18: the box line and a `127.0.0.1` entry made it answer
+/// two, and the docker-library healthchecks (`redis-cli -h "$(hostname -i)"`) failed forever.
+#[test]
+fn on_a_bridge_hostname_i_answers_one_address() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("kern-hostni-{}", std::process::id()));
+    for sub in ["run", "config", "p"] {
+        std::fs::create_dir_all(root.join(sub)).expect("world dir");
+    }
+    let _ = Command::new("chmod")
+        .arg("700")
+        .arg(root.join("run"))
+        .status();
+    let file = root.join("p/compose.yml");
+    std::fs::write(
+        &file,
+        "services:\n  one:\n    image: alpine:latest\n    command: sleep 30\n    networks: [n1]\n  two:\n    image: alpine:latest\n    command: sleep 30\n    networks: [n1, n2]\nnetworks:\n  n1:\n  n2:\n",
+    )
+    .expect("compose file");
+    let world = [
+        ("XDG_RUNTIME_DIR", root.join("run")),
+        ("XDG_CONFIG_HOME", root.join("config")),
+    ];
+    let up = kern()
+        .envs(world.iter().map(|(k, v)| (k, v)))
+        .arg("compose")
+        .arg(&file)
+        .args(["up", "-d"])
+        .output()
+        .expect("up");
+    let ip = kern()
+        .envs(world.iter().map(|(k, v)| (k, v)))
+        .args(["exec", "p-one-1", "--", "hostname", "-i"])
+        .output()
+        .expect("exec");
+    let _ = kern()
+        .envs(world.iter().map(|(k, v)| (k, v)))
+        .arg("compose")
+        .arg(&file)
+        .arg("down")
+        .output();
+    let _ = std::fs::remove_dir_all(&root);
+    if !up.status.success() {
+        eprintln!(
+            "SKIP: the stack did not start here: {:.300}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    let said = String::from_utf8_lossy(&ip.stdout).trim().to_string();
+    assert_eq!(said.split_whitespace().count(), 1, "hostname -i: {said:?}");
+    assert!(!said.starts_with("127."), "hostname -i: {said:?}");
+}
+
+/// `stop --all`, `prune` and `gc` run from one runtime directory never end a box of another. The
+/// boxes of every runtime dir of a user share the user manager (and, on the direct path, one unit),
+/// so a cleanup that read "every box I can see" as "every box of mine" reached the other world: the
+/// class of the two defects fixed in v0.51.1 (`uninstall`, `stop <name>`).
+#[test]
+fn cleanups_from_one_world_never_end_a_box_of_another() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("kern-xworld-{}", std::process::id()));
+    let world = |w: &str| -> Vec<(String, std::path::PathBuf)> {
+        let d = root.join(w);
+        for sub in ["run", "data", "config"] {
+            std::fs::create_dir_all(d.join(sub)).expect("world dir");
+        }
+        let _ = Command::new("chmod").arg("700").arg(d.join("run")).status();
+        vec![
+            ("XDG_RUNTIME_DIR".into(), d.join("run")),
+            ("XDG_DATA_HOME".into(), d.join("data")),
+            ("XDG_CONFIG_HOME".into(), d.join("config")),
+        ]
+    };
+    let a = world("a");
+    let b = world("b");
+    let name = format!("xworld{}", std::process::id());
+    let started = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args([
+            "box",
+            &name,
+            "-d",
+            "--image",
+            "alpine:latest",
+            "--",
+            "sleep",
+            "60",
+        ])
+        .output()
+        .expect("start the box in world A");
+    if !started.status.success() {
+        eprintln!(
+            "SKIP: the box did not start: {:.300}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    // Each cleanup must RUN (an unknown flag would make this test pass on a no-op), and `stop --all`
+    // from B must not even see A's box.
+    let mut said = String::new();
+    for args in [vec!["stop", "--all", "-t", "0"], vec!["prune"], vec!["gc"]] {
+        let out = kern()
+            .envs(b.iter().map(|(k, v)| (k, v)))
+            .args(&args)
+            .output()
+            .expect("cleanup in world B");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ran = out.status.success()
+            || (args[0] == "stop" && text.contains("no running boxes to stop"));
+        assert!(
+            ran,
+            "`kern {}` in world B did not run: {text}",
+            args.join(" ")
+        );
+        said.push_str(&format!("$ kern {}\n{text}", args.join(" ")));
+    }
+    let ps = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args(["ps", "-q"])
+        .output()
+        .expect("ps in world A");
+    let alive = String::from_utf8_lossy(&ps.stdout).contains(&name);
+    let _ = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args(["stop", &name, "-t", "0"])
+        .output();
+    let _ = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args(["rm", &name])
+        .output();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(alive, "a cleanup in world B ended world A's box:\n{said}");
+}
+
 /// `kern stop <name>` from one runtime directory leaves a same-named box of another one alone. The
 /// record-less stop (a box whose record here is gone) found its target among EVERY box of the user,
 /// so it also stopped a box another directory's world started under that name. Now that box is

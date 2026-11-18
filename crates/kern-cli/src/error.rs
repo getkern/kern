@@ -51,6 +51,9 @@ pub enum Error {
     /// (see `main`). It prints NOTHING: the command already said whatever it had to say on its own
     /// stdout, and "error: exited 3" underneath would be kern narrating someone else's result.
     Workload(i32),
+    /// `kern self-update` refused or failed. Every message names its own way out (the package
+    /// manager to use, the flag, the file kept), so it carries no generic hint.
+    SelfUpdate(String),
 }
 
 impl Error {
@@ -166,9 +169,12 @@ impl Error {
             Error::NotRunning(msg) => {
                 (!msg.contains('`')).then(|| "run `kern ps` to see running boxes".into())
             }
-            Error::AlreadyRunning(_) => {
-                Some("run `kern ps` to see running boxes; `kern stop <name>` frees the name".into())
-            }
+            // A refusal that names its own remedy (a taken PORT says who holds it and what frees it)
+            // gets no generic line about names under it; measured on `compose up` with a port held by
+            // a dev server, the hint said "`kern stop <name>` frees the name" about a port.
+            Error::AlreadyRunning(msg) => (!msg.contains('`')).then(|| {
+                "run `kern ps` to see running boxes; `kern stop <name>` frees the name".into()
+            }),
             // A volume error that already carries its own remedy needs no generic pointer under it:
             // printing "run `kern volume ls`" beneath two paste-ready commands is noise, and noise
             // under an instruction is how an instruction gets skipped. Multi-line means the message
@@ -182,6 +188,10 @@ impl Error {
             // A refusal that already names the box and both ways out has no hint to add; the generic
             // one ("check the image name and tag exist") contradicted it, the name being right.
             Error::Oci(msg) if msg.starts_with("conflict: unable to remove") => None,
+            // A refusal that already names `kern login` (stored credentials refused, a private image)
+            // carries its remedy; the generic "private images need `kern login` first" under it is
+            // wrong when the credentials were just sent and refused.
+            Error::Oci(msg) if msg.contains("`kern login") => None,
             Error::Oci(msg) => Some(oci_hint(msg)),
             // THE HINT USED TO DESCRIBE THE WRONG FILE FORMAT. kern reads two kinds of stack: a
             // `docker-compose.yml` and its own TOML. The hint named only the TOML
@@ -220,6 +230,9 @@ impl Error {
             // A build-history lookup miss (`build logs|inspect <id>`) is not a Dockerfile problem, so
             // point it at the list - not the FROM/COPY hint, which would mislead. Same message-shape
             // routing as `oci_hint`.
+            // A `--chown` that names no user of the image already says so; the FROM/COPY hint under it
+            // is about a different mistake.
+            Error::Build(msg) if msg.starts_with("COPY --chown") => None,
             Error::Build(msg) if msg.starts_with("no build ") => {
                 Some("run `kern builds` to list build ids".into())
             }
@@ -232,6 +245,7 @@ impl Error {
                 Some("profiles live in ~/.config/kern/kern.toml - see docs/CONFIG.md".into())
             }
             Error::Cli(_) | Error::Usage(_) => Some("run `kern --help` for full usage".into()),
+            Error::SelfUpdate(_) => None,
         }
     }
 }
@@ -302,6 +316,7 @@ impl std::fmt::Display for Error {
             Error::Build(why) => write!(f, "build: {why}"),
             Error::Config(why) => write!(f, "config: {why}"),
             Error::Cli(why) => write!(f, "{why}"),
+            Error::SelfUpdate(why) => write!(f, "self-update: {why}"),
             Error::Usage(u) => write!(f, "usage: kern {u}"),
             // Deliberately empty: `main` never prints this one. See the variant's doc.
             Error::Workload(_) => Ok(()),

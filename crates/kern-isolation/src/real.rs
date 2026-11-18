@@ -7185,10 +7185,18 @@ fn write_all(fd: i32, mut data: &[u8]) {
 /// workload nor a setuid/file-cap binary inside it can ever wield them. These are namespaced (they
 /// grant no power over host-owned resources - verified) and several are already seccomp-blocked;
 /// dropping them shrinks the attack surface against kernel bugs reachable only with the cap.
-/// KEPT (so apt/apk, chown, and privilege-drop to non-root keep working): CHOWN, DAC_*, FOWNER,
-/// FSETID, KILL, SETUID, SETGID, SETPCAP, NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, MKNOD, SETFCAP,
-/// IPC_*, SYS_NICE/RESOURCE, … Best-effort; an unknown cap number on an older kernel just fails
-/// harmlessly.
+/// KEPT, and nothing else: Docker's default set (so apt/apk, chown, and privilege-drop to non-root
+/// keep working): CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID, SETPCAP,
+/// NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, MKNOD, AUDIT_WRITE, SETFCAP. Best-effort; an unknown cap
+/// number on an older kernel just fails harmlessly.
+///
+/// ELEVEN MORE WERE KEPT UNTIL 2026-11-18 (DAC_READ_SEARCH, LINUX_IMMUTABLE, NET_BROADCAST, IPC_LOCK,
+/// IPC_OWNER, SYS_NICE, SYS_RESOURCE, SYS_TTY_CONFIG, LEASE, BLOCK_SUSPEND, CHECKPOINT_RESTORE), on
+/// the ground that a rootless box holds them over its own namespace only. That ground does not hold
+/// where kern runs as REAL root: MEASURED in the WSL distro install.ps1 created, a box's uid 0 was
+/// the distro's uid 0, so `DAC_READ_SEARCH` read any root-owned file a volume exposed. Docker's
+/// containers have run without all eleven for years; a workload that needs one asks with
+/// `--cap-add`.
 /// `NET_ADMIN` (12) and `SYS_ADMIN` (21) are dropped too - this converges kern's default onto the
 /// Docker/Podman default set - but CONDITIONALLY (see [`cap_drop_mask`]): `NET_ADMIN` is KEPT for
 /// `--tun` (the box brings its own tunnel interface up; kern itself brings `lo` up BEFORE the drop, so
@@ -7209,6 +7217,17 @@ const CAP_NET_ADMIN: u32 = 12;
 const CAP_SYS_ADMIN: u32 = 21;
 
 const DEFAULT_DROP: &[u32] = &[
+    CAP_DAC_READ_SEARCH, // (2) read and traverse any file, whatever its mode
+    9,                   // LINUX_IMMUTABLE  set the immutable / append-only file flags
+    11,                  // NET_BROADCAST
+    14,                  // IPC_LOCK         mlock beyond RLIMIT_MEMLOCK
+    15,                  // IPC_OWNER        bypass SysV IPC permission checks
+    23,                  // SYS_NICE         raise priority, set real-time scheduling
+    24,                  // SYS_RESOURCE     exceed resource limits and quotas
+    26,                  // SYS_TTY_CONFIG   vhangup, privileged tty ioctls
+    28,                  // LEASE            file leases on files it does not own
+    36,                  // BLOCK_SUSPEND
+    40,                  // CHECKPOINT_RESTORE  ns_last_pid, clone3 set_tid
     CAP_NET_ADMIN, // (12) network admin. KEPT for `--tun` (the box needs it to bring its tunnel
     //     interface up) or `--cap-add NET_ADMIN`. kern brings the box's `lo` up itself, before the
     //     drop, so 127.0.0.1 works without it. Docker's default drops it; kern now matches, closing the
@@ -11100,6 +11119,22 @@ mod cap_mask_tests {
         }
         // The mask is exactly the default drop of an unmodified spec (the bounding set kern imposes).
         assert_eq!(m, cap_drop_mask(&CapSpec::default(), false, false));
+    }
+
+    #[test]
+    fn a_default_box_keeps_exactly_dockers_default_capabilities() {
+        // Docker's default set: CHOWN 0, DAC_OVERRIDE 1, FOWNER 3, FSETID 4, KILL 5, SETGID 6,
+        // SETUID 7, SETPCAP 8, NET_BIND_SERVICE 10, NET_RAW 13, SYS_CHROOT 18, MKNOD 27,
+        // AUDIT_WRITE 29, SETFCAP 31, which `CapEff` shows as 00000000a80425fb.
+        let docker: u64 = [0u32, 1, 3, 4, 5, 6, 7, 8, 10, 13, 18, 27, 29, 31]
+            .iter()
+            .fold(0, |m, c| m | (1u64 << c));
+        assert_eq!(docker, 0xa804_25fb);
+        let all: u64 = (1u64 << 41) - 1; // CAP_LAST_CAP is 40 on the kernels kern supports
+        assert_eq!(
+            all & !cap_drop_mask(&CapSpec::default(), false, false),
+            docker
+        );
     }
 
     #[test]

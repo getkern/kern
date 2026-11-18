@@ -294,12 +294,15 @@ mod relayhold;
 mod runstats;
 mod sandbox;
 mod secret;
+mod selfupdate;
 mod systemd;
 mod toml_surgery;
 mod tui;
 mod ui;
 mod vdisk;
 mod volume;
+mod wslentry;
+mod wslrelay;
 
 use std::process::ExitCode;
 
@@ -311,6 +314,9 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    // In kern's own WSL distro, root becomes the distro's ordinary user before anything else runs
+    // (see `wslentry`). One failed `stat` everywhere else.
+    wslentry::enter_as_user_if_kern_distro();
     // Stamp process entry as early as possible: `kern run` measures entry→exec against it to record its
     // own per-run setup latency (the honest "~1 ms" shown in `kern top`'s Runs tab). Cheap and harmless
     // on every other subcommand.

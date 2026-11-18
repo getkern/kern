@@ -2845,6 +2845,7 @@ mod net_resource_tests {
                 dst: "/app".into(),
                 from: None,
                 chmod: None,
+                chown: None,
             },
         ];
         let key = |c: &std::path::Path| flat_image_key("base", &instrs, c, c, ig.as_ref());
@@ -2868,6 +2869,7 @@ mod net_resource_tests {
                 dst: "/other".into(),
                 from: None,
                 chmod: None,
+                chown: None,
             },
         ];
         assert_ne!(

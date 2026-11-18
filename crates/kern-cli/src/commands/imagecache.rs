@@ -516,7 +516,7 @@ impl Accounts<'_> {
     /// `key_field` is `0` for a name and `2` for the numeric id, which is what a NUMERIC spec needs.
     /// `None` when there is no file or no such line; a file with no match is authoritative, and the
     /// layers below it are not consulted, as the merged view would not.
-    fn entry(&self, file: &str, key: &str, key_field: usize) -> Option<Vec<String>> {
+    pub(crate) fn entry(&self, file: &str, key: &str, key_field: usize) -> Option<Vec<String>> {
         let text = self.text(file)?;
         text.lines()
             .find(|line| line.split(':').nth(key_field) == Some(key))

@@ -1771,9 +1771,45 @@ pub(crate) fn discover_auth_scoped(
             };
             let s = String::from_utf8_lossy(&body);
             // Docker uses `token`; GHCR/others use `access_token` (both per the OAuth2 token spec).
-            let tok = first_str(&s, "token")
-                .or_else(|| first_str(&s, "access_token"))
-                .ok_or_else(|| {
+            let token_in = |s: &str| first_str(s, "token").or_else(|| first_str(s, "access_token"));
+            let tok = match token_in(&s) {
+                Some(t) => t,
+                // STORED CREDENTIALS REFUSED ON A PULL: ask once more without them. MEASURED on a real
+                // stack (2026-11-18, ghcr.io, a public image): credentials saved by an old `kern login`
+                // were sent, ghcr.io answered DENIED, and the pull failed, while an anonymous token for
+                // the same image came back at once. A public image does not need them; a private one
+                // is refused anonymously too, and then the error below says which case it is. A push
+                // never retries: without credentials it cannot succeed, and the account's refusal is
+                // the answer.
+                None if action == "pull" && send_creds.is_some() => {
+                    let anon = curl(&base)?;
+                    let anon = String::from_utf8_lossy(&anon);
+                    match token_in(&anon) {
+                        Some(t) => {
+                            eprintln!(
+                                "kern: the credentials stored for {registry} were refused; pulled anonymously (fine for a \
+                                 public image). Fix them with `kern login {registry}`, or remove \
+                                 them with `kern logout {registry}`"
+                            );
+                            t
+                        }
+                        None => {
+                            return Err(match registry_diagnosis(&s) {
+                                Some(m) => OciError::Registry(format!(
+                                    "{registry} refused the token request: {m} (the credentials \
+                                     stored for it were sent and refused, and so was an anonymous \
+                                     request: the image is private or the name is wrong, and those \
+                                     credentials cannot read it. Check the name, or run `kern \
+                                     login {registry}` again)"
+                                )),
+                                None => {
+                                    OciError::Registry("no auth token in token response".into())
+                                }
+                            })
+                        }
+                    }
+                }
+                None => {
                     // A token endpoint that refuses answers with the registry's OWN diagnosis, and
                     // that is the only thing here worth reading. GHCR replies
                     // `{"errors":[{"code":"DENIED","message":"requested access to the resource is
@@ -1793,15 +1829,21 @@ pub(crate) fn discover_auth_scoped(
                     // where the text is guaranteed to be attacker-influenced. Control characters
                     // include newline and tab, which is also what keeps a multi-line reply from
                     // breaking the single-line error format.
-                    match registry_diagnosis(&s) {
-                        Some(m) => OciError::Registry(format!(
+                    let refusal = match registry_diagnosis(&s) {
+                        Some(m) if send_creds.is_some() => OciError::Registry(format!(
                             "{registry} refused the token request: {m} (the credentials reached it, \
                              so this is about what that account may do with this name, not about \
                              logging in again)"
                         )),
+                        Some(m) => OciError::Registry(format!(
+                            "{registry} refused the token request: {m} (no credentials were sent: \
+                             if the image is private, run `kern login {registry}`)"
+                        )),
                         None => OciError::Registry("no auth token in token response".into()),
-                    }
-                })?;
+                    };
+                    return Err(refusal);
+                }
+            };
             Ok(Auth::Bearer(tok))
         }
         Some(Challenge::Basic) => {

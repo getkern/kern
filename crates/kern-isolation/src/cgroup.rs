@@ -1095,7 +1095,81 @@ fn user_manager_reachable() -> bool {
         // Without XDG_RUNTIME_DIR, `systemd-run --user` cannot locate the manager either: best-effort.
         return false;
     };
-    manager_live_under(&xdg)
+    manager_live_under(&xdg) || manager_env().is_some()
+}
+
+/// THE USER MANAGER WHEN `XDG_RUNTIME_DIR` POINTS ELSEWHERE: the standard `/run/user/<uid>`, when
+/// the manager lives there and not under the caller's `XDG_RUNTIME_DIR`. `None` otherwise (the
+/// caller's directory already reaches it, the variable is unset, or nothing lives at the standard
+/// one either).
+///
+/// WHY. A box re-execs into a transient scope through `systemd-run --user`, which finds the manager
+/// through `XDG_RUNTIME_DIR`. A runtime dir of its own (a test world, a CI job, a systemd unit) made
+/// kern conclude "no user manager", and on a host where the caller's cgroup cannot be delegated
+/// (WSL2, whose shells live in `/init.scope`) every box ran with `memory.max=max` (MEASURED on
+/// 2026-11-18). Every `systemd-run` and `systemctl --user` kern runs gets this directory
+/// ([`manager_envs`]) to reach the manager, and the re-exec hands the box its own directory back
+/// ([`manager_setenv_args`]), so the box stays in the world that started it.
+///
+/// UNSET STAYS UNREACHABLE, on purpose: the CI host this probe was written for has
+/// `/run/user/<uid>/{systemd,bus}` left over with no manager behind them and no variable set, and
+/// only a set-but-elsewhere variable is the case this answers. Asked once per process.
+pub fn manager_env() -> Option<&'static Path> {
+    static MEMO: OnceLock<Option<PathBuf>> = OnceLock::new();
+    MEMO.get_or_init(|| {
+        if as_root() {
+            return None;
+        }
+        let xdg = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|d| !d.as_os_str().is_empty())?;
+        let standard = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
+        let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let is_standard = canon(&xdg) == canon(&standard);
+        manager_via_standard_dir(
+            is_standard,
+            || manager_live_under(&xdg),
+            || manager_live_under(&standard),
+        )
+        .then_some(standard)
+    })
+    .as_deref()
+}
+
+/// The rule behind [`manager_env`] as a function of the three facts, lazily asked in the order that
+/// costs least on the common host (the caller's own directory answers, so nothing else is probed).
+fn manager_via_standard_dir(
+    xdg_is_standard: bool,
+    xdg_live: impl FnOnce() -> bool,
+    standard_live: impl FnOnce() -> bool,
+) -> bool {
+    !xdg_is_standard && !xdg_live() && standard_live()
+}
+
+/// The environment every `systemd-run` / `systemctl --user` kern runs needs to reach the user
+/// manager: empty on the common host, `XDG_RUNTIME_DIR=/run/user/<uid>` when the caller's variable
+/// points elsewhere ([`manager_env`]).
+pub fn manager_envs() -> Vec<(&'static str, &'static Path)> {
+    manager_env()
+        .map(|d| vec![("XDG_RUNTIME_DIR", d)])
+        .unwrap_or_default()
+}
+
+/// For a `systemd-run --scope` that re-executes kern: `--setenv=XDG_RUNTIME_DIR=<the caller's>`, so
+/// the re-executed kern keeps the runtime dir (registry, logs, history) of the world that started
+/// it while `systemd-run` itself reached the manager through [`manager_envs`]. Empty when no
+/// redirection happened. MEASURED with systemd 255: in `--scope` mode the command sees the
+/// `--setenv` value, not `systemd-run`'s own.
+pub fn manager_setenv_args() -> Vec<std::ffi::OsString> {
+    if manager_env().is_none() {
+        return Vec::new();
+    }
+    let Some(orig) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return Vec::new();
+    };
+    let mut arg = std::ffi::OsString::from("--setenv=XDG_RUNTIME_DIR=");
+    arg.push(orig);
+    vec![arg]
 }
 
 /// Is the user manager reachable through the runtime directory `xdg` - by EITHER door `systemd-run`
@@ -1524,7 +1598,7 @@ const CAP_PROBE_BYTES: &str = "1048576";
 /// kern's shared parent slice, named ONCE. [`kern_slice_path`] resolves it to a directory and the
 /// scope probe hands the same name to `systemd-run --slice=`; two spellings of it is one rename away
 /// from a probe that measures a slice no box uses.
-const KERN_SLICE_NAME: &str = "kern.slice";
+pub const KERN_SLICE_NAME: &str = "kern.slice";
 
 /// How long the scope probe waits for `systemd-run` before giving up on it. Generous next to a healthy
 /// scope (measured 8-11 ms on a Raspberry Pi 5, ~40 ms on the slowest board) and short enough that a
@@ -1635,7 +1709,14 @@ pub fn memory_cap_state() -> MemoryCapState {
     // re-execs into a transient scope and the MANAGER applies `MemoryMax` to it, which the direct
     // probe never touches because it creates no scope. Ask the second path before reporting a host
     // uncapped: see [`MemoryCapState::EnforcedOnScope`] for the measurement that made this necessary.
-    if scope_path_caps_memory() {
+    // THE SCOPE COUNTS ONLY WHEN A BOX WOULD TAKE IT. A box re-execs into a transient scope only if
+    // `user_systemd_present()` says so (`reexec_in_scope_if_possible`), and that predicate looks for
+    // the manager under `$XDG_RUNTIME_DIR`. The probe's own `systemd-run --user` can reach a manager
+    // that predicate does not see, over `DBUS_SESSION_BUS_ADDRESS`: MEASURED on WSL2 on 2026-11-18,
+    // with `XDG_RUNTIME_DIR` outside `/run/user`, doctor said "caps enforced on a transient scope"
+    // while every `--memory 64m` box read `memory.max=max` in `/init.scope`. One predicate for both,
+    // so the verdict is what a box gets.
+    if user_systemd_present() && scope_path_caps_memory() {
         return MemoryCapState::EnforcedOnScope;
     }
     direct
@@ -1710,6 +1791,7 @@ fn scope_probe_read(unit: &str, what: &std::path::Path) -> Option<String> {
     let systemd_run = crate::real::trusted_helper("systemd-run")?;
     let cat = crate::real::trusted_helper("cat")?;
     let mut child = Command::new(systemd_run)
+        .envs(manager_envs())
         .arg(systemd_scope_mode())
         .args(["--scope", "--quiet", "--collect"])
         .arg(format!("--slice={KERN_SLICE_NAME}"))
@@ -2051,7 +2133,7 @@ fn kern_slice_path() -> Option<PathBuf> {
 /// with nothing said; the start of a box landing in that window was refused ("caps could not be
 /// enforced on the direct cgroup path"). A `Delegate=yes` unit is the one subtree systemd never
 /// touches, and the controllers it needs are the slice's to keep on.
-const KERN_ANCHOR_UNIT: &str = "kern-boxes.service";
+pub const KERN_ANCHOR_UNIT: &str = "kern-boxes.service";
 
 /// The leaf the anchor's own process moves into: a cgroup with processes of its own cannot hand
 /// controllers to children (cgroup v2), and the boxes are its children.
@@ -2074,6 +2156,7 @@ fn start_kern_anchor(anchor: &std::path::Path) -> bool {
                   while :; do sleep 86400; done";
     let unit = format!("--unit={}", KERN_ANCHOR_UNIT.trim_end_matches(".service"));
     let _ = Command::new(systemd_run)
+        .envs(manager_envs())
         .args([
             systemd_scope_mode(),
             unit.as_str(),
@@ -2419,6 +2502,12 @@ fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
             (None, None, Some(rest)) => (leaf_owner_is_dead(rest), false),
             (None, None, None) => (false, false),
         };
+        // NOT OURS TO JUDGE: a leaf with a member this pid namespace cannot see belongs to a kern in
+        // ANOTHER pid namespace, whose supervisor is "dead" here only because `/proc/<pid>` cannot
+        // show it. MEASURED in the field on 2026-11-18: two WSL distros share the VM's cgroup tree,
+        // and a `kern build` in one SIGKILLed the boxes of the other through `cgroup.kill` below (exit
+        // 137, 2 of 2). The kernel lists such a member as pid 0 in `cgroup.procs`.
+        let dead = dead && !has_foreign_members(&e.path());
         if dead {
             // The supervisor `<pid>` is gone. A detached box whose supervisor was SIGKILL'd/OOM-killed
             // ran no cleanup, and its PID-ns init carries no launcher PDEATHSIG, so the whole tree
@@ -2445,6 +2534,28 @@ fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
             let _ = fs::remove_dir(&path);
         }
     }
+}
+
+/// Does the cgroup at `dir`, or any cgroup below it, hold a process this pid namespace cannot see?
+/// `cgroup.procs` shows such a process as `0` (the kernel's `task_pid_vnr` of a task outside the
+/// reader's namespace). Depth-bounded: a box's tree is two or three levels.
+pub(crate) fn has_foreign_members(dir: &std::path::Path) -> bool {
+    fn walk(dir: &std::path::Path, depth: u32) -> bool {
+        if fs::read_to_string(dir.join("cgroup.procs"))
+            .is_ok_and(|t| t.lines().any(|l| l.trim() == "0"))
+        {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        fs::read_dir(dir).is_ok_and(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .any(|e| walk(&e.path(), depth - 1))
+        })
+    }
+    walk(dir, 4)
 }
 
 /// SIGKILL every process in the cgroup at `dir`, atomically, via cgroup-v2 `cgroup.kill` (kernel
@@ -3409,6 +3520,7 @@ pub fn scope_accepts_oom_policy() -> bool {
             return false;
         };
         let ok = Command::new(systemd_run)
+            .envs(manager_envs())
             .arg(systemd_scope_mode())
             .args(["--scope", "--quiet", "--collect"])
             .args(["-p", "OOMPolicy=continue"])
@@ -5348,6 +5460,17 @@ mod outer_memory_high_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_standard_manager_is_used_only_when_the_callers_dir_misses_it() {
+        // Every combination, and the lazy order: when the caller's own directory answers, the
+        // standard one is never asked (that is the common host's whole cost).
+        let never = || -> bool { panic!("asked a probe that cannot change the answer") };
+        assert!(!manager_via_standard_dir(true, never, never));
+        assert!(!manager_via_standard_dir(false, || true, never));
+        assert!(manager_via_standard_dir(false, || false, || true));
+        assert!(!manager_via_standard_dir(false, || false, || false));
+    }
+
     #[test]
     fn the_systemd_version_gating_expand_environment_is_read_from_the_first_line() {
         assert_eq!(

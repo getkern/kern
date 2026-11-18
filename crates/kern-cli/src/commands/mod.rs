@@ -2594,6 +2594,7 @@ fn user_systemd_dir() -> Result<PathBuf, Error> {
 /// Run `systemctl --user <args>` quietly; `true` on success. Used for the persistent-box unit.
 fn systemctl_user(args: &[&str]) -> bool {
     std::process::Command::new("systemctl")
+        .envs(kern_isolation::manager_envs())
         .arg("--user")
         .args(args)
         .stdout(std::process::Stdio::null())
@@ -4485,6 +4486,7 @@ fn prepare_stage(
                     dst,
                     from: Some(cf),
                     chmod,
+                    chown,
                 } => {
                     // Resolve the source's overlay chain (top-first list of layer dirs), pulling an
                     // external image on demand. A build STAGE takes precedence over an image of the same
@@ -4545,6 +4547,7 @@ fn prepare_stage(
                         dst: dst.clone(),
                         from: None,
                         chmod: chmod.clone(),
+                        chown: chown.clone(),
                     });
                 }
                 // A context COPY (from: None) - the stage references the real build context.
@@ -5111,9 +5114,12 @@ fn run_build_step(
     if let Some(out) = crate::builds::run_stdout() {
         cmd.stdout(out);
     }
-    let status = cmd
-        .status()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| Error::Sandbox(format!("RUN: cannot start kern box: {e}")))?;
+    let box_name = format!("_build-{}-{step}", std::process::id());
+    let status = wait_with_heartbeat(&mut child, &display_run(argv), Some(&box_name))
+        .map_err(|e| Error::Sandbox(format!("RUN: cannot wait for kern box: {e}")))?;
     if !status.success() {
         // For a batched RUN this prints the combined `&&` chain; the box inherited stdio, so the
         // failing sub-step's own stderr already appeared above - enough to see which step failed.
@@ -5124,6 +5130,75 @@ fn run_build_step(
         )));
     }
     Ok(())
+}
+
+/// Wait for a build step, saying every so often that it is still running and for how long.
+///
+/// MEASURED in the field on 2026-11-18: an `npm ci` printed nothing for over a minute while it
+/// worked, and a stalled one looked exactly the same, so the reader could not tell slow from stuck
+/// and killed it. A line every 30 s (every 60 s after ten minutes) names the step and its elapsed
+/// time. It is NOT a thread: the build is single-threaded on purpose (the id-mapped work after a step
+/// forks, and kern refuses to fork a multi-threaded process), so the wait polls instead, five times a
+/// second, which is nothing next to a step that runs for seconds. `KERN_QUIET` silences it.
+pub(crate) fn wait_with_heartbeat(
+    child: &mut std::process::Child,
+    what: &str,
+    box_name: Option<&str>,
+) -> std::io::Result<std::process::ExitStatus> {
+    let quiet = kern_common::env_flag("KERN_QUIET");
+    let start = std::time::Instant::now();
+    let mut next = std::time::Duration::from_secs(30);
+    let label: String = what.chars().take(70).collect();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        let elapsed = start.elapsed();
+        if !quiet && elapsed >= next {
+            let secs = elapsed.as_secs();
+            // THE STEP'S OWN COUNTERS, so "slow" and "stuck against a limit" stop looking alike: a step
+            // at its `pids.max`, or with its memory at the cap, says so here.
+            let usage = box_name.map(step_usage).unwrap_or_default();
+            eprintln!(
+                "  ⋯ still running ({}m{:02}s{usage}): {label}",
+                secs / 60,
+                secs % 60
+            );
+            next += if secs >= 600 {
+                std::time::Duration::from_secs(60)
+            } else {
+                std::time::Duration::from_secs(30)
+            };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// `, pids N/M, memory X/Y` for the running box `name`, from its own cgroup; empty when it cannot be
+/// read (no cgroup, or the box is not registered yet).
+fn step_usage(name: &str) -> String {
+    let Some(cg) = registry::find(name).and_then(|i| registry::box_cgroup(i.cgroup_pid())) else {
+        return String::new();
+    };
+    let read = |f: &str| {
+        std::fs::read_to_string(cg.join(f))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    let bytes = |v: String| match v.parse::<u64>() {
+        Ok(n) => human_bytes(n),
+        Err(_) => v,
+    };
+    let (pc, pm) = (read("pids.current"), read("pids.max"));
+    let (mc, mm) = (read("memory.current"), read("memory.max"));
+    let mut out = String::new();
+    if !pc.is_empty() {
+        out.push_str(&format!(", pids {pc}/{pm}"));
+    }
+    if !mc.is_empty() {
+        out.push_str(&format!(", memory {}/{}", bytes(mc), bytes(mm)));
+    }
+    out
 }
 
 /// Set (replace or append) `K=V` in an image-config env list.
@@ -6109,10 +6184,25 @@ fn wait_for_conditions(
                 b.name
             )));
         }
+        let waited = Instant::now();
+        let mut beat = Duration::from_secs(30);
         loop {
             let status = current_health(dep);
             if status == "healthy" {
                 break;
+            }
+            // STILL WAITING, SAID: a dependency's start period can run for a minute or more, and a
+            // silent `up` reads as a hung one (MEASURED in the field on 2026-11-18).
+            if waited.elapsed() >= beat {
+                let secs = waited.elapsed().as_secs();
+                eprintln!(
+                    "  ⋯ still waiting for '{dep}' to become healthy ({}m{:02}s, status: {}) (for '{}')",
+                    secs / 60,
+                    secs % 60,
+                    if status.is_empty() { "starting" } else { status.as_str() },
+                    b.name
+                );
+                beat += Duration::from_secs(30);
             }
             if status == "unhealthy" {
                 // THE MESSAGE CARRIES ITS OWN REPAIR, and that is load-bearing rather than polish: a
@@ -6194,7 +6284,19 @@ fn wait_for_conditions(
             }
         }
         eprintln!("  ⋯ waiting for '{dep}' to complete (for '{}')", b.name);
+        let waited = Instant::now();
+        let mut beat = Duration::from_secs(30);
         loop {
+            if waited.elapsed() >= beat {
+                let secs = waited.elapsed().as_secs();
+                eprintln!(
+                    "  ⋯ still waiting for '{dep}' to complete ({}m{:02}s) (for '{}')",
+                    secs / 60,
+                    secs % 60,
+                    b.name
+                );
+                beat += Duration::from_secs(30);
+            }
             if let Some(code) = registry::exit_of(&key_of(dep)) {
                 if code == 0 {
                     break;

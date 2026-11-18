@@ -81,6 +81,7 @@ COMMANDS:
     config get [<key>] [--json]                                    The [kern] keys and their values; one key prints its value, exit 1 if unset, 3 if kern.toml does not parse
     config unset <key>                                             Remove a [kern] key, back to kern's default
     validate [path]                                                Check a kern.toml
+    self-update [--check [--json]] [--to X.Y.Z] [--rollback]       Replace kern with a newer SIGNED release (keeps the old one for --rollback)
     uninstall [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     examples                                                       Print an example kern.toml (alias: example)
     volume <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes (alias: vol)

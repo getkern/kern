@@ -23,3 +23,13 @@ kern-oci = { path = "../kern-oci" }
 kern-isolation = { path = "../kern-isolation" }
 # Already in the tree via kern-isolation; used here for detach (fork/setsid) + liveness (kill).
 libc = "0.2"
+# `kern self-update` checks the release signature with it: minisign's own verifier, by minisign's
+# author, with no dependencies of its own. Pinned exactly: a signature check is not code to take
+# new versions of without reading them.
+minisign-verify = "=0.3.0"
+
+[dev-dependencies]
+# The tests SIGN fake releases with a throwaway key, which a verifier cannot do. Test builds only:
+# none of this is in the shipped binary.
+ed25519-dalek = "2.2"
+blake2 = "0.10"

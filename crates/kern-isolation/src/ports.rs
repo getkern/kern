@@ -313,8 +313,12 @@ fn announce(m: &PortMap) {
         // SDK tells kern's lines from the workload's by that prefix and nothing else.
         // Through the same channel as the cap notices: to the launcher when one is listening, so a
         // detached service's LOG does not carry it (reported in every published service's log).
+        // THE HOST PORT, which is the one the network sees: naming the box port (`443`) under a
+        // `3000:443` mapping sent the reader looking for the wrong number (field report, 18/11).
+        let proto = if m.udp { "/udp" } else { "" };
         crate::cgroup::cap_notice(&format!(
-            "kern: warning: bound {ip} - box port {bp} is reachable from the network"
+            "kern: warning: bound {ip} - host port {hp}{proto} (box port {bp}) is reachable from the \
+             network; publish it as 127.0.0.1:{hp}:{bp} to keep it on this machine"
         ));
     }
 }

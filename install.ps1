@@ -276,6 +276,160 @@ function Import-Distro {
     }
 }
 
+# ---- 2b. kern runs boxes as an ordinary user, not root ----------------------
+# MEASURED on 2026-11-18: in the distro this installer created, kern ran as root, so a box's uid 0
+# was the distro's uid 0 and an escape held every capability, /mnt/c read-write and the other
+# distributions' disks. A distro imported from a current rootfs already has the user `kern` and the
+# marker that makes kern give root up (crates/kern-cli/src/wslentry.rs); one installed before has
+# neither, and its image cache and volumes live under /root. This brings either to the same state,
+# idempotently: the user and its uid range, passt (pods had no network without it), root's boxes
+# stopped, root's kern state moved to the user with uid 0 shifted to the user's uid ONLY where it is
+# 0 (an image layer's other owners sit in the subordinate range, which the user inherits from root),
+# the marker, and a restart of the distro so the next command starts clean.
+$KernWslSetup = @'
+set -u
+U=kern
+ID=1000
+say() { echo "kern: $*"; }
+# The user, its group and home, and the uid ranges (the user takes root's, root the next one).
+grep -q "^$U:" /etc/passwd || echo "$U:x:$ID:$ID:kern:/home/$U:/bin/sh" >> /etc/passwd
+grep -q "^$U:" /etc/group || echo "$U:x:$ID:" >> /etc/group
+grep -q "^$U:" /etc/shadow 2>/dev/null || echo "$U:!::0:::::" >> /etc/shadow
+mkdir -p "/home/$U" && chown "$ID:$ID" "/home/$U"
+for f in /etc/subuid /etc/subgid; do
+  if ! grep -q "^$U:" "$f" 2>/dev/null; then
+    grep -v '^root:' "$f" 2>/dev/null > "$f.new"
+    printf '%s:100000:65536\nroot:165536:65536\n' "$U" >> "$f.new"
+    mv "$f.new" "$f"
+  fi
+done
+# No way back to root from the user: root's password locked, `su` without setuid.
+sed -i 's/^root::/root:*:/' /etc/shadow
+[ -e /bin/bbsuid ] && chmod u-s /bin/bbsuid
+# passt: pods have no network without it. Judged by what is there afterwards, not by apk's status.
+command -v pasta >/dev/null 2>&1 || apk add -q passt >/dev/null 2>&1
+command -v pasta >/dev/null 2>&1 || say "passt is not installed (no network now?): run 'apk add passt' in the distro"
+# The marker first: the image import below runs kern as the user, which the marker is what decides.
+mkdir -p /etc/kern && chmod 755 /etc/kern
+printf '%s\n' "$U" > /etc/kern/wsl-user
+chmod 644 /etc/kern/wsl-user
+chown 0:0 /etc/kern /etc/kern/wsl-user
+# THE MIGRATION, resumable: everything below is safe to run again, and only its end writes the
+# flag, so a distro stopped halfway finishes on the next run.
+# NOTHING THE USER CAN POINT ELSEWHERE IS FOLLOWED AS ROOT. The user `kern` owns its home: a symlink
+# it put at ~/.config (to /usr/local/bin, /etc) would make a root `chown` hand that directory over,
+# and a hard link to a root file inside its data would make the owner shift hand over the file. So:
+# no migration through a symlinked path, `chown -h` everywhere, and a regular file is shifted only
+# when it has a single name.
+user_paths_safe() {
+  for p in "/home/$U" "/home/$U/.local" "/home/$U/.local/share" "/home/$U/.config" \
+           "/home/$U/.local/share/kern" "/home/$U/.config/kern"; do
+    [ -L "$p" ] && { say "$p is a symbolic link: not migrating through it (remove it and run install.ps1 again)"; return 1; }
+  done
+  return 0
+}
+if [ ! -e /etc/kern/wsl-migrated ] && ! user_paths_safe; then
+  echo "kern-wsl-setup: ok"
+  exit 0
+fi
+if [ ! -e /etc/kern/wsl-migrated ]; then
+  KERN_WSL_AS_ROOT=1 kern stop --all -t 10 >/dev/null 2>&1
+  # Data and configuration: moved, then owner/group 0 become the user's, and every file gets its
+  # own mode back afterwards, because a chown clears setuid and setgid.
+  for rel in .local/share/kern .config/kern; do
+    src="/root/$rel"; dst="/home/$U/$rel"
+    if [ -d "$src" ] && [ ! -e "$dst" ]; then
+      mkdir -p "$(dirname "$dst")"
+      mv "$src" "$dst" || continue
+    fi
+    [ -d "$dst" ] || continue
+    [ -L "$dst" ] && continue
+    find "$dst" -xdev \( -user 0 -o -group 0 \) \( -type d -o -type l -o -links 1 \) -exec sh -c '
+      for f; do
+        m=$(stat -c %a "$f"); u=$(stat -c %u "$f"); g=$(stat -c %g "$f")
+        [ "$u" = 0 ] && u='"$ID"'
+        [ "$g" = 0 ] && g='"$ID"'
+        chown -h "$u:$g" "$f"
+        [ -L "$f" ] || chmod "$m" "$f"
+      done' sh {} +
+  done
+  for d in "/home/$U/.local" "/home/$U/.local/share" "/home/$U/.config"; do
+    [ -d "$d" ] && [ ! -L "$d" ] && chown -h "$ID:$ID" "$d"
+  done
+  # Images: NOT moved as files, and not through `kern save`, which flattens a layer's owners to
+  # root and strips its setuid bits (MEASURED: debian:bookworm-slim, 11 setuid/setgid files before,
+  # 8 after a save/load). Each image is pulled again by the user, so its layers are extracted as on a
+  # fresh install, setuid bits and file capabilities included; only an image that cannot be pulled
+  # (built here, or no network) falls back to save/load, and says so. An image leaves root's cache
+  # only once the user has it; root's cache is removed only when root's own listing is empty.
+  if [ -d /root/.cache/kern ]; then
+    if refs=$(KERN_WSL_AS_ROOT=1 kern images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null); then
+      t=$(mktemp -d /var/tmp/kern-migrate.XXXXXX) && chmod 755 "$t"
+      moved=""
+      # FIRST every image into the user's cache. Pulled again BY TAG: kern 0.51.1 recorded no
+      # digest, so the registry's CURRENT image for that tag is what the user gets (the same as a
+      # fresh install would).
+      for ref in $refs; do
+        case "$ref" in *"<none>"*) continue ;; esac
+        if kern pull "$ref" >/dev/null 2>&1; then
+          say "image pulled again for the user, by tag (the registry's current $ref): $ref"
+        elif KERN_WSL_AS_ROOT=1 kern save "$ref" -o "$t/image.tar" >/dev/null 2>&1 && chmod 644 "$t/image.tar" && kern load -i "$t/image.tar" >/dev/null 2>&1; then
+          say "image moved with save/load (it could not be pulled; setuid bits are not kept that way): $ref"
+        else
+          say "image NOT moved, kept in /root/.cache/kern: $ref"
+          rm -f "$t/image.tar"
+          continue
+        fi
+        rm -f "$t/image.tar"
+        moved="$moved $ref"
+      done
+      case "$t" in /var/tmp/kern-migrate.*) rmdir "$t" 2>/dev/null ;; esac
+      # THEN out of root's, in rounds: an image another one is built on cannot go while that one is
+      # there (MEASURED: alpine:3.20 under a local build stayed, and the migration finished only on a
+      # second run). Each round removes what it can; it stops when a round removes nothing.
+      for _ in 1 2 3 4 5 6 7 8; do
+        before=$(KERN_WSL_AS_ROOT=1 kern images --format '{{.Repository}}' 2>/dev/null | wc -l)
+        for ref in $moved; do KERN_WSL_AS_ROOT=1 kern rmi "$ref" >/dev/null 2>&1; done
+        after=$(KERN_WSL_AS_ROOT=1 kern images --format '{{.Repository}}' 2>/dev/null | wc -l)
+        [ "$after" -lt "$before" ] || break
+      done
+    fi
+    if left=$(KERN_WSL_AS_ROOT=1 kern images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null) && [ -z "$(printf '%s\n' "$left" | grep -v '<none>')" ]; then
+      # Root's listing is empty (an unnamed leftover counts as nothing): what is left there is
+      # layers no image references.
+      case /root/.cache/kern in /root/.cache/kern) rm -rf /root/.cache/kern ;; esac
+    else
+      say "some images stayed in root's cache: the migration resumes on the next install.ps1 run"
+      echo "kern-wsl-setup: ok"
+      exit 0
+    fi
+  fi
+  : > /etc/kern/wsl-migrated
+  chmod 644 /etc/kern/wsl-migrated
+fi
+echo "kern-wsl-setup: ok"
+'@
+
+function Set-DistroUser {
+    $tmp = Join-Path $env:TEMP 'kern-wsl-setup.sh'
+    try {
+        # LF line endings: the script runs under the distro's sh.
+        [IO.File]::WriteAllText($tmp, ($KernWslSetup -replace "`r`n", "`n"))
+        $src = (wsl.exe -d $DistroName -- wslpath -u "$($tmp -replace '\\','/')" 2>$null | Out-String).Trim()
+        if (-not $src) { Warn "could not reach the setup script from the distro: kern still runs boxes as root there"; return }
+        $said = (wsl.exe -d $DistroName -u root -- sh $src 2>&1 | Out-String)
+        if ($said -notmatch 'kern-wsl-setup: ok') {
+            Warn "setting up the user kern runs boxes as did not finish: $($said.Trim())"
+            return
+        }
+        # A restart, so no process started as root before the change is left behind.
+        wsl.exe --terminate $DistroName *> $null
+        Info "kern runs its boxes as the distro's ordinary user 'kern', not root."
+    } finally {
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    }
+}
+
 # ---- 3. shim + PATH ---------------------------------------------------------
 function Install-Shim {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -586,6 +740,7 @@ function Verify-Install {
 # which under `iex` closed the reader's window on the very line telling them to reboot.
 if (Ensure-WslEngine) {
     Import-Distro
+    Set-DistroUser
     Install-Shim
     if (-not (Verify-Install)) {
         Warn "install NOT verified - nothing above was silently accepted."

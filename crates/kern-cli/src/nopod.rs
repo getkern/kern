@@ -364,33 +364,43 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
     let my_index = plan.iter().position(|a| a.service == me).unwrap_or(0);
     let i_am_a_replica = plan.get(my_index).is_some_and(|a| a.replica_of.is_some());
     let mut out = Vec::with_capacity(plan.len());
+    let mut buf = [0u8; 15];
+    // WHERE MY OWN NAMES POINT. Through relays, at my own loopback, where my listener is. On a BRIDGE,
+    // at my own bridge address, as Docker resolves a container's own name: MEASURED on 2026-11-18, a
+    // bridge box's `/etc/hosts` carried `10.89.0.5 voting-redis-1` (the box line) AND `127.0.0.1
+    // voting-redis-1` from here, so `hostname -i` printed two addresses and the docker-library
+    // healthchecks (`redis-cli -h "$(hostname -i)"`, the same for psql) failed forever.
+    let me_assigned = plan.iter().find(|a| a.service == me);
+    // My address as a PEER would reach me (`peer_addr`, the one rule for every name in this file):
+    // outside `127.0.0.0/8` it is a bridge address and my names point there; inside it, it is a relay
+    // alias other boxes bind, and my names stay on my own loopback. Neither `via_relay` nor
+    // `net_addrs` alone says which (a single-network bridge keeps its address in `alias`).
+    let my_addr = me_assigned.map(|a| peer_addr(&mine_eff, a));
+    let on_bridge = my_addr.is_some_and(|a| a >> 24 != 127);
+    let self_addr = match my_addr.filter(|_| on_bridge) {
+        Some(a) => alias_to_dotted(a, &mut buf).to_string(),
+        None => "127.0.0.1".to_string(),
+    };
     // A REPLICA'S PLAN KEY (`web-2`) IS NOT A NAME: see `Assigned::replica_of`.
     if !i_am_a_replica {
-        out.push(format!("{me}:127.0.0.1"));
+        out.push(format!("{me}:{self_addr}"));
     }
     // MY OWN BOX NAME TOO, because that is what `hostname` answers inside the box and what a
-    // clustered service ANNOUNCES to its peers. See the peer loop below for what it cost.
-    if let Some(bn) = plan
-        .iter()
-        .find(|a| a.service == me)
-        .map(|a| a.box_name.as_str())
-    {
-        if bn != me {
-            out.push(format!("{bn}:127.0.0.1"));
+    // clustered service ANNOUNCES to its peers. See the peer loop below for what it cost. Not on a
+    // bridge: the box's own hosts line already maps that name to that address, and a second line
+    // would be the duplicate above.
+    if let Some(bn) = me_assigned.map(|a| a.box_name.as_str()) {
+        if bn != me && !on_bridge {
+            out.push(format!("{bn}:{self_addr}"));
         }
     }
-    // MY OWN ALIASES POINT AT MY OWN LOOPBACK, like my name: a service that calls itself by an alias
-    // must not be sent across the network to reach itself.
-    for al in plan
-        .iter()
-        .find(|a| a.service == me)
-        .map_or(&[][..], |a| a.aliases.as_slice())
-    {
+    // MY OWN ALIASES POINT WHERE MY NAME DOES: a service that calls itself by an alias must not be
+    // sent across the network to reach itself.
+    for al in me_assigned.map_or(&[][..], |a| a.aliases.as_slice()) {
         if al != me {
-            out.push(format!("{al}:127.0.0.1"));
+            out.push(format!("{al}:{self_addr}"));
         }
     }
-    let mut buf = [0u8; 15];
     for a in plan {
         if a.service == me {
             continue;
@@ -874,7 +884,13 @@ mod tests {
             3,
             "{from_2:?}"
         );
-        assert!(from_2.iter().any(|e| e == "web:127.0.0.1"), "{from_2:?}");
+        // On a bridge a replica's own name is its own bridge address, as Docker resolves it; never
+        // 127.0.0.1, which made `hostname -i` answer two addresses.
+        assert!(from_2.iter().any(|e| e == "web:10.89.0.3"), "{from_2:?}");
+        assert!(
+            !from_2.iter().any(|e| e.ends_with(":127.0.0.1")),
+            "{from_2:?}"
+        );
     }
 
     /// A `networks.<net>.aliases` NAME RESOLVES IN EVERY WIRING, not only in the pod.

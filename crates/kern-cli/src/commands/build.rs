@@ -939,12 +939,15 @@ fn materialize_final_image(tag: &str) -> Result<(), Error> {
     write_image_config(&cache.join(format!("{safe}.image")), &config)
         .map_err(|e| Error::Sandbox(format!("materialize '{tag}': image config: {e}")))?;
     // Sealed like every other way into the cache: see `imagecache::seal_entry`.
+    // `true`: a BUILT image is its own source. The "re-extract an entry an older kern stripped"
+    // repair asks a registry for the image, and a local build is on none: MEASURED, a `FROM <stage>`
+    // build was re-pulled from registry-1.docker.io/library/<local tag> at its first start.
     let _ = super::imagecache::seal_entry(
         &cache,
         &safe,
         tag,
         super::imagecache::Owners::ThisProcess,
-        false,
+        true,
     );
     Ok(())
 }
@@ -1292,6 +1295,7 @@ fn build_run(
                 dst,
                 from: _,
                 chmod,
+                chown,
             } => {
                 announce(step, format!("COPY {} {dst}", srcs.join(" ")));
                 // Expand `*`/`?`/`[…]` globs against the context (Docker does), so `COPY *.txt /d/`
@@ -1314,7 +1318,10 @@ fn build_run(
                         dst,
                         config.workdir.as_deref(),
                         &[],
-                        chmod.as_deref(),
+                        crate::commands::rootfs::CopyMeta {
+                            chmod: chmod.as_deref(),
+                            chown: chown.as_deref(),
+                        },
                     )?;
                 }
                 i += 1;
@@ -1324,6 +1331,7 @@ fn build_run(
                 dst,
                 checksum,
                 chmod,
+                chown,
             } => {
                 announce(step, format!("ADD {url} {dst}"));
                 let dl = work.join(format!("addurl{step}"));
@@ -1336,7 +1344,10 @@ fn build_run(
                     dst,
                     config.workdir.as_deref(),
                     &[],
-                    None,
+                    crate::commands::rootfs::CopyMeta {
+                        chmod: None,
+                        chown: chown.as_deref(),
+                    },
                 )?;
                 i += 1;
             }
@@ -1344,6 +1355,7 @@ fn build_run(
                 content,
                 dst,
                 chmod,
+                chown,
             } => {
                 announce(step, format!("COPY (inline heredoc) {dst}"));
                 let dl = work.join(format!("inline{step}"));
@@ -1356,7 +1368,10 @@ fn build_run(
                     dst,
                     config.workdir.as_deref(),
                     &[],
-                    None,
+                    crate::commands::rootfs::CopyMeta {
+                        chmod: None,
+                        chown: chown.as_deref(),
+                    },
                 )?;
                 i += 1;
             }
@@ -1458,12 +1473,15 @@ fn build_run(
     write_image_config(&cache.join(format!("{safe}.image")), &config)
         .map_err(|e| Error::Sandbox(format!("image config for '{tag}': {e}")))?;
     // Sealed like every other way into the cache: see `imagecache::seal_entry`.
+    // `true`: a BUILT image is its own source. The "re-extract an entry an older kern stripped"
+    // repair asks a registry for the image, and a local build is on none: MEASURED, a `FROM <stage>`
+    // build was re-pulled from registry-1.docker.io/library/<local tag> at its first start.
     let _ = super::imagecache::seal_entry(
         &cache,
         &safe,
         tag,
         super::imagecache::Owners::ThisProcess,
-        false,
+        true,
     );
     // Record the content key so the NEXT identical build hits the flat cache above and skips the rebuild.
     write_flat_key(tag, &flat_key);
@@ -1637,6 +1655,7 @@ fn build_layered_cached(
                 dst,
                 from: _,
                 chmod,
+                chown,
             } => {
                 // Expand `*`/`?`/`[…]` globs against the context before hashing, so the cache key
                 // reflects the ACTUAL matched files (a new match must miss the cache).
@@ -1689,7 +1708,10 @@ fn build_layered_cached(
                             dst,
                             config.workdir.as_deref(),
                             &chain,
-                            chmod.as_deref(),
+                            crate::commands::rootfs::CopyMeta {
+                                chmod: chmod.as_deref(),
+                                chown: chown.as_deref(),
+                            },
                         )?;
                     }
                     commit_layer(&fresh, &lc, &key)?;
@@ -1704,6 +1726,7 @@ fn build_layered_cached(
                 dst,
                 checksum,
                 chmod,
+                chown,
             } => {
                 // Key on url + checksum + chmod + dst: with a `--checksum` this layer is fully
                 // content-addressed; without one, the URL string identifies it (a changed remote
@@ -1737,7 +1760,10 @@ fn build_layered_cached(
                         dst,
                         config.workdir.as_deref(),
                         &chain,
-                        None,
+                        crate::commands::rootfs::CopyMeta {
+                            chmod: None,
+                            chown: chown.as_deref(),
+                        },
                     )?;
                     commit_layer(&fresh, &lc, &key)?;
                     unit += 1;
@@ -1750,6 +1776,7 @@ fn build_layered_cached(
                 content,
                 dst,
                 chmod,
+                chown,
             } => {
                 // Content-addressed: the full body (+ chmod) is folded into the layer key (layer_key
                 // hashes its whole repr), so editing the heredoc or its mode busts the cache.
@@ -1781,7 +1808,10 @@ fn build_layered_cached(
                         dst,
                         config.workdir.as_deref(),
                         &chain,
-                        None,
+                        crate::commands::rootfs::CopyMeta {
+                            chmod: None,
+                            chown: chown.as_deref(),
+                        },
                     )?;
                     commit_layer(&fresh, &lc, &key)?;
                     unit += 1;
@@ -1910,12 +1940,15 @@ fn build_layered_cached(
     write_image_config(&cache.join(format!("{safe}.image")), &config)
         .map_err(|e| Error::Sandbox(format!("image config for '{tag}': {e}")))?;
     // Sealed like every other way into the cache: see `imagecache::seal_entry`.
+    // `true`: a BUILT image is its own source. The "re-extract an entry an older kern stripped"
+    // repair asks a registry for the image, and a local build is on none: MEASURED, a `FROM <stage>`
+    // build was re-pulled from registry-1.docker.io/library/<local tag> at its first start.
     let _ = super::imagecache::seal_entry(
         &cache,
         &safe,
         tag,
         super::imagecache::Owners::ThisProcess,
-        false,
+        true,
     );
     announce_built(tag);
     Ok(())

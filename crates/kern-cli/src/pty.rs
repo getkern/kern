@@ -53,7 +53,7 @@ fn is_tty(fd: RawFd) -> bool {
 }
 
 /// Put the terminal at `fd` into raw mode, returning the previous settings for [`restore`].
-fn make_raw(fd: RawFd) -> io::Result<libc::termios> {
+pub(crate) fn make_raw(fd: RawFd) -> io::Result<libc::termios> {
     unsafe {
         let mut prev: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut prev) != 0 {
@@ -90,7 +90,7 @@ pub fn raw_with_resize(master: RawFd) -> Option<libc::termios> {
 }
 
 /// Copy the window size from `from` (the host tty) to `to` (the PTY master). Best-effort.
-fn copy_winsize(from: RawFd, to: RawFd) {
+pub(crate) fn copy_winsize(from: RawFd, to: RawFd) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(from, libc::TIOCGWINSZ, &mut ws) == 0 {

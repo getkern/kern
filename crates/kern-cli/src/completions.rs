@@ -72,6 +72,7 @@ const VERBS: &[&str] = &[
     "up",
     "down",
     "uninstall",
+    "self-update",
     "port",
     // `kern box --keep` gave these two something to act on; they were documented and uncompletable
     // until `the_completions_and_the_reference_agree` said so.

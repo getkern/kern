@@ -416,7 +416,55 @@ impl<'a> Extract<'a> {
     }
 }
 
+/// [`merged_view_extract_once`] as this user, and, when a directory of the image could not be READ,
+/// once more as root of the subordinate uid range, where a directory a subordinate id owns is
+/// readable. `kern save` and `kern push` already retried this way (`as_user_then_mapped`); a
+/// `FROM <stage>` and a `COPY --from` did not. MEASURED on 2026-11-18: any multi-stage build on a
+/// `python:*-slim` base (`/var/lib/apt/lists/partial`, `drwx------ _apt`) failed rootless, and passed
+/// as root.
 pub(crate) fn merged_view_extract(
+    chain: &[String],
+    src_rel: Extract<'_>,
+    out_dir: &std::path::Path,
+) -> Result<(), Error> {
+    let first = match merged_view_extract_once(chain, src_rel, out_dir) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let unreadable = matches!(&first, Error::Oci(m) if m.starts_with(UNREADABLE_DIR_PREFIX));
+    if !unreadable
+        || kern_isolation::is_root_of_ranged_userns()
+        || !kern_isolation::id_range_available()
+    {
+        return Err(first);
+    }
+    // A clean destination for the second attempt: the first one may have copied part of the tree.
+    if let Ok(rd) = std::fs::read_dir(out_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && !p.is_symlink() {
+                let _ = std::fs::remove_dir_all(&p);
+            } else {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    match kern_isolation::with_id_mapped_userns(|ranged| {
+        if !ranged {
+            return 2;
+        }
+        i32::from(merged_view_extract_once(chain, src_rel, out_dir).is_err())
+    }) {
+        Ok(0) => Ok(()),
+        _ => Err(first),
+    }
+}
+
+/// The start of the error a directory the copier could not open produces (exit 113-115), which is
+/// the one a retry as root of the subordinate range can fix.
+const UNREADABLE_DIR_PREFIX: &str = "a directory in the image could not be opened";
+
+fn merged_view_extract_once(
     chain: &[String],
     src_rel: Extract<'_>,
     out_dir: &std::path::Path,
@@ -742,7 +790,15 @@ pub(crate) unsafe fn copy_confined_tree(
         // The adapter returns `-errno`. ENOSYS → kernel < 5.6 (no openat2): 107 (parent maps to a precise
         // hint). ENOENT / RESOLVE refusal → 108 (a confined "no such file" - e.g. an opaque dir correctly
         // hid the source).
-        return if sfd == -libc::ENOSYS { 107 } else { 108 };
+        // A path this namespace may not traverse is NOT a missing one: EACCES/EPERM go to 114, so the
+        // caller retries as root of the subordinate range instead of reporting "does not exist"
+        // (MEASURED: a `FROM <stage>` over a `drwx------ _apt` directory said "COPY --from source
+        // does not exist" in a Dockerfile with no COPY --from).
+        return match -sfd {
+            libc::ENOSYS => 107,
+            libc::EACCES | libc::EPERM => 114,
+            _ => 108,
+        };
     }
     let mut st: libc::stat = std::mem::zeroed();
     if libc::fstatat(sfd, c"".as_ptr(), &mut st, libc::AT_EMPTY_PATH) != 0 {
@@ -991,8 +1047,13 @@ pub(crate) unsafe fn copy_one_file(
     // injection vector without losing anything usable - the same call kern makes for setuid (stripped at
     // push). `system.*`/`trusted.*` are skipped too (need privilege, not ours to propagate).
     copy_xattrs(rfd, dfd);
-    // Preserve owner + mtime best-effort (mode was set at create time).
+    // Preserve owner, then the MODE AGAIN, then mtime, best-effort. The mode given at create time is
+    // not enough: the chown CLEARS setuid and setgid, so it went in first and the bits came off.
+    // MEASURED on 2026-11-18: `FROM base` on `python:3.11-slim` left `/usr/bin/su` at 755 (4755 in
+    // the base), and kern then tried to re-pull the LOCAL image to get the bits back. The directory
+    // path (`own_like_source_dir`) already did chown, then chmod.
     libc::fchown(dfd, st.st_uid, st.st_gid);
+    libc::fchmod(dfd, st.st_mode & 0o7777);
     let times = [
         libc::timespec {
             tv_sec: st.st_atime,
@@ -1778,6 +1839,13 @@ pub(crate) fn context_escape_reason(ctx: &std::path::Path, src_rel: &str) -> Opt
     }
 }
 
+/// What a COPY sets on the files it creates: `--chmod` (the mode) and `--chown` (the owner).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CopyMeta<'a> {
+    pub(crate) chmod: Option<&'a str>,
+    pub(crate) chown: Option<&'a str>,
+}
+
 pub(crate) fn copy_into_rootfs(
     ctx: &std::path::Path,
     src_rel: &str,
@@ -1785,8 +1853,9 @@ pub(crate) fn copy_into_rootfs(
     dst: &str,
     workdir: Option<&str>,
     chain: &[String],
-    chmod: Option<&str>,
+    meta: CopyMeta<'_>,
 ) -> Result<(), Error> {
+    let CopyMeta { chmod, chown } = meta;
     // Source must resolve to a real path INSIDE the context (no `../`, no symlink pointing out).
     // The rule itself is [`context_escape_reason`], so `build --check` asks the same question
     // without performing the copy; this call site keeps its own wording.
@@ -1873,6 +1942,30 @@ pub(crate) fn copy_into_rootfs(
             let _ = std::fs::remove_file(&target);
         }
     }
+    // WHAT THIS COPY CREATES, for `--chown`: a file's own path, or a directory's copied entries plus
+    // the destination when this copy makes it. A directory that was already there keeps its owner,
+    // as under Docker, which owns only what the instruction adds.
+    let chown_ids = chown.map(|c| resolve_chown(c, rootfs, chain)).transpose()?;
+    let copied: Vec<std::path::PathBuf> = if chown_ids.is_none() {
+        Vec::new()
+    } else if src.is_dir() {
+        let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(&src)
+            .map(|rd| rd.flatten().map(|e| target.join(e.file_name())).collect())
+            .unwrap_or_default();
+        if !target.exists() {
+            v.push(target.clone());
+        }
+        v
+    } else {
+        vec![target.clone()]
+    };
+    let finish = |res: Result<(), Error>| -> Result<(), Error> {
+        res?;
+        match chown_ids {
+            Some((uid, gid)) => chown_copied(&copied, uid, gid, src_rel),
+            None => Ok(()),
+        }
+    };
     // When the build context carries a `.dockerignore`/`.kernignore`, a directory COPY must skip the
     // excluded paths (so `COPY . /app` doesn't bake `.git`/secrets). The filter needs re-include
     // (`!`) and last-match-wins semantics that `cp`/`tar --exclude` can't express, so a directory copy
@@ -1891,7 +1984,7 @@ pub(crate) fn copy_into_rootfs(
             let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
             copy_dir_filtered(&src, &target, &ctx_root, &ig)
                 .map_err(|e| Error::Sandbox(format!("COPY '{src_rel}' → '{dst}': {e}")))?;
-            return apply_chmod_tree(&target, chmod);
+            return finish(apply_chmod_tree(&target, chmod));
         }
     }
     let arg = if src.is_dir() {
@@ -1908,18 +2001,135 @@ pub(crate) fn copy_into_rootfs(
     // target is never read at build time. If this `cp -a` is ever replaced (e.g. a Rust `walkdir` copy
     // for portability), that replacement MUST be no-follow too, or a `leak -> /host/secret` inside a
     // build context would leak the host file into the image. Verified live: it does not, today.
-    let ok = std::process::Command::new("cp")
+    let out = std::process::Command::new("cp")
         .arg("-a")
         .arg("--") // src/target are absolute, but never let cp parse them as flags
         .arg(&arg)
         .arg(&target)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    // `cp -a` TRIES TO KEEP THE SOURCE'S OWNER, and the builder is not root: a context whose files
+    // belong to someone else (every file under WSL's `/mnt/c` shows uid 0) makes BusyBox's `cp` say
+    // "can't preserve ownership" for each one. MEASURED on a real build from kern.exe on 2026-11-18,
+    // one line per COPY. The copy is right regardless (a COPY's files belong to the box's root, as
+    // under Docker, unless `--chown` says otherwise), so those lines are dropped and every other line
+    // `cp` writes is passed on.
+    let ok = match out {
+        Ok(o) => {
+            for line in String::from_utf8_lossy(&o.stderr).lines() {
+                if !is_ownership_notice(line) {
+                    eprintln!("{line}");
+                }
+            }
+            o.status.success()
+        }
+        Err(_) => false,
+    };
     if ok {
-        apply_chmod_tree(&target, chmod)
+        finish(apply_chmod_tree(&target, chmod))
     } else {
         Err(Error::Sandbox(format!("COPY '{src_rel}' → '{dst}' failed")))
+    }
+}
+
+/// A `cp` line that only says it could not keep a source file's owner (BusyBox: "can't preserve
+/// ownership of"; GNU: "failed to preserve ownership for").
+fn is_ownership_notice(line: &str) -> bool {
+    line.contains("preserve ownership")
+}
+
+/// `COPY --chown=<user>[:<group>]` as Docker resolves it: a number is taken as it is, a name is looked
+/// up in the IMAGE's `/etc/passwd` / `/etc/group` (this layer first, then the layers below), and a
+/// missing group takes the user's NUMERIC id, as Docker documents ("a username without groupname ...
+/// will use the same numeric UID as the GID"). A name the image does not have is an error, as it is
+/// under Docker.
+pub(crate) fn resolve_chown(
+    spec: &str,
+    rootfs: &std::path::Path,
+    chain: &[String],
+) -> Result<(u32, u32), Error> {
+    let (user, group) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    // THROUGH THE ONE READER OF AN IMAGE'S ACCOUNTS (`imagecache::Accounts`), which confines a
+    // hostile layer's symlink to the layer, refuses a FIFO and bounds the size. Its layers are TOP
+    // first; `chain` here is BASE first, so it is reversed under this layer.
+    let layers: Vec<String> = std::iter::once(rootfs.to_string_lossy().into_owned())
+        .chain(chain.iter().rev().cloned())
+        .collect();
+    let accounts = crate::commands::imagecache::Accounts::Layers(&layers);
+    let uid = id_of(user, &accounts, "etc/passwd", "user")?;
+    let gid = match group {
+        None | Some("") => uid,
+        Some(g) => id_of(g, &accounts, "etc/group", "group")?,
+    };
+    Ok((uid, gid))
+}
+
+/// A numeric id, or the third field of the line naming `name` in the image's `file`.
+fn id_of(
+    name: &str,
+    accounts: &crate::commands::imagecache::Accounts<'_>,
+    file: &str,
+    what: &str,
+) -> Result<u32, Error> {
+    if let Ok(n) = name.parse::<u32>() {
+        return Ok(n);
+    }
+    accounts
+        .entry(file, name, 0)
+        .and_then(|f| f.get(2).and_then(|v| v.parse::<u32>().ok()))
+        .ok_or_else(|| {
+            Error::Build(format!(
+                "COPY --chown: unable to find {what} {name}: no matching entries in the image's /{file}"
+            ))
+        })
+}
+
+/// Give what a COPY created to box ids `uid:gid`, inside the namespace that maps them (box uid N is a
+/// subordinate id on the host, which the builder cannot assign from outside). Symlinks are owned, not
+/// followed. Box root (`0:0`) is what the copy already produced, so it needs no namespace.
+pub(crate) fn chown_copied(
+    paths: &[std::path::PathBuf],
+    uid: u32,
+    gid: u32,
+    src_rel: &str,
+) -> Result<(), Error> {
+    if paths.is_empty() || (uid == 0 && gid == 0) {
+        return Ok(());
+    }
+    fn walk(p: &std::path::Path, uid: u32, gid: u32) -> bool {
+        let Ok(m) = std::fs::symlink_metadata(p) else {
+            return true; // excluded by an ignore file, or never created
+        };
+        let mut ok = std::os::unix::fs::lchown(p, Some(uid), Some(gid)).is_ok();
+        if m.file_type().is_dir() {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    ok &= walk(&e.path(), uid, gid);
+                }
+            }
+        }
+        ok
+    }
+    let code = kern_isolation::with_id_mapped_userns(|ranged| {
+        if !ranged {
+            return 2;
+        }
+        i32::from(!paths.iter().all(|p| walk(p, uid, gid)))
+    });
+    match code {
+        Ok(0) => Ok(()),
+        Ok(2) | Err(_) => Err(Error::Build(format!(
+            "COPY --chown={uid}:{gid} '{src_rel}': owning files as a non-root box user needs a \
+             subordinate uid range (newuidmap/newgidmap and an /etc/subuid allocation); `kern doctor` \
+             says whether this host has one"
+        ))),
+        Ok(_) => Err(Error::Build(format!(
+            "COPY --chown={uid}:{gid} '{src_rel}': some files could not be given that owner"
+        ))),
     }
 }
 
@@ -2275,6 +2485,18 @@ pub(crate) fn scratch_dir() -> PathBuf {
         if fs_magic_of(cand) == Some(OVERLAYFS_SUPER_MAGIC) {
             continue;
         }
+        // THE BASE TOO, for `$XDG_RUNTIME_DIR`. `scratch_base_usable` checks every directory below
+        // the base and lets the base itself through, which is right for `/tmp` and `/dev/shm` (root's,
+        // world-writable, meant to be shared) and wrong for a runtime directory: WSLg's
+        // `/mnt/wslg/runtime-dir` is ONE directory for every uid, owned by 1000, and root (or any other
+        // uid) putting a box's overlay upper there is the failure described above, `mount(overlay)
+        // failed: Permission denied`, because 1000 is not mapped in that box's namespace. MEASURED in
+        // the field on 2026-11-18, kern as root in a WSL distro, 4 of 4. A runtime directory that is
+        // not this user's is not used for scratch; `/run/user/<uid>` or `/tmp/kern-<uid>` is, quietly,
+        // since nothing is wrong with the host.
+        if *kind == "xdg" && !owned_by_caller(base) {
+            continue;
+        }
         if !scratch_base_usable(base, cand) {
             if *kind == "xdg" && !kern_common::env_flag("KERN_QUIET") {
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2301,6 +2523,15 @@ pub(crate) fn scratch_dir() -> PathBuf {
         return cand.clone();
     }
     tmp
+}
+
+/// Is `dir` a directory owned by the calling user? A runtime directory shared between users is not
+/// one a box's scratch may live in (see `scratch_dir`).
+pub(crate) fn owned_by_caller(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid takes no arguments.
+    let uid = unsafe { libc::getuid() };
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == uid)
 }
 
 /// Can this user put a box's writable layer at `cand`? The leaf is created on demand, so the
@@ -2865,5 +3096,85 @@ mod commit_snapshot_tests {
             missing.first()
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod chown_tests {
+    use super::*;
+
+    #[test]
+    fn chown_ids_resolve_as_docker_resolves_them() {
+        let dir = std::env::temp_dir().join(format!("kern-chown-{}", std::process::id()));
+        let base = dir.join("base");
+        let top = dir.join("top");
+        for d in [&base, &top] {
+            assert!(std::fs::create_dir_all(d.join("etc")).is_ok());
+        }
+        // The base has `nobody`; a later layer (a RUN adduser) has `node` too. The chain is BASE
+        // FIRST, so the later layer's file must win.
+        let _ = std::fs::write(
+            base.join("etc/passwd"),
+            "root:x:0:0::/root:/bin/sh\nnobody:x:65534:65534::/:/sbin/nologin\n",
+        );
+        let _ = std::fs::write(base.join("etc/group"), "root:x:0:\nnogroup:x:65533:\n");
+        let _ = std::fs::write(top.join("etc/passwd"), "root:x:0:0::/root:/bin/sh\nnobody:x:65534:65534::/:/sbin/nologin\nnode:x:1500:1500::/home/node:/bin/sh\n");
+        let fresh = dir.join("fresh");
+        let _ = std::fs::create_dir_all(&fresh);
+        let chain = vec![
+            base.to_string_lossy().into_owned(),
+            top.to_string_lossy().into_owned(),
+        ];
+        let r = |spec: &str| resolve_chown(spec, &fresh, &chain).ok();
+        assert_eq!(r("1000:1000"), Some((1000, 1000)));
+        assert_eq!(r("1000"), Some((1000, 1000)), "no group: the uid's number");
+        assert_eq!(
+            r("nobody"),
+            Some((65534, 65534)),
+            "no group: the uid's number, not a lookup"
+        );
+        assert_eq!(r("nobody:nogroup"), Some((65534, 65533)));
+        assert_eq!(r("node:1500"), Some((1500, 1500)), "a later layer's user");
+        assert_eq!(r("0:0"), Some((0, 0)));
+        assert_eq!(r("nosuchuser"), None);
+        assert_eq!(r("node:nosuchgroup"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_ownership_notices_of_cp_are_dropped() {
+        assert!(is_ownership_notice(
+            "cp: can't preserve ownership of '/x/package.json': Operation not permitted"
+        ));
+        assert!(is_ownership_notice(
+            "cp: failed to preserve ownership for '/x': Operation not permitted"
+        ));
+        assert!(!is_ownership_notice(
+            "cp: can't create '/x/y': No space left on device"
+        ));
+        assert!(!is_ownership_notice(
+            "cp: cannot stat 'a': No such file or directory"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod scratch_owner_tests {
+    use super::owned_by_caller;
+
+    #[test]
+    fn a_runtime_dir_is_ours_only_when_this_user_owns_it() {
+        let mine = std::env::temp_dir().join(format!("kern-own-{}", std::process::id()));
+        assert!(std::fs::create_dir_all(&mine).is_ok());
+        assert!(owned_by_caller(&mine));
+        let _ = std::fs::remove_dir_all(&mine);
+        // `/` is root's: for anyone else it is the shared-directory case WSLg's runtime dir is.
+        // SAFETY: getuid takes no arguments.
+        if unsafe { libc::getuid() } != 0 {
+            assert!(!owned_by_caller(std::path::Path::new("/")));
+        }
+        assert!(!owned_by_caller(std::path::Path::new(
+            "/no/such/dir/at/all"
+        )));
     }
 }

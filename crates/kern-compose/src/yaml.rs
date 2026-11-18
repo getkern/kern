@@ -359,7 +359,8 @@ fn required_unset_error(missing: &[String]) -> String {
 }
 
 /// THE FRONT END EVERY READER OF A FILE GOES THROUGH: multi-line folding, the structural
-/// prescreen, document-level interpolation, the line parse, anchors, `extends:` and `!reset`. One
+/// prescreen, the line parse, anchors, per-value interpolation of the parsed tree, `extends:` and
+/// `!reset`. One
 /// function, so `parse_document` (which builds the boxes) and [`document_val`] (which `config`
 /// prints) read the same tree and cannot drift apart.
 fn front_end(
@@ -376,17 +377,25 @@ fn front_end(
     // or a tab-indented file fails fast with a clear reason, never reaches the line scanner.
     prescreen(&folded)?;
 
-    // Interpolate `${VAR}` / `${VAR:-default}` at the DOCUMENT level, like Docker - so it works
-    // everywhere (ports, command, volumes, environment, build.args), not just in a couple of fields. A
-    // per-field pass would miss `ports: ["${PORT}:80"]`; Docker substitutes over the whole file before
-    // parsing, and so do we. Unset with no default → empty + warn (Docker semantics), never a literal
-    // `${VAR}` left to confuse a downstream tool.
-    // `config --no-interpolate` reads the file with its `${...}` as written.
-    let interpolated = if interpolate {
-        interpolate_document(&folded, dotenv)
-    } else {
-        folded.clone()
-    };
+    // Interpolation is NOT done on this text: it runs on the parsed tree below, on every value
+    // (ports, command, volumes, environment, build.args alike). See [`interpolate_tree`] for what
+    // substituting into the text did to a value that looked like YAML.
+    let text = folded.as_str();
+    let mut lines = lex(text)?;
+    rewrite_merge_tags(&mut lines, true);
+    let mut root = build_tree(&lines)?;
+    // Expand YAML anchors (`&x`), aliases (`*x`) and merge keys (`<<: *x`) - the common `x-*` template
+    // DRY pattern real compose files use - under a hard node budget (billion-laughs-safe). After this,
+    // the tree holds only concrete values.
+    resolve_anchors(&mut root)?;
+    // Interpolate `${VAR}` / `${VAR:-default}` in every VALUE, like Compose: after the anchors (an
+    // alias copies the text written, and the copy is interpolated like the original), before
+    // `extends:` (whose `file:` may itself be a `${VAR}`). Unset with no default -> empty + warn,
+    // never a literal `${VAR}` left to confuse a downstream tool. `config --no-interpolate` reads the
+    // file with its `${...}` as written.
+    if interpolate {
+        interpolate_tree(&mut root, dotenv);
+    }
     // TAKEN, not read: draining here is what stops one document's missing variables being reported
     // against the next one parsed in this process. A mutation replacing the take with a clone leaves
     // the second parse refusing a variable its file never mentions, which the test pins.
@@ -398,15 +407,6 @@ fn front_end(
     if !missing.is_empty() {
         return Err(required_unset_error(&missing));
     }
-    let text = interpolated.as_str();
-
-    let mut lines = lex(text)?;
-    rewrite_merge_tags(&mut lines, true);
-    let mut root = build_tree(&lines)?;
-    // Expand YAML anchors (`&x`), aliases (`*x`) and merge keys (`<<: *x`) - the common `x-*` template
-    // DRY pattern real compose files use - under a hard node budget (billion-laughs-safe). After this,
-    // the tree holds only concrete values.
-    resolve_anchors(&mut root)?;
     // Resolve `extends:` (a service inheriting another service's fields) - a real Compose feature the
     // `x-`/anchor pattern doesn't cover, since it references another SERVICE by name. Same-file only.
     resolve_extends(&mut root, dir, dotenv)?;
@@ -475,63 +475,37 @@ fn document_val_uncached(
     // a value an interpolation produced is a STRING whatever it reads as. MEASURED on Docker
     // Compose 5.3.1: `C: ${ALT:+alt}` with ALT unset is `C: ""`, where the text-level pass leaves
     // `C: ` and reads it as null; and the service hash (`config --hash`) follows the string.
+    //
+    // THE SAME INTERPOLATION AS THE BOXES, by construction: this used to interpolate here, value by
+    // value, while the parse that builds the boxes substituted into the text, and the two disagreed
+    // on a real file (`config` printed `V: 'a #b'` while the box got `V=a`). Both now read the tree
+    // [`front_end`] interpolates, which refuses a missing `${VAR:?}` itself.
     SILENT_WARNINGS.with(|s| s.set(true));
-    let root = front_end(text, dotenv, dir, false);
-    let val = root.map(|r| node_val(&r, interpolate.then_some(dotenv)));
+    let root = front_end(text, dotenv, dir, interpolate);
     SILENT_WARNINGS.with(|s| s.set(false));
-    let val = val?;
-    if interpolate {
-        let missing = one_entry_per_variable(take_required_unset());
-        if !missing.is_empty() {
-            return Err(required_unset_error(&missing));
-        }
-    }
-    Ok(val)
+    Ok(node_val(&root?))
 }
 
 /// One parsed node as a [`crate::canon::Val`]: children are a mapping, items a sequence (each item a
 /// scalar or the flow form `build_tree` renders a block item to), a scalar decoded by
 /// [`scalar_str`] and marked quoted when it was quoted or a block scalar.
-fn node_val(n: &Node, dotenv: Option<&crate::DotEnv>) -> crate::canon::Val {
+fn node_val(n: &Node) -> crate::canon::Val {
     use crate::canon::Val;
     if !n.children.is_empty() {
         return Val::Map(
             n.children
                 .iter()
-                .map(|(k, v)| (k.clone(), node_val(v, dotenv)))
+                .map(|(k, v)| (k.clone(), node_val(v)))
                 .collect(),
         );
     }
     if !n.items.is_empty() {
-        return Val::Seq(
-            n.items
-                .iter()
-                .map(|i| interpolated_val(i, dotenv))
-                .collect(),
-        );
+        return Val::Seq(n.items.iter().map(|i| raw_val(i)).collect());
     }
     match &n.scalar {
         None => Val::Null,
-        Some(s) => interpolated_val(s, dotenv),
+        Some(s) => raw_val(s),
     }
-}
-
-/// A raw value, interpolated when `dotenv` is given: a scalar the interpolation changed is a
-/// string (see [`document_val`]).
-fn interpolated_val(raw: &str, dotenv: Option<&crate::DotEnv>) -> crate::canon::Val {
-    use crate::canon::Val;
-    let Some(env) = dotenv.filter(|_| raw.contains('$')) else {
-        return raw_val(raw);
-    };
-    let out = interpolate_fragment(raw, env);
-    if out == raw {
-        return raw_val(raw);
-    }
-    let t = out.trim();
-    if t.starts_with('[') || t.starts_with('{') {
-        return Val::from_flow(&strip_unset_mark(t));
-    }
-    Val::Scalar(scalar_str(t), true)
 }
 
 /// A raw scalar or flow collection as kern's line parser keeps it.
@@ -2500,8 +2474,8 @@ const EXTENDS_NOT_INHERITED: &[&str] = &["depends_on", "links", "external_links"
 /// in ADDITION to the exact-cycle guard (which catches the honest case with a better message).
 const MAX_EXTENDS_DEPTH: usize = 32;
 
-/// Load another compose file as a node tree, ready to be extended from: interpolated with the same
-/// `.env`, folded, prescreened, anchor-expanded, and with its OWN `extends` already resolved
+/// Load another compose file as a node tree, ready to be extended from: folded, prescreened,
+/// anchor-expanded, its values interpolated with the same `.env`, and with its OWN `extends` resolved
 /// relative to ITS directory. Cached by path within one parse.
 fn load_extends_base<'a>(
     path: &std::path::Path,
@@ -2524,10 +2498,10 @@ fn load_extends_base<'a>(
     // The SAME `.env`, because a base file is written with the same variables as the file that
     // extends it - Zabbix's components file is `${ZABBIX_SERVER_PGSQL_IMAGE}` from end to end. A
     // `${VAR:?}` it requires is collected by the same thread-local and reported with the rest.
-    let interpolated = interpolate_document(&folded, dotenv);
-    let lines = lex(&interpolated)?;
+    let lines = lex(&folded)?;
     let mut root = build_tree(&lines)?;
     resolve_anchors(&mut root)?;
+    interpolate_tree(&mut root, dotenv);
     // ITS extends, from ITS directory: a base file may extend a third file next to itself. The
     // cache and the chain travel with it, which is what makes a cycle through two files visible
     // instead of a recursion that runs until the stack ends (measured: it did).
@@ -6419,8 +6393,8 @@ fn command_argv(node: &Node) -> (Vec<String>, bool) {
 
 /// A `K=v` collection written in either compose shape - a list of `- K=v` and/or a map of `K: v` -
 /// flattened to `["K=v", …]`. Shared by `environment` and `build.args`, which have the identical YAML
-/// shape, so the two can't drift. `${VAR}` is already substituted document-wide (see
-/// `interpolate_document`), so values are used verbatim here.
+/// shape, so the two can't drift. `${VAR}` is already substituted in every value (see
+/// [`interpolate_tree`]), so values are used verbatim here.
 ///
 /// A list item with NO `=` (`- API_KEY`) is Docker's **host pass-through**: the value is taken from the
 /// host environment. If the host has it, we emit `API_KEY=<host value>`; if not, we OMIT it (Docker
@@ -6529,37 +6503,75 @@ fn kv_pairs_from(node: &Node, dotenv: Option<&crate::DotEnv>) -> Vec<String> {
     out
 }
 
-/// Substitute `${VAR}` and `${VAR:-default}` throughout the compose text from the host env, like
-/// Docker's pre-parse interpolation. Handles `$$` → literal `$` (Docker's escape). An unset var with
-/// no default → empty string + one warning (Docker semantics), never a leftover literal `${VAR}` that
-/// would confuse a downstream tool. `$VAR` without braces and other `${...}` operators are left as-is.
+/// Interpolate every VALUE of a parsed tree, the way compose-go does: after the YAML is read, so a
+/// substituted value is always the string it holds and never YAML.
 ///
-/// COMMENT-AWARE: a `${VAR}` inside a trailing `#` comment is NOT substituted and raises no unset-var
-/// warning (the comment text is dropped by the lexer anyway; interpolating it only produced spurious
-/// stderr noise - audit finding). We split each line at its first unquoted `#`, interpolate the code
-/// part, and re-attach the comment verbatim.
-fn interpolate_document(text: &str, dotenv: &crate::DotEnv) -> String {
-    if !text.contains('$') {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    // `text.lines()` drops the line terminators; rebuild them. A trailing newline is preserved by
-    // checking the original. We interpolate only the pre-comment part of each line.
-    let ends_with_nl = text.ends_with('\n');
-    let mut first = true;
-    for line in text.lines() {
-        if !first {
-            out.push('\n');
+/// WHAT THIS REPLACED, MEASURED 2026-11-18 on the box path (the one that builds what runs), with
+/// `.env` values substituted into the TEXT before the parse: `V: ${V}` with `V="a #b"` gave the box
+/// `V=a` (the rest read as a comment), `a: b #c` gave `V=a: b`, `&a b` gave `V=b` (an anchor),
+/// `{abc-123}` became a mapping and `*ref` an unknown alias. A secret with ` #` in it reached the
+/// service truncated, with nothing said, while `config`, which already interpolated per value,
+/// printed it whole. Found on a real stack whose `.env` held a GUID in braces.
+///
+/// Keys are not interpolated, as in Compose. A flow collection written inline (`[...]`, `{...}`,
+/// and the flow form a block item is rendered to) keeps the text substitution it had: its
+/// structure is the author's, and its elements are split after.
+fn interpolate_tree(node: &mut Node, dotenv: &crate::DotEnv) {
+    if let Some(sc) = node.scalar.as_mut() {
+        if sc.contains('$') {
+            *sc = interpolate_scalar(sc, dotenv);
         }
-        first = false;
-        let (code, comment) = split_at_comment(line);
-        out.push_str(&interpolate_fragment(code, dotenv));
-        out.push_str(comment); // verbatim - no interpolation, no warning
     }
-    if ends_with_nl {
-        out.push('\n');
+    for item in &mut node.items {
+        if item.contains('$') {
+            *item = interpolate_scalar(item, dotenv);
+        }
     }
-    out
+    for (_, child) in &mut node.children {
+        interpolate_tree(child, dotenv);
+    }
+}
+
+/// One raw scalar as the line parser keeps it (quotes, `!!str`, block markers included),
+/// interpolated so that it still parses to exactly the text the substitution produced.
+///
+/// * double-quoted: each substituted value is escaped for double quotes (`\` and `"`);
+/// * single-quoted: each substituted value has its `'` doubled;
+/// * plain: the whole result is written single-quoted, so no character of a value can be read as a
+///   comment, an anchor, an alias, a tag, a flow collection or a `key: value`. `!!str` is kept;
+/// * a block scalar (`|`, `>`) is literal text already and is substituted as it is;
+/// * a flow collection keeps the text substitution (see [`interpolate_tree`]).
+fn interpolate_scalar(raw: &str, dotenv: &crate::DotEnv) -> String {
+    let t = raw.trim();
+    if t.contains(BLOCK_OPAQUE) || t.contains(BLOCK_NL) {
+        return interpolate_fragment(raw, dotenv);
+    }
+    let (tag, body) = match t.strip_prefix("!!str") {
+        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+            ("!!str ", rest.trim())
+        }
+        _ => ("", t),
+    };
+    let b = body.as_bytes();
+    let quoted_by = |q: u8| b.len() >= 2 && b[0] == q && b[b.len() - 1] == q;
+    if quoted_by(b'"') {
+        let esc = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
+        let inner = interpolate_depth(&body[1..body.len() - 1], 0, dotenv, Some(&esc));
+        return format!("{tag}\"{inner}\"");
+    }
+    if quoted_by(b'\'') {
+        let esc = |v: &str| v.replace('\'', "''");
+        let inner = interpolate_depth(&body[1..body.len() - 1], 0, dotenv, Some(&esc));
+        return format!("{tag}'{inner}'");
+    }
+    if body.starts_with('[') || body.starts_with('{') {
+        return interpolate_fragment(raw, dotenv);
+    }
+    let out = interpolate_fragment(body, dotenv);
+    if out == body {
+        return raw.to_string();
+    }
+    format!("{tag}'{}'", out.replace('\'', "''"))
 }
 
 /// Split a line into `(code, comment)` at the first unquoted `#` (the `#` and everything after it is
@@ -6593,7 +6605,7 @@ pub(crate) fn strip_unset_mark(s: &str) -> String {
 }
 
 pub(crate) fn interpolate_fragment(text: &str, dotenv: &crate::DotEnv) -> String {
-    interpolate_depth(text, 0, dotenv)
+    interpolate_depth(text, 0, dotenv, None)
 }
 
 /// Max nesting depth for `${A:-${B:-…}}` - a hard cap so an adversarial input can't drive unbounded
@@ -6621,7 +6633,15 @@ fn matching_brace_end(inner: &str) -> Option<usize> {
     None
 }
 
-fn interpolate_depth(text: &str, depth: usize, dotenv: &crate::DotEnv) -> String {
+/// `escape`, when given, is applied to each SUBSTITUTED value and never to the text around it: it is
+/// how a value lands inside a quoted scalar as the characters it holds (a `"` in it closes nothing).
+/// Nested defaults are resolved without it, so a value is escaped exactly once.
+fn interpolate_depth(
+    text: &str,
+    depth: usize,
+    dotenv: &crate::DotEnv,
+    escape: Option<&dyn Fn(&str) -> String>,
+) -> String {
     if !text.contains('$') {
         return text.to_string();
     }
@@ -6658,7 +6678,11 @@ fn interpolate_depth(text: &str, depth: usize, dotenv: &crate::DotEnv) -> String
                 }
             };
             if name_len > 0 {
-                out.push_str(&interpolate_expr(&after[..name_len], dotenv));
+                let value = interpolate_expr(&after[..name_len], dotenv);
+                match escape {
+                    Some(e) => out.push_str(&e(&value)),
+                    None => out.push_str(&value),
+                }
                 rest = &after[name_len..];
             } else {
                 out.push('$');
@@ -6691,11 +6715,15 @@ fn interpolate_depth(text: &str, depth: usize, dotenv: &crate::DotEnv) -> String
         // expression FIRST (bounded recursion, depth-capped), then evaluate the outer expression on the
         // resolved text. `matching_brace_end` found the BALANCED `}`, so `expr` holds the whole inner.
         let resolved = if expr.contains("${") {
-            interpolate_depth(expr, depth + 1, dotenv)
+            interpolate_depth(expr, depth + 1, dotenv, None)
         } else {
             expr.to_string()
         };
-        out.push_str(&interpolate_expr(&resolved, dotenv));
+        let value = interpolate_expr(&resolved, dotenv);
+        match escape {
+            Some(e) => out.push_str(&e(&value)),
+            None => out.push_str(&value),
+        }
         rest = &inner[end + 1..];
     }
     out.push_str(rest);
@@ -11387,7 +11415,7 @@ mod tests {
         std::env::remove_var("KERN_NX_B");
         // Nested default `${A:-${B:-c}}` resolves the inner first, then the outer (Docker parity).
         assert_eq!(
-            interpolate_document(
+            interpolate_fragment(
                 "x=${KERN_NX_A:-${KERN_NX_B:-deep}}",
                 &crate::DotEnv::default()
             ),
@@ -11400,22 +11428,22 @@ mod tests {
         // nothing" so a valueless key can be told from a value that vanished; `scalar_str` erases it
         // before anything reads the value.
         assert_eq!(
-            interpolate_document("x=${A${B}}", &crate::DotEnv::default()),
+            interpolate_fragment("x=${A${B}}", &crate::DotEnv::default()),
             format!("x={UNSET_MARK}")
         );
         assert_eq!(
-            scalar_str(&interpolate_document("${A${B}}", &crate::DotEnv::default())),
+            scalar_str(&interpolate_fragment("${A${B}}", &crate::DotEnv::default())),
             "",
             "the mark never survives into a value"
         );
         // A normal `${VAR:-def}` still works.
         assert_eq!(
-            interpolate_document("x=${UNSET_XYZ_KERN:-def}", &crate::DotEnv::default()),
+            interpolate_fragment("x=${UNSET_XYZ_KERN:-def}", &crate::DotEnv::default()),
             "x=def"
         );
         // Adversarial deep nesting terminates (depth cap), never hangs.
         let deep = "${".repeat(100) + "X" + &"}".repeat(100);
-        let _ = interpolate_document(&deep, &crate::DotEnv::default());
+        let _ = interpolate_fragment(&deep, &crate::DotEnv::default());
     }
 
     #[test]
@@ -11451,27 +11479,85 @@ mod tests {
     }
 
     #[test]
+    fn a_substituted_value_reaches_the_box_as_the_string_it_holds() {
+        // MEASURED 2026-11-18 before this, on the path that builds the boxes: `a #b` arrived as `a`,
+        // `a: b #c` as `a: b`, `&a b` as `b`, `{abc-123}` and `*ref` were refused, and `config` printed
+        // the right value meanwhile. Found on a real stack whose `.env` held a GUID in braces. Each
+        // value, in each way a file writes it, must reach the box exactly, and `config` must agree.
+        let values = [
+            "{abc-123}",
+            "[1,2]",
+            "*ref",
+            "a #b",
+            "a: b #c",
+            "&a b",
+            "x: y",
+            "yes",
+            "0123",
+            "plain",
+            "\"dq\"",
+            "it's",
+            "back\\slash",
+            "!tag v",
+            "- x",
+            "%x",
+            "|",
+            "",
+        ];
+        type Form = (&'static str, fn(&str) -> String);
+        let forms: [Form; 6] = [
+            ("V: ${V}", |v| format!("V={v}")),
+            ("V: \"${V}\"", |v| format!("V={v}")),
+            ("V: '${V}'", |v| format!("V={v}")),
+            ("V: pre-${V}", |v| format!("V=pre-{v}")),
+            ("- V=${V}", |v| format!("V={v}")),
+            ("- \"V=${V}\"", |v| format!("V={v}")),
+        ];
+        for v in values {
+            let de = crate::DotEnv(vec![("V".to_string(), v.to_string())]);
+            for (line, want) in forms {
+                let y =
+                    format!("services:\n  app:\n    image: x\n    environment:\n      {line}\n");
+                let boxes = parse_with_env(&y, &de, false, crate::StackNet::Pod, None, false)
+                    .unwrap_or_else(|e| panic!("{v:?} in `{line}` refused: {e}"));
+                let got: Vec<&String> = boxes[0]
+                    .env
+                    .iter()
+                    .filter(|e| e.starts_with("V="))
+                    .collect();
+                assert_eq!(got, [&want(v)], "{v:?} in `{line}`");
+                let val = document_val(&y, &de, None, true)
+                    .unwrap_or_else(|e| panic!("config: {v:?} in `{line}` refused: {e}"));
+                let shown = format!("{val:?}");
+                let expect = want(v);
+                let inner = expect.trim_start_matches("V=");
+                assert!(
+                    shown.contains(&format!("{inner:?}")) || shown.contains(&format!("{expect:?}")),
+                    "config disagrees for {v:?} in `{line}`: {shown}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn interpolation_skips_comments() {
         // Audit regression: a `${VAR}` inside a trailing comment must not be interpolated (no spurious
-        // unset-var warning, comment text left verbatim). The value part is still interpolated.
-        assert_eq!(
-            interpolate_document(
-                "image: x  # see ${SOME_UNSET_XYZ}",
-                &crate::DotEnv::default()
-            ),
-            "image: x  # see ${SOME_UNSET_XYZ}"
+        // unset-var warning, comment text left out). Values are interpolated on the parsed tree, so a
+        // comment never reaches the interpolator: a `:?` in one would otherwise refuse the file.
+        let y = "services:\n  app:\n    image: x  # see ${KERN_UNSET_IN_COMMENT:?boom}\n";
+        let boxes = parse_with_env(
+            y,
+            &crate::DotEnv::default(),
+            false,
+            crate::StackNet::Pod,
+            None,
+            false,
         );
-        assert_eq!(
-            interpolate_document(
-                "cmd: ${UNSET_XYZ_KERN:-run}  # ${ALSO_UNSET}",
-                &crate::DotEnv::default()
-            ),
-            "cmd: run  # ${ALSO_UNSET}"
-        );
+        assert!(boxes.is_ok(), "a comment was interpolated: {boxes:?}");
         // A `#` inside quotes is NOT a comment - interpolation applies across it.
         assert_eq!(
-            interpolate_document("v: \"${UNSET_XYZ_KERN:-a#b}\"", &crate::DotEnv::default()),
-            "v: \"a#b\""
+            interpolate_scalar("\"${UNSET_XYZ_KERN:-a#b}\"", &crate::DotEnv::default()),
+            "\"a#b\""
         );
     }
 

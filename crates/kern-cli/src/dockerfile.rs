@@ -141,6 +141,10 @@ pub enum Instr {
         /// Optional `--chmod=<octal>`: the mode applied to every copied file/dir (like Docker), for
         /// a context COPY and a `COPY --from`. `None` preserves the source mode (`cp -a`).
         chmod: Option<String>,
+        /// Optional `--chown=<user>[:<group>]`: the owner of every copied file/dir, resolved against
+        /// the image's own `/etc/passwd` and `/etc/group` as Docker resolves it. `None` = the box's
+        /// root, which is what a COPY gives under Docker.
+        chown: Option<String>,
     },
     Env(String, String),
     Workdir(String),
@@ -180,6 +184,8 @@ pub enum Instr {
         dst: String,
         checksum: Option<String>,
         chmod: Option<String>,
+        /// `--chown`, as on `Copy`.
+        chown: Option<String>,
     },
     /// `COPY <<DELIM … DELIM <dst>` - BuildKit's inline-file COPY: the heredoc body is written
     /// verbatim to `dst` in the image, no build context needed. `chmod` is the optional `--chmod=<octal>`
@@ -188,6 +194,8 @@ pub enum Instr {
         content: String,
         dst: String,
         chmod: Option<String>,
+        /// `--chown`, as on `Copy`.
+        chown: Option<String>,
     },
     /// `HEALTHCHECK [--interval=D] [--timeout=D] [--start-period=D] [--retries=N] CMD ...`, or
     /// `HEALTHCHECK NONE`.
@@ -298,9 +306,19 @@ pub enum CopyFrom {
 /// no-recommends / `--no-cache` flag, a `RUN cd` that doesn't persist, and a missing final `CMD`.
 pub fn lint(instrs: &[Instr]) -> Vec<String> {
     let mut warns = Vec::new();
+    // The stage names declared so far: `FROM base` naming an earlier `AS base` is a stage, not an
+    // image, and has no tag to pin (it warned once per stage built on it).
+    let mut stages: Vec<&str> = Vec::new();
     for i in instrs {
         match i {
-            Instr::From { image, .. } => {
+            Instr::From { image, as_name } => {
+                let is_stage = stages.iter().any(|s| s.eq_ignore_ascii_case(image));
+                if let Some(n) = as_name {
+                    stages.push(n.as_str());
+                }
+                if is_stage {
+                    continue;
+                }
                 // Unpinned tag: no `:tag`/`@digest`, or the mutable `:latest` - non-reproducible builds.
                 let bare = image.rsplit('/').next().unwrap_or(image);
                 if !bare.contains(':') && !bare.contains('@') {
@@ -686,12 +704,17 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     // other flags are dropped.
                     let mut toks = split_ws(&subst(rest, &vars));
                     let mut hd_chmod: Option<String> = None;
+                    let mut hd_chown: Option<String> = None;
                     while let Some(t) = toks.first() {
                         let Some(flag) = t.strip_prefix("--") else {
                             break;
                         };
                         if let Some(m) = flag.strip_prefix("chmod=") {
                             hd_chmod = Some(m.to_string());
+                        } else if let Some(c) =
+                            flag.strip_prefix("chown=").filter(|c| !c.is_empty())
+                        {
+                            hd_chown = Some(c.to_string());
                         }
                         toks.remove(0);
                     }
@@ -705,6 +728,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                         content: hd.body.clone(),
                         dst: dst.clone(),
                         chmod: hd_chmod,
+                        chown: hd_chown,
                     });
                     continue;
                 }
@@ -719,9 +743,21 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                 // executor can apply them. For a local-file COPY/ADD they're dropped (source mode is kept).
                 let mut checksum: Option<String> = None;
                 let mut chmod: Option<String> = None;
+                let mut chown: Option<String> = None;
                 while toks.first().is_some_and(|t| t.starts_with("--")) {
                     let flag = toks.remove(0);
-                    if let Some(cs) = flag.strip_prefix("--checksum=") {
+                    if let Some(c) = flag.strip_prefix("--chown=") {
+                        // HONOURED, no longer dropped. MEASURED 2026-11-18: `COPY --chown=1000:1000`,
+                        // `--chown=nobody` and `--chown=nobody:nogroup` all left the file 0:0, so a
+                        // `COPY --chown=node:node` followed by `USER node` gave the process files it
+                        // could not write. Docker sets them.
+                        if c.is_empty() {
+                            return err(
+                                "COPY --chown needs a user, e.g. --chown=node or --chown=1000:1000",
+                            );
+                        }
+                        chown = Some(c.to_string());
+                    } else if let Some(cs) = flag.strip_prefix("--checksum=") {
                         checksum = Some(cs.to_string());
                     } else if let Some(m) = flag.strip_prefix("--chmod=") {
                         chmod = Some(m.to_string());
@@ -778,6 +814,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                         dst,
                         checksum,
                         chmod,
+                        chown,
                     });
                     continue;
                 }
@@ -791,6 +828,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     dst,
                     from,
                     chmod,
+                    chown,
                 });
             }
             "EXPOSE" => {
@@ -1928,6 +1966,7 @@ mod tests {
                 dst: "/dst/".into(),
                 from: None,
                 chmod: None,
+                chown: None,
             }
         );
     }
@@ -1945,6 +1984,7 @@ mod tests {
                 dst: "/app".into(),
                 from: None,
                 chmod: Some("755".into()),
+                chown: None,
             }
         );
         // And on a `COPY --from` too (flag order independent; needs a real earlier stage).
@@ -2129,6 +2169,7 @@ mod tests {
                 dst: "/app".into(),
                 from: Some(CopyFrom::Stage("build".into())),
                 chmod: None,
+                chown: None,
             }
         );
     }
@@ -2186,6 +2227,7 @@ mod tests {
                 dst: "/bb".into(),
                 from: Some(CopyFrom::Image("busybox".into())),
                 chmod: None,
+                chown: None,
             }
         );
         // A tagged/registry-qualified ref is fine too.
@@ -2216,6 +2258,7 @@ mod tests {
                 dst: "/a".into(),
                 from: Some(CopyFrom::Stage("busybox".into())),
                 chmod: None,
+                chown: None,
             }
         );
     }
@@ -2338,6 +2381,7 @@ mod tests {
                 content: "hello\nworld".into(),
                 dst: "/app/x".into(),
                 chmod: None,
+                chown: None,
             }
         );
         // A quoted delimiter + a leading `--chmod` flag: the mode is CAPTURED (a heredoc script needs
@@ -2349,6 +2393,7 @@ mod tests {
                 content: "#!/bin/sh\necho ${NOPE}".into(),
                 dst: "/run.sh".into(),
                 chmod: Some("755".into()),
+                chown: None,
             }
         );
         // ADD heredoc (extract-to-dir) is still rejected clearly.
@@ -2418,7 +2463,7 @@ mod tests {
 
     #[test]
     fn from_run_copy_buildkit_flags_are_accepted_and_dropped() {
-        // `FROM --platform=…`, `RUN --network=…` and `COPY --chown/--link` parse and drop; `--chmod`
+        // `FROM --platform=…`, `RUN --network=…` and `COPY --link` parse and drop; `--chown` and `--chmod`
         // and `RUN --mount=…` parse too but are CAPTURED (the executor applies them), not dropped.
         let df = "FROM --platform=$BUILDPLATFORM alpine AS b\n\
                   RUN --mount=type=cache,target=/c --network=none echo hi\n\
@@ -2443,6 +2488,7 @@ mod tests {
                 dst: "/dst/".into(),
                 from: None,
                 chmod: Some("644".into()),
+                chown: Some("1000:1000".into()),
             }
         );
         // An unknown COPY flag is still rejected (never silently ignored).
@@ -2509,6 +2555,7 @@ mod tests {
                 dst: "/tmp/f.tar.gz".into(),
                 checksum: None,
                 chmod: None,
+                chown: None,
             }
         );
         // With BuildKit `--checksum` (verified) and `--chmod` (applied - the download-a-binary pattern).
@@ -2520,6 +2567,7 @@ mod tests {
                 dst: "/y".into(),
                 checksum: Some("sha256:abc123".into()),
                 chmod: Some("755".into()),
+                chown: None,
             }
         );
         // A local-file ADD stays a Copy (no URL).

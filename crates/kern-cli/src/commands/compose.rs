@@ -1050,6 +1050,19 @@ fn refuse_what_docker_would_not_create(
                 b.service_name()
             )));
         }
+        // THE kern.toml PROFILES TOO, with the resolver the box itself runs: a `vcpu:`/`vgpio:`/
+        // `vdisk:` the file names and kern.toml does not declare is the file's mistake, and it must
+        // be refused before the images are fetched, for the reason `config` gives.
+        let tokens = b.profile_tokens();
+        if !tokens.is_empty() {
+            let mut ap = super::AppliedProfiles::default();
+            if let Err(e) = super::apply_profile_list(&tokens, b.config.as_deref(), &mut ap) {
+                return Err(Error::Compose(format!(
+                    "service '{}': {e}\n  no service was started",
+                    b.service_name()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1280,11 +1293,17 @@ fn docker_only_verb_hint(word: &str, on_box: Option<&str>) -> Option<String> {
 /// for a tag that is about to be built locally is a request that can only fail, slowly.
 ///
 /// DISTINCT IMAGES ONLY, in file order: a stack of eight services on one image resolves it once.
-fn ensure_images_for_wiring(boxes: &[crate::compose::ComposeBox]) {
-    if boxes.len() < 2 {
-        return; // one service cannot collide with another, so nothing here changes an answer
-    }
+///
+/// Returns every image that could not be fetched, with the services that wanted it and why. `up`
+/// refuses on a non-empty answer BEFORE starting anything: MEASURED on a real stack (2026-11-18,
+/// ten services), the failures were ignored here, five services were started, and `up` then
+/// stopped on the sixth's pull, leaving the stack half up with the reason scrolled away. Compose
+/// pulls as a phase and stops there.
+fn ensure_images_for_wiring(
+    boxes: &[crate::compose::ComposeBox],
+) -> Vec<(String, Vec<String>, String)> {
     let mut done: Vec<&str> = Vec::with_capacity(boxes.len());
+    let mut failed: Vec<(String, Vec<String>, String)> = Vec::new();
     for b in boxes {
         if b.build.is_some() {
             continue;
@@ -1293,13 +1312,39 @@ fn ensure_images_for_wiring(boxes: &[crate::compose::ComposeBox]) {
             continue;
         };
         if done.contains(&img) {
+            if let Some(f) = failed.iter_mut().find(|(i, _, _)| i == img) {
+                f.1.push(b.service_name().to_string());
+            }
             continue;
         }
         done.push(img);
-        // Best effort by design: the launch path reports a fetch failure with the service that
-        // wanted the image, which is a better message than anything this loop could produce.
-        let _ = crate::commands::resolve_image_depth(img, 0, crate::commands::PullPolicy::Missing);
+        if let Err(e) =
+            crate::commands::resolve_image_depth(img, 0, crate::commands::PullPolicy::Missing)
+        {
+            failed.push((
+                img.to_string(),
+                vec![b.service_name().to_string()],
+                e.to_string(),
+            ));
+        }
     }
+    failed
+}
+
+/// The refusal `up` gives when [`ensure_images_for_wiring`] could not fetch every image.
+fn unpulled_refusal(failed: &[(String, Vec<String>, String)]) -> Error {
+    let mut msg = format!(
+        "{} image(s) could not be pulled, so no service was started:",
+        failed.len()
+    );
+    for (img, services, why) in failed {
+        msg.push_str(&format!(
+            "\n  {img} (service {}): {}",
+            services.join(", "),
+            why.trim()
+        ));
+    }
+    Error::Compose(msg)
 }
 
 /// Scope a project's NAMED volumes to that project, as Docker names them `<project>_<volume>`.
@@ -2194,14 +2239,20 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // would have fetched moments later.
     //
     // NOT for `config`, which must stay a dry run: there the answer is left provisional and SAID so
-    // (`wiring-images-unread:`). Best effort: an image that cannot be fetched leaves the decision
+    // (`wiring-images-unread:`). For `up`, an image that cannot be fetched stops the stack HERE,
+    // before any box starts (see `ensure_images_for_wiring`); the other verbs leave the decision
     // where it was, and the launch reports the failure with the service that wanted it.
-    if matches!(
+    // What could not be fetched is KEPT, not acted on here: `up` refuses on it after the create
+    // phase below, so a file the create phase refuses is refused for its own reason first (the
+    // order Compose has: the file, then the images, then the containers).
+    let unpulled = if matches!(
         action,
         ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart | ComposeAction::Run
     ) {
-        ensure_images_for_wiring(&boxes);
-    }
+        ensure_images_for_wiring(&boxes)
+    } else {
+        Vec::new()
+    };
     // NOW THAT IMAGES CAN BE READ, the health gates the parser deferred are decided. Before the
     // wiring note below, so a reader sees the gate's fate next to the rest of the stack's plan.
     crate::commands::settle_deferred_health_gates(&mut boxes);
@@ -3979,6 +4030,17 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // `e` (which depends on `b`) was not. kern ran none of them. The `up` still exits with the
     // failure, after the rest is released.
     refuse_what_docker_would_not_create(&boxes, &levels)?;
+    // THE IMAGES AND THE PORTS, ALSO BEFORE ANY BOX STARTS, for `up`. An image that cannot be
+    // fetched is Compose's own behaviour (it pulls as a phase and stops there). A taken host port is
+    // DELIBERATELY STRICTER than the Compose measurement above, which starts the other services:
+    // MEASURED on a real ten-service stack on 2026-11-18, that left five services running around
+    // four busy ports, and the operator asked for the stack to start whole or not at all.
+    if matches!(action, ComposeAction::Up) {
+        if !unpulled.is_empty() {
+            return Err(unpulled_refusal(&unpulled));
+        }
+        crate::commands::start::preflight_stack_ports(&boxes, &pod)?;
+    }
     let mut failed: Vec<(String, Error)> = Vec::new();
     let mut not_started: Vec<String> = Vec::new();
     for level in &levels {

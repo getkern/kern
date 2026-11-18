@@ -2363,70 +2363,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         }
     }
     if let Err((hp, e)) = preflight {
-        // Tell the two failures apart. `EACCES` on a port <1024 is NOT "in use": rootless kern lacks
-        // CAP_NET_BIND_SERVICE, so the fix is a higher port - sending the user to `kern ps`/`kern stop`
-        // would chase a phantom holder (the old message did). `EADDRINUSE` (or any other errno) IS the
-        // taken-port case, where AlreadyRunning's "run `kern ps` … `kern stop`" hint fits.
-        if e.raw_os_error() == Some(libc::EACCES) && hp < unprivileged_port_start() {
-            let start = unprivileged_port_start();
-            return Err(Error::Sandbox(format!(
-                "cannot publish port {hp}: this host lets an unprivileged process bind from {start} \
-                 upward (net.ipv4.ip_unprivileged_port_start) and kern is rootless, so it lacks the \
-                 CAP_NET_BIND_SERVICE a lower port needs. Publish it on a host port >={start} \
-                 instead (e.g. -p 8080:80), or have the machine's owner lower that sysctl"
-            )));
-        }
-        // NAME THE HOLDER WHEN KERN CAN. The registry records every running box's published ports,
-        // so "another box, or a non-kern process" is a shrug in the one case kern can answer: two
-        // stacks competing for a port is the commonest way this fires, and "which one" is the whole
-        // question. MEASURED on two projects publishing 18099: the message named the port and left
-        // the reader to find the holder with `kern ps` and their own eyes.
-        //
-        // STILL A SHRUG WHEN IT HAS TO BE. A port held by something that is not a kern box - another
-        // runtime, a dev server, systemd - is invisible from here, and claiming otherwise would be
-        // worse than the shrug. The two cases get two different sentences.
-        let holder = crate::registry::list().into_iter().find(|b| {
-            b.ports
-                .split(',')
-                .filter_map(|p| p.split("->").next())
-                .filter_map(|a| a.rsplit(':').next())
-                .any(|p| p.trim().parse::<u16>() == Ok(hp))
-        });
-        // NOT A TAKEN PORT AT ALL: the host has no such address. Said as what it is, because "held by
-        // something else, `ss -ltnp` names it" sent the reader after a process that does not exist.
-        // MEASURED on a VPS whose loopback has IPv6 disabled: `-p [::1]:18202:80` answered exactly
-        // that. Docker refuses the same spec there ("cannot assign requested address").
-        if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) {
-            let asked: Vec<String> = ports
-                .iter()
-                .filter(|p| p.host == hp)
-                .map(crate::ports::host_side)
-                .collect();
-            return Err(Error::Sandbox(format!(
-                "cannot publish {}: {e} - this host has no such address to listen on (an IPv6 \
-                 address where IPv6 is disabled on that interface, or an address of another \
-                 machine); publish it on an address the host has, or without an address",
-                asked.join(", ")
-            )));
-        }
-        return Err(Error::AlreadyRunning(match holder {
-            Some(b) if b.pod.is_empty() => format!(
-                "cannot publish host port {hp}: {e} - box '{}' is already publishing it. \
-                 `kern stop {}` frees it, or publish this one on another port",
-                b.name, b.name
-            ),
-            Some(b) => format!(
-                "cannot publish host port {hp}: {e} - service '{}' of stack '{}' is already \
-                 publishing it. Take that stack down, or publish this one on another port",
-                crate::ui::display_box_name(&b.name, &b.pod),
-                b.pod
-            ),
-            None => format!(
-                "cannot publish host port {hp}: {e} - and no running kern box is publishing it, so \
-                 it is held by something else on this machine (another runtime, a dev server, a \
-                 systemd unit). `ss -ltnp | grep :{hp}` names it"
-            ),
-        }));
+        return Err(publish_refusal(hp, &e, ports));
     }
     // `--hostname`: validate before it reaches `sethostname`. `--tmpfs`: parse the Docker-style
     // specs (blocking a tmpfs over the hardened mounts). `--user`: parse UID[:GID].
@@ -4012,6 +3949,240 @@ pub fn run(
     eprintln!("kern: cannot run '{}': {err}", command[0]);
     eprintln!("hint: the command must exist and be executable (an absolute path, or on $PATH)");
     std::process::exit(127);
+}
+
+/// Why host port `hp` cannot be published, naming the holder when kern can see it: a kern box (from
+/// the registry), a process of this user listening on it (from `/proc`), or neither, said as such.
+/// One function for `kern box` and for `compose up`'s check before the first service starts.
+pub(crate) fn publish_refusal(
+    hp: u16,
+    e: &std::io::Error,
+    ports: &[kern_isolation::PortMap],
+) -> Error {
+    // Tell the two failures apart. `EACCES` on a port <1024 is NOT "in use": rootless kern lacks
+    // CAP_NET_BIND_SERVICE, so the fix is a higher port - sending the user to `kern ps`/`kern stop`
+    // would chase a phantom holder (the old message did). `EADDRINUSE` (or any other errno) IS the
+    // taken-port case, where AlreadyRunning's "run `kern ps` … `kern stop`" hint fits.
+    if e.raw_os_error() == Some(libc::EACCES) && hp < unprivileged_port_start() {
+        let start = unprivileged_port_start();
+        return Error::Sandbox(format!(
+            "cannot publish port {hp}: this host lets an unprivileged process bind from {start} \
+             upward (net.ipv4.ip_unprivileged_port_start) and kern is rootless, so it lacks the \
+             CAP_NET_BIND_SERVICE a lower port needs. Publish it on a host port >={start} \
+             instead (e.g. -p 8080:80), or have the machine's owner lower that sysctl"
+        ));
+    }
+    // NAME THE HOLDER WHEN KERN CAN. The registry records every running box's published ports,
+    // so "another box, or a non-kern process" is a shrug in the one case kern can answer: two
+    // stacks competing for a port is the commonest way this fires, and "which one" is the whole
+    // question. MEASURED on two projects publishing 18099: the message named the port and left
+    // the reader to find the holder with `kern ps` and their own eyes.
+    //
+    // STILL A SHRUG WHEN IT HAS TO BE. A port held by something that is not a kern box - another
+    // runtime, a dev server, systemd - is invisible from here, and claiming otherwise would be
+    // worse than the shrug. The two cases get two different sentences.
+    let holder = registry_holder(hp);
+    // NOT A TAKEN PORT AT ALL: the host has no such address. Said as what it is, because "held by
+    // something else, `ss -ltnp` names it" sent the reader after a process that does not exist.
+    // MEASURED on a VPS whose loopback has IPv6 disabled: `-p [::1]:18202:80` answered exactly
+    // that. Docker refuses the same spec there ("cannot assign requested address").
+    if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) {
+        let asked: Vec<String> = ports
+            .iter()
+            .filter(|p| p.host == hp)
+            .map(crate::ports::host_side)
+            .collect();
+        return Error::Sandbox(format!(
+            "cannot publish {}: {e} - this host has no such address to listen on (an IPv6 \
+             address where IPv6 is disabled on that interface, or an address of another \
+             machine); publish it on an address the host has, or without an address",
+            asked.join(", ")
+        ));
+    }
+    Error::AlreadyRunning(match holder {
+        Some(b) if b.pod.is_empty() => format!(
+            "cannot publish host port {hp}: {e} - box '{}' is already publishing it. \
+             `kern stop {}` frees it, or publish this one on another port",
+            b.name, b.name
+        ),
+        Some(b) => format!(
+            "cannot publish host port {hp}: {e} - service '{}' of stack '{}' is already \
+             publishing it. Take that stack down, or publish this one on another port",
+            crate::ui::display_box_name(&b.name, &b.pod),
+            b.pod
+        ),
+        None => match local_listener(hp) {
+            Some((pid, comm)) => format!(
+                "cannot publish host port {hp}: {e} - no running kern box is publishing it: process \
+                 {pid} ({comm}) is listening on it. Stop it, or publish this one on another port \
+                 (`ss -ltnp | grep :{hp}` shows it)"
+            ),
+            None => format!(
+                "cannot publish host port {hp}: {e} - and no running kern box is publishing it, \
+                 so it is held by {}. `ss -ltnp | grep :{hp}` names it when it is visible",
+                unseen_holder()
+            ),
+        },
+    })
+}
+
+/// The running kern box publishing host port `hp`, read from the registry with the one parser of a
+/// recorded port list.
+fn registry_holder(hp: u16) -> Option<crate::registry::Instance> {
+    crate::registry::list().into_iter().find(|b| {
+        crate::ports::parse_display_list(&b.ports)
+            .iter()
+            .any(|m| m.host == hp)
+    })
+}
+
+/// What holds a port when it is not a kern box and no process of this user listens on it.
+fn unseen_holder() -> &'static str {
+    let wsl = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .is_ok_and(|r| r.to_ascii_lowercase().contains("microsoft"));
+    if wsl {
+        "something kern cannot see from here: under WSL most often a Windows program (Docker \
+         Desktop's com.docker.backend, a node.exe dev server, wslrelay), or another user's process"
+    } else {
+        "something else on this machine that kern cannot see (another user's process, another \
+         runtime, a systemd unit)"
+    }
+}
+
+/// Who holds host port `hp`, in a few words, for the stack-wide refusal.
+fn holder_of(hp: u16, e: &std::io::Error) -> String {
+    if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) {
+        return format!("not an address this host has ({e})");
+    }
+    if let Some(b) = registry_holder(hp) {
+        return if b.pod.is_empty() {
+            format!("kern box '{}'", b.name)
+        } else {
+            format!(
+                "service '{}' of kern stack '{}'",
+                crate::ui::display_box_name(&b.name, &b.pod),
+                b.pod
+            )
+        };
+    }
+    match local_listener(hp) {
+        Some((pid, comm)) => format!("{comm} (pid {pid})"),
+        None => unseen_holder().to_string(),
+    }
+}
+
+/// The process of this user listening on TCP port `port`, from `/proc/net/tcp{,6}` and the socket
+/// links under `/proc/<pid>/fd`. `None` when the socket is not found or belongs to a process this
+/// user cannot read, which is every process of another user and, under WSL, every Windows one.
+fn local_listener(port: u16) -> Option<(u32, String)> {
+    let want = format!(":{port:04X}");
+    let mut inodes: Vec<String> = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            // local_address, rem_address, st (0A = LISTEN), ..., inode at index 9.
+            if f.len() > 9 && f[1].ends_with(&want) && f[3] == "0A" && f[9] != "0" {
+                inodes.push(format!("socket:[{}]", f[9]));
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+    let procs = std::fs::read_dir("/proc").ok()?;
+    for entry in procs.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            if inodes.iter().any(|i| target.as_os_str() == i.as_str()) {
+                let comm = std::fs::read_to_string(entry.path().join("comm"))
+                    .map(|c| c.trim().to_string())
+                    .unwrap_or_default();
+                return Some((pid, comm));
+            }
+        }
+    }
+    None
+}
+
+/// `compose up`'s port check, BEFORE any service starts: every host port the stack publishes must
+/// be free, except the ones a box of this same stack already publishes (an `up` on a running stack
+/// recreates or keeps those). MEASURED on 2026-11-18: a port held by a dev server let the first
+/// service start and refused the second, leaving the stack half up.
+///
+/// Privileged ports are left to the box's own path, which can move them under the publish policy;
+/// so are the implicit IPv6 twins, which a box drops where they cannot bind.
+pub(crate) fn preflight_stack_ports(
+    boxes: &[crate::compose::ComposeBox],
+    project: &str,
+) -> Result<(), Error> {
+    let floor = unprivileged_port_start();
+    let own: Vec<u16> = crate::registry::list()
+        .into_iter()
+        .filter(|b| b.pod == project)
+        .flat_map(|b| {
+            crate::ports::parse_display_list(&b.ports)
+                .into_iter()
+                .map(|m| m.host)
+        })
+        .collect();
+    // Every busy port of every service, so one run names them all: fixing them one `up` at a time
+    // is what the reader was doing.
+    let mut busy: Vec<(u16, bool, String, String)> = Vec::new();
+    for b in boxes {
+        let mut maps: Vec<kern_isolation::PortMap> = b
+            .ports
+            .iter()
+            .filter_map(|spec| crate::ports::parse(spec))
+            .flatten()
+            .filter(|m| m.host != 0 && m.host >= floor && !own.contains(&m.host))
+            .collect();
+        drop_unbindable_twins(&mut maps, kern_isolation::address_is_bindable);
+        for m in &maps {
+            if busy
+                .iter()
+                .any(|(p, udp, _, _)| *p == m.host && *udp == m.udp)
+            {
+                continue;
+            }
+            if let Err((hp, e)) = kern_isolation::preflight_ports(std::slice::from_ref(m)) {
+                busy.push((hp, m.udp, b.service_name().to_string(), holder_of(hp, &e)));
+            }
+        }
+    }
+    if busy.is_empty() {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "{} host port(s) already in use, so no service was started:",
+        busy.len()
+    );
+    for (port, udp, service, holder) in &busy {
+        let proto = if *udp { "udp" } else { "tcp" };
+        msg.push_str(&format!(
+            "\n  {port}/{proto}  service {service}  held by {holder}"
+        ));
+    }
+    msg.push_str(
+        "\nfix one of: stop what holds them, or publish those services on other host ports in the \
+         file (or in the variable the file reads them from). kern never moves a port by itself: the \
+         address you open would answer nothing",
+    );
+    Err(Error::Compose(msg))
 }
 
 /// Give every mapping whose host port is 0 (`-p 80`, `-p ip::80`, `-p 0:80`, compose `"80"`) a port
@@ -6263,9 +6434,13 @@ fn reexec_exec_in_bare_scope() {
         .unwrap_or_else(|| std::path::PathBuf::from("systemd-run"));
     let unit = format!("--unit=kern-exec-{}.scope", std::process::id());
     let mut cmd = std::process::Command::new(systemd_run);
-    cmd.arg(kern_isolation::systemd_scope_mode())
+    // The manager through `/run/user/<uid>` when `XDG_RUNTIME_DIR` points elsewhere, and the
+    // caller's own runtime dir handed back to the re-executed kern (see `manager_env`).
+    cmd.envs(kern_isolation::manager_envs())
+        .arg(kern_isolation::systemd_scope_mode())
         .args(["--scope", "--quiet", "--collect"])
         .args(kern_isolation::scope_no_expand_arg())
+        .args(kern_isolation::manager_setenv_args())
         .arg(&unit)
         .arg("--")
         .arg(self_exe)
@@ -6479,7 +6654,8 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     // this dir: that sweep reads the last `-` field as a pid, which `<pid>.scope` never parses as.
     let unit = format!("--unit=kern-box-{}.scope", std::process::id());
     let mut cmd = std::process::Command::new(systemd_run);
-    cmd.arg(kern_isolation::systemd_scope_mode()) // `--system` as root, else `--user`
+    cmd.envs(kern_isolation::manager_envs())
+        .arg(kern_isolation::systemd_scope_mode()) // `--system` as root, else `--user`
         .args(["--scope", "--quiet", "--collect"])
         // NO `-p Delegate=yes` here, deliberately. kern DOES build a cgroup subtree inside this scope
         // (`prepare_delegated_scope`), which is what `Delegate=` is nominally for - but it does not need
@@ -6495,6 +6671,9 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
         .args(&props)
         // The caller's arguments verbatim: see `scope_no_expand_arg`.
         .args(kern_isolation::scope_no_expand_arg())
+        // The box keeps the runtime dir of the world that started it while `systemd-run` reaches
+        // the manager through `/run/user/<uid>` (see `manager_env`; `envs` below).
+        .args(kern_isolation::manager_setenv_args())
         .arg("--")
         .arg(self_exe)
         .args(&args)

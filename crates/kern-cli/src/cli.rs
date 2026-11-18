@@ -896,6 +896,9 @@ pub enum Command {
         yes: bool,
         keep_images: bool,
     },
+    /// `kern self-update [--check [--json]] [--to X.Y.Z] [--rollback]`: replace this kern with a newer
+    /// signed release, report whether one exists, or put the replaced binary back.
+    SelfUpdate(crate::selfupdate::Request),
     /// `kern examples`: print an example `kern.toml` to stdout.
     Examples,
     /// `kern volume <create|ls|rm|inspect|prune> …`: manage named volumes.
@@ -3062,6 +3065,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 keep_images: rest.contains(&"--keep-images"),
             }
         }
+        Some("self-update") => Command::SelfUpdate(parse_self_update(&rest[1..])?),
         Some("validate") => {
             reject_unknown_flags("validate", &rest, &[])?;
             Command::Validate {
@@ -6782,8 +6786,51 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::ConfigUnset { args } => commands::config_unset(&args),
         Command::Validate { path } => commands::validate(path.as_deref()),
         Command::Uninstall { yes, keep_images } => commands::uninstall(yes, keep_images),
+        Command::SelfUpdate(req) => crate::selfupdate::run(&req),
         Command::Examples => commands::examples(),
         Command::Volume { args } => crate::volume::run(&args),
+    }
+}
+
+/// `self-update [--check [--json]] [--to X.Y.Z] [--rollback]`. The three modes exclude each other,
+/// and an unknown flag is refused: `--dry-run` would otherwise read as a switch and replace the
+/// binary. `--check` IS the dry run.
+fn parse_self_update(args: &[&str]) -> Result<crate::selfupdate::Request, Error> {
+    use crate::selfupdate::{Request, Version};
+    let usage = "self-update takes --check [--json], --to X.Y.Z, or --rollback";
+    let (mut check, mut json, mut rollback, mut to) = (false, false, false, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--check" => check = true,
+            "--json" => json = true,
+            "--rollback" => rollback = true,
+            "--to" => {
+                let Some(v) = it.next() else {
+                    return Err(Error::Cli(format!(
+                        "self-update: --to needs a version - {usage}"
+                    )));
+                };
+                to = Some(Version::parse(v).ok_or_else(|| {
+                    Error::Cli(format!(
+                        "self-update: --to {v:?} is not a release version (X.Y.Z)"
+                    ))
+                })?);
+            }
+            other => {
+                return Err(Error::Cli(format!(
+                    "self-update: unknown argument {other:?} - {usage}"
+                )))
+            }
+        }
+    }
+    match (check, rollback, to) {
+        (false, false, to) if !json => Ok(Request::Install { to }),
+        (true, false, None) => Ok(Request::Check { json }),
+        (false, true, None) if !json => Ok(Request::Rollback),
+        _ => Err(Error::Cli(format!(
+            "self-update: those flags do not combine - {usage}"
+        ))),
     }
 }
 

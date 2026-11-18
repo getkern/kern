@@ -265,6 +265,12 @@ pub use cgroup::{delegation_blocker, DelegationBlocker};
 /// [`cgroup::memory_max_in_force`].
 pub use cgroup::{effective_cgroup_dir, memory_max_in_force};
 pub use cgroup::{fleet_status, FleetStatus};
+/// The user manager reached through `/run/user/<uid>` when `XDG_RUNTIME_DIR` points elsewhere:
+/// the environment for `systemd-run`/`systemctl --user`, and the `--setenv` that keeps a re-executed
+/// kern in its own runtime dir. See [`cgroup::manager_env`].
+pub use cgroup::{
+    manager_env, manager_envs, manager_setenv_args, KERN_ANCHOR_UNIT, KERN_SLICE_NAME,
+};
 /// The write-tested state of `--memory` enforcement on this host (`Enforced` / `PresentNotDelegated`
 /// / `Absent` / `Unknown`), by creating a throwaway child cgroup and checking a `memory.max` write
 /// binds. Stronger than [`cgroup::memory_cap_enforceable`], which reads controller PRESENCE and

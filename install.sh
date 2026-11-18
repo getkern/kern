@@ -207,6 +207,34 @@ else
   printf "${DIM}    (skipping checksum verification)${ZZ}\n"
 fi
 
+# --- signature (when minisign is installed) ---
+# The checksum above only proves the download matches the file next to it, on the same server. The
+# signature proves the tarball is a release: made with one of the two keys below, the ones
+# `kern self-update` trusts, and naming this file and this machine in its signed comment. Without
+# minisign it is said and skipped, as the checksum is without sha256sum.
+KERN_RELEASE_KEYS="RWSuYG/qtD8AV5p5IzIqfRuCwh5eJlT7ed5+7lVKrgILE1qvIpPGv+Ej RWRLQt2lFPXXsC0g2+1SPfSmOdjpxJ/f+t5DU+xPOaRNjElnisOR0Uo3"
+if dl "${base}/${asset}.minisig" "${tmp}/${asset}.minisig" 2>/dev/null; then
+  if command -v minisign >/dev/null 2>&1; then
+    signed=""
+    for key in $KERN_RELEASE_KEYS; do
+      if minisign -V -q -P "$key" -m "${tmp}/${asset}" -x "${tmp}/${asset}.minisig" >/dev/null 2>&1; then
+        signed="$key"
+        break
+      fi
+    done
+    [ -n "$signed" ] || err "the signature of ${asset} does not check out with the kern release keys - not installing."
+    comment="$(sed -n 's/^trusted comment: //p' "${tmp}/${asset}.minisig")"
+    case " $comment " in
+      *" target=${arch} "*" file=${asset} "*) info "signature verified" ;;
+      *) err "the signature of ${asset} is valid but names another file or machine (${comment}) - not installing." ;;
+    esac
+  else
+    printf "${DIM}    (signature not checked: install minisign to check it)${ZZ}\n"
+  fi
+else
+  printf "${DIM}    (this release carries no signature)${ZZ}\n"
+fi
+
 info "installing to ${bindir}"
 mkdir -p "$bindir"
 tar -C "$tmp" -xzf "${tmp}/${asset}"

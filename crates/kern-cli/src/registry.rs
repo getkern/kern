@@ -3627,10 +3627,10 @@ mod tests {
             assert!(!BOX_DATA_DIRS.contains(&a), "{a:?} is in BOTH classes");
         }
         // A PRIVATE ROOT, NOT THE HOST'S. This used to scan the live `$XDG_RUNTIME_DIR/kern`, so any kern
-        // binary on the machine could redden it: on 2026-09-24 a KVolt build from another worktree had
+        // binary on the machine could redden it: on 2026-09-24 a build from another worktree had
         // created an empty `vm/`, a child this tree does not know because it does not have that
         // feature, and all three test steps of the gate failed on a defect that was not here. The same
-        // repointing was already on the KVolt branch, where `networks/` from another build had done
+        // repointing was already on that other branch, where `networks/` from another build had done
         // the same on 2026-09-12; it had never reached this tree.
         //
         // WHAT THE TEST CLAIMS IS UNCHANGED: "every registry child THIS CODE creates is classified",

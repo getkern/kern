@@ -454,6 +454,34 @@ fn emit_setsockopt_vnet_hdr_rule(prog: &mut Vec<libc::sock_filter>) {
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)); // any other level/option → allow
 }
 
+/// `ioctl(fd, TIOCSTI | TIOCLINUX, ...)` returns `EPERM`; every other `ioctl` is allowed.
+///
+/// A box started without `-t` shares the terminal it was started from, and `TIOCSTI` pushes bytes
+/// into that terminal's INPUT: a workload could type a command into the shell that launched it, after
+/// the box exits (the bubblewrap class, CVE-2017-5226). Under kern's WSL distro that shell is root's.
+/// `TIOCLINUX` subcode 2 does the same through a selection paste on a virtual console. Neither has a
+/// use inside a box. Shared by both builders, like [`emit_setsockopt_vnet_hdr_rule`], and built the
+/// same way: both exits are explicit returns, and a non-`ioctl` call skips the block with `nr` intact.
+fn emit_ioctl_tty_inject_rule(prog: &mut Vec<libc::sock_filter>) {
+    let eperm = SECCOMP_RET_ERRNO | (libc::EPERM as u32 & SECCOMP_RET_DATA);
+    // nr == ioctl ? fall through to the 5-instruction body : skip it (jf = 5), nr preserved.
+    prog.push(jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        libc::SYS_ioctl as u32,
+        0,
+        5,
+    ));
+    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG1)); // A = request (low 32 bits of args[1])
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCSTI, 1, 0)); // ==TIOCSTI → skip 1 → errno
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCLINUX, 0, 1)); // ==TIOCLINUX → next (errno); else allow
+    prog.push(stmt(BPF_RET | BPF_K, eperm));
+    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+}
+
+/// `TIOCSTI` and `TIOCLINUX` from `asm-generic/ioctls.h` (the same numbers on x86_64 and aarch64).
+const TIOCSTI: u32 = 0x5412;
+const TIOCLINUX: u32 = 0x541C;
+
 fn build_filter(allow_nesting: bool) -> Vec<libc::sock_filter> {
     // Arch guard, load nr, x32 kill, and the hard-kill set - shared with the allowlist builder.
     let mut prog = emit_kill_prologue(allow_nesting);
@@ -473,6 +501,7 @@ fn build_filter(allow_nesting: bool) -> Vec<libc::sock_filter> {
     // sockets and loses only the caller-chosen `virtio_net_hdr`; see `emit_setsockopt_vnet_hdr_rule`).
     // Same placement rule as the family block above, and for the same reason.
     emit_setsockopt_vnet_hdr_rule(&mut prog);
+    emit_ioctl_tty_inject_rule(&mut prog);
     // 3c. `clone(2)` carrying ANY namespace bit → kill; every other `clone` passes untouched.
     //
     // This closes the hole that denying `unshare`/`setns` alone left open: they are not the only way
@@ -613,6 +642,7 @@ fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_fi
     // below for a non-packet `setsockopt`, which widens nothing: the kill prologue has already run and
     // `setsockopt` is in the allow set anyway (see `emit_setsockopt_vnet_hdr_rule`).
     emit_setsockopt_vnet_hdr_rule(&mut prog);
+    emit_ioctl_tty_inject_rule(&mut prog);
     // `clone` with any `CLONE_NEW*` bit is a namespace-creation vector and dies; a plain `clone`
     // (fork/pthread) is allowed. Skipped under `allow_nesting`, where `clone` is allowed unconditionally
     // via the search. Placed before the search because it inspects `args[0]`, which clobbers `nr`.
@@ -956,6 +986,7 @@ mod tests {
         BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W, CLONE_NEW_MASK, OFF_ARCH, OFF_ARG0,
         OFF_ARG1, OFF_ARG2, OFF_NR, PACKET_VNET_HDR, PACKET_VNET_HDR_SZ, SECCOMP_RET_ALLOW,
         SECCOMP_RET_DATA, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_LOG, SOL_PACKET,
+        TIOCLINUX, TIOCSTI,
     };
 
     /// A minimal classic-BPF interpreter for the seccomp program: enough opcodes to execute what
@@ -1034,8 +1065,8 @@ mod tests {
     /// Every generated filter must fit the kernel's `BPF_MAXINSNS` (4096) with headroom, or a future
     /// profile bump would fail to load at box start. Their EXACT sizes are also PINNED so no instruction
     /// count can drift silently (the class that has already produced ~1273, ~1174 and a stale denylist
-    /// figure): the allowlist is 189 on x86_64 after the range-merge (184 for a nesting box), the
-    /// denylist 99 (85 nesting). A change to an emitter or the ALLOW set fails this test, and this
+    /// figure): the allowlist is 195 on x86_64 after the range-merge (190 for a nesting box), the
+    /// denylist 105 (91 nesting). A change to an emitter or the ALLOW set fails this test, and this
     /// comment is where the four numbers live: the ROADMAP note the failure message used to send a
     /// reader to was cut when that page was reduced to the decisions, and it cites no count today.
     ///
@@ -1043,7 +1074,8 @@ mod tests {
     /// socket-family list, each delta being that block's exact growth; neither is gated on posture or
     /// nesting, so both apply uniformly to all four numbers. When `open_tree_attr` and `listns` joined
     /// the denied sets (17/11) the allowlist grew by 2 (189, 184 nesting) and the denylist by 4 (99,
-    /// 85 nesting), two instructions per syscall there.
+    /// 85 nesting), two instructions per syscall there. The `ioctl` TIOCSTI/TIOCLINUX rule (18/11) adds
+    /// 6 to all four.
     #[test]
     fn the_seccomp_filter_instruction_counts_are_pinned() {
         for &nesting in &[false, true] {
@@ -1059,7 +1091,7 @@ mod tests {
                 // to x86_64. aarch64 still gets the fit check above.
                 #[cfg(target_arch = "x86_64")]
                 {
-                    let allow_expected = if nesting { 184 } else { 189 };
+                    let allow_expected = if nesting { 190 } else { 195 };
                     assert_eq!(
                         len, allow_expected,
                         "x86_64 allowlist instruction count changed (nesting={nesting}): {len} vs \
@@ -1077,7 +1109,7 @@ mod tests {
             );
             #[cfg(target_arch = "x86_64")]
             {
-                let deny_expected = if nesting { 85 } else { 99 };
+                let deny_expected = if nesting { 91 } else { 105 };
                 assert_eq!(
                     deny, deny_expected,
                     "x86_64 denylist instruction count changed (nesting={nesting}): {deny} vs \
@@ -1287,6 +1319,41 @@ mod tests {
     /// Both halves of the control are asserted, because a rule that refuses everything is as wrong as
     /// one that refuses nothing: the two enabling options must be SEEN refused in every posture, and
     /// the options a capture actually uses must be SEEN allowed.
+    #[test]
+    fn a_box_cannot_push_input_into_its_terminal_and_other_ioctls_pass() {
+        // Pinned against the kernel's numbers (`asm-generic/ioctls.h`), not against themselves.
+        assert_eq!(TIOCSTI, libc::TIOCSTI as u32);
+        assert_eq!(TIOCLINUX, 0x541C);
+        let ioctl = libc::SYS_ioctl as u32;
+        let eperm = SECCOMP_RET_ERRNO | (libc::EPERM as u32 & SECCOMP_RET_DATA);
+        let progs = [
+            build_filter(false),
+            build_filter(true),
+            build_allowlist_filter(false, false),
+            build_allowlist_filter(true, false),
+        ];
+        for prog in &progs {
+            for req in [TIOCSTI, TIOCLINUX] {
+                assert_eq!(
+                    run_filter_args(prog, ioctl, AUDIT_ARCH, [0, u64::from(req), 0]),
+                    eperm
+                );
+            }
+            // The ioctls a box does use: terminal size and attributes, FIONREAD, a high-bits request.
+            for req in [
+                libc::TIOCGWINSZ as u32,
+                libc::TCGETS as u32,
+                libc::FIONREAD as u32,
+            ] {
+                assert_eq!(
+                    run_filter_args(prog, ioctl, AUDIT_ARCH, [0, u64::from(req), 0]),
+                    SECCOMP_RET_ALLOW,
+                    "ioctl {req:#x}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_vnet_header_options_are_refused_and_every_other_packet_option_is_not() {
         // Pinned against the kernel's own numbers (`linux/if_packet.h`, `bits/socket.h`), not against

@@ -104,6 +104,7 @@ fn check_scope_toll() -> R {
     let once = || -> Option<f64> {
         let t0 = std::time::Instant::now();
         let ok = std::process::Command::new("systemd-run")
+            .envs(kern_isolation::manager_envs())
             .args(["--user", "--scope", "--quiet", "/bin/true"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -272,6 +273,8 @@ fn current_username() -> Option<String> {
 /// time is how two of them reached 169 and 181 characters.
 fn rows() -> Vec<R> {
     let mut results: Vec<R> = vec![
+        // Who kern runs as, which decides what a box's root is on this host.
+        check_identity(),
         // Core: can we create an unprivileged user namespace at all?
         check_userns(),
         check_apparmor_userns(),
@@ -1066,6 +1069,66 @@ fn apparmor_userns_verdict(sysctl: Option<i64>, probe: Userns) -> R {
     }
 }
 
+/// Who kern runs as, said plainly, because it decides what a box's root IS: the user that started
+/// kern (rootless), or this host's root. MEASURED on 2026-11-18 in the WSL distro `install.ps1`
+/// created: kern ran as root, a box's uid 0 was the distro's uid 0, and no line here said so.
+fn check_identity() -> R {
+    // SAFETY: getuid takes no arguments.
+    let uid = unsafe { libc::getuid() };
+    let in_kern_distro = std::fs::symlink_metadata(crate::wslentry::MARKER).is_ok();
+    let r = identity_verdict(uid, in_kern_distro, current_username().as_deref());
+    // WHICH WSL DISTRO, AND WHICH kern: with several distros `kern.exe` talks to one of them, and a
+    // field test ran the wrong one without noticing. WSL sets `WSL_DISTRO_NAME` in every session.
+    match crate::global_env_str("WSL_DISTRO_NAME")
+        .ok()
+        .filter(|d| !d.is_empty())
+    {
+        Some(d) => with_suffix(
+            r,
+            &format!(" [WSL distro '{d}', kern {}]", kern_common::VERSION),
+        ),
+        None => r,
+    }
+}
+
+/// `r` with `suffix` appended to its message.
+fn with_suffix(r: R, suffix: &str) -> R {
+    match r {
+        R::Ok(m, h) => R::Ok(m + suffix, h),
+        R::Warn(m, h) => R::Warn(m + suffix, h),
+        R::Fail(m, h) => R::Fail(m + suffix, h),
+    }
+}
+
+/// [`check_identity`]'s answer, from the facts alone, so each case is checked by a test.
+fn identity_verdict(uid: u32, in_kern_distro: bool, user: Option<&str>) -> R {
+    match (uid, in_kern_distro) {
+        (0, true) => R::Warn(
+            "identity: kern runs as ROOT in its WSL distro: a box's root is this distro's root".into(),
+            "it becomes the distro's ordinary user on its own unless KERN_WSL_AS_ROOT=1 is set: unset it".into(),
+        ),
+        (0, false) => R::Ok(
+            "identity: kern runs as root: a box's root is this host's root, as under rootful Docker".into(),
+            "run kern as an ordinary user for rootless boxes, where a box's root is that user".into(),
+        ),
+        (uid, true) => R::Ok(
+            format!(
+                "identity: kern runs as {} (uid {uid}), not root: a box's root is uid {uid} of this distro",
+                user.unwrap_or("its user")
+            ),
+            format!(
+                "kern started as root here gives root up first; an escape from a box would be uid \
+                 {uid}: no capability, no other distro's disk, but the Windows files under /mnt/c \
+                 that kern itself reads"
+            ),
+        ),
+        (uid, false) => R::Ok(
+            format!("identity: rootless, as uid {uid}: a box's root is this user"),
+            String::new(),
+        ),
+    }
+}
+
 /// SELinux is the RHEL-family counterpart of the AppArmor gate above, and until this existed `kern
 /// doctor` probed one and not the other: on Fedora, RHEL, CentOS, Rocky and Alma it printed a full
 /// page of green without once looking at the mechanism that governs those hosts.
@@ -1092,7 +1155,13 @@ fn check_selinux() -> R {
     // selinuxfs" with "cannot read enforce" is what the split exists to prevent.
     let mode = std::fs::read_to_string(SELINUX_ENFORCE).ok();
     let enforcing = mode.as_deref().map(str::trim) == Some("1");
-    let verdict = selinux_verdict(std::path::Path::new(SELINUXFS).is_dir(), mode);
+    // MOUNTED, not merely present as a directory. On WSL2 `/sys/fs/selinux` exists as an EMPTY
+    // directory (selinuxfs is listed in /proc/filesystems and not mounted), and testing the
+    // directory read that as "SELinux is present" and warned that `enforce` could not be opened
+    // (MEASURED on 2026-11-18). The mount table says whether the kernel's interface is there.
+    let mounted =
+        std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|m| selinuxfs_mounted(&m));
+    let verdict = selinux_verdict(mounted, mode);
     // ENFORCING IS WHERE ONE POLICY REFUSES PASTA AND ANOTHER DOES NOT, and nothing on the host says
     // which: openSUSE Leap 16 refuses pasta every namespace of an unconfined process without an AVC,
     // Fedora 45 lets it through. So on an enforcing host, and only there, the row EXERCISES pasta
@@ -1124,6 +1193,20 @@ fn selinux_pasta_refused(why: &str) -> R {
 }
 
 const SELINUXFS: &str = "/sys/fs/selinux";
+
+/// Whether `mountinfo` (the contents of `/proc/self/mountinfo`) holds a `selinuxfs` mounted at
+/// [`SELINUXFS`]. A line is `id parent maj:min root MOUNTPOINT options [optional fields] - FSTYPE
+/// source superoptions`; the filesystem type follows the ` - ` separator and the mount point is the
+/// fifth field before it. Pure, so the three host shapes are testable here.
+fn selinuxfs_mounted(mountinfo: &str) -> bool {
+    mountinfo.lines().any(|line| {
+        let Some((left, right)) = line.split_once(" - ") else {
+            return false;
+        };
+        right.split_whitespace().next() == Some("selinuxfs")
+            && left.split_whitespace().nth(4) == Some(SELINUXFS)
+    })
+}
 const SELINUX_ENFORCE: &str = "/sys/fs/selinux/enforce";
 
 /// The verdict as a PURE function of the two facts, so all five states are unit-testable without a
@@ -1243,26 +1326,27 @@ fn delegation_hint() -> String {
 /// into the verdict and a GitHub runner's is
 /// `/sys/fs/cgroup/system.slice/hosted-compute-agent.service`. A path is EVIDENCE: it belongs on
 /// the second line with the remedy, not in the sentence that says what is wrong.
-fn no_user_manager_verdict(state: kern_isolation::MemoryCapState, sites: &str) -> R {
+fn no_user_manager_verdict(state: kern_isolation::MemoryCapState, sites: &str, why: &str) -> R {
     use kern_isolation::MemoryCapState;
     match state {
         MemoryCapState::Enforced => R::ok(
             "cgroup v2, no systemd --user manager needed: caps enforced in the current cgroup"
                 .into(),
         ),
-        // Reachable only if a transient scope carried a `MemoryMax` that bound while this host
-        // reports no user manager. Not observed anywhere; report what was measured, not a state
-        // derived from the two facts disagreeing.
-        MemoryCapState::EnforcedOnScope => R::ok_note(
-            "cgroup v2: caps enforced on a transient scope (probed in force)",
-            "no systemd --user manager was detected, which is not the arrangement this is \
-             expected in",
+        // `memory_cap_state` reports a scope only when a box would take it (the same
+        // `user_systemd_present` this branch was entered on said no), so this arm is not expected
+        // here. Kept as what a box gets if it ever is: a scope it never enters caps nothing.
+        // MEASURED on WSL2 on 2026-11-18 before the probe was gated: this row said "caps enforced
+        // on a transient scope" while every `--memory 64m` box read `memory.max=max`.
+        MemoryCapState::EnforcedOnScope => R::Warn(
+            "cgroup v2: boxes run UNCAPPED here: they take no systemd scope".into(),
+            format!("{why}; `systemd-run` alone reaching a manager does not cap a box"),
         ),
         MemoryCapState::PresentNotDelegated => R::Warn(
             "cgroup v2, no systemd --user manager, and `memory` is NOT delegated to a child cgroup"
                 .into(),
             format!(
-                "a `--memory` write is accepted and silently never bites ({sites}). {}",
+                "a `--memory` write is accepted and silently never bites ({sites}); {why}. {}",
                 delegation_hint()
             ),
         ),
@@ -1270,7 +1354,7 @@ fn no_user_manager_verdict(state: kern_isolation::MemoryCapState, sites: &str) -
             "cgroup v2, no systemd --user manager, and `memory` is not in this cgroup's tree"
                 .into(),
             format!(
-                "`--memory`/`--pids-limit` will not bind ({sites}); boxes still run and the \
+                "`--memory`/`--pids-limit` will not bind ({sites}); {why}. Boxes still run and the \
                  isolation holds. Enable `cgroup_enable=memory` (stock Raspberry Pi OS) or use a \
                  kernel that delegates it (Microsoft's default WSL2 kernel does not)"
             ),
@@ -1338,9 +1422,13 @@ fn check_cgroup() -> R {
     // `memory_cap_state()` creates a throwaway child, writes its `memory.max`, reads it back, and
     // removes it - the exact operation a box performs - so the three states are told apart.
     if !kern_isolation::user_systemd_present() {
+        // The runtime's own sentence for WHY no manager is used here, with the remedy when there is
+        // one (`XDG_RUNTIME_DIR` pointing away from a live `/run/user/<uid>`): the box prints the
+        // same clause, so the two cannot name different causes.
         return no_user_manager_verdict(
             kern_isolation::memory_cap_state(),
             &memory_probe_sites_phrase(),
+            &kern_isolation::missing_manager_clause(),
         );
     }
     // A scope alone isn't enough, and neither is the controller being LISTED: the box's `memory.max`
@@ -1971,12 +2059,17 @@ fn check_tools() -> Vec<R> {
             "",
             "install openssh-server in your images",
         ),
-        tool_opt(
-            "sshfs",
-            "-v sshfs:// network volumes",
-            "",
-            "install sshfs, or use nfs/smb",
-        ),
+        // INFORMATION, NOT A WARNING: only `-v sshfs://` volumes need it, and a host without it
+        // runs every box. As a warning it was one of the two on a clean WSL2 host (18/11), which
+        // trains a reader to skip the yellow lines that do matter (pasta, below, stays a warning).
+        if which("sshfs") {
+            R::Ok("sshfs: found (-v sshfs:// network volumes)".into(), String::new())
+        } else {
+            R::Ok(
+                "sshfs: not installed (optional: only -v sshfs:// network volumes need it)".into(),
+                "install sshfs to use them, or use nfs/smb".into(),
+            )
+        },
         tool_opt(
             "pasta",
             // NOT "pod / box": a plain box is loopback-only whatever pasta does, and outbound there
@@ -1987,7 +2080,7 @@ fn check_tools() -> Vec<R> {
             // is why it is not welded into the capability name.
             "pod outbound networking (NAT + DNS)",
             "a plain box is loopback-only whatever pasta does; `--net` gives it the host's stack",
-            "install passt (apt install passt / dnf install passt); without it a pod is loopback-only \
+            "install passt (apt install passt / dnf install passt / apk add passt / zypper install passt); without it a pod is loopback-only \
              - peers reach each other but nothing reaches the network (no apk add / pip install). kern \
              uses pasta if present, it does not ship it",
         ),
@@ -2645,12 +2738,39 @@ mod tests {
         }
     }
 
+    /// A scope the boxes never enter caps nothing: the row says the boxes run uncapped and carries
+    /// the runtime's own reason, never "caps enforced". MEASURED on WSL2 on 2026-11-18: doctor said
+    /// enforced while a `--memory 64m` box read `memory.max=max`.
+    #[test]
+    fn a_scope_the_boxes_never_take_is_reported_as_uncapped() {
+        use kern_isolation::MemoryCapState;
+        let why =
+            "`XDG_RUNTIME_DIR` points at `/tmp/x` while the user manager is at `/run/user/1000`";
+        let row = no_user_manager_verdict(MemoryCapState::EnforcedOnScope, "probed: x", why);
+        assert!(matches!(row, R::Warn(..)), "not a warning: {}", row.text());
+        let text = row.text();
+        assert!(text.contains("UNCAPPED"), "{text}");
+        assert!(
+            text.contains(why),
+            "the runtime's reason is missing: {text}"
+        );
+        assert!(
+            !text.contains("caps enforced"),
+            "the row still claims caps: {text}"
+        );
+        // And the two denials carry the reason too, so the remedy is printed where it applies.
+        for st in [MemoryCapState::PresentNotDelegated, MemoryCapState::Absent] {
+            let t = no_user_manager_verdict(st, "probed: x", why).text();
+            assert!(t.contains(why), "{st:?} lacks the reason: {t}");
+        }
+    }
+
     #[test]
     fn a_row_that_denies_a_memory_cap_names_the_cgroup_it_probed() {
         use kern_isolation::MemoryCapState;
         const SITES: &str = "probed a child of: /sys/fs/cgroup/user.slice/user-1000.slice";
         for st in [MemoryCapState::PresentNotDelegated, MemoryCapState::Absent] {
-            let row = no_user_manager_verdict(st, SITES).text();
+            let row = no_user_manager_verdict(st, SITES, "no manager").text();
             assert!(
                 row.contains(SITES),
                 "a row saying a cap does not bind names no cgroup, so a later pass cannot \
@@ -2659,7 +2779,7 @@ mod tests {
         }
         // POSITIVE CONTROL: the assertion must be capable of failing. A verdict that is NOT a denial
         // has no reason to carry the phrase, and if every row did, the loop above proves nothing.
-        let fine = no_user_manager_verdict(MemoryCapState::Enforced, SITES).text();
+        let fine = no_user_manager_verdict(MemoryCapState::Enforced, SITES, "no manager").text();
         assert!(
             !fine.contains(SITES),
             "the ENFORCED row carries the probed path too: {fine}"
@@ -3340,6 +3460,7 @@ mod tests {
             all.push(no_user_manager_verdict(
                 st,
                 "probed a child of: /sys/fs/cgroup/system.slice/hosted-compute-agent.service",
+                "`XDG_RUNTIME_DIR` points at `/tmp/x` while the user manager is at `/run/user/1000`",
             ));
         }
         // The `memory.high` row, with the longest path a real host gives it (a runner's), since the
@@ -3769,6 +3890,42 @@ mod tests {
         );
         // Idempotent: it forks a child each time and must not leave the parent changed.
         assert_eq!(p, probe_userns(), "the probe changed its own answer");
+    }
+
+    #[test]
+    fn the_identity_row_says_what_a_box_root_is() {
+        let msg = |r: &R| match r {
+            R::Ok(m, _) | R::Warn(m, _) | R::Fail(m, _) => m.clone(),
+        };
+        let wsl_root = identity_verdict(0, true, Some("root"));
+        assert!(matches!(wsl_root, R::Warn(..)) && msg(&wsl_root).contains("ROOT"));
+        let host_root = identity_verdict(0, false, None);
+        assert!(matches!(host_root, R::Ok(..)) && msg(&host_root).contains("this host's root"));
+        let wsl_user = identity_verdict(1000, true, Some("kern"));
+        assert!(msg(&wsl_user).contains("kern (uid 1000), not root"));
+        assert!(msg(&identity_verdict(1000, false, None)).contains("rootless"));
+    }
+
+    #[test]
+    fn selinuxfs_counts_only_when_mounted() {
+        use super::selinuxfs_mounted;
+        // Fedora with SELinux: the kernel's interface is mounted.
+        let fedora = "22 23 0:21 / /sys/fs/selinux rw,nosuid,noexec,relatime shared:4 - selinuxfs selinuxfs rw\n\
+                      24 1 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw\n";
+        assert!(selinuxfs_mounted(fedora));
+        // WSL2: /sys/fs/selinux is an empty directory, nothing is mounted there (MEASURED 18/11).
+        let wsl = "40 30 0:20 / /sys rw,nosuid,nodev,noexec,noatime - sysfs sysfs rw\n\
+                   41 40 0:21 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n";
+        assert!(!selinuxfs_mounted(wsl));
+        // Ubuntu without SELinux, and a selinuxfs mounted somewhere else: neither is the interface.
+        assert!(!selinuxfs_mounted(
+            "24 1 0:5 / /dev rw - devtmpfs devtmpfs rw\n"
+        ));
+        assert!(!selinuxfs_mounted(
+            "50 1 0:30 / /mnt/x rw - selinuxfs selinuxfs rw\n"
+        ));
+        // A line without the separator is ignored, not misread.
+        assert!(!selinuxfs_mounted("garbage /sys/fs/selinux selinuxfs\n"));
     }
 
     #[test]

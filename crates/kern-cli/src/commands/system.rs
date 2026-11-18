@@ -249,6 +249,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}config get{z} [<key>] [--json]                                    The [kern] keys and their values; one key prints its value, exit 1 if unset, 3 if kern.toml does not parse
     {c}config unset{z} <key>                                             Remove a [kern] key, back to kern's default
     {c}validate{z} [path]                                                Check a kern.toml
+    {c}self-update{z} [--check [--json]] [--to X.Y.Z] [--rollback]       Replace kern with a newer SIGNED release (keeps the old one for --rollback)
     {c}uninstall{z} [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     {c}examples{z}                                                       Print an example kern.toml (alias: example)
     {c}volume{z} <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes (alias: vol)
@@ -1483,6 +1484,7 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
         "the transient kern.slice cgroup disappears on its own"
     } else if registry::list().is_empty() && others == 0 {
         let stopped = std::process::Command::new("systemctl")
+            .envs(kern_isolation::manager_envs())
             .args(["--user", "stop", "kern-boxes.service"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
