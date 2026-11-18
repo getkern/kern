@@ -25,6 +25,7 @@ both halves of that rule, so removing one from the parser fails the build by nam
 (`10.1.2.0/24`, private ones included), and `*` for any public host; `--egress-deny` refuses domains,
 addresses and ranges even when the allowlist covers them, and alone means `*` minus these. A list
 kern cannot read is refused before the box starts.
+kern sandbox: `egress_allow` takes the same forms and `egress_deny=[...]` is new.
 
 **kern sandbox: labels, `Sandbox.list()`, `get_metrics()`, `set_timeout()`, `watch_dir()`.** `labels={...}`
 goes on every box a sandbox starts and `Sandbox.list(labels=...)` finds the running ones;

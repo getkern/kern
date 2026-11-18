@@ -42,6 +42,7 @@ import contextlib
 import errno
 import functools
 import hashlib
+import ipaddress
 import json
 import os
 import queue
@@ -3925,6 +3926,34 @@ _DOMAIN_RE = re.compile(
 )
 
 
+def _validate_egress_entry(entry: object, *, allow: bool) -> str:
+    """One `egress_allow` / `egress_deny` entry, canonical: a hostname (``pypi.org``), an address or a
+    range (``10.1.2.0/24``, private ones included; IPv6 too), or ``*`` (allow only: any public host).
+    kern decides what each opens; this is the binding's gate, so a malformed entry fails at
+    construction with its name instead of at box start."""
+    which = "egress_allow" if allow else "egress_deny"
+    if not isinstance(entry, str):
+        raise SandboxError(f"{which}: entries are str, got {type(entry).__name__}")
+    e = entry.strip()
+    if e == "*":
+        if not allow:
+            raise SandboxError(
+                "egress_deny '*' denies everything: use network=False (the default) for a box "
+                "with no outbound"
+            )
+        return e
+    try:
+        return str(ipaddress.ip_network(e.strip("[]"), strict=False))
+    except ValueError:
+        pass
+    if _DOMAIN_RE.fullmatch(e):
+        return e
+    raise SandboxError(
+        f"invalid {which} entry {entry!r}: expected a hostname like 'pypi.org', an address or a "
+        f"range like '10.1.2.0/24'{', or *' if allow else ''} (no scheme, port, path or spaces)"
+    )
+
+
 def _validate_domain(domain: str) -> str:
     """Validate one egress-allowlist domain (an FQDN like ``pypi.org``) before it reaches the argv."""
     if not isinstance(domain, str) or not _DOMAIN_RE.fullmatch(domain):
@@ -4429,12 +4458,14 @@ class Sandbox:
         network: **RELAXES ISOLATION.** ``True`` shares the host network for every ``run_code`` (kern
             ``--net``). Default ``False``. There is no per-call network override - network is a
             session-level, explicit choice.
-        egress_allow: restrict ``run_code``/``run`` to a DOMAIN ALLOWLIST instead of all-or-nothing,
+        egress_allow: restrict ``run_code``/``run`` to an ALLOWLIST instead of all-or-nothing,
             e.g. ``["pypi.org", "files.pythonhosted.org"]``. The box runs in an isolated network
             namespace and reaches the internet only through kern's filtering proxy, which permits just
-            these domains (an agent can fetch from the index you allow but cannot exfiltrate elsewhere).
-            Mutually exclusive with ``network=True``. The ``setup=`` box keeps full network to install
-            deps; the allowlist governs the untrusted run phase.
+            these destinations (an agent can fetch from the index you allow but cannot exfiltrate
+            elsewhere): hostnames and their subdomains, addresses and ranges (``"10.1.2.0/24"``, which
+            may be private), or ``"*"`` for any public host. ``egress_deny`` removes destinations from
+            it. Mutually exclusive with ``network=True``. The ``setup=`` box keeps full network to
+            install deps; the allowlist governs the untrusted run phase.
         mounts: extra host paths to bind, ``{host_src: box_target}`` (or ``{src: (target, "ro")}``).
             Sensitive sources are refused. The workspace is mounted automatically; this is for extras.
         tmpfs: fresh in-box scratch filesystems, ``{"/path": "64m"}`` or ``["/path"]`` (kern
@@ -4675,8 +4706,15 @@ class Sandbox:
     #: letters, digits and ``. _ / -`` (``kern.`` is reserved); a value is one line. ⚠️ Visible to local
     #: users (process list, ``kern ps``): a secret belongs in ``env=``.
     labels: "Mapping[str, str] | None" = None
+    #: Destinations refused even when ``egress_allow`` covers them (deny wins): hostnames (and their
+    #: subdomains), addresses and ranges (``"10.0.0.0/8"``). Alone, it means every public host but
+    #: these. ``egress_allow`` takes the same forms, a written range may be private, and ``"*"`` is
+    #: any public host. Loopback, link-local (cloud metadata) and multicast are never reachable.
+    #: Needs kern 0.52 or newer (``--egress-deny``).
+    egress_deny: "Sequence[str] | None" = None
 
     _kern: str = field(default="", repr=False)
+    _egress_deny: list = field(default_factory=list, init=False, repr=False)
     _label_args: list = field(default_factory=list, init=False, repr=False)
     _mount_args: list = field(default_factory=list, init=False, repr=False)
     _tmpfs_args: list = field(default_factory=list, init=False, repr=False)
@@ -4818,7 +4856,19 @@ class Sandbox:
             resolved = _tmpfs_size_vs_cap(norm, valid_size, self.memory_mb, self._tmpfs_default)
             self._tmpfs_args += ["--tmpfs", norm if resolved is None else f"{norm}:{resolved}"]
         self._profile_args = [_validate_profile(p) for p in (self.profiles or [])]
-        self._egress_allow = [_validate_domain(d) for d in (self.egress_allow or [])]
+        if isinstance(self.egress_allow, str) or isinstance(self.egress_deny, str):
+            raise SandboxError(
+                "egress_allow / egress_deny take a list of entries, e.g. ['pypi.org'], not one str"
+            )
+        self._egress_allow = [
+            _validate_egress_entry(d, allow=True) for d in (self.egress_allow or [])
+        ]
+        self._egress_deny = [
+            _validate_egress_entry(d, allow=False) for d in (self.egress_deny or [])
+        ]
+        # A deny list alone is "any public host but these", as kern reads `--egress-deny` alone.
+        if self._egress_deny and not self._egress_allow:
+            self._egress_allow = ["*"]
         if self.apparmor is not None:
             _validate_apparmor(self.apparmor)
         # A str is a Sequence[str], so `cap_drop="ALL"` would iterate into ['A','L','L'] and produce
@@ -5778,6 +5828,8 @@ class Sandbox:
         # it needs to install deps. egress_allow and network are mutually exclusive (checked at construct).
         if self._egress_allow and not is_setup:
             argv += ["--egress-allow", ",".join(self._egress_allow)]
+            if self._egress_deny:
+                argv += ["--egress-deny", ",".join(self._egress_deny)]
         elif network:
             argv += ["--net"]
         # Resource profiles (vcpu:/vgpio:/vdisk:NAME) are positional tokens `kern box` resolves against the

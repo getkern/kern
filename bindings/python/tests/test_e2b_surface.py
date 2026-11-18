@@ -219,3 +219,47 @@ def test_watch_dir_never_follows_a_symlink_out_of_the_workspace(tmp_path):
             (outside / "secret.txt").write_text("host")
             time.sleep(0.4)
         assert not any("secret" in e.path for e in got), got
+
+
+# ------------------------------------------------------------------------------- egress deny / ranges
+
+
+def test_egress_entries_take_domains_ranges_and_star_and_deny_alone_means_star():
+    s = _cfg(egress_allow=["pypi.org", "10.1.2.9/24", "2001:db8::1", "*"], egress_deny=["bad.io", "10.9.0.0/16"])
+    argv = s._base_argv("x", network=False, timeout_s=10, dry=True)
+    i = argv.index("--egress-allow")
+    assert argv[i + 1] == "pypi.org,10.1.2.0/24,2001:db8::1/128,*"
+    j = argv.index("--egress-deny")
+    assert argv[j + 1] == "bad.io,10.9.0.0/16"
+    only_deny = _cfg(egress_deny=["github.com"])
+    argv = only_deny._base_argv("x", network=False, timeout_s=10, dry=True)
+    assert argv[argv.index("--egress-allow") + 1] == "*"
+    for bad, says in [
+        ({"egress_deny": ["*"]}, "denies everything"),
+        ({"egress_allow": ["http://x.com"]}, "invalid egress_allow"),
+        ({"egress_deny": ["a b"]}, "invalid egress_deny"),
+        ({"egress_allow": "pypi.org"}, "list of entries"),
+        ({"egress_deny": ["x.com"], "network": True}, "mutually exclusive"),
+    ]:
+        with pytest.raises(SandboxError, match=says):
+            _cfg(**bad)
+
+
+_EGRESS_PROBE = """
+import urllib.request, ssl
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+for u in ["https://example.com", "https://github.com"]:
+    try:
+        urllib.request.urlopen(u, timeout=10, context=ctx).read(16); print(u, "OPEN")
+    except Exception as e:
+        print(u, "SHUT")
+"""
+
+
+@integration
+@pytest.mark.skipif(os.environ.get("KERN_TEST_NO_INTERNET") == "1", reason="no internet here")
+def test_egress_deny_refuses_what_the_allowlist_would_open():
+    with Sandbox(egress_deny=["github.com"]) as sb:
+        out = sb.run_code(_EGRESS_PROBE).stdout
+    assert "https://example.com OPEN" in out, out
+    assert "https://github.com SHUT" in out, out
