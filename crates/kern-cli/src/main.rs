@@ -297,6 +297,7 @@ mod secret;
 mod selfupdate;
 mod systemd;
 mod toml_surgery;
+mod transcript;
 mod tui;
 mod ui;
 mod vdisk;

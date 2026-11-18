@@ -33,6 +33,7 @@ COMMANDS:
     top                                                            Interactive task manager (TUI): host, every GPU, boxes, sandboxes (finished too)
     stats [--json] [--no-stream] [name...]                         Per-box memory + CPU (always a snapshot; --no-stream names that, `kern top` is the live view)
     sandbox ls|history|stats [-n N] [--failed] [--all] [--json]      The SDK and MCP sandboxes: running now, finished (metadata only), outcomes
+    sandbox show [<box>] [-n N] [--json]                         The code SDK sandboxes ran and their output (kept with the history)
     sandbox keep|clear [memory|disk|off]                             Where the finished ones are kept (default memory: until reboot), or remove them
     inspect <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
     port <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has

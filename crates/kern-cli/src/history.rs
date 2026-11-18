@@ -379,6 +379,21 @@ fn dir() -> std::io::Result<PathBuf> {
     dir_of(keep())
 }
 
+/// [`dir_of`] for the transcripts, which live under the history's directory.
+pub(crate) fn dir_for(k: Keep) -> std::io::Result<PathBuf> {
+    dir_of(k)
+}
+
+/// [`places`], for the transcripts.
+pub(crate) fn places_pub() -> Vec<PathBuf> {
+    places().collect()
+}
+
+/// [`local_datetime`], for the transcripts.
+pub(crate) fn local_datetime_pub(ms: u64) -> String {
+    local_datetime(ms)
+}
+
 /// The file the history is written to now (for `off`, the one that holds what came before), for
 /// display: what `kern top` names on every frame, so the disk path is COMPUTED and nothing is made
 /// or checked on disk to name it.
@@ -651,6 +666,8 @@ pub fn set_keep(new: Keep) -> Result<usize, String> {
     for from in places() {
         moved += move_rows(&from, &to, max).map_err(|e| format!("moving the history: {e}"))?;
     }
+    // The transcripts go where the rows go, so the sensitive half never stays behind on disk.
+    crate::transcript::move_to(&to)?;
     Ok(moved)
 }
 
@@ -661,6 +678,7 @@ pub fn clear() -> Result<usize, String> {
         n += held_in(&d);
         remove_in(&d).map_err(|e| format!("clearing {}: {e}", d.display()))?;
     }
+    crate::transcript::clear()?;
     Ok(n)
 }
 
@@ -820,6 +838,18 @@ pub enum SandboxCmd {
     Keep { to: Option<Keep> },
     /// Remove every row held.
     Clear,
+    /// One call's code and output from stdin (the SDKs, after each call).
+    Record {
+        box_name: String,
+        language: String,
+        exit: i32,
+    },
+    /// The recorded code and output, newest `n`, of one box or of all.
+    Show {
+        box_name: Option<String>,
+        n: usize,
+        json: bool,
+    },
 }
 
 /// `kern sandbox ls|history|stats`.
@@ -903,6 +933,14 @@ pub fn sandbox_cmd(cmd: &SandboxCmd) -> Result<(), crate::error::Error> {
                 println!("{m}");
             }
             Ok(())
+        }
+        SandboxCmd::Record {
+            box_name,
+            language,
+            exit,
+        } => crate::transcript::record_from_stdin(box_name, language, *exit),
+        SandboxCmd::Show { box_name, n, json } => {
+            crate::transcript::show(box_name.as_deref(), *n, *json)
         }
         SandboxCmd::Clear => {
             let n = clear().map_err(crate::error::Error::Config)?;

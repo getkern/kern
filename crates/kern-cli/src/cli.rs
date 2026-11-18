@@ -1747,9 +1747,59 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     _ => return Err(Error::Usage("sandbox keep [memory | disk | off]")),
                 },
                 Some("clear") if rest.len() == 2 => Command::Sandbox(SandboxCmd::Clear),
+                Some("record") => {
+                    let usage = "sandbox record <box> [--exit N] [--language L]  (stdin: v1 <code> <stdout> <stderr> bytes)";
+                    let mut box_name = None;
+                    let mut language = "python".to_string();
+                    let mut exit = 0i32;
+                    let mut i = 2;
+                    while i < rest.len() {
+                        match rest[i] {
+                            "--exit" => {
+                                i += 1;
+                                exit = rest.get(i).and_then(|v| v.parse().ok()).ok_or(Error::Usage(usage))?;
+                            }
+                            "--language" => {
+                                i += 1;
+                                language = rest.get(i).map(|v| (*v).to_string()).ok_or(Error::Usage(usage))?;
+                            }
+                            w if !w.starts_with('-') && box_name.is_none() => box_name = Some(w.to_string()),
+                            _ => return Err(Error::Usage(usage)),
+                        }
+                        i += 1;
+                    }
+                    Command::Sandbox(SandboxCmd::Record {
+                        box_name: box_name.ok_or(Error::Usage(usage))?,
+                        language,
+                        exit,
+                    })
+                }
+                Some("show") => {
+                    let usage = "sandbox show [<box>] [-n N] [--json]";
+                    let mut box_name = None;
+                    let mut n = 5usize;
+                    let mut i = 2;
+                    while i < rest.len() {
+                        match rest[i] {
+                            "-n" => {
+                                i += 1;
+                                n = rest
+                                    .get(i)
+                                    .and_then(|v| v.parse().ok())
+                                    .filter(|v| *v > 0)
+                                    .ok_or(Error::Usage(usage))?;
+                            }
+                            "--json" => {}
+                            w if !w.starts_with('-') && box_name.is_none() => box_name = Some(w.to_string()),
+                            _ => return Err(Error::Usage(usage)),
+                        }
+                        i += 1;
+                    }
+                    Command::Sandbox(SandboxCmd::Show { box_name, n, json })
+                }
                 _ => {
                     return Err(Error::Usage(
-                        "sandbox ls|history|stats [-n N] [--failed] [--all] [--json] | sandbox keep [memory|disk|off] | sandbox clear",
+                        "sandbox ls|history|stats [-n N] [--failed] [--all] [--json] | sandbox show [<box>] [-n N] [--json] | sandbox keep [memory|disk|off] | sandbox clear",
                     ))
                 }
             }

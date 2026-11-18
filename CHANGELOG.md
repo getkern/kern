@@ -21,6 +21,12 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**`kern sandbox show`: the code SDK sandboxes ran and their output.** The SDKs record each call
+(`kern sandbox record`); transcripts are kept where `sandbox_history` keeps the history (in memory by
+default), mode 0600, up to 64 KiB of code and 256 KiB of each stream per call and
+`sandbox_transcripts_max_size` (16m) in all; `[kern] sandbox_transcripts = false` keeps none, and
+`kern sandbox clear` and `kern sandbox keep` remove and move them with the history.
+
 **`--egress-deny` and ranges in `--egress-allow`.** The allowlist takes addresses and ranges
 (`10.1.2.0/24`, private ones included), and `*` for any public host; `--egress-deny` refuses domains,
 addresses and ranges even when the allowlist covers them, and alone means `*` minus these. A list

@@ -134,6 +134,8 @@ log_max_file             = 2      # files each box keeps, the active one include
 log_keep_ended           = "24h"  # the log of a box that ended goes after this long
 build_keep               = 200    # build records kept; older ones go when a build ends
 sandbox_history_max_size = "1m"   # the history rotates at this size, two files kept (default 1m)
+sandbox_transcripts      = true   # keep the code SDK sandboxes ran and its output (default true)
+sandbox_transcripts_max_size = "16m"  # the most they occupy; the oldest go past it (default 16m)
 ```
 
 A box's log holds at most `log_max_size` times `log_max_file`. A box's own `--log-max-size` and
@@ -151,7 +153,12 @@ them by hand). With it, the records that ended longest ago go each time a build 
 running is never removed and does not count among the N.
 
 Sandbox calls through the SDKs and MCP write no log file: their output goes back to the caller. What
-they leave is the one-line history above, bounded at twice `sandbox_history_max_size`.
+they leave is the one-line history above, bounded at twice `sandbox_history_max_size`, and a
+transcript per call: the code it ran and its output (`kern sandbox show`), up to 64 KiB of code and
+256 KiB of each stream, in all at most `sandbox_transcripts_max_size`. Transcripts are kept where the
+history is (`sandbox_history`: in memory by default, cleared at reboot; on disk only when chosen),
+mode 0600; code and output can hold a secret, so `sandbox_transcripts = false` keeps none, and
+`kern sandbox clear` removes them with the history.
 
 `kern info` shows the values in force and where each comes from (`kern.toml` or the default), with
 the number of build records kept.

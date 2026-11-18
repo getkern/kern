@@ -239,6 +239,13 @@ pub struct KernSettings {
     /// history holds this file and one rotated generation, so it is bounded at twice this. Absent
     /// means 1 MiB, about 18 000 lines.
     pub sandbox_history_max_size: Option<u64>,
+    /// `sandbox_transcripts` - whether the code an SDK sandbox ran and its output are kept beside
+    /// the history (`kern sandbox show`). Absent means kept, where `sandbox_history` keeps the
+    /// history; `false`, or `sandbox_history = "off"`, keeps none.
+    pub sandbox_transcripts: Option<bool>,
+    /// `sandbox_transcripts_max_size` - the most the transcripts may occupy together; past it the
+    /// oldest go. Absent means 16 MiB.
+    pub sandbox_transcripts_max_size: Option<u64>,
 }
 
 /// The `[kern]` keys `kern config set|get|unset` reads and writes, with the shape of each value.
@@ -277,6 +284,16 @@ pub(crate) const SETTABLE_KERN_KEYS: &[(&str, SettingKind, &str)] = &[
         "sandbox_history",
         SettingKind::Word(&["memory", "disk", "off"]),
         "where finished sandboxes are recorded (default memory)",
+    ),
+    (
+        "sandbox_transcripts",
+        SettingKind::Bool,
+        "keep the code SDK sandboxes ran and its output with the history (default true)",
+    ),
+    (
+        "sandbox_transcripts_max_size",
+        SettingKind::Size,
+        "the most the sandbox transcripts occupy; the oldest go past it (default 16m)",
     ),
     (
         "publish_bind",
@@ -389,6 +406,9 @@ pub(crate) fn parse_keep_secs(s: &str) -> Option<u64> {
 /// The smallest `sandbox_history_max_size` accepted: a history line is under 1 KiB, so a smaller
 /// file would rotate on every box and keep almost nothing.
 pub(crate) const HISTORY_MIN_BYTES: u64 = 4 * 1024;
+
+/// The smallest `sandbox_transcripts_max_size` accepted: room for at least one capped transcript.
+pub(crate) const TRANSCRIPTS_MIN_BYTES: u64 = 64 * 1024;
 
 // ─────────────────────────────── CPU (implemented) ───────────────────────────────
 
@@ -1118,6 +1138,20 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
                 );
             }
             k.build_keep = Some(n);
+        }
+        "sandbox_transcripts" => k.sandbox_transcripts = Some(value_bool(v)?),
+        "sandbox_transcripts_max_size" => {
+            let raw = value_string(v)?;
+            k.sandbox_transcripts_max_size = Some(
+                kern_common::parse_binary_size(raw.trim())
+                    .filter(|n| *n >= TRANSCRIPTS_MIN_BYTES)
+                    .ok_or_else(|| {
+                        format!(
+                            "[kern] sandbox_transcripts_max_size = '{raw}': expected a size like \
+                             \"16m\" or \"100m\", at least 64k"
+                        )
+                    })?,
+            );
         }
         "sandbox_history_max_size" => {
             let raw = value_string(v)?;

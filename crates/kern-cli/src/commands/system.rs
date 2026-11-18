@@ -176,6 +176,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}top{z}                                                            Interactive task manager (TUI): host, every GPU, boxes, sandboxes (finished too)
     {c}stats{z} [--json] [--no-stream] [name...]                         Per-box memory + CPU (always a snapshot; --no-stream names that, `kern top` is the live view)
     {c}sandbox{z} ls|history|stats [-n N] [--failed] [--all] [--json]      The SDK and MCP sandboxes: running now, finished (metadata only), outcomes
+    {c}sandbox show{z} [<box>] [-n N] [--json]                         The code SDK sandboxes ran and their output (kept with the history)
     {c}sandbox{z} keep|clear [memory|disk|off]                             Where the finished ones are kept (default memory: until reboot), or remove them
     {c}inspect{z} <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
                                                                      (`-f '{{{{.State.Status}}}}'`, the common field paths)

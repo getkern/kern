@@ -7504,6 +7504,89 @@ fn copy_chown_owns_the_copied_files() {
     }
 }
 
+/// `kern sandbox record` keeps a call's code and output where the history is, 0600, and `kern
+/// sandbox show` prints it without the escapes the output carried; `clear` removes it.
+#[test]
+fn a_sandbox_transcript_is_kept_shown_and_cleared() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    let w = std::env::temp_dir().join(format!("kern-transcript-{}", std::process::id()));
+    let run = w.join("run");
+    std::fs::create_dir_all(&run).expect("runtime dir");
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let env = |c: &mut Command| {
+        c.env("XDG_RUNTIME_DIR", &run)
+            .env("XDG_CONFIG_HOME", w.join("cfg"))
+            .env("XDG_DATA_HOME", w.join("data"));
+    };
+    let out = b"42\n\x1b[31mred\x1b[0m\n";
+    let mut frame = format!("v1 9 {} 0\n", out.len()).into_bytes();
+    frame.extend_from_slice(b"print(42)");
+    frame.extend_from_slice(out);
+    let mut rec = kern();
+    env(&mut rec);
+    let mut child = rec
+        .args([
+            "sandbox",
+            "record",
+            "pysbx-tr0001",
+            "--exit",
+            "3",
+            "--language",
+            "python",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("record");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(&frame)
+        .expect("write");
+    assert!(child.wait().expect("wait").success());
+    let dir = run.join("kern/history/transcripts");
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("transcripts dir")
+        .flatten()
+        .collect();
+    assert_eq!(files.len(), 1);
+    let mode = files[0].metadata().expect("meta").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let mut show = kern();
+    env(&mut show);
+    let shown = show.args(["sandbox", "show"]).output().expect("show");
+    let text = String::from_utf8_lossy(&shown.stdout).into_owned();
+    assert!(
+        text.contains("pysbx-tr0001 python exit 3")
+            && text.contains("print(42)")
+            && text.contains("red"),
+        "{text}"
+    );
+    assert!(
+        !text.contains('\x1b'),
+        "an escape reached the terminal: {text:?}"
+    );
+    let mut js = kern();
+    env(&mut js);
+    let j = js
+        .args(["sandbox", "show", "pysbx-tr0001", "--json"])
+        .output()
+        .expect("json");
+    assert!(String::from_utf8_lossy(&j.stdout).contains("\"code\":\"print(42)\""));
+    let mut clear = kern();
+    env(&mut clear);
+    assert!(clear
+        .args(["sandbox", "clear"])
+        .output()
+        .expect("clear")
+        .status
+        .success());
+    let left = std::fs::read_dir(&dir).map(|r| r.count()).unwrap_or(0);
+    let _ = std::fs::remove_dir_all(&w);
+    assert_eq!(left, 0, "clear left transcripts behind");
+}
+
 /// `kern update --timeout` moves a running detached box's deadline: shorter ends it sooner, longer
 /// keeps it past the old deadline, 0 removes it. What the SDK's `set_timeout` stands on.
 #[test]
