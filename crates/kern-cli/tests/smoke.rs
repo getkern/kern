@@ -7504,6 +7504,94 @@ fn copy_chown_owns_the_copied_files() {
     }
 }
 
+/// `kern update --timeout` moves a running detached box's deadline: shorter ends it sooner, longer
+/// keeps it past the old deadline, 0 removes it. What the SDK's `set_timeout` stands on.
+#[test]
+fn update_timeout_moves_a_running_boxs_deadline() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let tag = std::process::id();
+    let alive = |name: &str| {
+        kern()
+            .args(["ps", "-q", "--filter", &format!("name={name}")])
+            .output()
+            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false)
+    };
+    let start = |name: &str, secs: &str| {
+        let ok = kern()
+            .args([
+                "box",
+                name,
+                "-d",
+                "--timeout",
+                secs,
+                "--image",
+                "alpine:latest",
+                "--",
+                "sleep",
+                "600",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "box {name} did not start");
+    };
+    let update = |name: &str, secs: &str| {
+        let out = kern()
+            .args(["update", "--timeout", secs, name])
+            .output()
+            .expect("update");
+        assert!(
+            out.status.success(),
+            "update {name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let wait_gone = |name: &str, within: std::time::Duration| {
+        let t = std::time::Instant::now();
+        while t.elapsed() < within {
+            if !alive(name) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
+    };
+    let (short, long, off) = (
+        format!("tos{tag}"),
+        format!("tol{tag}"),
+        format!("too{tag}"),
+    );
+    start(&short, "60");
+    start(&long, "2");
+    start(&off, "2");
+    update(&short, "1");
+    update(&long, "6");
+    update(&off, "0");
+    let shortened = wait_gone(&short, std::time::Duration::from_secs(6));
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let long_alive_past_old = alive(&long);
+    let off_alive_past_old = alive(&off);
+    let long_ended = wait_gone(&long, std::time::Duration::from_secs(8));
+    let _ = kern().args(["stop", &short, &long, &off]).output();
+    assert!(
+        shortened,
+        "a deadline moved from 60 s to 1 s did not end the box within 6 s"
+    );
+    assert!(
+        long_alive_past_old,
+        "a deadline moved from 2 s to 6 s ended the box at the old one"
+    );
+    assert!(long_ended, "a deadline moved to 6 s never ended the box");
+    assert!(
+        off_alive_past_old,
+        "--timeout 0 did not remove the deadline"
+    );
+}
+
 /// An attached `compose up` (stdout a terminal) shows a service that exited before the attach, as
 /// Docker shows it. MEASURED 2026-11-18: `command: echo ...` printed nothing on a terminal, because
 /// a service with no live pid was skipped. The terminal comes from `script(1)`.

@@ -679,6 +679,8 @@ pub enum Command {
         memory: Option<u64>,
         cpus: Option<f64>,
         pids: Option<u64>,
+        /// `--timeout N`: the box ends N seconds from now (0: no deadline).
+        timeout: Option<u64>,
     },
     /// `kern wait <box>...`: block until each box exits, print its exit code.
     Wait {
@@ -2125,12 +2127,13 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
             Command::Rm { names, force }
         }
-        // `update <box> [--memory M] [--cpus N] [--pids-limit P]`: change a running box's caps live.
+        // `update <box> [--memory M] [--cpus N] [--pids-limit P] [--timeout S]`: change a running
+        // box's caps live, and move its deadline.
         Some("update") => {
             reject_unknown_flags(
                 "update",
                 &rest,
-                &["-m", "--memory", "--cpus", "--pids-limit"],
+                &["-m", "--memory", "--cpus", "--pids-limit", "--timeout"],
             )?;
             // THE BOX IS THE WORD THAT IS NEITHER A FLAG NOR A FLAG'S VALUE, so the flags may come
             // first, as Docker's `update --cpus 0.5 web` writes them. MEASURED: that line took `0.5`
@@ -2138,14 +2141,17 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut name: Option<String> = None;
             let mut words = rest.iter().skip(1);
             while let Some(a) = words.next() {
-                if matches!(*a, "-m" | "--memory" | "--cpus" | "--pids-limit") {
+                if matches!(
+                    *a,
+                    "-m" | "--memory" | "--cpus" | "--pids-limit" | "--timeout"
+                ) {
                     words.next();
                 } else if !a.starts_with('-') && name.is_none() {
                     name = Some((*a).to_string());
                 }
             }
             let name = name.ok_or(Error::Usage(
-                "update <box> [--memory M] [--cpus N] [--pids-limit P]",
+                "update <box> [--memory M] [--cpus N] [--pids-limit P] [--timeout S]",
             ))?;
             let memory = match flag_value(&rest, "-m").or_else(|| flag_value(&rest, "--memory")) {
                 Some(v) => {
@@ -2182,11 +2188,20 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 ),
                 None => None,
             };
+            let timeout = match flag_value(&rest, "--timeout") {
+                Some(v) => Some(v.parse::<u64>().map_err(|_| {
+                    Error::Usage(
+                        "update: --timeout expects whole seconds from now (0: no deadline)",
+                    )
+                })?),
+                None => None,
+            };
             Command::Update {
                 name,
                 memory,
                 cpus,
                 pids,
+                timeout,
             }
         }
         // `events`: stream box lifecycle events until Ctrl-C (Docker parity, best-effort/daemonless).
@@ -6660,7 +6675,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             memory,
             cpus,
             pids,
-        } => commands::update(&name, memory, cpus, pids),
+            timeout,
+        } => commands::update(&name, memory, cpus, pids, timeout),
         Command::Wait { names } => commands::wait(&names),
         Command::Diff { name, json } => commands::diff(&name, json),
         Command::Events => commands::events(),

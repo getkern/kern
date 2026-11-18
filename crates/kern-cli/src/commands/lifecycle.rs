@@ -1109,21 +1109,128 @@ pub(crate) fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> Optio
     //
     // The pidfd is opened AFTER `fork_detached`, never before: that helper runs `close_range(3, ..)`
     // in the child, which would close an fd taken by the parent.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, sup_pid, 0) as i32 };
-    let supervisor_gone = unsafe { wait_for_box_exit(pidfd, secs.saturating_mul(1000)) };
+    //
+    // THE DEADLINE CAN MOVE WHILE THE BOX RUNS (`kern update --timeout`, the SDK's `set_timeout`).
+    // It is kept in the box's deadline sidecar with this process's pid and start-time; the updater
+    // rewrites it and sends SIGUSR1. SIGUSR1 stays BLOCKED except inside `ppoll`, which unblocks it
+    // atomically for the wait, so a wake sent between reading the file and starting to wait is not
+    // lost: it is delivered the moment the wait begins. Nothing here wakes on a period.
+    let me = unsafe { libc::getpid() };
+    let mut original: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        let mut usr1: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut usr1);
+        libc::sigaddset(&mut usr1, libc::SIGUSR1);
+        libc::sigprocmask(libc::SIG_BLOCK, &usr1, &mut original);
+    }
+    let mut wait_mask = original;
+    unsafe {
+        libc::sigdelset(&mut wait_mask, libc::SIGUSR1);
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_deadline_moved as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+    }
+    let mut owned = registry::Deadline {
+        at_unix_ms: registry::unix_ms().saturating_add(secs.saturating_mul(1000)),
+        watchdog: me,
+        watchdog_start: registry::proc_starttime(me),
+    };
+    let _ = registry::set_box_deadline(&name, sup_pid, owned);
+    let mut pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, sup_pid, 0) as i32 };
+    let expired = loop {
+        // The file is the deadline; this process's own copy covers a file that cannot be read. A
+        // file naming ANOTHER watchdog means this one was replaced: it leaves, the other enforces.
+        match registry::box_deadline(&name, sup_pid) {
+            Some(d) if d.watchdog == me => owned = d,
+            Some(_) => break false,
+            None => {}
+        }
+        if owned.at_unix_ms == 0 {
+            break false; // disarmed: `--timeout 0`
+        }
+        let now = registry::unix_ms();
+        if now >= owned.at_unix_ms {
+            break true;
+        }
+        match unsafe { wait_exit_or_wake(pidfd, owned.at_unix_ms - now, &wait_mask) } {
+            Waited::Exited => break false, // nothing left to stop
+            Waited::Unwaitable => {
+                // An fd that cannot be waited on: wait on the clock and the wake alone.
+                unsafe { libc::close(pidfd) };
+                pidfd = -1;
+            }
+            Waited::Expired | Waited::Woken => {}
+        }
+    };
     if pidfd >= 0 {
         unsafe { libc::close(pidfd) };
     }
-    if supervisor_gone {
-        unsafe { libc::_exit(0) }; // nothing left to stop, and the pair-probe would say so too
-    }
+    // The mask back as it was, so nothing `stop` starts inherits a blocked SIGUSR1.
+    unsafe { libc::sigprocmask(libc::SIG_SETMASK, &original, std::ptr::null_mut()) };
     // Exact (name,pid)-PAIR probe: a by-name `find` would test the pid against whichever same-name
     // entry readdir yields first - a duplicate entry (fail-open unclaimed start / pre-claim kern)
     // could shadow the tracked box and the timeout would silently never fire.
-    if registry::pair_alive(&name, sup_pid) {
+    if expired && registry::pair_alive(&name, sup_pid) {
         let _ = stop(std::slice::from_ref(&name), false);
     }
+    if registry::box_deadline(&name, sup_pid).is_some_and(|d| d.watchdog == me) {
+        registry::clear_box_deadline(&name, sup_pid);
+    }
     unsafe { libc::_exit(0) };
+}
+
+/// SIGUSR1 in a deadline watchdog: nothing to do in the handler, the interrupted wait re-reads.
+extern "C" fn on_deadline_moved(_sig: libc::c_int) {}
+
+/// How a watchdog's wait ended.
+enum Waited {
+    /// The supervisor exited: the box is gone.
+    Exited,
+    /// The time asked for passed.
+    Expired,
+    /// SIGUSR1: the deadline may have moved.
+    Woken,
+    /// The pidfd reported something other than readable: it cannot be waited on.
+    Unwaitable,
+}
+
+/// Wait up to `ms` for the supervisor behind `pidfd` (none when negative) to exit, with `mask` in
+/// force during the wait (SIGUSR1 unblocked) and blocked again after it.
+unsafe fn wait_exit_or_wake(pidfd: i32, ms: u64, mask: &libc::sigset_t) -> Waited {
+    let ts = libc::timespec {
+        tv_sec: libc::time_t::try_from(ms / 1000).unwrap_or(libc::time_t::MAX),
+        tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
+    };
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let (fds, n) = if pidfd >= 0 {
+        (&mut pfd as *mut libc::pollfd, 1)
+    } else {
+        (std::ptr::null_mut(), 0)
+    };
+    let r = libc::ppoll(fds, n, &ts, mask);
+    if r > 0 {
+        return if pfd.revents & libc::POLLIN != 0 {
+            Waited::Exited
+        } else {
+            Waited::Unwaitable
+        };
+    }
+    if r == 0 {
+        return Waited::Expired;
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+        Waited::Woken
+    } else {
+        // Not a wait at all (EINVAL, ENOMEM): a second's pause keeps a persistent error from
+        // spinning, and the loop re-reads the deadline after it.
+        libc::sleep(1);
+        Waited::Expired
+    }
 }
 
 /// Run one health probe inside the box and report whether it succeeded (exit 0). Forks a child that

@@ -21,6 +21,9 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**`kern update --timeout S <box>`**: a running detached box ends S seconds from now; `0` removes its
+deadline. A box started without `--timeout` gets one.
+
 **`compose up` on a terminal shows a service that exited before it attached** (`command: echo ...`).
 
 **`kern self-update` tells a failed download from an unsigned release**: a network that does not answer

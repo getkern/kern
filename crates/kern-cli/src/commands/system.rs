@@ -190,7 +190,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}restart{z} [-t N] <name>...                                       Stop a kept box and start it again, or start it if stopped (N: seconds before the kill)
     {c}rm{z} [-f] <name>...                                              Remove a stopped or exited box and its record (`--keep`: its layer too); -f stops a running one first
     {c}rename{z} <old> <new>                                             Give a box (running or kept) a new name
-    {c}update{z} [--memory M] [--cpus N] [--pids-limit P] <box>          Change a box's caps: live when running (needs delegated cgroup), and a kept box's record
+    {c}update{z} [--memory M] [--cpus N] [--pids-limit P] [--timeout S] <box>  Change a box's caps: live when running (needs delegated cgroup), and a kept box's record
+                                                                     --timeout S: a running detached box ends S seconds from now (0: no deadline)
     {c}wait{z} <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
     {c}diff{z} <box> [--json]                                            List filesystem changes vs the image (C/D); a kept box's too, running or not
     {c}export{z} <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
@@ -992,16 +993,79 @@ fn scope_follow(cg: &std::path::Path, memory: Option<u64>, cpus: Option<f64>, pi
     }
 }
 
+/// Move a running box's deadline to `secs` from now (0: none), and say what it is now.
+///
+/// A box with a deadline watchdog (`kern box -d --timeout`, or an earlier `update --timeout`) gets
+/// the new deadline written to its sidecar and the watchdog woken, after the watchdog is proved to be
+/// that very process (pid AND start-time: SIGUSR1's default action ends whatever it reaches). A box
+/// without one gets one. A foreground box's own `--timeout` is a different timer and still applies.
+fn move_deadline(name: &str, pid: i32, secs: u64) -> Result<String, Error> {
+    let at = if secs == 0 {
+        0
+    } else {
+        registry::unix_ms().saturating_add(secs.saturating_mul(1000))
+    };
+    let said = if secs == 0 {
+        "no deadline".to_string()
+    } else {
+        format!("ends in {secs}s")
+    };
+    match registry::box_deadline(name, pid) {
+        Some(d) if d.watchdog_alive() => {
+            registry::set_box_deadline(
+                name,
+                pid,
+                registry::Deadline {
+                    at_unix_ms: at,
+                    ..d
+                },
+            )
+            .map_err(|e| Error::Sandbox(format!("update {name}: writing the deadline: {e}")))?;
+            // SAFETY: kill takes plain integers; the target was proved to be the watchdog above.
+            if unsafe { libc::kill(d.watchdog, libc::SIGUSR1) } != 0 {
+                return Err(Error::Sandbox(format!(
+                    "update {name}: the deadline is written but its watchdog could not be woken: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(said)
+        }
+        _ if secs == 0 => Ok(said),
+        _ => {
+            if crate::commands::spawn_timeout_stop(name.to_string(), pid, secs).is_none() {
+                return Err(Error::Sandbox(format!(
+                    "update {name}: could not start the watchdog that ends it"
+                )));
+            }
+            Ok(said)
+        }
+    }
+}
+
 pub fn update(
     name: &str,
     memory: Option<u64>,
     cpus: Option<f64>,
     pids: Option<u64>,
+    timeout: Option<u64>,
 ) -> Result<(), Error> {
-    if memory.is_none() && cpus.is_none() && pids.is_none() {
+    if memory.is_none() && cpus.is_none() && pids.is_none() && timeout.is_none() {
         return Err(Error::Usage(
-            "update <box> [--memory M] [--cpus N] [--pids-limit P] (at least one)",
+            "update <box> [--memory M] [--cpus N] [--pids-limit P] [--timeout S] (at least one)",
         ));
+    }
+    if let Some(secs) = timeout {
+        let Some(inst) = registry::find_ref(name) else {
+            return Err(Error::NotRunning(format!(
+                "no running box named '{name}': --timeout moves the deadline of a running box"
+            )));
+        };
+        let said = move_deadline(&inst.name, inst.pid, secs)?;
+        let pal = crate::ui::Palette::detect();
+        println!("{}updated{} {}: {said}", pal.g, pal.z, inst.name);
+        if memory.is_none() && cpus.is_none() && pids.is_none() {
+            return Ok(());
+        }
     }
     // THE KNOBS AS `kern box` SPELLS THEM, for a kept box's record (see `keepbox::set_flags`): what
     // Docker's `update` does to a container's configuration, which the next start keeps.

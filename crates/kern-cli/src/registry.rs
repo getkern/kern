@@ -344,12 +344,90 @@ pub fn box_env(name: &str, pid: i32) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Drop a box's environment sidecar. Called wherever the health sidecar is dropped, so the two
-/// cannot diverge into one file that outlives the box and one that does not.
+/// Drop a box's environment and deadline sidecars. Called wherever the health sidecar is dropped,
+/// so none of them can outlive the box while another does not.
 pub fn clear_box_env(name: &str, pid: i32) {
     if let Ok(d) = env_dir() {
         let _ = fs::remove_file(d.join(format!("{name}-{pid}")));
     }
+    clear_box_deadline(name, pid);
+}
+
+/// Where a detached box's `--timeout` deadline is kept, one `<name>-<pid>` file per box, so
+/// `kern update --timeout` can move it while the box runs. Swept with the other sidecars.
+fn deadline_dir() -> io::Result<PathBuf> {
+    runtime_subdir("deadline")
+}
+
+/// A box's timeout as its watchdog enforces it: when the box is stopped, in milliseconds since the
+/// Unix epoch (0 = no deadline: the watchdog leaves), and the watchdog's pid with its start-time, so
+/// a signal is never sent to a process that merely reuses the pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deadline {
+    pub at_unix_ms: u64,
+    pub watchdog: i32,
+    pub watchdog_start: u64,
+}
+
+impl Deadline {
+    fn render(&self) -> String {
+        format!(
+            "{} {} {}\n",
+            self.at_unix_ms, self.watchdog, self.watchdog_start
+        )
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut f = text.split_whitespace();
+        let at_unix_ms = f.next()?.parse().ok()?;
+        let watchdog = f.next()?.parse().ok()?;
+        let watchdog_start = f.next()?.parse().ok()?;
+        f.next().is_none().then_some(Self {
+            at_unix_ms,
+            watchdog,
+            watchdog_start,
+        })
+    }
+
+    /// Is the recorded watchdog that very process, still alive? Strict: an unreadable start-time is
+    /// "no", because the answer decides whether a signal may be sent to that pid.
+    pub fn watchdog_alive(&self) -> bool {
+        self.watchdog > 0
+            && self.watchdog_start != 0
+            && proc_starttime(self.watchdog) == self.watchdog_start
+    }
+}
+
+/// Record a box's deadline, written beside and renamed into place so a reader never sees half.
+pub fn set_box_deadline(name: &str, pid: i32, d: Deadline) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = deadline_dir()?;
+    let path = dir.join(format!("{name}-{pid}"));
+    let tmp = dir.join(format!(".{name}-{pid}.{}", std::process::id()));
+    fs::write(&tmp, d.render())?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&tmp, &path)
+}
+
+/// The deadline recorded for a box, `None` when it has none (no `--timeout`, or already ended).
+pub fn box_deadline(name: &str, pid: i32) -> Option<Deadline> {
+    let dir = deadline_dir().ok()?;
+    let text = fs::read_to_string(dir.join(format!("{name}-{pid}"))).ok()?;
+    Deadline::parse(&text)
+}
+
+/// Drop a box's deadline sidecar.
+pub fn clear_box_deadline(name: &str, pid: i32) {
+    if let Ok(d) = deadline_dir() {
+        let _ = fs::remove_file(d.join(format!("{name}-{pid}")));
+    }
+}
+
+/// Milliseconds since the Unix epoch, 0 when the clock reads before it.
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// The host directory holding the `/dev/shm` of the box `name` when it was started `--ipc shareable`.
@@ -479,7 +557,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 14] = [
+const AUTHORITATIVE_DIRS: [&str; 15] = [
     "instances",
     "claims",
     "exit",
@@ -508,6 +586,11 @@ const AUTHORITATIVE_DIRS: [&str; 14] = [
     // line is written ONCE, as `stopped`, by whichever of the stop and the owner claims it first. AUTHORITATIVE for `history`'s reason: a box
     // able to place a marker there relabels how a peer's run ended.
     "stopping",
+    // `deadline/` holds when each detached box is stopped and which process stops it. kern reads it
+    // and acts on it for that box: a box able to write a peer's record would end the peer early, keep
+    // it alive past its timeout, or name another process for `update --timeout` to signal (the pid is
+    // only signalled when its start-time matches, but the deadline itself is taken as written).
+    "deadline",
     // `gpu/` remembers which directories of the WSL2 driver store hold the NVIDIA driver, and kern
     // binds what it lists into every `--gpus` box. A box able to write it would choose host
     // directories other boxes get, so it is authoritative; the reader also re-checks every line.
@@ -2817,7 +2900,7 @@ pub fn prune() -> (usize, u64) {
     //
     // `clear_box_env` drops it on the normal exit path, which is the fix at the source; this is the
     // net beneath it, for the box whose supervisor was SIGKILLed and never ran its teardown.
-    for target in [health_dir(), env_dir()] {
+    for target in [health_dir(), env_dir(), deadline_dir()] {
         sweep_orphans(target, sidecar_key, &live, inst, &mut removed, &mut freed);
     }
     // `kern wait` exit sidecars of boxes whose supervisor is gone (dead-pid). Reaped here too, not
@@ -3368,6 +3451,39 @@ pub(crate) fn command_line(argv: &[String]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::Deadline;
+
+    #[test]
+    fn a_deadline_reads_back_as_written_and_refuses_anything_else() {
+        let d = Deadline {
+            at_unix_ms: 1_795_000_000_123,
+            watchdog: 4242,
+            watchdog_start: 98_765,
+        };
+        assert_eq!(Deadline::parse(&d.render()), Some(d));
+        for bad in ["", "1 2", "1 2 3 4", "x 2 3", "1 -x 3"] {
+            assert_eq!(Deadline::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_watchdog_with_an_unreadable_start_time_is_never_called_alive() {
+        let d = Deadline {
+            at_unix_ms: 1,
+            watchdog: std::process::id() as i32,
+            watchdog_start: 0,
+        };
+        assert!(!d.watchdog_alive());
+        let me = Deadline {
+            watchdog_start: super::proc_starttime(std::process::id() as i32),
+            ..d
+        };
+        assert!(me.watchdog_alive());
+    }
 }
 
 #[cfg(test)]
