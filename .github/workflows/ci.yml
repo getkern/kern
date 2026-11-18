@@ -613,7 +613,9 @@ jobs:
     # installer's Darwin branch (driven against a stub `limactl`), and each SDK's error when no
     # binary is on PATH. Those are the doors a Mac user meets, and they were verified only by faking
     # `uname` on a Linux box until this job existed.
-    runs-on: macos-latest
+    # On the Intel label: on 2026-11-18 GitHub assigned no arm64 macOS runner for 15 minutes and
+    # cancelled the job twice; nothing this job checks depends on the CPU.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v5
       - name: the installer's Darwin branch drives Lima as it should, without a VM
