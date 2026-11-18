@@ -356,7 +356,12 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         its own on a bridge stack and every name of that network in its
                         /etc/hosts (`kern pod ls` names the stacks)
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
-    --egress-allow d,d  Restrict outbound to an allowlist of domains via a filtering proxy (foreground-only)
+    --egress-allow d,d  Restrict outbound to an allowlist via a filtering proxy (foreground-only): domains
+                        (and their subdomains), addresses and ranges (`10.1.2.0/24`, which may be
+                        private), or `*` for any public host. HTTP(S) on ports 80 and 443
+    --egress-deny d,d   Domains, addresses and ranges refused even when the allowlist covers them
+                        (deny wins); alone it means `--egress-allow '*'` minus these. Loopback,
+                        link-local (cloud metadata) and multicast are never reachable
     --hostname <name>   Set the box's hostname (default: the box name)
     --tun               Expose /dev/net/tun in the box (WireGuard / userspace VPN)
     --gpus <spec>       Hand the box NVIDIA cards. A bare number

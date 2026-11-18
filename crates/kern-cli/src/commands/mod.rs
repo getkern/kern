@@ -240,6 +240,8 @@ pub struct BoxRunArgs<'a> {
     /// `--egress-allow d1,d2`: outbound network restricted to these domains (+ subdomains) via a
     /// kern-run filtering proxy; empty = the default (no outbound unless `--net`/`--pod`).
     pub egress_allow: &'a [String],
+    /// `--egress-deny`: destinations refused even when `egress_allow` covers them (deny wins).
+    pub egress_deny: &'a [String],
     /// `--landlock-rw <path>` (repeatable): a Landlock (LSM) write-allowlist; the box root is read+exec
     /// and writes are confined to these paths (+ box scratch dirs). Empty = no Landlock. Each path must
     /// EXIST at box start (typically a `-v` volume or a dir the image ships): the box root is read-only

@@ -90,6 +90,215 @@ fn valid_allow_entry(entry: &str) -> bool {
     })
 }
 
+/// An address range in an egress rule: `203.0.113.0/24`, `2001:db8::/32`, or one address (`/32`,
+/// `/128`). An IPv4-mapped IPv6 address is the IPv4 address it maps, so one rule covers both spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpNet {
+    addr: std::net::IpAddr,
+    prefix: u8,
+}
+
+/// `::ffff:a.b.c.d` is `a.b.c.d`: one host, one spelling for every comparison below.
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(a) => a.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+impl IpNet {
+    /// `addr`, `addr/prefix`, or a bracketed IPv6 address. `None` for anything else, including a
+    /// prefix longer than the address.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (a, p) = match s.trim().split_once('/') {
+            Some((a, p)) => (a, Some(p)),
+            None => (s.trim(), None),
+        };
+        let a = a.trim().trim_start_matches('[').trim_end_matches(']');
+        let addr = canonical_ip(a.parse::<std::net::IpAddr>().ok()?);
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = match p {
+            Some(p) => p.trim().parse::<u8>().ok().filter(|n| *n <= max)?,
+            None => max,
+        };
+        Some(Self {
+            addr: Self::masked(addr, prefix),
+            prefix,
+        })
+    }
+
+    fn masked(addr: std::net::IpAddr, prefix: u8) -> std::net::IpAddr {
+        match addr {
+            std::net::IpAddr::V4(a) => {
+                let bits = u32::from(a);
+                let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+                std::net::IpAddr::V4((bits & mask).into())
+            }
+            std::net::IpAddr::V6(a) => {
+                let bits = u128::from(a);
+                let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+                std::net::IpAddr::V6((bits & mask).into())
+            }
+        }
+    }
+
+    /// Is `ip` inside this range? An IPv4 range never contains an IPv6 address and the reverse,
+    /// after the mapped form is folded.
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        let ip = canonical_ip(ip);
+        match (self.addr, ip) {
+            (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_))
+            | (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_)) => {
+                Self::masked(ip, self.prefix) == self.addr
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for IpNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
+/// Addresses no rule opens: loopback, link-local (the cloud metadata service lives there),
+/// multicast, broadcast, unspecified and `0.0.0.0/8`, in either spelling. They are the host's own and
+/// the network's plumbing, never a destination a workload is sent to.
+fn never_reachable(ip: std::net::IpAddr) -> bool {
+    match canonical_ip(ip) {
+        std::net::IpAddr::V4(a) => {
+            a.is_loopback()
+                || a.is_link_local()
+                || a.is_multicast()
+                || a.is_broadcast()
+                || a.is_unspecified()
+                || a.octets()[0] == 0
+        }
+        std::net::IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4() {
+                return never_reachable(std::net::IpAddr::V4(v4));
+            }
+            a.is_loopback()
+                || a.is_multicast()
+                || a.is_unspecified()
+                || (a.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// What a box with `--egress-allow` / `--egress-deny` may reach, decided in ONE place for the name
+/// in a request and for every address that name resolves to.
+///
+/// * A NAME is allowed when no deny domain covers it and an allow domain does (or the allowlist is
+///   `*`). Matching is [`host_allowed`]'s: exact or a subdomain.
+/// * An ADDRESS (a literal in the request, or one the allowed name resolves to) is never one of
+///   [`never_reachable`]'s, and never inside a deny range. An allow range opens it, a private range
+///   included: that is what writing `10.1.2.0/24` asks for. Otherwise a resolved address must be
+///   public, and a LITERAL public address needs `*`.
+/// * Deny wins over allow, everywhere.
+///
+/// With domains alone this is exactly the filter before ranges existed: the name must be listed and
+/// every address it resolves to public.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressPolicy {
+    any_public: bool,
+    allow_domains: Vec<String>,
+    allow_nets: Vec<IpNet>,
+    deny_domains: Vec<String>,
+    deny_nets: Vec<IpNet>,
+}
+
+impl EgressPolicy {
+    /// Read the allow and deny lists, refusing an entry that is none of: a domain, an address, a
+    /// range, `*` (allow only).
+    pub fn parse(allow: &[String], deny: &[String]) -> Result<Self, String> {
+        let mut p = Self::default();
+        for (list, is_allow) in [(allow, true), (deny, false)] {
+            let flag = if is_allow {
+                "--egress-allow"
+            } else {
+                "--egress-deny"
+            };
+            for raw in list {
+                let e = raw.trim();
+                if e.is_empty() {
+                    continue;
+                }
+                if e == "*" {
+                    if !is_allow {
+                        return Err(
+                            "egress: --egress-deny '*' denies everything: run the box without a network instead"
+                                .to_string(),
+                        );
+                    }
+                    p.any_public = true;
+                } else if let Some(net) = IpNet::parse(e) {
+                    if is_allow {
+                        p.allow_nets.push(net);
+                    } else {
+                        p.deny_nets.push(net);
+                    }
+                } else if valid_allow_entry(e) {
+                    let d = e.trim_matches('.').to_ascii_lowercase();
+                    if is_allow {
+                        p.allow_domains.push(d);
+                    } else {
+                        p.deny_domains.push(d);
+                    }
+                } else {
+                    return Err(format!(
+                        "egress: {raw:?} in {flag} is not a domain, an address, a range (CIDR){}",
+                        if is_allow { " or *" } else { "" }
+                    ));
+                }
+            }
+        }
+        Ok(p)
+    }
+
+    /// The canonical lists, comma-separated, as the proxy re-exec takes them.
+    pub fn to_csv(&self) -> (String, String) {
+        let mut allow: Vec<String> = Vec::new();
+        if self.any_public {
+            allow.push("*".to_string());
+        }
+        allow.extend(self.allow_domains.iter().cloned());
+        allow.extend(self.allow_nets.iter().map(ToString::to_string));
+        let mut deny: Vec<String> = self.deny_domains.clone();
+        deny.extend(self.deny_nets.iter().map(ToString::to_string));
+        (allow.join(","), deny.join(","))
+    }
+
+    /// May a request name `host` (a domain, or an address literal)?
+    pub fn name_permitted(&self, host: &str) -> bool {
+        let Some(h) = normalized_host(host) else {
+            return false;
+        };
+        let bare = h.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+            return self.address_permitted(ip, true);
+        }
+        if host_allowed(&h, &self.deny_domains) {
+            return false;
+        }
+        self.any_public || host_allowed(&h, &self.allow_domains)
+    }
+
+    /// May the proxy connect to `ip`? `literal`: the request named the address itself, so a public
+    /// address is not covered by an allowed name and needs `*`.
+    pub fn address_permitted(&self, ip: std::net::IpAddr, literal: bool) -> bool {
+        let ip = canonical_ip(ip);
+        if never_reachable(ip) || self.deny_nets.iter().any(|n| n.contains(ip)) {
+            return false;
+        }
+        if self.allow_nets.iter().any(|n| n.contains(ip)) {
+            return true;
+        }
+        ip_is_public(ip) && (!literal || self.any_public)
+    }
+}
+
 /// Parse the host of a `CONNECT host:port …` request line (the HTTPS proxy verb). Returns the bare host
 /// (no port). `None` if the line is not a well-formed CONNECT. IPv6 literals arrive bracketed
 /// (`[::1]:443`); the brackets are stripped so a bare `[::1]` never accidentally matches a domain entry.
@@ -219,8 +428,17 @@ fn port_allowed(port: u16) -> bool {
 /// compromised or hostile, and we do not negotiate with the record set (an operator who orders the
 /// records `[public, private]`, or flips them on re-resolution, gets nothing rather than the private
 /// one). Closes the SSRF where an allowlisted NAME points at a host-local service.
-fn connect_vetted(host: &str, port: u16) -> std::io::Result<std::net::TcpStream> {
+fn connect_vetted(
+    host: &str,
+    port: u16,
+    policy: &EgressPolicy,
+) -> std::io::Result<std::net::TcpStream> {
     use std::net::ToSocketAddrs;
+    let literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok();
     let addrs: Vec<std::net::SocketAddr> = (host, port).to_socket_addrs()?.collect();
     if addrs.is_empty() {
         return Err(std::io::Error::new(
@@ -228,11 +446,14 @@ fn connect_vetted(host: &str, port: u16) -> std::io::Result<std::net::TcpStream>
             format!("{host} did not resolve"),
         ));
     }
-    if let Some(bad) = addrs.iter().find(|a| !ip_is_public(a.ip())) {
+    if let Some(bad) = addrs
+        .iter()
+        .find(|a| !policy.address_permitted(a.ip(), literal))
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "refusing {host}: resolves to non-public address {}",
+                "refusing {host}: resolves to {}, which the egress rules do not open",
                 bad.ip()
             ),
         ));
@@ -404,17 +625,15 @@ fn helper_pre_exec() -> std::io::Result<()> {
 /// give `getaddrinfo` `EAI_AGAIN`). It is a CLEAN RE-EXEC of kern (`__egress-proxy`), not a raw fork of
 /// this (multi-threaded) process, so glibc's resolver starts fresh. Returns the proxy child and the
 /// UNIX socket path it binds. Pair with [`attach_pump`] once the box's init pid is known.
-pub fn spawn_proxy(allow: &[String]) -> Result<(std::process::Child, std::path::PathBuf), String> {
-    // Validate every allowlist entry BEFORE flattening to the CSV argv (`allow.join(",")`): a domain
-    // containing a comma / space / control char would otherwise split silently in the re-exec, producing
-    // phantom or truncated entries. Reject the whole invocation (fail-closed) rather than filter a
-    // malformed allowlist into a surprising one.
-    for d in allow {
-        let t = d.trim();
-        if !t.is_empty() && !valid_allow_entry(t) {
-            return Err(format!("egress: invalid domain in --egress-allow: {d:?}"));
-        }
-    }
+pub fn spawn_proxy(
+    allow: &[String],
+    deny: &[String],
+) -> Result<(std::process::Child, std::path::PathBuf), String> {
+    // Validate every entry BEFORE flattening to the CSV argv: a domain containing a comma / space /
+    // control char would otherwise split silently in the re-exec, producing phantom or truncated
+    // entries. Reject the whole invocation (fail-closed) rather than filter a malformed list into a
+    // surprising one. The argv carries the CANONICAL lists the policy read back.
+    let (allow_csv, deny_csv) = EgressPolicy::parse(allow, deny)?.to_csv();
     let uid = unsafe { libc::getuid() };
     let sock_path = crate::xdg_var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|| std::path::PathBuf::from(format!("/run/user/{uid}")))
@@ -424,7 +643,8 @@ pub fn spawn_proxy(allow: &[String]) -> Result<(std::process::Child, std::path::
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__egress-proxy")
         .arg(&sock_path)
-        .arg(allow.join(","))
+        .arg(allow_csv)
+        .arg(deny_csv)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     unsafe { cmd.pre_exec(helper_pre_exec) };
@@ -459,8 +679,8 @@ pub fn spawn_proxy(allow: &[String]) -> Result<(std::process::Child, std::path::
 /// re-exec, so a CLOEXEC pipe fd would not survive its `execve`; the read end is therefore left
 /// non-CLOEXEC and box_run closes its own copy right after the spawn so the box (forked later) can never
 /// inherit it.
-pub fn spawn(allow: &[String], box_port: u16) -> Result<EgressPending, String> {
-    let (proxy, sock_path) = spawn_proxy(allow)?;
+pub fn spawn(allow: &[String], deny: &[String], box_port: u16) -> Result<EgressPending, String> {
+    let (proxy, sock_path) = spawn_proxy(allow, deny)?;
 
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), 0) } != 0 {
@@ -583,7 +803,7 @@ pub fn pump_reexec(read_fd: i32, box_port: u16, sock_path: &str, ready_fd: i32) 
 
 /// Entry point for the re-exec'd filtering proxy (`kern __egress-proxy <sock_path> <allow-csv>`). Binds
 /// the UNIX socket and runs the proxy loop with a fresh libc (so `getaddrinfo` works). Never returns.
-pub fn proxy_reexec(sock_path: &str, allow_csv: &str) -> ! {
+pub fn proxy_reexec(sock_path: &str, allow_csv: &str, deny_csv: &str) -> ! {
     drop_signals();
     let _ = std::fs::remove_file(sock_path);
     let listener = match UnixListener::bind(sock_path) {
@@ -600,13 +820,24 @@ pub fn proxy_reexec(sock_path: &str, allow_csv: &str) -> ! {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600));
     }
-    let allow: Vec<String> = allow_csv
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect();
-    proxy_main(listener, allow);
+    let list = |csv: &str| -> Vec<String> {
+        csv.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    // FAIL CLOSED: lists the launcher validated cannot fail here, and a list that does is not
+    // filtered into something looser - the proxy refuses to start and the box has no way out.
+    let policy = match EgressPolicy::parse(&list(allow_csv), &list(deny_csv)) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kern: egress proxy: {e}");
+            let _ = std::fs::remove_file(sock_path);
+            unsafe { libc::_exit(1) };
+        }
+    };
+    proxy_main(listener, policy);
 }
 
 fn drop_signals() {
@@ -615,22 +846,21 @@ fn drop_signals() {
 
 /// The filtering proxy: accept a UNIX connection (relayed from the box by the pump), read the request
 /// head, decide via `host_allowed`, and either dial the target and pump bytes, or refuse.
-fn proxy_main(listener: UnixListener, allow: Vec<String>) -> ! {
+fn proxy_main(listener: UnixListener, policy: EgressPolicy) -> ! {
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
-        let allow = allow.clone();
         // one child per connection (cheap; keeps a slow/hostile client from blocking others)
         let c = unsafe { libc::fork() };
         if c == 0 {
             drop_signals();
-            handle_client(stream, &allow);
+            handle_client(stream, &policy);
             unsafe { libc::_exit(0) };
         }
     }
     unsafe { libc::_exit(0) }
 }
 
-fn handle_client(mut client: UnixStream, allow: &[String]) {
+fn handle_client(mut client: UnixStream, policy: &EgressPolicy) {
     // Read the request head (up to the blank line), bounded on BOTH size and time so a client that
     // connects and then dribbles (or goes silent) can't pin this per-connection proxy child: the 16 KiB
     // cap stops unbounded buffering, the per-read timeout kills a silent peer, and the wall-clock deadline
@@ -680,11 +910,11 @@ fn handle_client(mut client: UnixStream, allow: &[String]) {
             return;
         };
         let port = connect_port(request_line).unwrap_or(443);
-        if !host_allowed(&host, allow) || !port_allowed(port) {
+        if !policy.name_permitted(&host) || !port_allowed(port) {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
         }
-        let upstream = match connect_vetted(&host, port) {
+        let upstream = match connect_vetted(&host, port, policy) {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("kern: egress proxy: CONNECT upstream {host}:{port} refused/failed: {e}");
@@ -706,7 +936,7 @@ fn handle_client(mut client: UnixStream, allow: &[String]) {
         // to 80, so `http://allowed.com:22/` silently dialed 80; now the vetted port equals the dialed
         // port and a non-80/443 target is refused, not silently redirected.
         let port = http_target_port(request_line);
-        if !host_allowed(&host, allow) || !port_allowed(port) {
+        if !policy.name_permitted(&host) || !port_allowed(port) {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
         }
@@ -720,7 +950,7 @@ fn handle_client(mut client: UnixStream, allow: &[String]) {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
         }
-        let mut upstream = match connect_vetted(&host, port) {
+        let mut upstream = match connect_vetted(&host, port, policy) {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("kern: egress proxy: HTTP upstream {host}:{port} refused/failed: {e}");
@@ -996,6 +1226,126 @@ impl TryCloneStream for UnixStream {
     }
     fn set_read_idle_timeout(&self) {
         let _ = self.set_read_timeout(Some(std::time::Duration::from_secs(RELAY_IDLE_SECS)));
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::{EgressPolicy, IpNet};
+
+    fn p(allow: &[&str], deny: &[&str]) -> EgressPolicy {
+        let v = |l: &[&str]| l.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        match EgressPolicy::parse(&v(allow), &v(deny)) {
+            Ok(p) => p,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        match s.parse() {
+            Ok(a) => a,
+            Err(e) => panic!("{s}: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_range_contains_what_its_prefix_says_in_both_spellings() {
+        let Some(n) = IpNet::parse("10.1.2.0/24") else {
+            panic!("parse")
+        };
+        assert!(n.contains(ip("10.1.2.200")));
+        assert!(n.contains(ip("::ffff:10.1.2.7")));
+        assert!(!n.contains(ip("10.1.3.1")));
+        assert_eq!(
+            IpNet::parse("10.1.2.9/24")
+                .map(|n| n.to_string())
+                .as_deref(),
+            Some("10.1.2.0/24")
+        );
+        assert_eq!(
+            IpNet::parse("2001:db8::1")
+                .map(|n| n.to_string())
+                .as_deref(),
+            Some("2001:db8::1/128")
+        );
+        assert!(IpNet::parse("[2001:db8::]/32").is_some_and(|n| n.contains(ip("2001:db8:ffff::1"))));
+        for bad in ["10.0.0.0/33", "::/129", "pypi.org", "10.0.0.0/x", ""] {
+            assert!(IpNet::parse(bad).is_none(), "{bad}");
+        }
+        assert!(IpNet::parse("0.0.0.0/0").is_some_and(|n| n.contains(ip("8.8.8.8"))));
+    }
+
+    #[test]
+    fn domains_alone_behave_as_the_allowlist_always_did() {
+        let pol = p(&["pypi.org"], &[]);
+        assert!(pol.name_permitted("files.pypi.org"));
+        assert!(!pol.name_permitted("evilpypi.org"));
+        assert!(
+            !pol.name_permitted("93.184.216.34"),
+            "a literal needs a range or *"
+        );
+        assert!(pol.address_permitted(ip("151.101.0.223"), false));
+        assert!(
+            !pol.address_permitted(ip("10.0.0.1"), false),
+            "a name resolving private stays refused"
+        );
+    }
+
+    #[test]
+    fn deny_wins_over_allow_for_names_and_addresses() {
+        let pol = p(&["*"], &["example.com", "203.0.113.0/24"]);
+        assert!(pol.name_permitted("github.com"));
+        assert!(!pol.name_permitted("example.com"));
+        assert!(!pol.name_permitted("www.example.com"));
+        assert!(pol.name_permitted("8.8.8.8"), "* opens a public literal");
+        assert!(!pol.name_permitted("203.0.113.5"));
+        assert!(
+            !pol.address_permitted(ip("203.0.113.5"), false),
+            "a name resolving into a denied range"
+        );
+        let both = p(&["203.0.113.0/24"], &["203.0.113.5"]);
+        assert!(both.name_permitted("203.0.113.6"));
+        assert!(!both.name_permitted("203.0.113.5"));
+    }
+
+    #[test]
+    fn a_written_range_opens_a_private_network_and_nothing_opens_the_host() {
+        let pol = p(&["10.1.2.0/24", "registry.internal"], &[]);
+        assert!(pol.name_permitted("10.1.2.3"));
+        assert!(
+            pol.address_permitted(ip("10.1.2.3"), false),
+            "an allowed name may resolve into it"
+        );
+        assert!(!pol.name_permitted("10.1.3.3"));
+        let all = p(&["*", "0.0.0.0/0", "::/0"], &[]);
+        for never in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "224.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "0.1.2.3",
+        ] {
+            assert!(!all.name_permitted(never), "{never}");
+            assert!(!all.address_permitted(ip(never), false), "{never}");
+        }
+    }
+
+    #[test]
+    fn a_list_that_is_not_one_is_refused_and_a_valid_one_round_trips() {
+        let v = |l: &[&str]| l.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(EgressPolicy::parse(&v(&["a b.com"]), &[]).is_err());
+        assert!(EgressPolicy::parse(&[], &v(&["*"])).is_err());
+        assert!(EgressPolicy::parse(&v(&["x,y"]), &[]).is_err());
+        let pol = p(&["*", "PyPI.org.", "10.0.0.9"], &["bad.io", "10.9.0.0/16"]);
+        let (a, d) = pol.to_csv();
+        assert_eq!(a, "*,pypi.org,10.0.0.9/32");
+        assert_eq!(d, "bad.io,10.9.0.0/16");
+        let split = |c: &str| c.split(',').map(String::from).collect::<Vec<_>>();
+        assert_eq!(EgressPolicy::parse(&split(&a), &split(&d)).ok(), Some(pol));
     }
 }
 

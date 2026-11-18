@@ -19,6 +19,28 @@ to the listed domains** (and their subdomains). An agent can `pip install` from 
 to an arbitrary host. Without the flag the box's default is unchanged: **no outbound at all** (an isolated
 loopback-only netns). `--egress-allow` is strictly *more* open than the default, never less.
 
+## Addresses, ranges, `*` and `--egress-deny`
+
+`--egress-allow` takes more than domains:
+
+- an **address** or a **range**, `203.0.113.7` or `10.1.2.0/24` (IPv6 too, `2001:db8::/32`). A range
+  written here may be **private**: `--egress-allow registry.internal,10.1.2.0/24` lets the box reach an
+  internal registry by name, since the name may then resolve into that range;
+- `*`, any **public** host, by name or by address.
+
+`--egress-deny` takes domains, addresses and ranges that are refused **even when the allowlist covers
+them**: deny wins, for the name in the request and for every address that name resolves to (one
+resolved address inside a denied range refuses the whole name). Given alone, it means
+`--egress-allow '*'` minus these:
+
+```
+kern box … --egress-deny github.com,203.0.113.0/24 --image python:3.12-slim -- …
+```
+
+Some addresses no rule opens, `0.0.0.0/0` included: loopback, link-local (the cloud metadata service,
+`169.254.169.254`), multicast, broadcast and unspecified. A list kern cannot read is refused before the
+box starts (`--egress-deny '*'` too: that is a box without a network).
+
 ## The client inside the box has to speak proxy
 
 kern hands the box the allowlist as a **forward proxy** and exports `http_proxy`, `https_proxy` and
@@ -57,14 +79,16 @@ image, or any of the runtimes above, and the same box reaches the allowlisted ho
    egress more restrictive, never open it.
 3. **The proxy allowlists by the host the client names**: the `CONNECT host:port` target for HTTPS, or
    the request's `Host` / absolute-URI for plain HTTP. A host that is not the allowlist (or a subdomain of
-   an entry) is refused with `403`, and no connection is dialed. An **IP-literal** target (`CONNECT
-   1.2.3.4:443`) never matches a domain entry, so it is refused too.
+   an entry), or that `--egress-deny` names, is refused with `403`, and no connection is dialed. An
+   **IP-literal** target (`CONNECT 1.2.3.4:443`) never matches a domain entry: it passes only inside an
+   allowed range, or as a public address under `*`, and never inside a denied range.
 4. **The proxy pins the dialed host to what it allowed.** It resolves and connects to the *allowlisted*
    name itself; the client cannot ask it to connect to one host and stream to another. It connects only
-   to a **public unicast** resolved address (loopback / link-local / `169.254.169.254` / RFC-1918 / ULA /
-   multicast are refused), which closes the SSRF where an allowlisted name resolves to a host-local
-   service, and it tunnels **only ports 80 and 443**, so an allowlisted host's `:22` or `:6379` is not
-   reachable.
+   to a **public unicast** resolved address, or one inside a range the allowlist names (loopback /
+   link-local / `169.254.169.254` / multicast never; RFC-1918 / ULA only when a written range covers
+   them; nothing inside a denied range), which closes the SSRF where an allowlisted name resolves to a
+   host-local service, and it tunnels **only ports 80 and 443**, so an allowlisted host's `:22` or
+   `:6379` is not reachable.
 
 Because the box has no route except the proxy (point 1), a workload that simply ignores `HTTP_PROXY` and
 tries to open a raw socket to `evil.com:443` gets `ENETUNREACH`: there is nowhere for the packet to go.

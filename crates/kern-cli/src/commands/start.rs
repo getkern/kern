@@ -599,6 +599,11 @@ fn point_the_box_at_the_egress_proxy(
     if args.egress_allow.is_empty() {
         return Ok(());
     }
+    // A LIST THAT IS NOT ONE IS REFUSED HERE, before anything starts. The filter used to fail to
+    // spawn later and the box ran with no outbound at all after a warning: a typo became a box that
+    // was silently offline.
+    crate::egress::EgressPolicy::parse(args.egress_allow, args.egress_deny)
+        .map_err(Error::Sandbox)?;
     if args.detached {
         return Err(Error::Sandbox(
             "--egress-allow is foreground-only for now (the filter's lifetime is tied to the box); \
@@ -614,9 +619,11 @@ fn point_the_box_at_the_egress_proxy(
         ));
     }
     eprintln!(
-        "kern: note: --egress-allow gives the box outbound to the listed domains only (over an HTTP \
-         CONNECT/forward proxy; the box's isolated netns has no other route). It resolves and pins the \
-         dialed host, refuses non-public resolved IPs (SSRF), and tunnels only ports 80/443. The one \
+        "kern: note: --egress-allow gives the box outbound to the listed domains, addresses and ranges \
+         only, minus --egress-deny (over an HTTP CONNECT/forward proxy; the box's isolated netns has no \
+         other route). It resolves and pins the dialed host, refuses a resolved address the rules do \
+         not open (non-public ones unless a range names them; loopback, link-local and cloud metadata \
+         never), and tunnels only ports 80/443. The one \
          hole it can't close, and it is HTTPS-only: any allowed domain hosted on a SHARED CDN reaches \
          every other tenant of that CDN, because the site is chosen by the HTTP Host header INSIDE the \
          TLS session, which a non-intercepting proxy cannot read - a matching SNI does not change that. \
@@ -3044,7 +3051,15 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             workdir: spec.workdir.clone().unwrap_or_default(),
             run_as: spec.run_as,
             extra_gids: spec.extra_gids.clone(),
-            egress: args.egress_allow.join(","),
+            egress: if args.egress_deny.is_empty() {
+                args.egress_allow.join(",")
+            } else {
+                format!(
+                    "{} deny {}",
+                    args.egress_allow.join(","),
+                    args.egress_deny.join(",")
+                )
+            },
             bridges: registry::encode_bridges(&spec.pod_bridges),
             log_driver: if log_cap.keep {
                 String::new()
@@ -3135,7 +3150,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // failure the box simply has no outbound.
     let mut egress_pending: Option<crate::egress::EgressPending> = None;
     if !args.egress_allow.is_empty() {
-        match crate::egress::spawn(args.egress_allow, EGRESS_PROXY_PORT) {
+        match crate::egress::spawn(args.egress_allow, args.egress_deny, EGRESS_PROXY_PORT) {
             Ok(p) => egress_pending = Some(p),
             Err(e) => eprintln!(
                 "kern: warning: egress filter failed to start ({e}); the box has NO outbound"

@@ -85,6 +85,9 @@ pub enum Command {
         env: Vec<String>,
         /// `--egress-allow d1,d2` (repeatable / comma-separated): outbound restricted to these domains.
         egress_allow: Vec<String>,
+        /// `--egress-deny d,cidr` (repeatable / comma-separated): destinations refused even when the
+        /// allowlist covers them. Alone, it implies `--egress-allow '*'`.
+        egress_deny: Vec<String>,
         /// `--landlock-rw <path>` (repeatable): a Landlock write-allowlist (box RO except these paths).
         landlock_rw: Vec<String>,
         /// `--pod-bridge <ip>/<prefix>[@<n>]` (repeatable): join the pod through its bridge number
@@ -473,6 +476,7 @@ pub enum Command {
     EgressProxy {
         sock: String,
         allow: String,
+        deny: String,
     },
     /// Hidden: a build step's SSH agent proxy (spawned by `RUN --mount=type=ssh`).
     BuildSshProxy {
@@ -1248,6 +1252,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("__egress-proxy") => Command::EgressProxy {
             sock: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
             allow: rest.get(2).map(|s| s.to_string()).unwrap_or_default(),
+            // Absent from an older launcher: no deny list, the filter it asked for.
+            deny: rest.get(3).map(|s| s.to_string()).unwrap_or_default(),
         },
         Some("__egress-pump") => Command::EgressPump {
             read_fd: rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(-1),
@@ -3602,6 +3608,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--dns-option",
     "--dns-search",
     "--egress-allow",
+    "--egress-deny",
     "--entrypoint",
     "--env",
     "--env-file",
@@ -3862,6 +3869,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut mounts: Vec<(String, String, bool)> = Vec::new();
     let mut env: Vec<String> = Vec::new();
     let mut egress_allow: Vec<String> = Vec::new();
+    let mut egress_deny: Vec<String> = Vec::new();
     let mut landlock_rw: Vec<String> = Vec::new();
     let mut net_ips: Vec<std::net::Ipv4Addr> = Vec::new();
     let mut apparmor: Option<String> = None;
@@ -4619,6 +4627,22 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         );
                     }
                 }
+                "--egress-deny" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => egress_deny.extend(
+                            v.split(',')
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(String::from),
+                        ),
+                        None => {
+                            return Err(Error::Usage(
+                                "--egress-deny <domain|address|cidr>[,...] (e.g. --egress-deny 10.0.0.0/8)",
+                            ))
+                        }
+                    }
+                }
                 // `--ip <addr>`: an extra address this box's loopback answers on. REFUSED AT THE
                 // BOUNDARY rather than carried as a string, so a value that is not an IPv4 literal
                 // cannot reach a box and fail there with nothing to point at. Repeatable: a service
@@ -5080,6 +5104,11 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             device: device.clone(),
         }
     } else {
+        // A DENY LIST ALONE MEANS "EVERYTHING PUBLIC BUT THESE": the filter is the one
+        // `--egress-allow '*'` starts, so every check that asks "is egress filtered" agrees.
+        if !egress_deny.is_empty() && egress_allow.is_empty() {
+            egress_allow.push("*".to_string());
+        }
         Command::BoxRun {
             rm,
             // The name is optional (Docker-style): omit it and kern assigns `box-<pid>`, so a quick
@@ -5098,6 +5127,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             mounts,
             env,
             egress_allow,
+            egress_deny,
             landlock_rw,
             net_ips,
             pod_bridges,
@@ -5239,6 +5269,7 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     "--gpus",
     "--device",
     "--egress-allow",
+    "--egress-deny",
     // `--landlock-rw` is deliberately NOT here: it is the one confinement that needs no mount
     // namespace, so it is the one `box` flag that `run` can honour for real. See `parse_run`.
 ];
@@ -6249,6 +6280,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             mounts,
             env,
             egress_allow,
+            egress_deny,
             landlock_rw,
             net_ips,
             pod_bridges,
@@ -6355,6 +6387,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 mounts: &mounts,
                 env: &env,
                 egress_allow: &egress_allow,
+                egress_deny: &egress_deny,
                 landlock_rw: &landlock_rw,
                 net_ips: &net_ips,
                 pod_bridges: pod_bridges.clone(),
@@ -6561,7 +6594,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         // A hidden verb whose exit status IS its answer, and which has already cleaned up after itself.
         Command::PastaProbe => std::process::exit(crate::pod::pasta_probe_verb()),
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
-        Command::EgressProxy { sock, allow } => crate::egress::proxy_reexec(&sock, &allow),
+        Command::EgressProxy { sock, allow, deny } => {
+            crate::egress::proxy_reexec(&sock, &allow, &deny)
+        }
         Command::BuildSshProxy { listen, upstream } => {
             commands::ssh_agent_proxy(&listen, &upstream)
         }

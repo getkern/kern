@@ -21,6 +21,11 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**`--egress-deny` and ranges in `--egress-allow`.** The allowlist takes addresses and ranges
+(`10.1.2.0/24`, private ones included), and `*` for any public host; `--egress-deny` refuses domains,
+addresses and ranges even when the allowlist covers them, and alone means `*` minus these. A list
+kern cannot read is refused before the box starts.
+
 **kern sandbox: labels, `Sandbox.list()`, `get_metrics()`, `set_timeout()`, `watch_dir()`.** `labels={...}`
 goes on every box a sandbox starts and `Sandbox.list(labels=...)` finds the running ones;
 `get_metrics()` (also on a `Kernel`) reads CPU, memory, tasks, workspace disk and the deadline;
