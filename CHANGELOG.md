@@ -19,6 +19,10 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
+## kern-sandbox 0.2.51 - 2026-11-18
+
+**It carries the kern v0.51.1 binary.** Both bindings move together; nothing else in them changed.
+
 ## v0.51.1 - 2026-11-17
 
 **`kern stop <name>` no longer stops a box of another runtime directory.** A box whose record is
