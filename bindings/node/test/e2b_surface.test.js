@@ -7,6 +7,7 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
+const { spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -19,7 +20,16 @@ const kern = require("../index.js");
 const { Sandbox, SandboxError } = kern;
 
 const KERN = kernBin();
-const integration = { skip: !KERN && "no runnable kern (set KERN_BIN)" };
+// A kern from before these features (the pre-push gate keeps PATH, where an installed release may be)
+// is skipped by name rather than failed: `__watch-dir` arrived with the rest of them.
+const KERN_TOO_OLD =
+  KERN &&
+  /unknown command/.test(
+    String(spawnSync(KERN, ["__watch-dir", "/", "kern-probe-none", "0"], { encoding: "utf8" }).stderr),
+  );
+const integration = {
+  skip: (!KERN && "no runnable kern (set KERN_BIN)") || (KERN_TOO_OLD && `${KERN} predates __watch-dir (set KERN_BIN)`),
+};
 
 /** A Sandbox built against the fake kern, the real `$KERN_BIN` put back afterwards. */
 function cfg(opts = {}) {
