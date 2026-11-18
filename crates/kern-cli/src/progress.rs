@@ -559,7 +559,7 @@ fn draw_loop(title: &str, err_rd: i32, ev_rd: i32, ack_wr: i32, out: i32) {
         }
         pending.extend_from_slice(&buf[..got as usize]);
     }
-    above.extend(pending.drain(..));
+    above.append(&mut pending);
     if !above.is_empty() && above.last() != Some(&b'\n') {
         above.push(b'\n');
     }
