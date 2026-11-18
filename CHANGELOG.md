@@ -32,6 +32,9 @@ resident box and every `kernel()` publish the listed ports on this host's loopba
 `get_host(port)` answers the address. `start_cmd` runs in the background of the resident box and
 `ready_cmd` is waited for (`ready_timeout_s`) every time the box is created or adopted.
 
+**kern sandbox: `pty()`**, an interactive terminal: `on_data` receives the output, `send_input`,
+`resize`, `wait`, `kill`; in the resident box of a `persist` sandbox, else in a box of its own.
+
 **kern sandbox: labels, `Sandbox.list()`, `get_metrics()`, `set_timeout()`, `watch_dir()`.** `labels={...}`
 goes on every box a sandbox starts and `Sandbox.list(labels=...)` finds the running ones;
 `get_metrics()` (also on a `Kernel`) reads CPU, memory, tasks, workspace disk and the deadline;

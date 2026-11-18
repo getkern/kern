@@ -73,6 +73,7 @@ __all__ = [
     "SandboxError",
     "MountRefused",
     "SandboxInfo",
+    "Pty",
     "SandboxMetrics",
     "WatchEvent",
     "DirWatch",
@@ -4183,6 +4184,125 @@ def _host_of(kern: str, box: str, port: int, published: "Sequence[int] | None") 
     )
 
 
+class Pty:
+    """An interactive terminal in a sandbox, from :meth:`Sandbox.pty`. Output arrives as raw bytes
+    (escape sequences included) to ``on_data``, from one background thread, in order; ``send_input``
+    is the keyboard (``b"\\x03"`` is Ctrl-C), ``resize`` the window. ``wait`` returns the exit code;
+    leaving the ``with`` block or ``kill`` ends it.
+
+    THE TERMINAL IS A REAL ONE ON BOTH SIDES. This process holds a pseudo-terminal pair and hands kern
+    its slave as ``kern box -it``/``kern exec -it`` would get a terminal, and kern gives the box a pty
+    of its own. A resize sets this pair's size and sends kern ``SIGWINCH``, which kern copies into the
+    box: the same path a terminal emulator's resize takes."""
+
+    def __init__(self, argv: "list[str]", env: "dict[str, str]", cols: int, rows: int,
+                 on_data: "Callable[[bytes], None]") -> None:
+        import fcntl
+        import pty as _pty
+        import termios
+
+        self._fcntl, self._termios = fcntl, termios
+        self._on_data = on_data
+        master, slave = _pty.openpty()
+        try:
+            self._set_size(slave, cols, rows)
+            self._proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
+                argv, stdin=slave, stdout=slave, stderr=slave, env=env,
+                start_new_session=True, close_fds=True,
+            )
+        except BaseException:
+            os.close(master)
+            os.close(slave)
+            raise
+        os.close(slave)
+        self._master = master
+        self._lock = threading.Lock()
+        self._reader = threading.Thread(target=self._pump, name="kern-sandbox-pty", daemon=True)
+        self._reader.start()
+
+    def __enter__(self) -> "Pty":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.kill()
+
+    def _set_size(self, fd: int, cols: int, rows: int) -> None:
+        for v, what in ((cols, "cols"), (rows, "rows")):
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 1000:
+                raise SandboxError(f"pty: {what} must be a whole number from 1 to 1000, got {v!r}")
+        self._fcntl.ioctl(fd, self._termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def _pump(self) -> None:
+        while True:
+            try:
+                chunk = os.read(self._master, 65536)
+            except OSError:
+                return  # EIO: every holder of the slave is gone
+            if not chunk:
+                return
+            try:
+                self._on_data(chunk)
+            except Exception as e:  # noqa: BLE001 - a callback's error must not stop the output
+                warnings.warn(f"pty: on_data raised {type(e).__name__}: {e}", stacklevel=1)
+
+    def send_input(self, data: "bytes | str") -> None:
+        """Type ``data`` into the terminal (a ``str`` is sent as UTF-8)."""
+        raw = data.encode() if isinstance(data, str) else bytes(data)
+        with self._lock:
+            if self._master < 0:
+                raise SandboxError("pty: the terminal is closed")
+            view = memoryview(raw)
+            while view:
+                n = os.write(self._master, view)
+                view = view[n:]
+
+    def resize(self, cols: int, rows: int) -> None:
+        """Set the terminal's size; the program in the box sees it (``SIGWINCH``, ``stty size``)."""
+        with self._lock:
+            if self._master < 0:
+                raise SandboxError("pty: the terminal is closed")
+            self._set_size(self._master, cols, rows)
+        if self._proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(self._proc.pid, signal.SIGWINCH)
+
+    @property
+    def exit_code(self) -> "int | None":
+        """The exit code once the program ended, ``None`` while it runs."""
+        return self._proc.poll()
+
+    def wait(self, timeout_s: "float | None" = None) -> int:
+        """Wait for the program to end and return its exit code (``SandboxError`` on timeout)."""
+        try:
+            rc = self._proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired as e:
+            raise SandboxError(f"pty: still running after {timeout_s} s") from e
+        self._reader.join(timeout=2)
+        self._close()
+        return rc
+
+    def kill(self) -> None:
+        """End the terminal's program (and the box of a one-shot sandbox). Idempotent."""
+        if self._proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    self._proc.kill()
+                self._proc.wait()
+        self._reader.join(timeout=2)
+        self._close()
+
+    def _close(self) -> None:
+        with self._lock:
+            if self._master >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(self._master)
+                self._master = -1
+
+
 @dataclass(frozen=True)
 class WatchEvent:
     """One change in a watched workspace directory.
@@ -5414,6 +5534,49 @@ class Sandbox:
             raise SandboxError("watch_dir needs on_event, a callable taking a WatchEvent")
         rel = os.path.relpath(self._ws_path(path), self._ws) if path else ""
         return DirWatch(self, "" if rel == "." else rel.replace(os.sep, "/"), on_event, recursive)
+
+    def pty(
+        self,
+        command: "Sequence[str] | None" = None,
+        *,
+        on_data: "Callable[[bytes], None]",
+        cols: int = 80,
+        rows: int = 24,
+        timeout_s: "int | None" = None,
+    ) -> Pty:
+        """An interactive terminal running ``command`` (default: ``bash`` when the image has it,
+        else ``sh``). A ``persist=True`` sandbox opens it in the resident box (``kern exec -it``), a
+        one-shot sandbox in a fresh box of its own (``kern box -it``) with the session's posture, and
+        that box is bounded by ``timeout_s`` (default: the sandbox's)."""
+        self._require_entered()
+        if on_data is None or not callable(on_data):
+            raise SandboxError("pty needs on_data, a callable taking bytes")
+        if command is None:
+            cmd = ["sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash -i || exec sh -i"]
+        else:
+            if isinstance(command, (str, bytes)) or not all(isinstance(c, str) for c in command):
+                raise SandboxError('pty: command is an argv list, e.g. ["python3"]')
+            cmd = list(command)
+            if not cmd:
+                raise SandboxError("pty: command is empty")
+        child_env = dict(os.environ)
+        if not self.enforce_limits:
+            child_env["KERN_NO_SCOPE"] = "1"
+        child_env.setdefault("TERM", "xterm-256color")
+        if self.persist:
+            box = self._resident_ensure()
+            argv = [self._kern, "exec", box, "-it", "-w", _WORKSPACE]
+            if self._as_user is not None:
+                argv += ["-u", self._as_user]
+            argv += ["--"] + cmd
+        else:
+            limit = int(timeout_s) if timeout_s is not None else int(self.timeout_s)
+            if limit <= 0:
+                raise SandboxError("pty: timeout_s must be positive")
+            argv = self._base_argv(
+                _unique_name(), network=self.network, timeout_s=limit
+            ) + ["-it", "--"] + cmd
+        return Pty(argv, child_env, cols, rows, on_data)
 
     def destroy(self) -> None:
         """Stop the resident box. The ONLY way a `persist=True` sandbox goes away before its TTL.

@@ -347,3 +347,74 @@ def test_a_kernel_publishes_its_ports():
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(0.2)
+
+
+# ------------------------------------------------------------------------------------------------ pty
+
+
+def _drive_pty(sb: Sandbox) -> "tuple[int, str]":
+    buf = bytearray()
+    lock = threading.Lock()
+
+    def on(b: bytes) -> None:
+        with lock:
+            buf.extend(b)
+
+    def wait_for(text: str, within: float = 10.0) -> None:
+        end = time.monotonic() + within
+        while time.monotonic() < end:
+            with lock:
+                if text in bytes(buf).decode(errors="replace"):
+                    return
+            time.sleep(0.05)
+        raise AssertionError(f"{text!r} never appeared: {bytes(buf)!r}")
+
+    with sb.pty(on_data=on, cols=100, rows=30) as t:
+        t.send_input("stty size; echo mark-$((6*7))\n")
+        wait_for("mark-42")
+        t.resize(120, 40)
+        time.sleep(0.2)
+        t.send_input("stty size; echo after-resize\n")
+        wait_for("after-resize")
+        t.send_input("sleep 30\n")
+        time.sleep(0.5)
+        t.send_input(b"\x03")
+        t.send_input("exit 5\n")
+        rc = t.wait(timeout_s=15)
+    with lock:
+        return rc, bytes(buf).decode(errors="replace").replace("\r", "")
+
+
+@integration
+def test_a_pty_in_a_one_shot_sandbox_sizes_resizes_interrupts_and_exits():
+    with Sandbox() as sb:
+        rc, screen = _drive_pty(sb)
+    assert rc == 5, screen
+    assert "30 100" in screen and "40 120" in screen, screen
+
+
+@integration
+def test_a_pty_in_a_persist_sandbox_runs_in_the_resident_box(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir(mode=0o700)
+    sb = Sandbox(persist=True, name=f"pty{uuid.uuid4().hex[:8]}", workspace=str(ws))
+    with sb:
+        try:
+            sb.run_code("open('/tmp/resident-mark','w').write('x')")
+            rc, screen = _drive_pty(sb)
+            assert rc == 5, screen
+            got = bytearray()
+            with sb.pty(["sh", "-c", "cat /tmp/resident-mark; echo; echo done"], on_data=got.extend) as t:
+                assert t.wait(timeout_s=15) == 0
+            assert b"x" in got and b"done" in got, got
+        finally:
+            sb.destroy()
+
+
+def test_pty_arguments_are_checked():
+    s = _cfg()
+    s._entered = True
+    with pytest.raises(SandboxError, match="on_data"):
+        s.pty(on_data=None)
+    with pytest.raises(SandboxError, match="argv list"):
+        s.pty("bash", on_data=print)
