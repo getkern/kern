@@ -26,6 +26,9 @@ both halves of that rule, so removing one from the parser fails the build by nam
 **`kern self-update` tells a failed download from an unsigned release**: a network that does not answer
 is named as such, not as a missing signature.
 
+**`kern self-update` works in kern's WSL distro**: the new binary is checked as root there, and a host
+name that does not resolve is tried again over IPv4.
+
 ## kern sandbox 0.2.53 - 2026-11-18
 
 **It carries the kern v0.51.3 binary.** Both bindings move together; nothing else in them changed.

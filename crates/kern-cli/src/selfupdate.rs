@@ -384,6 +384,9 @@ enum Fetched {
 /// that is not there (37).
 const CURL_MISSING: [i32; 2] = [22, 37];
 
+/// curl's exit for "could not resolve host".
+const CURL_RESOLVE: i32 = 6;
+
 fn fetch_as(url: &str, out: &Path, cap: u64, max_seconds: &str) -> Result<(), Fetched> {
     let local = cfg!(debug_assertions) && url.starts_with("file://");
     if !local && !url.starts_with("https://") {
@@ -393,32 +396,44 @@ fn fetch_as(url: &str, out: &Path, cap: u64, max_seconds: &str) -> Result<(), Fe
     }
     let proto = if local { "=file" } else { "=https" };
     let cap_arg = cap.to_string();
-    let mut cmd = Command::new("curl");
-    cmd.args(["--no-progress-meter", "-S", "-L", "--fail"])
-        .args(["--proto", proto, "--proto-redir", proto])
-        .args(["--max-redirs", "10", "--connect-timeout", "10"])
-        .args(["--max-time", max_seconds, "--max-filesize", &cap_arg])
-        .args(["--speed-limit", "1024", "--speed-time", "30"]);
-    if !local {
-        cmd.arg("--tlsv1.2");
-    }
-    let done = cmd
-        .arg("-o")
-        .arg(out)
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| {
-            Fetched::Failed(if e.kind() == std::io::ErrorKind::NotFound {
-                Error::SelfUpdate(
-                    "self-update downloads with curl, and curl is not installed".into(),
-                )
-            } else {
-                Error::SelfUpdate(format!("cannot run curl: {e}"))
+    let run = |ipv4: bool| {
+        let mut cmd = Command::new("curl");
+        cmd.args(["--no-progress-meter", "-S", "-L", "--fail"])
+            .args(["--proto", proto, "--proto-redir", proto])
+            .args(["--max-redirs", "10", "--connect-timeout", "10"])
+            .args(["--max-time", max_seconds, "--max-filesize", &cap_arg])
+            .args(["--speed-limit", "1024", "--speed-time", "30"]);
+        if !local {
+            cmd.arg("--tlsv1.2");
+        }
+        if ipv4 {
+            cmd.arg("--ipv4");
+        }
+        cmd.arg("-o")
+            .arg(out)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| {
+                Fetched::Failed(if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::SelfUpdate(
+                        "self-update downloads with curl, and curl is not installed".into(),
+                    )
+                } else {
+                    Error::SelfUpdate(format!("cannot run curl: {e}"))
+                })
             })
-        })?;
+    };
+    let mut done = run(false)?;
+    // A NAME THAT DOES NOT RESOLVE (curl 6) IS TRIED AGAIN OVER IPv4. MEASURED 2026-11-18 in kern's
+    // WSL distro (Alpine curl with c-ares, WSL's DNS proxy): following the redirect from github.com
+    // to release-assets.githubusercontent.com failed 5 of 5 times with "Could not resolve host",
+    // and 5 of 5 succeeded with `--ipv4`; so every `kern self-update` there failed.
+    if done.status.code() == Some(CURL_RESOLVE) {
+        done = run(true)?;
+    }
     if !done.status.success() {
         let said = String::from_utf8_lossy(&done.stderr);
         let said = said.lines().last().unwrap_or("").trim();
@@ -512,7 +527,12 @@ fn lock_dir(dir: &Path) -> Result<DirLock, Error> {
 
 /// Run `bin --version` and return what it printed, or why it is not a kern that runs here.
 fn probe(bin: &Path) -> Result<String, String> {
+    // ROOT STAYS ROOT FOR THIS ONE QUESTION. MEASURED 2026-11-18 in kern's WSL distro: started as
+    // root there, the new binary gives root up and starts again as the user from the staging
+    // directory, which the user cannot enter, so `--version` exited 125 and every update was
+    // refused. The probe asks for a version string and starts no box.
     let mut child = Command::new(bin)
+        .env("KERN_WSL_AS_ROOT", "1")
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
