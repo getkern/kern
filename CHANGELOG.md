@@ -19,7 +19,7 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
-## Unreleased
+## v0.51.3 - 2026-11-18
 
 **`install.sh` installs a signed release when `minisign` is installed**; it refused every one.
 
