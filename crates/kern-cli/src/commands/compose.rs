@@ -5556,20 +5556,14 @@ fn attach_to_stack(
 ) -> Result<(), Error> {
     let mut who = Vec::with_capacity(mine.len());
     for b in mine {
-        // A service that exited during the settle window has no live pid to follow. It is not an
-        // error: `settle_and_collect_dead` has already reported any death, and the rest of the
-        // stack must still be followable.
-        let Some(ins) = registry::find_ref(&b.name) else {
-            continue;
-        };
+        // A SERVICE THAT HAS ALREADY EXITED IS SHOWN TOO, as Docker shows it. MEASURED 2026-11-18:
+        // `command: echo ...` finished before the attach, was skipped here, and `up` on a terminal
+        // printed nothing of it. With no live pid (0 is never a registry pair) its log is replayed
+        // once and the follow is done with it.
+        let pid = registry::find_ref(&b.name).map_or(0, |ins| ins.pid);
         // `None` replays the log from its start: the box was launched seconds ago, so this is
         // everything it has printed, which is what an attached `up` shows under Docker.
-        match crate::commands::Followed::open(
-            docker_log_label(b, pod),
-            b.name.clone(),
-            ins.pid,
-            None,
-        ) {
+        match crate::commands::Followed::open(docker_log_label(b, pod), b.name.clone(), pid, None) {
             Ok(Some(f)) => who.push(f),
             Ok(None) => {}
             Err(e) => eprintln!("kern: warning: {}: {e}", b.service_name()),

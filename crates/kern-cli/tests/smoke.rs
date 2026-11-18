@@ -7504,6 +7504,53 @@ fn copy_chown_owns_the_copied_files() {
     }
 }
 
+/// An attached `compose up` (stdout a terminal) shows a service that exited before the attach, as
+/// Docker shows it. MEASURED 2026-11-18: `command: echo ...` printed nothing on a terminal, because
+/// a service with no live pid was skipped. The terminal comes from `script(1)`.
+#[test]
+fn attached_up_shows_a_service_that_already_exited() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    if Command::new("script").arg("--version").output().is_err() {
+        eprintln!("SKIP: no script(1) to give `up` a terminal");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-upexited-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let file = dir.join("compose.yml");
+    std::fs::write(
+        &file,
+        "services:\n  t:\n    image: alpine:latest\n    command: echo QUICK-AND-GONE\n",
+    )
+    .expect("compose file");
+    let line = format!(
+        "{} compose -f {} up",
+        env!("CARGO_BIN_EXE_kern"),
+        file.display()
+    );
+    let out = Command::new("script")
+        .args(["-qec", &line, "/dev/null"])
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("script");
+    let _ = kern()
+        .args(["compose", "-f"])
+        .arg(&file)
+        .arg("down")
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let said = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(out.status.success(), "up failed: {said}");
+    assert!(
+        said.lines()
+            .any(|l| l.contains("t-1") && l.contains("QUICK-AND-GONE")),
+        "the exited service's output was not shown: {said}"
+    );
+}
+
 /// `COPY` INTO a directory a box user owns (`RUN adduser -D app` then `COPY f /home/app/`) works,
 /// with and without `--chown`, by `cp` (a file) and by the `.dockerignore` walk (a directory).
 /// MEASURED 2026-11-18 after the v0.51.2 release: "cp: cannot create regular file
