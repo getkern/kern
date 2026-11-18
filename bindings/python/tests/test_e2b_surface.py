@@ -418,3 +418,55 @@ def test_pty_arguments_are_checked():
         s.pty(on_data=None)
     with pytest.raises(SandboxError, match="argv list"):
         s.pty("bash", on_data=print)
+
+
+# ----------------------------------------------------------------------------------------------- fork
+
+
+def test_fork_needs_a_count_from_1_to_64():
+    s = _cfg()
+    s._entered = True
+    for bad in (0, 65, True, "2"):
+        with pytest.raises(SandboxError, match="from 1 to 64"):
+            s.fork(bad)
+
+
+@integration
+def test_fork_gives_copies_their_own_workspace_with_the_files_and_deps():
+    with Sandbox() as sb:
+        sb.run_code(
+            "import os\n"
+            "os.makedirs('d/e', exist_ok=True); open('d/e/a.txt','w').write('orig')\n"
+            "os.makedirs('.deps', exist_ok=True); open('.deps/forkmod.py','w').write('X = 1')\n"
+        )
+        copies = sb.fork(3)
+        assert len(copies) == 3
+        dirs = []
+        for i, c in enumerate(copies):
+            with c:
+                dirs.append(c._ws)
+                r = c.run_code(f"import forkmod; print(open('d/e/a.txt').read(), forkmod.X); open('d/e/a.txt','w').write('c{i}')")
+                assert r.stdout.strip() == "orig 1", r.stderr
+        assert len(set(dirs)) == 3 and not any(os.path.exists(d) for d in dirs)
+        assert sb.read_file("d/e/a.txt") == b"orig"
+
+
+@integration
+def test_a_persist_fork_has_its_own_name_and_keeps_its_workspace(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir(mode=0o700)
+    sb = Sandbox(persist=True, name=f"fk{uuid.uuid4().hex[:8]}", workspace=str(ws))
+    with sb:
+        try:
+            sb.run_code("open('s.txt','w').write('p')")
+            [c] = sb.fork(1)
+            assert c.name.startswith(f"{sb.name}-fork1-") and c.workspace != sb.workspace
+            with c:
+                try:
+                    assert c.run_code("print(open('s.txt').read())").stdout.strip() == "p"
+                finally:
+                    c.destroy()
+            assert os.path.isdir(c.workspace)
+            shutil.rmtree(c.workspace, ignore_errors=True)
+        finally:
+            sb.destroy()

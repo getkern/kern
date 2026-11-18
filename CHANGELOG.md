@@ -35,6 +35,9 @@ resident box and every `kernel()` publish the listed ports on this host's loopba
 **kern sandbox: `pty()`**, an interactive terminal: `on_data` receives the output, `send_input`,
 `resize`, `wait`, `kill`; in the resident box of a `persist` sandbox, else in a box of its own.
 
+**kern sandbox: `fork(n)`**, N copies of a sandbox, each with its own copy of the workspace (`.deps`
+included); a `persist` copy gets its own name.
+
 **kern sandbox: labels, `Sandbox.list()`, `get_metrics()`, `set_timeout()`, `watch_dir()`.** `labels={...}`
 goes on every box a sandbox starts and `Sandbox.list(labels=...)` finds the running ones;
 `get_metrics()` (also on a `Kernel`) reads CPU, memory, tasks, workspace disk and the deadline;

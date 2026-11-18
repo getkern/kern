@@ -59,7 +59,7 @@ import threading
 import time
 import uuid
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Sequence
 
@@ -4871,6 +4871,9 @@ class Sandbox:
 
     _kern: str = field(default="", repr=False)
     _port_args: list = field(default_factory=list, init=False, repr=False)
+    # Set by `fork` on a copy whose workspace `fork` created for a one-shot sandbox: the copy owns it
+    # and removes it at exit, as it would a temporary workspace of its own.
+    _fork_owned: bool = field(default=False, init=False, repr=False)
     _egress_deny: list = field(default_factory=list, init=False, repr=False)
     _label_args: list = field(default_factory=list, init=False, repr=False)
     _mount_args: list = field(default_factory=list, init=False, repr=False)
@@ -5578,6 +5581,54 @@ class Sandbox:
             ) + ["-it", "--"] + cmd
         return Pty(argv, child_env, cols, rows, on_data)
 
+    def fork(self, n: int = 1) -> "list[Sandbox]":
+        """``n`` copies of this sandbox: the same configuration, each with a workspace of its own
+        holding a copy of this one's files (``.deps`` included, so ``setup`` is not run again).
+
+        WHAT IS COPIED IS WHAT :meth:`snapshot` ARCHIVES: regular files and directories. A symlink,
+        FIFO, device or socket is left out and named in a warning. The box root is read-only, so the
+        workspace IS a sandbox's persistent state; ``/tmp`` (a tmpfs), processes and memory are not
+        copied.
+
+        The copies are returned NOT entered: use each in a ``with`` block. A one-shot sandbox's copy
+        owns its workspace and removes it at exit; a ``persist=True`` copy gets a name of its own
+        (``<name>-fork<i>-<id>``) and keeps its workspace (``copy.workspace``), as ``persist`` does."""
+        self._require_entered()
+        if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 64:
+            raise SandboxError("fork: n must be a whole number from 1 to 64")
+        scratch = tempfile.mkdtemp(prefix="kern-fork-")
+        os.chmod(scratch, 0o700)
+        made_dirs: "list[str]" = []
+        try:
+            snap = os.path.join(scratch, "workspace.tar.gz")
+            self.snapshot(snap)
+            copies: "list[Sandbox]" = []
+            for i in range(n):
+                ws = os.path.realpath(tempfile.mkdtemp(prefix="kern-ws-fork-"))
+                os.chmod(ws, 0o700)
+                made_dirs.append(ws)
+                # THE ONE RESTORE, through a throwaway session on the copy's workspace with this
+                # sandbox's account and image: symlinks never followed, a non-root user's ACLs set.
+                seeder = _dc_replace(
+                    self, workspace=ws, persist=False, name=None, setup=None, prewarm=0,
+                    start_cmd=None, ready_cmd=None, ports=None,
+                )
+                with seeder:
+                    seeder.restore(snap)
+                name = None
+                if self.persist:
+                    name = f"{self.name}-fork{i + 1}-{uuid.uuid4().hex[:6]}"
+                copy = _dc_replace(self, workspace=ws, name=name, setup=None)
+                copy._fork_owned = not self.persist
+                copies.append(copy)
+            return copies
+        except BaseException:
+            for d in made_dirs:
+                shutil.rmtree(d, ignore_errors=True)
+            raise
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
     def destroy(self) -> None:
         """Stop the resident box. The ONLY way a `persist=True` sandbox goes away before its TTL.
 
@@ -5623,7 +5674,7 @@ class Sandbox:
             Path(self.workspace).mkdir(parents=True, exist_ok=True)
             _validate_mount(self.workspace, _WORKSPACE)
             self._ws = os.path.realpath(self.workspace)
-            self._own_ws = False
+            self._own_ws = self._fork_owned
         self._entered = True
         # THE PERSIST GUARDS FIRE BEFORE ANY WORK, so a combination that cannot be resumed is refused
         # before a setup spends two minutes on a pip install.
