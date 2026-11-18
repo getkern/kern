@@ -23,7 +23,7 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 **Windows (WSL): boxes run as the distro's user `kern` (uid 1000), not root.** A box's root is
 uid 1000 of the distro. `install.ps1` converts an existing distro: images pulled again for the user,
-volumes and settings moved with their modes kept. Each distro has its own cgroup subtree. The distro
+volumes and settings moved with their modes kept; an account already on uid 1000 becomes the user. Each distro has its own cgroup subtree. The distro
 ships `passt`; root's password is locked. Started from a root terminal, kern runs as the user on a
 terminal and in a session of its own, relayed by a root process the user cannot trace or signal: the
 user's processes hold no descriptor of root's terminal and none of the descriptors root's shell left
