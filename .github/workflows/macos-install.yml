@@ -21,9 +21,11 @@ permissions:
   contents: read
 
 jobs:
-  # No VM: the script parses as POSIX sh and shellcheck has nothing to say about it.
+  # No VM: the script parses as POSIX sh and shellcheck has nothing to say about it. On the Intel
+  # label the `vm` job uses: on 2026-11-18 no arm64 macOS runner was assigned at all ("not acquired
+  # by Runner of type hosted even after multiple attempts"), and this job needs no particular CPU.
   script:
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v5
       - name: syntax
