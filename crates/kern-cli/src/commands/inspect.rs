@@ -1826,7 +1826,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&gpu)
         };
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
@@ -1852,6 +1852,11 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
                 .as_ref()
                 .map_or_else(|| "null".to_string(), |o| json_str(&o.cgroup_path())),
             num(b.pids_max),
+            // When the box's deadline stops it (Unix seconds), `null` for none: `--timeout`, moved
+            // by `kern update --timeout`. A foreground box's own timer is not recorded here.
+            num(registry::box_deadline(&b.name, b.pid)
+                .filter(|d| d.at_unix_ms > 0)
+                .map(|d| d.at_unix_ms / 1000)),
         );
     } else {
         let p = crate::ui::Palette::detect();
