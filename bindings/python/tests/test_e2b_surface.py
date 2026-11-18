@@ -3,6 +3,7 @@
 The unit tests need no kern. The integration ones start real boxes and need a kern with
 `kern update --timeout` and `ends_at` in `kern inspect --json` (0.51.4 or newer, or this tree's).
 """
+import contextlib
 import os
 import shutil
 import threading
@@ -263,3 +264,86 @@ def test_egress_deny_refuses_what_the_allowlist_would_open():
         out = sb.run_code(_EGRESS_PROBE).stdout
     assert "https://example.com OPEN" in out, out
     assert "https://github.com SHUT" in out, out
+
+
+# ------------------------------------------------------------------- ports, get_host, start and ready
+
+
+def test_ports_start_and_ready_are_validated_and_ports_are_loopback_only():
+    s = _cfg(persist=True, name="p", workspace="/tmp", ports=[8000, 9000], start_cmd="srv", ready_cmd="ok")
+    argv = s._base_argv("x", network=False, timeout_s=10, dry=True, resident=True)
+    assert argv.count("-p") == 2 and "127.0.0.1::8000" in argv and "127.0.0.1::9000" in argv
+    assert "-p" not in s._base_argv("x", network=False, timeout_s=10, dry=True), "a call box publishes nothing"
+    a = s._posture_material(network=False, timeout_s=10, resident=True)
+    b = _cfg(persist=True, name="p", workspace="/tmp", ports=[8000, 9000], start_cmd="other", ready_cmd="ok")
+    assert a != b._posture_material(network=False, timeout_s=10, resident=True), "start_cmd is posture"
+    for bad, says in [
+        ({"ports": [0]}, "not a port"),
+        ({"ports": [80, 80]}, "twice"),
+        ({"ports": "8000"}, "list of box ports"),
+        ({"start_cmd": "x"}, "needs persist=True"),
+        ({"ready_cmd": "x"}, "needs persist=True"),
+        ({"persist": True, "name": "p", "workspace": "/tmp", "ready_timeout_s": 0}, "positive"),
+    ]:
+        with pytest.raises(SandboxError, match=says):
+            _cfg(**bad)
+
+
+@integration
+def test_a_started_server_is_waited_for_and_reached_through_get_host(tmp_path):
+    import urllib.request
+
+    ws = tmp_path / "ws"
+    ws.mkdir(mode=0o700)
+    sb = Sandbox(
+        persist=True,
+        name=f"srv{uuid.uuid4().hex[:8]}",
+        workspace=str(ws),
+        ports=[8000],
+        start_cmd="cd /workspace && echo served > index.html && python3 -m http.server 8000",
+        ready_cmd="python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000')\"",
+    )
+    with sb:
+        try:
+            host = sb.get_host(8000)
+            assert host.startswith("127.0.0.1:")
+            assert urllib.request.urlopen(f"http://{host}/index.html", timeout=10).read() == b"served\n"
+            with pytest.raises(SandboxError, match="not published"):
+                sb.get_host(9000)
+        finally:
+            sb.destroy()
+
+
+@integration
+def test_a_box_that_never_gets_ready_is_refused_by_name(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir(mode=0o700)
+    sb = Sandbox(persist=True, name=f"nr{uuid.uuid4().hex[:8]}", workspace=str(ws), ready_cmd="false", ready_timeout_s=2)
+    try:
+        with pytest.raises(SandboxError, match="was not ready within 2"):
+            sb.__enter__()
+    finally:
+        sb.destroy()
+        with contextlib.suppress(Exception):
+            sb.__exit__(None, None, None)
+
+
+@integration
+def test_a_kernel_publishes_its_ports():
+    import urllib.request
+
+    with Sandbox(ports=[7000]) as sb, sb.kernel() as k:
+        k.run_code(
+            "import subprocess; subprocess.Popen(['python3','-m','http.server','7000'], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+        )
+        host = k.get_host(7000)
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                assert urllib.request.urlopen(f"http://{host}/", timeout=5).status == 200
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.2)

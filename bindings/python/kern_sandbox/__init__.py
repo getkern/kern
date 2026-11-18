@@ -4161,6 +4161,28 @@ def _box_metrics(kern: str, box: "str | None", interval_s: float, disk_bytes: in
     )
 
 
+def _host_of(kern: str, box: str, port: int, published: "Sequence[int] | None") -> str:
+    """The loopback address kern serves ``port`` of ``box`` on (`kern port`)."""
+    if isinstance(port, bool) or not isinstance(port, int) or port not in (published or ()):
+        raise SandboxError(
+            f"get_host: port {port!r} is not published; list it in Sandbox(ports=[...])"
+        )
+    try:
+        out = subprocess.run(  # noqa: S603 - argv list, no shell
+            [kern, "port", box, str(port)], capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SandboxError(f"get_host: could not run kern port: {e}") from e
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("127.0.0.1:"):
+            return line
+    raise SandboxError(
+        f"get_host: kern publishes no loopback address for port {port} of {box}: "
+        f"{(out.stderr or out.stdout).strip()[:200]}"
+    )
+
+
 @dataclass(frozen=True)
 class WatchEvent:
     """One change in a watched workspace directory.
@@ -4712,8 +4734,23 @@ class Sandbox:
     #: any public host. Loopback, link-local (cloud metadata) and multicast are never reachable.
     #: Needs kern 0.52 or newer (``--egress-deny``).
     egress_deny: "Sequence[str] | None" = None
+    #: Box ports published on THIS host's loopback, for the resident box of a ``persist=True``
+    #: sandbox and for every :meth:`kernel` box: ``ports=[8000]``, then :meth:`get_host` (or
+    #: ``Kernel.get_host``) answers ``"127.0.0.1:<port kern picked>"``. Never on another address. A
+    #: one-shot call's box lives for that call only and publishes nothing. Part of the posture.
+    ports: "Sequence[int] | None" = None
+    #: A ``persist=True`` sandbox's resident box runs this shell command in the background when it is
+    #: created (a server, a watcher); its output goes to the box's log (``kern logs <box>``). The box
+    #: outlives it. Part of the posture.
+    start_cmd: "str | None" = None
+    #: Readiness of a ``persist=True`` sandbox: this shell command is run in the resident box until
+    #: it exits 0, every time the box is created or adopted, before any call; ``ready_timeout_s``
+    #: bounds the wait and a box that never gets ready is a ``SandboxError`` naming its last output.
+    ready_cmd: "str | None" = None
+    ready_timeout_s: float = 60
 
     _kern: str = field(default="", repr=False)
+    _port_args: list = field(default_factory=list, init=False, repr=False)
     _egress_deny: list = field(default_factory=list, init=False, repr=False)
     _label_args: list = field(default_factory=list, init=False, repr=False)
     _mount_args: list = field(default_factory=list, init=False, repr=False)
@@ -4869,6 +4906,37 @@ class Sandbox:
         # A deny list alone is "any public host but these", as kern reads `--egress-deny` alone.
         if self._egress_deny and not self._egress_allow:
             self._egress_allow = ["*"]
+        self._port_args = []
+        if self.ports is not None:
+            if isinstance(self.ports, (str, bytes)) or not isinstance(self.ports, Sequence):
+                raise SandboxError("ports takes a list of box ports, e.g. [8000]")
+            seen = set()
+            for port in self.ports:
+                if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                    raise SandboxError(f"ports: {port!r} is not a port number (1-65535)")
+                if port in seen:
+                    raise SandboxError(f"ports: {port} is listed twice")
+                seen.add(port)
+                self._port_args += ["-p", f"127.0.0.1::{port}"]
+            if len(seen) > 64:
+                raise SandboxError("ports: at most 64 ports")
+        for fname in ("start_cmd", "ready_cmd"):
+            v = getattr(self, fname)
+            if v is None:
+                continue
+            if not isinstance(v, str) or not v.strip() or "\0" in v:
+                raise SandboxError(f"{fname} must be a non-empty shell command (str, no NUL)")
+            if not self.persist:
+                raise SandboxError(
+                    f"{fname} needs persist=True: it belongs to the resident box, which outlives "
+                    f"each call; a one-shot sandbox starts a fresh box for every call"
+                )
+        if (
+            isinstance(self.ready_timeout_s, bool)
+            or not isinstance(self.ready_timeout_s, (int, float))
+            or self.ready_timeout_s <= 0
+        ):
+            raise SandboxError("ready_timeout_s must be a positive number of seconds")
         if self.apparmor is not None:
             _validate_apparmor(self.apparmor)
         # A str is a Sequence[str], so `cap_drop="ALL"` would iterate into ['A','L','L'] and produce
@@ -5013,6 +5081,10 @@ class Sandbox:
         # Spelled as a pseudo-flag so it reads like the rest of the material being hashed, and so a
         # future out-of-argv control is added in the same obvious way.
         argv = argv + [f"--enforce-limits={int(bool(self.enforce_limits))}"]
+        # What the resident box starts and what makes it ready are what it IS, though neither is a
+        # kern flag: a box started for one server is not the box another Sandbox asks for.
+        if resident:
+            argv = argv + [f"--start-cmd={self.start_cmd or ''}", f"--ready-cmd={self.ready_cmd or ''}"]
         # 🚨 AND EVERY `KERN_*` IN THE ENVIRONMENT, because kern reads its own environment when it
         # BUILDS the box, which is the same hole `enforce_limits` was and one variable wider.
         #
@@ -5142,6 +5214,57 @@ class Sandbox:
         return None
 
     def _resident_ensure(self) -> str:
+        """Adopt the resident box or create it, wait for ``ready_cmd`` when one is set, and return
+        its name."""
+        box = self._resident_ensure_box()
+        if self.ready_cmd:
+            self._wait_ready(box)
+        return box
+
+    def _wait_ready(self, box: str) -> None:
+        """Run ``ready_cmd`` in ``box`` until it exits 0 or ``ready_timeout_s`` passes."""
+        deadline = time.monotonic() + float(self.ready_timeout_s)
+        argv = [self._kern, "exec", box, "-w", _WORKSPACE]
+        if self._as_user is not None:
+            argv += ["-u", self._as_user]
+        argv += ["--", "sh", "-c", str(self.ready_cmd)]
+        last = ""
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                r = subprocess.run(  # noqa: S603 - argv list, no shell
+                    argv, capture_output=True, text=True, timeout=max(1.0, min(left, 30.0))
+                )
+            except subprocess.TimeoutExpired:
+                last = "ready_cmd did not finish"
+                continue
+            except OSError as e:
+                raise SandboxError(f"ready_cmd: could not run kern: {e}") from e
+            if r.returncode == 0:
+                return
+            last = (r.stderr or r.stdout or f"exit {r.returncode}").strip()[-300:]
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+        raise SandboxError(
+            f"the resident sandbox {self.name!r} was not ready within {self.ready_timeout_s} s: "
+            f"ready_cmd {self.ready_cmd!r} never exited 0 (last: {last!r}); start_cmd's output is in "
+            f"`kern logs {box}`"
+        )
+
+    def get_host(self, port: int) -> str:
+        """``"127.0.0.1:<host port>"`` serving ``port`` of this ``persist=True`` sandbox's resident
+        box (``ports=[...]`` publishes it on this host's loopback only). The box is created when it
+        is not running."""
+        if not self.persist:
+            raise SandboxError(
+                "get_host() needs persist=True (or a Kernel: Kernel.get_host): a one-shot call's box "
+                "is gone when the call returns"
+            )
+        self._require_entered()
+        return _host_of(self._kern, self._resident_ensure(), port, self.ports)
+
+    def _resident_ensure_box(self) -> str:
         """Adopt the resident box or create it, and return its name.
 
         THE RACE IS REAL AND IS HANDLED BY LOSING GRACEFULLY. Two processes naming the same sandbox
@@ -5188,10 +5311,12 @@ class Sandbox:
         # TTL, which made the box's life a second deadline nothing could move: `set_timeout` extends
         # kern's (`kern update --timeout`) and the box would still have ended when `sleep` did.
         # 2147483647 s and not `infinity`, which BusyBox's `sleep` does not take.
-        argv += [
-            "-d", "--init", "--label", f"{self._CFG_LABEL}={want}",
-            "--", "sleep", "2147483647",
-        ]
+        argv += ["-d", "--init", "--label", f"{self._CFG_LABEL}={want}", "--"]
+        if self.start_cmd:
+            # The command as the shell's `$1`, never spliced into the script: no quoting to get wrong.
+            argv += ["sh", "-c", 'sh -c "$1" & exec sleep 2147483647', "kern-start", self.start_cmd]
+        else:
+            argv += ["sleep", "2147483647"]
         # 🚨 THE ENVIRONMENT IS BUILT, NOT INHERITED, because `enforce_limits` lives in it.
         #
         # This call used to be a plain `subprocess.run(argv, ...)` with no `env=`, so the box took
@@ -5748,6 +5873,7 @@ class Sandbox:
         is_setup: bool = False,
         dry: bool = False,
         resident: bool = False,
+        publish: bool = False,
     ) -> list[str]:
         """Build the `kern box` argv for one call. NOT a pure function: it also WRITES the private
         `--env-file` this box will read, so it must be called once per box that is actually started.
@@ -5905,6 +6031,10 @@ class Sandbox:
             finally:
                 os.close(fd)
             argv += ["--env-file", env_path]
+        # Ports on the boxes that outlive a call (the resident box, a Kernel), loopback only, and in
+        # the dry argv too: what a box publishes is part of what it is.
+        if resident or publish:
+            argv += self._port_args
         # Labels on the box that RUNS, never in a dry argv: they are metadata, not posture, so they
         # stay out of the resident fingerprint and the prewarm key.
         if not dry:
@@ -8519,7 +8649,9 @@ class Kernel:
         # same budget on both sides.
         sbx.write_file(self._driver, _kernel_driver(sbx.max_output_bytes, 0))
         self._name = _unique_name()
-        argv = sbx._base_argv(self._name, network=sbx.network, timeout_s=self._BACKSTOP_S) + [
+        argv = sbx._base_argv(
+            self._name, network=sbx.network, timeout_s=self._BACKSTOP_S, publish=True
+        ) + [
             "--",
             "python3",
             f"{_WORKSPACE}/{self._driver}",
@@ -8550,6 +8682,10 @@ class Kernel:
         self._err = _CappedReader(self._proc.stderr, sbx.max_output_bytes)
         self._err.start()
         return self
+
+    def get_host(self, port: int) -> str:
+        """``"127.0.0.1:<host port>"`` serving ``port`` of this kernel's box (``Sandbox(ports=[...])``)."""
+        return _host_of(self._sbx._kern, getattr(self, "_name", ""), port, self._sbx.ports)
 
     def get_metrics(self, *, interval_s: float = 0.2) -> SandboxMetrics:
         """This kernel's box: CPU (rate over ``interval_s``), memory, tasks, and the workspace disk."""

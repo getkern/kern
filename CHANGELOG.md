@@ -27,6 +27,11 @@ addresses and ranges even when the allowlist covers them, and alone means `*` mi
 kern cannot read is refused before the box starts.
 kern sandbox: `egress_allow` takes the same forms and `egress_deny=[...]` is new.
 
+**kern sandbox: `ports=[...]` and `get_host(port)`, `start_cmd` and `ready_cmd`.** A `persist` sandbox's
+resident box and every `kernel()` publish the listed ports on this host's loopback only;
+`get_host(port)` answers the address. `start_cmd` runs in the background of the resident box and
+`ready_cmd` is waited for (`ready_timeout_s`) every time the box is created or adopted.
+
 **kern sandbox: labels, `Sandbox.list()`, `get_metrics()`, `set_timeout()`, `watch_dir()`.** `labels={...}`
 goes on every box a sandbox starts and `Sandbox.list(labels=...)` finds the running ones;
 `get_metrics()` (also on a `Kernel`) reads CPU, memory, tasks, workspace disk and the deadline;
