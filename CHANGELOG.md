@@ -37,28 +37,36 @@ terminal on stdin works as before.
 (`10.1.2.0/24`, private ones included), and `*` for any public host; `--egress-deny` refuses domains,
 addresses and ranges even when the allowlist covers them, and alone means `*` minus these. A list
 kern cannot read is refused before the box starts.
-kern sandbox: `egress_allow` takes the same forms and `egress_deny=[...]` is new.
+kern sandbox: `egress_allow` takes the same forms and `egress_deny=[...]` is new; in Node,
+`egressAllow` and `egressDeny`.
 
 **kern sandbox: `ports=[...]` and `get_host(port)`, `start_cmd` and `ready_cmd`.** A `persist` sandbox's
 resident box and every `kernel()` publish the listed ports on this host's loopback only;
 `get_host(port)` answers the address. `start_cmd` runs in the background of the resident box and
-`ready_cmd` is waited for (`ready_timeout_s`) every time the box is created or adopted.
+`ready_cmd` is waited for (`ready_timeout_s`) every time the box is created or adopted. In Node:
+`ports`, `getHost(port)` (also on a kernel), `startCmd`, `readyCmd`, `readyTimeoutS`.
 
 **kern sandbox: `pty()`**, an interactive terminal: `on_data` receives the output, `send_input`,
-`resize`, `wait`, `kill`; in the resident box of a `persist` sandbox, else in a box of its own.
+`resize`, `wait`, `kill`; in the resident box of a `persist` sandbox, else in a box of its own. In
+Node, `pty(command, { onData, cols, rows, timeoutS })`, driven through pipes and
+`KERN_TTY_SIZE_FILE`: Node has no pseudo-terminal of its own.
 
 **kern sandbox: `fork(n)`**, N copies of a sandbox, each with its own copy of the workspace (`.deps`
-included); a `persist` copy gets its own name.
+included); a `persist` copy gets its own name. In Node, `fork(n)` needs `KERN_SANDBOX_SNAPSHOT=1`, as
+`snapshot()` and `restore()` do.
 
 **kern sandbox: labels, `Sandbox.list()`, `get_metrics()`, `set_timeout()`, `watch_dir()`.** `labels={...}`
 goes on every box a sandbox starts and `Sandbox.list(labels=...)` finds the running ones;
 `get_metrics()` (also on a `Kernel`) reads CPU, memory, tasks, workspace disk and the deadline;
 `set_timeout(s)` moves a `persist` sandbox's deadline (`0`: none); `watch_dir(path, on_event)` reports
-create, write, rename, chmod and remove in the workspace, never through a symlink.
+create, write, rename, chmod and remove in the workspace, never through a symlink. In Node:
+`labels`, `Sandbox.list(labels)`, `getMetrics({ intervalS })`, `setTimeout(s)` and
+`watchDir(path, onEvent, { recursive })`; the watch runs in a hidden `kern __watch-dir`, because
+Node's `fs.watch` cannot tell a create from a remove nor a write from a chmod.
 
 **kern sandbox: a `persist` sandbox's resident box is made in one shape**, without the bytecode-cache
 mount, whenever it is created, so the process that made it, another process and a recreation all
-agree on its fingerprint.
+agree on its fingerprint. The Node binding had the same mismatch and the same fix.
 
 **`kern update --timeout S <box>`**: a running detached box ends S seconds from now; `0` removes its
 deadline. A box started without `--timeout` gets one.

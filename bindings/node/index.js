@@ -3067,14 +3067,475 @@ const DOMAIN_RE = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])
 // a name kern rejects at box start, and validating here exists to fail at construction instead.
 const CAP_RE = /^(?=.{1,32}$)(?:CAP_)?[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$/;
 
-/** Validate one egress-allowlist domain (an FQDN like "pypi.org") before it reaches the argv. */
-function validateDomain(domain) {
-  if (typeof domain !== "string" || !DOMAIN_RE.test(domain))
-    throw new SandboxError(
-      `invalid egress domain ${JSON.stringify(domain)}: expected a bare hostname like 'pypi.org' ` +
-        "(no scheme, port, path, wildcard or spaces)",
-    );
-  return domain;
+/** An IPv4 address as four numbers, or null. No leading zeros, as Python's `ipaddress` refuses them. */
+function parseIPv4(s) {
+  const parts = s.split(".");
+  if (parts.length !== 4) return null;
+  const out = [];
+  for (const p of parts) {
+    if (!/^(?:0|[1-9][0-9]{0,2})$/.test(p) || Number(p) > 255) return null;
+    out.push(Number(p));
+  }
+  return out;
+}
+
+/** An IPv6 address as eight 16-bit numbers (an embedded IPv4 tail allowed), or null. */
+function parseIPv6(s) {
+  if (!/^[0-9A-Fa-f:.]+$/.test(s) || (s.match(/::/g) || []).length > 1) return null;
+  let tail = [];
+  let head = s;
+  const lastColon = s.lastIndexOf(":");
+  if (s.slice(lastColon + 1).includes(".")) {
+    const v4 = parseIPv4(s.slice(lastColon + 1));
+    if (v4 === null) return null;
+    tail = [(v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]];
+    head = s.slice(0, lastColon + 1);
+    if (head.endsWith(":") && !head.endsWith("::")) head = head.slice(0, -1);
+  }
+  const groups = (part) => (part === "" ? [] : part.split(":"));
+  let words;
+  if (head.includes("::")) {
+    const [a, b] = head.split("::");
+    const left = groups(a);
+    const right = groups(b);
+    const fill = 8 - tail.length - left.length - right.length;
+    if (fill < 1) return null;
+    words = [...left, ...Array(fill).fill("0"), ...right];
+  } else {
+    words = groups(head);
+    if (words.length + tail.length !== 8) return null;
+  }
+  const out = [];
+  for (const w of words) {
+    if (!/^[0-9A-Fa-f]{1,4}$/.test(w)) return null;
+    out.push(parseInt(w, 16));
+  }
+  out.push(...tail);
+  return out.length === 8 ? out : null;
+}
+
+/** Eight 16-bit numbers in the compressed form Python's `ipaddress` writes (RFC 5952): lowercase, no
+ * leading zeros, the first longest run of two or more zero groups as `::`. */
+function formatIPv6(words) {
+  let best = -1;
+  let bestLen = 0;
+  for (let i = 0; i < 8; ) {
+    if (words[i] !== 0) {
+      i += 1;
+      continue;
+    }
+    let j = i;
+    while (j < 8 && words[j] === 0) j += 1;
+    if (j - i > bestLen) {
+      best = i;
+      bestLen = j - i;
+    }
+    i = j;
+  }
+  const hex = words.map((w) => w.toString(16));
+  if (bestLen < 2) return hex.join(":");
+  return `${hex.slice(0, best).join(":")}::${hex.slice(best + bestLen).join(":")}`;
+}
+
+/** The prefix length a `/...` suffix names for an address of `bits` bits: a number, or (IPv4) a
+ * netmask or hostmask in dotted form, as Python's `ip_network` reads it. null when it is neither. */
+function prefixLength(suffix, bits) {
+  if (/^[0-9]+$/.test(suffix)) {
+    const n = Number(suffix);
+    return n <= bits ? n : null;
+  }
+  if (bits !== 32) return null;
+  const m = parseIPv4(suffix);
+  if (m === null) return null;
+  const v = ((m[0] << 24) | (m[1] << 16) | (m[2] << 8) | m[3]) >>> 0;
+  for (let n = 0; n <= 32; n += 1) {
+    const net = n === 0 ? 0 : (0xffffffff << (32 - n)) >>> 0;
+    if (v === net || v === (~net >>> 0)) return n;
+  }
+  return null;
+}
+
+/** `entry` as Python's `str(ipaddress.ip_network(entry, strict=False))` writes it, or null when it is
+ * not an address or a range. */
+function canonicalNetwork(entry) {
+  const slash = entry.indexOf("/");
+  const addr = slash < 0 ? entry : entry.slice(0, slash);
+  const suffix = slash < 0 ? null : entry.slice(slash + 1);
+  const v4 = parseIPv4(addr);
+  if (v4 !== null) {
+    const n = suffix === null ? 32 : prefixLength(suffix, 32);
+    if (n === null) return null;
+    const mask = n === 0 ? 0 : (0xffffffff << (32 - n)) >>> 0;
+    const v = (((v4[0] << 24) | (v4[1] << 16) | (v4[2] << 8) | v4[3]) & mask) >>> 0;
+    return `${v >>> 24}.${(v >>> 16) & 255}.${(v >>> 8) & 255}.${v & 255}/${n}`;
+  }
+  const v6 = parseIPv6(addr);
+  if (v6 !== null) {
+    const n = suffix === null ? 128 : prefixLength(suffix, 128);
+    if (n === null) return null;
+    const masked = v6.map((w, i) => {
+      const keep = Math.max(0, Math.min(16, n - i * 16));
+      return keep === 0 ? 0 : w & ((0xffff << (16 - keep)) & 0xffff);
+    });
+    return `${formatIPv6(masked)}/${n}`;
+  }
+  return null;
+}
+
+/** One `egressAllow` / `egressDeny` entry, canonical: a hostname (`pypi.org`), an address or a range
+ * (`10.1.2.0/24`, private ones included; IPv6 too), or `*` (allow only: any public host). kern decides
+ * what each opens; this is the binding's gate, so a malformed entry fails at construction with its
+ * name instead of at box start. Mirrors Python's `_validate_egress_entry`. */
+function validateEgressEntry(entry, allow) {
+  const which = allow ? "egressAllow" : "egressDeny";
+  if (typeof entry !== "string") throw new SandboxError(`${which}: entries are strings, got ${typeof entry}`);
+  const e = entry.trim();
+  if (e === "*") {
+    if (!allow)
+      throw new SandboxError(
+        "egressDeny '*' denies everything: use network: false (the default) for a box with no outbound",
+      );
+    return e;
+  }
+  const net = canonicalNetwork(e.replace(/^[[\]]+|[[\]]+$/g, ""));
+  if (net !== null) return net;
+  if (DOMAIN_RE.test(e)) return e;
+  throw new SandboxError(
+    `invalid ${which} entry ${JSON.stringify(entry)}: expected a hostname like 'pypi.org', an address or a ` +
+      `range like '10.1.2.0/24'${allow ? ", or *" : ""} (no scheme, port, path or spaces)`,
+  );
+}
+
+// ---- labels, listing, metrics, ports -------------------------------------------------------------
+//
+// A label is METADATA on every box a sandbox starts (`kern box --label k=v`): how a caller finds its
+// sandboxes again (`Sandbox.list(labels)`) and how `kern ps --filter label=k=v` shows them. Not
+// posture: left out of the resident fingerprint, so two processes that meet on one `persist` sandbox
+// with different labels still meet. ⚠️ VISIBLE TO LOCAL USERS (the box's command line, `kern ps`): a
+// secret belongs in `env`. Same rules, same words as the Python binding.
+const LABEL_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+const LABEL_MAX = 64;
+const LABEL_VALUE_MAX = 1024;
+/** Label keys kern and the SDKs use for themselves (`kern.sbx.cfg`, the resident fingerprint). */
+const RESERVED_LABEL_PREFIX = "kern.";
+/** The box-name prefixes the SDKs use (Python and kern-mcp, Node, a resident box), the table
+ * `kern sandbox ls` classifies by. */
+const SANDBOX_BOX_PREFIXES = ["pysbx-", "jssbx-", "kern-sbx-"];
+
+/** The `--label` arguments for `labels`, or a refusal naming the entry that cannot be one. */
+function validateLabels(labels) {
+  if (labels === null || labels === undefined) return [];
+  if (typeof labels !== "object" || Array.isArray(labels))
+    throw new SandboxError('labels must be a plain object of string to string, e.g. { run: "r-42" } (not a mapping)');
+  const entries = Object.entries(labels);
+  if (entries.length > LABEL_MAX) throw new SandboxError(`labels: at most ${LABEL_MAX} entries, got ${entries.length}`);
+  const out = [];
+  for (const [k, v] of entries) {
+    if (!LABEL_KEY_RE.test(k))
+      throw new SandboxError(
+        `label key ${JSON.stringify(k)}: letters, digits and . _ / - only, starting with a letter or digit, ` +
+          "at most 128 characters",
+      );
+    if (k.startsWith(RESERVED_LABEL_PREFIX))
+      throw new SandboxError(`label key ${JSON.stringify(k)}: keys starting with 'kern.' are kern's own`);
+    if (typeof v !== "string")
+      throw new SandboxError(`label ${JSON.stringify(k)}: the value must be a string, got ${typeof v}`);
+    if (v.length > LABEL_VALUE_MAX || /[\n\r\0]/.test(v))
+      throw new SandboxError(
+        `label ${JSON.stringify(k)}: the value must be one line of at most ${LABEL_VALUE_MAX} characters`,
+      );
+    out.push("--label", `${k}=${v}`);
+  }
+  return out;
+}
+
+/** `kern inspect <box> --json`, or null when the box is not running or the answer is unreadable. */
+async function inspectBox(kernBin, box) {
+  const r = await runCapture([kernBin, "inspect", box, "--json"], 20000);
+  if (r.code !== 0) return null;
+  let doc;
+  try {
+    doc = JSON.parse(r.stdout);
+  } catch {
+    return null;
+  }
+  if (!doc || typeof doc !== "object" || Array.isArray(doc) || !["running", "paused"].includes(doc.status))
+    return null;
+  return doc;
+}
+
+function intOrNull(v) {
+  return Number.isInteger(v) ? v : null;
+}
+
+/** Metrics of `box` read twice `intervalS` apart for the CPU rate (once when 0), or the workspace
+ * alone when there is no box or it is not running. Mirrors Python's `_box_metrics`; the fields are
+ * the same, camelCased: `cpuPercent` is percent of ONE core (two busy cores read 200), `endsAt` Unix
+ * seconds or null, box fields null when no box runs or the host does not account them. */
+async function boxMetrics(kernBin, box, intervalS, diskBytes) {
+  if (typeof intervalS !== "number" || !(intervalS >= 0))
+    throw new SandboxError("intervalS must be zero or positive");
+  const none = {
+    cpuSeconds: null, cpuPercent: null, memoryBytes: null, memoryLimitBytes: null,
+    pids: null, pidsLimit: null, diskBytes, endsAt: null,
+  };
+  const first = box ? await inspectBox(kernBin, box) : null;
+  if (first === null) return none;
+  let doc = first;
+  let rate = null;
+  if (intervalS > 0) {
+    const t0 = process.hrtime.bigint();
+    await new Promise((r) => setTimeout(r, intervalS * 1000));
+    const second = await inspectBox(kernBin, box);
+    const elapsed = Number(process.hrtime.bigint() - t0) / 1e9;
+    if (second !== null) {
+      const a = intOrNull(first.cpu_usec);
+      const b = intOrNull(second.cpu_usec);
+      if (a !== null && b !== null && elapsed > 0) rate = Math.max(0, ((b - a) / 1e6 / elapsed) * 100);
+      doc = second;
+    }
+  }
+  const usec = intOrNull(doc.cpu_usec);
+  return {
+    cpuSeconds: usec === null ? null : usec / 1e6,
+    cpuPercent: rate,
+    memoryBytes: intOrNull(doc.mem_bytes),
+    memoryLimitBytes: intOrNull(doc.memory_max_enforced),
+    pids: intOrNull(doc.tasks),
+    pidsLimit: intOrNull(doc.pids_max),
+    diskBytes,
+    endsAt: intOrNull(doc.ends_at),
+  };
+}
+
+/** The loopback address kern serves `port` of `box` on (`kern port`). Mirrors Python's `_host_of`. */
+async function hostOf(kernBin, box, port, published) {
+  if (!Number.isInteger(port) || !(published || []).includes(port))
+    throw new SandboxError(`getHost: port ${JSON.stringify(port)} is not published; list it in new Sandbox({ ports: [...] })`);
+  const r = await runCapture([kernBin, "port", box, String(port)], 20000);
+  for (const raw of String(r.stdout).split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("127.0.0.1:")) return line;
+  }
+  throw new SandboxError(
+    `getHost: kern publishes no loopback address for port ${port} of ${box}: ` +
+      `${(r.stderr || r.stdout || "").trim().slice(0, 200)}`,
+  );
+}
+
+/** A running `Sandbox.watchDir`. `stop()` ends it. The callback is called in event order, never
+ * concurrently with itself. Like Python's daemon thread, a watch does not keep the process alive. */
+class DirWatch {
+  /** Spawn `kern __watch-dir` and resolve once it reports the starting tree watched. */
+  static start(sbx, rel, onEvent, recursive) {
+    return new Promise((resolve, reject) => {
+      const w = new DirWatch();
+      w._onEvent = onEvent;
+      w._stopped = false;
+      w._child = spawn(sbx._kern, ["__watch-dir", sbx._ws, rel, recursive ? "1" : "0"], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      w._closed = new Promise((res) => w._child.once("close", res));
+      let ready = false;
+      let pending = "";
+      let stderr = "";
+      w._child.stderr.on("data", (b) => {
+        if (stderr.length < 4096) stderr += b;
+      });
+      w._child.on("error", (e) => {
+        if (!ready) reject(new SandboxError(`watchDir: could not run kern: ${e.message}`, { cause: e }));
+      });
+      w._child.once("close", (code) => {
+        w._stopped = true;
+        if (ready) return;
+        // kern's refusal is `error: __watch-dir: <why>`; a kern without the verb says something else.
+        const line = stderr.split("\n").find((l) => l.trim() && !l.startsWith("hint:")) || `exit ${code}`;
+        const why = line.replace(/^error: /, "");
+        reject(
+          new SandboxError(
+            why.startsWith("__watch-dir: ")
+              ? `watchDir: ${why.slice("__watch-dir: ".length)}`
+              : `watchDir needs a kern that has \`__watch-dir\`; the one at ${sbx._kern} said: ${why.slice(0, 300)}`,
+          ),
+        );
+      });
+      w._child.stdout.on("data", (b) => {
+        pending += b.toString("latin1");
+        let nl;
+        while ((nl = pending.indexOf("\n")) >= 0) {
+          const line = pending.slice(0, nl);
+          pending = pending.slice(nl + 1);
+          if (!ready) {
+            if (line === "ready") {
+              ready = true;
+              for (const s of [w._child, w._child.stdin, w._child.stdout, w._child.stderr]) s.unref?.();
+              resolve(w);
+            }
+            continue;
+          }
+          w._emit(line);
+        }
+      });
+    });
+  }
+
+  _emit(line) {
+    if (this._stopped) return;
+    const [type, kind, hexPath = "", hexOld] = line.split(" ");
+    const dec = (h) => Buffer.from(h, "hex").toString("utf8");
+    const ev = { type, path: dec(hexPath), isDir: kind === "d", oldPath: hexOld === undefined ? null : dec(hexOld) };
+    // This session's own file, as the workspace listing skips it.
+    if (ev.type !== "overflow" && ev.path === ENV_FILE) return;
+    try {
+      this._onEvent(ev);
+    } catch (e) {
+      // A callback's error must not end the watch.
+      process.emitWarning(`watchDir: the callback threw ${e && e.name}: ${e && e.message}`, "KernWatchCallback");
+    }
+  }
+
+  /** End the watch and wait for kern to leave. Idempotent. */
+  async stop() {
+    this._stopped = true;
+    const child = this._child;
+    if (child.exitCode === null && child.signalCode === null) {
+      // Held again while it is awaited: an unreferenced child lets the process exit with this pending.
+      for (const s of [child, child.stdout, child.stderr]) s.ref?.();
+      child.stdin.end();
+      const t = setTimeout(() => child.kill("SIGKILL"), 5000);
+      await this._closed;
+      clearTimeout(t);
+    }
+  }
+}
+
+/**
+ * An interactive terminal in a sandbox, from `Sandbox.pty`. Output arrives as raw Buffers (escape
+ * sequences included) to `onData`, in order; `sendInput` is the keyboard ("\x03" is Ctrl-C), `resize`
+ * the window. `wait` resolves to the exit code; `kill` ends it. Mirrors Python's `Pty`.
+ */
+class Pty {
+  static checkSize(cols, rows) {
+    for (const [v, what] of [
+      [cols, "cols"],
+      [rows, "rows"],
+    ])
+      if (!Number.isInteger(v) || v < 1 || v > 1000)
+        throw new SandboxError(`pty: ${what} must be a whole number from 1 to 1000, got ${JSON.stringify(v)}`);
+  }
+
+  constructor(argv, env, cols, rows, onData) {
+    this._onData = onData;
+    // The size travels in a file kern re-reads on SIGWINCH, in a directory of this terminal's own.
+    this._dir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pty-"));
+    fs.chmodSync(this._dir, 0o700);
+    this._sizeFile = path.join(this._dir, "size");
+    this._writeSize(cols, rows);
+    this._exit = null;
+    this._closed = false;
+    this._child = spawn(argv[0], argv.slice(1), {
+      env: { ...env, KERN_TTY_SIZE_FILE: this._sizeFile, KERN_TTY_SIZE: `${cols}x${rows}` },
+      // Its own session, as Python's `start_new_session`: a Ctrl-C at the caller's terminal is not
+      // delivered to the box's.
+      detached: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this._done = new Promise((resolve) => {
+      const finish = (code) => {
+        if (this._exit !== null) return;
+        this._exit = code;
+        this._closed = true;
+        fs.rmSync(this._dir, { recursive: true, force: true });
+        resolve(code);
+      };
+      this._child.once("error", () => finish(-1));
+      this._child.once("close", (code, signal) =>
+        finish(code !== null ? code : -(os.constants.signals[signal] || 0)),
+      );
+    });
+    for (const s of [this._child.stdout, this._child.stderr])
+      s.on("data", (chunk) => {
+        try {
+          this._onData(chunk);
+        } catch (e) {
+          // A callback's error must not stop the output.
+          process.emitWarning(`pty: onData threw ${e && e.name}: ${e && e.message}`, "KernPtyCallback");
+        }
+      });
+    this._child.stdin.on("error", () => {});
+  }
+
+  _writeSize(cols, rows) {
+    const tmp = `${this._sizeFile}.tmp`;
+    fs.writeFileSync(tmp, `${cols}x${rows}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, this._sizeFile);
+  }
+
+  /** Type `data` into the terminal (a string is sent as UTF-8). */
+  sendInput(data) {
+    if (this._closed) throw new SandboxError("pty: the terminal is closed");
+    this._child.stdin.write(typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data));
+  }
+
+  /** Set the terminal's size; the program in the box sees it (SIGWINCH, `stty size`). */
+  resize(cols, rows) {
+    if (this._closed) throw new SandboxError("pty: the terminal is closed");
+    Pty.checkSize(cols, rows);
+    this._writeSize(cols, rows);
+    try {
+      process.kill(this._child.pid, "SIGWINCH");
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /** The exit code once the program ended, null while it runs (a signal reads as its negative). */
+  get exitCode() {
+    return this._exit;
+  }
+
+  /** Wait for the program to end and resolve its exit code (`SandboxError` after `timeoutS`). */
+  async wait({ timeoutS } = {}) {
+    if (timeoutS === undefined || timeoutS === null) return this._done;
+    let t = null;
+    const late = new Promise((_, reject) => {
+      t = setTimeout(() => reject(new SandboxError(`pty: still running after ${timeoutS} s`)), timeoutS * 1000);
+    });
+    try {
+      return await Promise.race([this._done, late]);
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  /** End the terminal's program (and the box of a one-shot sandbox): SIGTERM, SIGKILL after 5 s.
+   * Idempotent. */
+  async kill() {
+    if (this._exit === null) {
+      try {
+        this._child.kill("SIGTERM");
+      } catch {
+        /* gone */
+      }
+      let t = null;
+      const timedOut = await Promise.race([
+        this._done.then(() => false),
+        new Promise((res) => {
+          t = setTimeout(() => res(true), 5000);
+        }),
+      ]);
+      clearTimeout(t);
+      if (timedOut) {
+        try {
+          this._child.kill("SIGKILL");
+        } catch {
+          /* gone */
+        }
+        await this._done;
+      }
+    }
+    this._closed = true;
+  }
 }
 
 /** Validate one capability name for `--cap-drop` before it reaches the argv. */
@@ -3911,8 +4372,29 @@ class Sandbox {
     // trackFiles=true populates result.files by walking the workspace before AND after each call (O(N)
     // in file count); a long session that accretes files slows every runCode. false = result.files [], O(1).
     this.trackFiles = opts.trackFiles ?? true;
+    // Labels on every box this sandbox starts, `{ key: "value" }` (`kern box --label`): `Sandbox.list`
+    // finds sandboxes by them. Not posture (see LABEL_KEY_RE). ⚠️ Visible to local users.
+    this.labels = opts.labels ?? null;
+    // Destinations refused even when `egressAllow` covers them (deny wins); alone, every public host but
+    // these. Needs kern 0.52 or newer (`--egress-deny`).
+    this.egressDeny = opts.egressDeny ?? null;
+    // Box ports published on THIS host's loopback, for the resident box of a `persist` sandbox and for
+    // every kernel() box; `getHost(port)` answers the address. A one-shot call publishes nothing.
+    this.ports = opts.ports ?? null;
+    // `persist` only, both posture: a shell command the resident box runs in the background when it is
+    // created, and one run in it until it exits 0 (within `readyTimeoutS`) whenever it is created or
+    // adopted, before any call.
+    this.startCmd = opts.startCmd ?? null;
+    this.readyCmd = opts.readyCmd ?? null;
+    this.readyTimeoutS = opts.readyTimeoutS ?? 60;
+    // What `fork` builds its copies from: the caller's options, as given.
+    this._opts = { ...opts };
+    // Set by `fork` on a copy of a one-shot sandbox: the copy owns the workspace `fork` made for it and
+    // removes it at close(), as it would a temporary workspace of its own.
+    this._forkOwned = false;
 
     if (!(this.timeoutS > 0)) throw new SandboxError("timeoutS must be a positive number of seconds");
+    this._labelArgs = validateLabels(this.labels);
     if (!(this.maxOutputBytes > 0)) throw new SandboxError("maxOutputBytes must be positive");
 
     // SHAPE GUARDS BEFORE ANYTHING CONSUMES THESE, the twin of the Python binding's and added after
@@ -4043,7 +4525,46 @@ class Sandbox {
       (c) => String(c).toUpperCase().replace(/^CAP_/, "") === "ALL",
     );
     this._profileArgs = (this.profiles || []).map(validateProfile);
-    this._egressAllow = (this.egressAllow || []).map(validateDomain);
+    for (const [which, list] of [
+      ["egressAllow", this.egressAllow],
+      ["egressDeny", this.egressDeny],
+    ])
+      if (list !== null && !Array.isArray(list))
+        throw new SandboxError(
+          `egressAllow / egressDeny take an array of entries, e.g. ["pypi.org"], not ${typeof list} (${which})`,
+        );
+    this._egressAllow = (this.egressAllow || []).map((d) => validateEgressEntry(d, true));
+    this._egressDeny = (this.egressDeny || []).map((d) => validateEgressEntry(d, false));
+    // A deny list alone is "any public host but these", as kern reads `--egress-deny` alone.
+    if (this._egressDeny.length && !this._egressAllow.length) this._egressAllow = ["*"];
+    this._portArgs = [];
+    if (this.ports !== null) {
+      if (!Array.isArray(this.ports)) throw new SandboxError("ports takes an array of box ports, e.g. [8000]");
+      const seen = new Set();
+      for (const port of this.ports) {
+        if (!Number.isInteger(port) || port < 1 || port > 65535)
+          throw new SandboxError(`ports: ${JSON.stringify(port)} is not a port number (1-65535)`);
+        if (seen.has(port)) throw new SandboxError(`ports: ${port} is listed twice`);
+        seen.add(port);
+        this._portArgs.push("-p", `127.0.0.1::${port}`);
+      }
+      if (seen.size > 64) throw new SandboxError("ports: at most 64 ports");
+    }
+    for (const [fname, v] of [
+      ["startCmd", this.startCmd],
+      ["readyCmd", this.readyCmd],
+    ]) {
+      if (v === null) continue;
+      if (typeof v !== "string" || !v.trim() || v.includes("\0"))
+        throw new SandboxError(`${fname} must be a non-empty shell command (string, no NUL)`);
+      if (!this.persist)
+        throw new SandboxError(
+          `${fname} needs persist: true: it belongs to the resident box, which outlives each call; a ` +
+            "one-shot sandbox starts a fresh box for every call",
+        );
+    }
+    if (typeof this.readyTimeoutS !== "number" || !(this.readyTimeoutS > 0))
+      throw new SandboxError("readyTimeoutS must be a positive number of seconds");
     if (this.apparmor !== null) validateApparmor(this.apparmor);
     if (this.user !== null) validateUser(this.user);
     // The spec the boxes run as when it is NOT box root (`user` or the image's own USER), and the host
@@ -4078,7 +4599,7 @@ class Sandbox {
       fs.mkdirSync(this.workspace, { recursive: true });
       validateMount(this.workspace, WORKSPACE);
       this._ws = fs.realpathSync(this.workspace);
-      this._ownWs = false;
+      this._ownWs = this._forkOwned;
     }
     this._entered = true;
     // THE RESIDENT BOX, adopted or created, BEFORE `setup` runs: a setup on a persistent sandbox has
@@ -4219,7 +4740,13 @@ class Sandbox {
   async _residentFingerprint() {
     return crypto
       .createHash("sha256")
-      .update(await this._postureMaterial({ network: this.network, timeoutS: Math.trunc(this.persistTtlS) }))
+      .update(
+        await this._postureMaterial({
+          network: this.network,
+          timeoutS: Math.trunc(this.persistTtlS),
+          resident: true,
+        }),
+      )
       .digest("hex")
       .slice(0, 16);
   }
@@ -4233,8 +4760,8 @@ class Sandbox {
   // with `profiles: ["vcpu:agent"]` and the definition changed from `cpus=1, memory="128M"` to
   // `cpus=4, memory="4G"`, the pool key was the SAME both times while the fingerprint differed. A
   // pool is adoption under another name: it hands a call a box that was built earlier.
-  async _postureMaterial({ network, timeoutS }) {
-    const argv = this._baseArgv("", { network, timeoutS, dry: true });
+  async _postureMaterial({ network, timeoutS, resident = false }) {
+    const argv = this._baseArgv("", { network, timeoutS, dry: true, resident });
     // AND THE CONTROLS THAT NEVER REACH argv ARE ADDED EXPLICITLY. Taking the posture from
     // `_baseArgv` answers the drift problem for everything that IS a flag; `enforceLimits` is not a
     // flag, it is `KERN_NO_SCOPE=1` in the spawn's ENVIRONMENT, so it changed whether the caps are
@@ -4242,6 +4769,9 @@ class Sandbox {
     // before the same fix: `enforceLimits` true and false produced ONE fingerprint, so an unenforced
     // box could be adopted by a Sandbox that had asked for enforcement.
     argv.push(`--enforce-limits=${this.enforceLimits ? 1 : 0}`);
+    // What the resident box starts and what makes it ready are what it IS, though neither is a kern
+    // flag: a box started for one server is not the box another Sandbox asks for.
+    if (resident) argv.push(`--start-cmd=${this.startCmd || ""}`, `--ready-cmd=${this.readyCmd || ""}`);
     // AND EVERY `KERN_*` IN THE ENVIRONMENT, because kern reads its OWN environment when it BUILDS
     // the box: `KERN_SECCOMP` picks the seccomp filter, and `KERN_ALLOW_UNCAPPED`,
     // `KERN_LANDLOCK_REQUIRED`, `KERN_DIRECT_CAPS` and `KERN_CONFIG` all change what the box is,
@@ -4328,6 +4858,243 @@ class Sandbox {
     return null;
   }
 
+  /** Adopt the resident box or create it, wait for `readyCmd` when one is set, and return its name. */
+  async _residentEnsure() {
+    const box = await this._residentEnsureBox();
+    if (this.readyCmd) await this._waitReady(box);
+    return box;
+  }
+
+  /** Run `readyCmd` in `box` until it exits 0 or `readyTimeoutS` passes. Mirrors Python's `_wait_ready`. */
+  async _waitReady(box) {
+    const deadline = Date.now() + this.readyTimeoutS * 1000;
+    const argv = [this._kern, "exec", box, "-w", WORKSPACE];
+    if (this._asUser !== null) argv.push("-u", this._asUser);
+    argv.push("--", "sh", "-c", String(this.readyCmd));
+    let last = "";
+    for (;;) {
+      const left = deadline - Date.now();
+      if (left <= 0) break;
+      const r = await runCapture(argv, Math.max(1000, Math.min(left, 30000)));
+      if (r.code === 0) return;
+      last =
+        r.code === -1 && !r.stderr.trim()
+          ? "ready_cmd did not finish"
+          : (r.stderr || r.stdout || `exit ${r.code}`).trim().slice(-300);
+      await new Promise((res) => setTimeout(res, Math.min(200, Math.max(0, deadline - Date.now()))));
+    }
+    throw new SandboxError(
+      `the resident sandbox ${JSON.stringify(this.name)} was not ready within ${this.readyTimeoutS} s: ` +
+        `readyCmd ${JSON.stringify(this.readyCmd)} never exited 0 (last: ${JSON.stringify(last)}); ` +
+        `startCmd's output is in \`kern logs ${box}\``,
+    );
+  }
+
+  /** `"127.0.0.1:<host port>"` serving `port` of this `persist` sandbox's resident box (`ports`
+   * publishes it on this host's loopback only). The box is created when it is not running. */
+  async getHost(port) {
+    if (!this.persist)
+      throw new SandboxError(
+        "getHost() needs persist: true (or a Kernel: kernel.getHost): a one-shot call's box is gone when " +
+          "the call returns",
+      );
+    this._requireEntered();
+    return hostOf(this._kern, await this._residentEnsure(), port, this.ports);
+  }
+
+  /** End this `persist` sandbox's resident box `timeoutS` seconds from NOW, longer or shorter than it
+   * had; 0 removes the deadline (the box then lives until destroy()). The box is created first when
+   * it is not running. Refused for a one-shot sandbox, whose calls are each bounded by `timeoutS`.
+   * Needs kern 0.51.4 or newer (`kern update --timeout`). Mirrors Python's `set_timeout`. */
+  async setTimeout(timeoutS) {
+    if (!this.persist)
+      throw new SandboxError(
+        "setTimeout() moves the deadline of a persist: true sandbox's resident box; a one-shot sandbox " +
+          "starts a fresh box per call, bounded by its timeoutS",
+      );
+    if (!Number.isInteger(timeoutS) || timeoutS < 0)
+      throw new SandboxError("setTimeout: timeoutS must be a whole number of seconds, 0 or more");
+    this._requireEntered();
+    const box = await this._residentEnsure();
+    const r = await runCapture([this._kern, "update", "--timeout", String(timeoutS), box], 60000);
+    if (r.code !== 0) {
+      const said = (r.stderr || r.stdout || "").trim();
+      if (said.includes("unknown flag") || (said.includes("--timeout") && !said.includes("expects")))
+        throw new SandboxError(
+          `setTimeout needs kern 0.51.4 or newer (\`kern update --timeout\`); ${this._kern} said: ` +
+            said.slice(0, 300),
+        );
+      throw new SandboxError(`setTimeout: ${said.slice(0, 400)}`);
+    }
+  }
+
+  /** CPU, memory, tasks and workspace disk now. The CPU rate is measured over `intervalS` (the call
+   * takes that long; 0 skips the rate). Box fields are null for a one-shot sandbox, which has no box
+   * between calls, and for a resident box that is not running: it is NOT created to be measured. */
+  async getMetrics({ intervalS = 0.2 } = {}) {
+    this._requireEntered();
+    const disk = workspaceUsage(this._ws, []);
+    let box = null;
+    if (this.persist && (await this._residentLookup()) !== null) box = this._residentName();
+    return boxMetrics(this._kern, box, intervalS, disk);
+  }
+
+  /**
+   * Watch a workspace directory (`""`: the whole workspace) and call `onEvent` with each event
+   * `{ type, path, isDir, oldPath }` until `stop()`. Resolves once the watch is in place. `type` is
+   * "create", "write" (a file closed after writing), "remove", "rename" (`oldPath` set), "chmod"
+   * (mode, owner or times) or "overflow" (events were dropped, or 8192 directories are watched:
+   * re-read the directory). Changes by the box, this process and anyone else are all reported;
+   * directories created later are watched too when `recursive`.
+   *
+   * THROUGH kern (`kern __watch-dir`), because Node has no inotify: `fs.watch` keeps only "rename" or
+   * "change" of the event mask, and a create could not be told from a remove nor a write from a chmod
+   * (measured, see `crates/kern-cli/src/dirwatch.rs`). kern runs the Python binding's algorithm: every
+   * directory reached one component at a time with O_NOFOLLOW from the workspace root, never through
+   * a symlink. A directory created and filled faster than its watch is added can miss its first entries.
+   */
+  async watchDir(dirPath = "", onEvent = null, { recursive = true } = {}) {
+    this._requireEntered();
+    if (typeof onEvent !== "function")
+      throw new SandboxError("watchDir needs onEvent, a function taking a watch event");
+    const rel = dirPath ? path.relative(this._ws, this._wsPath(dirPath)) : "";
+    return DirWatch.start(this, rel, onEvent, recursive);
+  }
+
+  /**
+   * An interactive terminal running `command` (default: `bash` when the image has it, else `sh`). A
+   * `persist` sandbox opens it in the resident box (`kern exec -it`), a one-shot sandbox in a fresh box
+   * of its own (`kern box -it`) with the session's posture, bounded by `timeoutS` (default: the
+   * sandbox's). `onData` receives the raw output, escape sequences included.
+   *
+   * NO PSEUDO-TERMINAL ON THIS SIDE, where Python holds one: Node has no openpty and this package takes
+   * no native dependency. kern gives the box its pty anyway when its stdin is a pipe, and learns the
+   * size from `KERN_TTY_SIZE_FILE`, which `resize` rewrites before sending kern SIGWINCH (as a
+   * terminal's resize would). kern's own messages arrive on `onData` too, as they do in Python.
+   */
+  async pty(command = null, { onData = null, cols = 80, rows = 24, timeoutS } = {}) {
+    this._requireEntered();
+    if (typeof onData !== "function") throw new SandboxError("pty needs onData, a function taking a Buffer");
+    let cmd;
+    if (command === null || command === undefined) {
+      cmd = ["sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash -i || exec sh -i"];
+    } else {
+      if (!Array.isArray(command) || !command.every((c) => typeof c === "string"))
+        throw new SandboxError('pty: command is an argv array, e.g. ["python3"]');
+      cmd = [...command];
+      if (!cmd.length) throw new SandboxError("pty: command is empty");
+    }
+    Pty.checkSize(cols, rows);
+    const childEnv = { ...process.env };
+    if (!this.enforceLimits) childEnv.KERN_NO_SCOPE = "1";
+    if (childEnv.TERM === undefined) childEnv.TERM = "xterm-256color";
+    let argv;
+    if (this.persist) {
+      const box = await this._residentEnsure();
+      argv = [this._kern, "exec", box, "-it", "-w", WORKSPACE];
+      if (this._asUser !== null) argv.push("-u", this._asUser);
+      argv.push("--", ...cmd);
+    } else {
+      const limit = Math.trunc(timeoutS === undefined || timeoutS === null ? this.timeoutS : timeoutS);
+      if (!(limit > 0)) throw new SandboxError("pty: timeoutS must be positive");
+      argv = [...this._baseArgv(uniqueName(), { network: this.network, timeoutS: limit }), "-it", "--", ...cmd];
+    }
+    return new Pty(argv, childEnv, cols, rows, onData);
+  }
+
+  /**
+   * `n` copies of this sandbox: the same configuration, each with a workspace of its own holding a copy
+   * of this one's files (`.deps` included, so `setup` is not run again). Mirrors Python's `fork`.
+   *
+   * WHAT IS COPIED IS WHAT snapshot() ARCHIVES: regular files and directories. The box root is
+   * read-only, so the workspace IS a sandbox's persistent state; /tmp, processes and memory are not
+   * copied. The copies are returned NOT opened. A one-shot sandbox's copy owns its workspace and
+   * removes it at close(); a `persist` copy gets a name of its own (`<name>-fork<i>-<id>`) and keeps its
+   * workspace (`copy.workspace`), as `persist` does.
+   *
+   * ⛔ OPT-IN WITH snapshot()/restore() (`KERN_SANDBOX_SNAPSHOT=1`), which Python's is not: the copy
+   * goes through this binding's own archive reader, and that reader is still behind the opt-in.
+   */
+  async fork(n = 1) {
+    this._requireEntered();
+    if (!Number.isInteger(n) || n < 1 || n > 64) throw new SandboxError("fork: n must be a whole number from 1 to 64");
+    this._requireSnapshotOptIn();
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "kern-fork-"));
+    fs.chmodSync(scratch, 0o700);
+    const madeDirs = [];
+    try {
+      const snap = path.join(scratch, "workspace.tar.gz");
+      this.snapshot(snap);
+      const copies = [];
+      for (let i = 0; i < n; i += 1) {
+        const ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "kern-ws-fork-")));
+        fs.chmodSync(ws, 0o700);
+        madeDirs.push(ws);
+        // THE ONE RESTORE, through a throwaway session on the copy's workspace with this sandbox's
+        // account and image: symlinks never followed, a non-root user's ACLs set.
+        const seeder = new Sandbox({
+          ...this._opts, workspace: ws, persist: false, name: null, setup: null, prewarm: 0,
+          startCmd: null, readyCmd: null, ports: null,
+        });
+        await seeder.open();
+        try {
+          seeder.restore(snap);
+        } finally {
+          await seeder.close();
+        }
+        const name = this.persist ? `${this.name}-fork${i + 1}-${crypto.randomBytes(3).toString("hex")}` : null;
+        const copy = new Sandbox({ ...this._opts, workspace: ws, name, setup: null });
+        copy._forkOwned = !this.persist;
+        copies.push(copy);
+      }
+      return copies;
+    } catch (e) {
+      for (const d of madeDirs) fs.rmSync(d, { recursive: true, force: true });
+      throw e;
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+
+  /** The sandbox boxes running now (this user's, every process's), optionally only those carrying
+   * every `labels` entry: `[{ box, name, kind, labels, pid, started }]`. A `persist` sandbox shows as
+   * its resident box (`name` set, kind "persist"); a one-shot sandbox only while a call, a kernel or
+   * a prewarmed box of it runs (kind "call"). kern's own `kern.*` labels are left out. */
+  static async list(labels = null) {
+    const want = labels === null || labels === undefined ? {} : labels;
+    if (typeof want !== "object" || Array.isArray(want) || Object.values(want).some((v) => typeof v !== "string"))
+      throw new SandboxError("list(labels) takes a plain object of string to string");
+    const kernBin = findKern();
+    const r = await runCapture([kernBin, "ps", "--json"], 30000);
+    if (r.code !== 0) throw new SandboxError(`list: kern ps failed: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+    let rows;
+    try {
+      rows = JSON.parse(r.stdout || "[]");
+    } catch (e) {
+      throw new SandboxError(`list: kern ps --json did not answer JSON: ${e.message}`, { cause: e });
+    }
+    const found = [];
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!row || typeof row !== "object" || !["running", "paused"].includes(row.status)) continue;
+      const box = row.name;
+      if (typeof box !== "string" || !SANDBOX_BOX_PREFIXES.some((p) => box.startsWith(p))) continue;
+      const raw = row.labels && typeof row.labels === "object" && !Array.isArray(row.labels) ? row.labels : {};
+      const mine = {};
+      for (const [k, v] of Object.entries(raw)) if (!k.startsWith(RESERVED_LABEL_PREFIX)) mine[k] = String(v);
+      if (Object.entries(want).some(([k, v]) => mine[k] !== v)) continue;
+      const resident = box.startsWith(RESIDENT_PREFIX);
+      found.push({
+        box,
+        name: resident ? box.slice(RESIDENT_PREFIX.length) : null,
+        kind: resident ? "persist" : "call",
+        labels: mine,
+        pid: intOrNull(row.pid) || 0,
+        started: intOrNull(row.started) || 0,
+      });
+    }
+    return found;
+  }
+
   /**
    * Adopt the resident box or create it, and return its name.
    *
@@ -4336,7 +5103,7 @@ class Sandbox {
    * again and adopts what the winner made, verified by the same fingerprint - so losing the race
    * cannot smuggle in a different posture.
    */
-  async _residentEnsure() {
+  async _residentEnsureBox() {
     const want = await this._residentFingerprint();
     const found = await this._residentLookup();
     if (found) {
@@ -4354,18 +5121,30 @@ class Sandbox {
     // and environment - plus `-d` to detach, `--init` so PID 1 REAPS, the fingerprint label, and a
     // PID 1 that does nothing else. `--init` and not a bare `sleep`: `sleep` never calls wait(), so a
     // process a call detached became a zombie and they accumulated until pids.max refused a fork.
+    //
+    // `resident: true`: NO BYTECODE-CACHE MOUNT, whenever the box is made. open() creates it before
+    // the cache is decided and a recreation happens after, so the two differed: the fingerprint this
+    // Sandbox computed after open() carried the mount and the box's label did not (MEASURED on
+    // 0.2.53: computed 1a00025afefa9395, on the box e9be32a2cedbadb1), so a box recreated mid-session
+    // could not be adopted by another process. One shape for every creator. Mirrors Python.
+    //
+    // PID 1 SLEEPS FOR GOOD AND kern's `--timeout` IS THE ONLY DEADLINE: a `sleep` of exactly the TTL
+    // was a second deadline `setTimeout` could not move. 2147483647 s and not `infinity`, which
+    // BusyBox's `sleep` does not take. `startCmd` is the shell's `$1`, never spliced into the script.
     const argv = [
       ...this._baseArgv(this._residentName(), {
         network: this.network,
         timeoutS: Math.trunc(this.persistTtlS),
+        resident: true,
       }),
       "-d",
       "--init",
       "--label",
       `${CFG_LABEL}=${want}`,
       "--",
-      "sleep",
-      String(Math.trunc(this.persistTtlS)),
+      ...(this.startCmd
+        ? ["sh", "-c", 'sh -c "$1" & exec sleep 2147483647', "kern-start", this.startCmd]
+        : ["sleep", "2147483647"]),
     ];
     // THE ENVIRONMENT IS BUILT, NOT INHERITED. Without this the box took whatever `KERN_NO_SCOPE`
     // was in the ambient environment: `enforceLimits: false` never reached the box (only `_spawn`'s
@@ -4722,7 +5501,7 @@ class Sandbox {
    * prewarm pool needs: it compares postures, and a comparison that created a file named after a box
    * that will never exist would both litter the workspace and collide with itself. A dry argv is for
    * COMPARING, never for running. */
-  _baseArgv(name, { network, timeoutS, isSetup = false, dry = false }) {
+  _baseArgv(name, { network, timeoutS, isSetup = false, dry = false, resident = false, publish = false }) {
     // IDENTITY IS RE-ASSERTED PER BOX, not once per Sandbox, and a later pass is the reason. He
     // overwrote the verified binary IN PLACE with `/bin/true` while a Sandbox was open: the next call
     // correctly refused to call an empty run a success, and the message it refused with quoted the
@@ -4743,7 +5522,8 @@ class Sandbox {
     // tree in between, and `--mount` refuses a source that is not there. Dropping the mount for this
     // one call degrades to compiling from source, which is what the missing directory produced
     // before, instead of failing the caller.
-    if (this._pycDir && !isSetup && pycHasContent(this._pycDir))
+    // Never on the resident box either (`resident`): see `_residentEnsureBox`.
+    if (this._pycDir && !isSetup && !resident && pycHasContent(this._pycDir))
       argv.push(...mountArgs(this._pycDir, PYC_MOUNT, true));
     if (this.depsReadonly && !isSetup) {
       const deps = path.join(this._ws, DEPS_DIR);
@@ -4774,8 +5554,10 @@ class Sandbox {
     // Network mode: egressAllow (a domain allowlist via an isolated netns + kern's filtering proxy)
     // governs the untrusted runCode/run boxes; the setup box keeps the full network it needs to install
     // deps. egressAllow and network are mutually exclusive (checked at construction).
-    if (this._egressAllow.length && !isSetup) argv.push("--egress-allow", this._egressAllow.join(","));
-    else if (network) argv.push("--net");
+    if (this._egressAllow.length && !isSetup) {
+      argv.push("--egress-allow", this._egressAllow.join(","));
+      if (this._egressDeny.length) argv.push("--egress-deny", this._egressDeny.join(","));
+    } else if (network) argv.push("--net");
     // Resource profiles (vcpu:/vgpio:/vdisk:NAME): positional tokens `kern box` resolves against the
     // user's kern.toml. Validated at construction, so nothing here can be a smuggled flag.
     argv.push(...this._profileArgs);
@@ -4792,7 +5574,7 @@ class Sandbox {
     if (mergedEnv.PYTHONPATH === undefined) mergedEnv.PYTHONPATH = `${WORKSPACE}/${DEPS_DIR}`;
     // Only when the mount exists, and never over a caller's own value: this is an optimisation and
     // must not overrule an explicit choice.
-    if (this._pycDir && !isSetup && mergedEnv.PYTHONPYCACHEPREFIX === undefined)
+    if (this._pycDir && !isSetup && !resident && mergedEnv.PYTHONPYCACHEPREFIX === undefined)
       mergedEnv.PYTHONPYCACHEPREFIX = PYC_MOUNT;
     // Pass env via a private 0600 --env-file, NOT `--env K=V` on argv (an argv value is visible in
     // `ps` to any local user for the box's lifetime; a credential in env= would leak).
@@ -4853,6 +5635,12 @@ class Sandbox {
       }
       argv.push("--env-file", envPath);
     }
+    // Ports on the boxes that outlive a call (the resident box, a kernel), loopback only, and in the dry
+    // argv too: what a box publishes is part of what it is.
+    if (resident || publish) argv.push(...this._portArgs);
+    // Labels on the box that RUNS, never in a dry argv: metadata, not posture, so they stay out of the
+    // resident fingerprint and the prewarm key.
+    if (!dry) argv.push(...this._labelArgs);
     return argv;
   }
 
@@ -7084,7 +7872,7 @@ class Kernel {
     if (!sbx.enforceLimits) this._childEnv.KERN_NO_SCOPE = "1";
     this._childEnv.KERN_STARTED_FD = "3"; // same unforgeable channel; here for the enforcement byte only
     const argv = [
-      ...sbx._baseArgv(this._name, { network: sbx.network, timeoutS: KERNEL_BACKSTOP_S }),
+      ...sbx._baseArgv(this._name, { network: sbx.network, timeoutS: KERNEL_BACKSTOP_S, publish: true }),
       "--", "python3", `${WORKSPACE}/${this._driver}`,
     ];
     // detached: own process group so we can killpg the box + kern as a unit, like _spawn. fd 3 carries
@@ -7106,6 +7894,17 @@ class Kernel {
         this._stderr = this._stderr.subarray(0, sbx.maxOutputBytes); // bound host RAM on a flooding box
     });
     return this;
+  }
+
+  /** `"127.0.0.1:<host port>"` serving `port` of this kernel's box (`new Sandbox({ ports: [...] })`). */
+  async getHost(port) {
+    return hostOf(this._sbx._kern, this._name, port, this._sbx.ports);
+  }
+
+  /** This kernel's box: CPU (rate over `intervalS`), memory, tasks, and the workspace disk. */
+  async getMetrics({ intervalS = 0.2 } = {}) {
+    const disk = workspaceUsage(this._sbx._ws, []);
+    return boxMetrics(this._sbx._kern, this._name || null, intervalS, disk);
   }
 
   _onData(d) {
@@ -8049,6 +8848,10 @@ module.exports = {
   Result,
   SandboxError,
   MountRefused,
+  DirWatch,
+  Pty,
+  // The egress entry gate, for its tests: the canonical form is what kern is handed.
+  _validateEgressEntry: validateEgressEntry,
   // The prewarm pool, exported for its tests only, and under an underscore for the same reason the
   // bytecode cache's internals are below: a pool key is the same posture question the resident
   // fingerprint asks, the two were allowed to drift once, and the test that stops them doing it

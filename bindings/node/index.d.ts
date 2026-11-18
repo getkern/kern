@@ -123,12 +123,34 @@ export interface SandboxOptions {
   /** RELAXES ISOLATION. true shares the host network for every runCode. Default false. */
   network?: boolean;
   /**
-   * Restrict runCode/run to a DOMAIN ALLOWLIST instead of all-or-nothing, e.g. ["pypi.org",
+   * Restrict runCode/run to an ALLOWLIST instead of all-or-nothing, e.g. ["pypi.org",
    * "files.pythonhosted.org"]. The box runs in an isolated network namespace and reaches the internet
-   * only through kern's filtering proxy, which permits just these domains. Mutually exclusive with
-   * network:true; the setup box keeps full network to install deps, the allowlist governs the run phase.
+   * only through kern's filtering proxy, which permits just these destinations: hostnames and their
+   * subdomains, addresses and ranges ("10.1.2.0/24", which may be private), or "*" for any public host.
+   * `egressDeny` removes destinations from it. Mutually exclusive with network:true; the setup box keeps
+   * full network to install deps, the allowlist governs the run phase.
    */
   egressAllow?: string[];
+  /** Destinations refused even when `egressAllow` covers them (deny wins): hostnames (and their
+   * subdomains), addresses and ranges. Alone, every public host but these. Loopback, link-local (cloud
+   * metadata) and multicast are never reachable. Needs kern 0.52 or newer (`--egress-deny`). */
+  egressDeny?: string[];
+  /** Labels on every box this sandbox starts (`kern box --label`): `Sandbox.list(labels)` finds
+   * sandboxes by them. Not posture. Keys are letters, digits and `. _ / -` (`kern.` is reserved); a
+   * value is one line. Visible to local users (process list, `kern ps`): a secret belongs in `env`. */
+  labels?: Record<string, string> | null;
+  /** Box ports published on THIS host's loopback, for the resident box of a `persist` sandbox and for
+   * every kernel() box; `getHost(port)` answers "127.0.0.1:<port kern picked>". A one-shot call's box
+   * publishes nothing. Part of the posture. */
+  ports?: number[] | null;
+  /** `persist` only: a shell command the resident box runs in the background when it is created (a
+   * server, a watcher); its output goes to `kern logs <box>`. Part of the posture. */
+  startCmd?: string | null;
+  /** `persist` only: a shell command run in the resident box until it exits 0, every time the box is
+   * created or adopted, before any call; `readyTimeoutS` (default 60) bounds the wait. Part of the
+   * posture. */
+  readyCmd?: string | null;
+  readyTimeoutS?: number;
   /** Extra host->box binds: { hostSrc: boxTarget } or { src: [target, "ro"] }. Sensitive sources refused. */
   mounts?: Record<string, MountSpec>;
   /**
@@ -232,6 +254,72 @@ export interface PerCallOptions {
   onStderr?: ((chunk: Buffer) => void) | null;
 }
 
+/** A running sandbox box, as `Sandbox.list` reports it. */
+export interface SandboxInfo {
+  /** The kern box name (`kern ps`, `kern logs`, `kern stop` take it). */
+  box: string;
+  /** The sandbox's `name` for a `persist` sandbox, null for a box of one call. */
+  name: string | null;
+  /** "persist" for a resident box, "call" for a box serving a call, a kernel or a prewarm. */
+  kind: "persist" | "call";
+  /** The caller's labels (kern's own `kern.*` keys are left out). */
+  labels: Record<string, string>;
+  /** The box's supervisor pid. */
+  pid: number;
+  /** When the box started, Unix seconds. */
+  started: number;
+}
+
+/** A sandbox's resource use at one moment. Box fields are null when no box is running (a one-shot
+ * sandbox between calls, an expired resident box) or when the host does not account them. */
+export interface SandboxMetrics {
+  /** CPU time the box has used, in seconds. */
+  cpuSeconds: number | null;
+  /** CPU use over the sampling interval, percent of ONE core (two busy cores read 200). */
+  cpuPercent: number | null;
+  memoryBytes: number | null;
+  /** The memory cap the kernel enforces on the box, null when nothing does. */
+  memoryLimitBytes: number | null;
+  /** Tasks (processes and threads) in the box. */
+  pids: number | null;
+  pidsLimit: number | null;
+  /** What the workspace occupies on disk. */
+  diskBytes: number;
+  /** When the box's deadline ends it, Unix seconds; null for no deadline or no box. */
+  endsAt: number | null;
+}
+
+/** One change in a watched workspace directory. A move into the watched tree arrives as "create" and
+ * a move out of it as "remove"; "overflow" means events were dropped: re-read the directory. */
+export interface WatchEvent {
+  type: "create" | "write" | "remove" | "rename" | "chmod" | "overflow";
+  /** Workspace-relative path ("" for "overflow"). */
+  path: string;
+  isDir: boolean;
+  /** The old path of a "rename", else null. */
+  oldPath: string | null;
+}
+
+/** A running `Sandbox.watchDir`. It does not keep the process alive. */
+export class DirWatch {
+  /** End the watch and wait for it. Idempotent. */
+  stop(): Promise<void>;
+}
+
+/** An interactive terminal in a sandbox, from `Sandbox.pty`. */
+export class Pty {
+  /** Type `data` into the terminal (a string is sent as UTF-8; "\x03" is Ctrl-C). */
+  sendInput(data: Buffer | Uint8Array | string): void;
+  /** Set the terminal's size (1 to 1000 each); the program in the box sees it. */
+  resize(cols: number, rows: number): void;
+  /** The exit code once the program ended, null while it runs (a signal reads as its negative). */
+  readonly exitCode: number | null;
+  /** Resolve the exit code when the program ends; rejects with SandboxError after `timeoutS`. */
+  wait(opts?: { timeoutS?: number }): Promise<number>;
+  /** End the program (and the box of a one-shot sandbox). Idempotent. */
+  kill(): Promise<void>;
+}
+
 /** A configured kernel sandbox. FILE state persists across runCode/run in a workspace on disk; each
  * call runs in a FRESH ephemeral box. Safe by default; every relaxing option says so. */
 export class Sandbox {
@@ -274,6 +362,27 @@ export class Sandbox {
    * done. Trade vs runCode: call-fast but NOT call-isolated (one process, one box; still network-off and
    * resource-capped; a fresh session/kernel is clean). A per-cell timeout tears the kernel down. */
   kernel(opts?: { timeoutS?: number }): Promise<Kernel>;
+  /** The sandbox boxes running now (every process's), optionally only those carrying every `labels`
+   * entry. A `persist` sandbox shows as its resident box; a one-shot one only while a box of it runs. */
+  static list(labels?: Record<string, string> | null): Promise<SandboxInfo[]>;
+  /** `persist` only: end the resident box `timeoutS` seconds from now; 0 removes its deadline. Needs
+   * kern 0.51.4 or newer. */
+  setTimeout(timeoutS: number): Promise<void>;
+  /** CPU (rate over `intervalS`, default 0.2; 0 skips it), memory, tasks, workspace disk and the
+   * deadline. Box fields are null for a one-shot sandbox; a resident box is not created to be measured. */
+  getMetrics(opts?: { intervalS?: number }): Promise<SandboxMetrics>;
+  /** `persist` only: "127.0.0.1:<host port>" serving a port listed in `ports`. */
+  getHost(port: number): Promise<string>;
+  /** Watch a workspace directory ("" for all of it), recursively by default, calling `onEvent` for each
+   * change by the box, this process or anyone else; never through a symlink. Resolves once watching. */
+  watchDir(path: string, onEvent: (event: WatchEvent) => void, opts?: { recursive?: boolean }): Promise<DirWatch>;
+  /** An interactive terminal running `command` (default bash, else sh): in the resident box of a
+   * `persist` sandbox, else in a box of its own bounded by `timeoutS`. */
+  pty(command: string[] | null, opts: { onData: (chunk: Buffer) => void; cols?: number; rows?: number; timeoutS?: number }): Promise<Pty>;
+  /** `n` (1 to 64) copies of this sandbox, each with its own copy of the workspace (`.deps` included),
+   * returned NOT opened. A one-shot copy removes its workspace at close(); a `persist` copy is named
+   * `<name>-fork<i>-<id>` and keeps it. Needs `KERN_SANDBOX_SNAPSHOT=1`, as snapshot()/restore() do. */
+  fork(n?: number): Promise<Sandbox[]>;
 }
 
 /** A warm, persistent Python interpreter in one long-lived box (see `Sandbox.kernel`). `runCode` sends a
@@ -285,6 +394,10 @@ export class Kernel {
    * expression, display() calls and matplotlib figures are captured into `results`. `timeoutS` overrides
    * the kernel's deadline for this cell; exceeding it tears the kernel down and returns a timeout fault. */
   runCode(code: string, opts?: { timeoutS?: number }): Promise<ExecutionResult>;
+  /** "127.0.0.1:<host port>" serving a port listed in the Sandbox's `ports`. */
+  getHost(port: number): Promise<string>;
+  /** This kernel's box: CPU, memory, tasks, and the workspace disk. */
+  getMetrics(opts?: { intervalS?: number }): Promise<SandboxMetrics>;
   /** Tear down the kernel box (close its stdin, then SIGKILL its process group) and remove its driver. */
   close(): Promise<void>;
 }
