@@ -4424,6 +4424,15 @@ const STAGE_TAG_PREFIX: &str = ".stage-";
 /// [`STAGE_TAG_PREFIX`]), which the user shouldn't see. Single-sourced so the create/suppress contract
 /// can't drift.
 fn announce_built(tag: &str) {
+    if kern_common::progress_mode() == kern_common::ProgressMode::Json {
+        if !tag.starts_with(STAGE_TAG_PREFIX) {
+            kern_common::progress_event(
+                "build_done",
+                &format!("\"image\":{},\"ok\":true", kern_common::json_str(tag)),
+            );
+        }
+        return;
+    }
     if !tag.starts_with(STAGE_TAG_PREFIX) {
         // NOT `println!`: this runs while the build ignores SIGPIPE (see `build_one`), and a
         // `println!` to a closed stdout panics. A reader that went away misses the line; the
@@ -4431,8 +4440,11 @@ fn announce_built(tag: &str) {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "built '{tag}'");
-        // The `run:` hint is for an image someone built by hand; one built for a stack is run by it.
-        if crate::global_env("KERN_BUILD_FOR_COMPOSE").is_none() {
+        // The `run:` hint is for an image someone built by hand; one built for a stack is run by it,
+        // and `--progress quiet` asked for the result alone.
+        if crate::global_env("KERN_BUILD_FOR_COMPOSE").is_none()
+            && kern_common::progress_mode() != kern_common::ProgressMode::Quiet
+        {
             let _ = writeln!(out, "  run: kern box myapp --image {tag}");
         }
         let _ = out.flush();
@@ -5162,11 +5174,23 @@ pub(crate) fn wait_with_heartbeat(
             // THE STEP'S OWN COUNTERS, so "slow" and "stuck against a limit" stop looking alike: a step
             // at its `pids.max`, or with its memory at the cap, says so here.
             let usage = box_name.map(step_usage).unwrap_or_default();
-            eprintln!(
-                "  ⋯ still running ({}m{:02}s{usage}): {label}",
-                secs / 60,
-                secs % 60
-            );
+            if kern_common::progress_mode() == kern_common::ProgressMode::Json {
+                kern_common::progress_event(
+                    "heartbeat",
+                    &format!(
+                        "\"elapsed_ms\":{},\"what\":{},\"usage\":{}",
+                        elapsed.as_millis(),
+                        kern_common::json_str(&label),
+                        kern_common::json_str(usage.trim_start_matches(", "))
+                    ),
+                );
+            } else {
+                eprintln!(
+                    "  ⋯ still running ({}m{:02}s{usage}): {label}",
+                    secs / 60,
+                    secs % 60
+                );
+            }
             next += if secs >= 600 {
                 std::time::Duration::from_secs(60)
             } else {

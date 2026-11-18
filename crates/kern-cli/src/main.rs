@@ -287,6 +287,7 @@ mod nopod;
 mod openat2;
 mod pod;
 mod ports;
+mod progress;
 mod pty;
 mod registry;
 /// Ownership and lifetime of a `--no-pod` stack's peer relays.
@@ -381,7 +382,7 @@ fn main() -> ExitCode {
     let _ = invoked;
     // Map the result to an exit code in exactly ONE place (the lib/command layer returns
     // `Result`, never calls `process::exit` itself).
-    match cli::run(&args) {
+    match progress::take_progress_flag(&args).and_then(|args| cli::run(&args)) {
         Ok(()) => ExitCode::SUCCESS,
         // A WORKLOAD'S OWN STATUS, adopted verbatim and printed nowhere: `compose run` is
         // transparent about what the command it ran did. `as u8` is the whole range a process exit

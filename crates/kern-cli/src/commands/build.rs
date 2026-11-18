@@ -337,7 +337,37 @@ fn build_arg_map(args: &BuildArgs) -> Result<std::collections::HashMap<String, S
 /// name to this machine's variant (else the first), and record the set in `<name>.platforms` for
 /// `kern push`, which publishes a manifest list: what `docker buildx build --platform a,b --push`
 /// publishes. Measured first that an arm64 rootfs runs here through qemu-user.
+/// A `build_step` event (`--progress json`): step `s` of `total` starts.
+fn step_event(s: usize, total: usize, what: &str) {
+    kern_common::progress_event(
+        "build_step",
+        &format!(
+            "\"step\":{s},\"total\":{total},\"instruction\":{}",
+            kern_common::json_str(what)
+        ),
+    );
+}
+
 pub fn build(args: BuildArgs) -> Result<(), Error> {
+    let tag = args.tag.unwrap_or_default().to_string();
+    let started = std::time::Instant::now();
+    let result = build_inner(args);
+    // A FAILED BUILD IS AN EVENT TOO: the stream must end in an answer either way.
+    if let Err(e) = &result {
+        kern_common::progress_event(
+            "build_done",
+            &format!(
+                "\"image\":{},\"ok\":false,\"ms\":{},\"error\":{}",
+                kern_common::json_str(&tag),
+                started.elapsed().as_millis(),
+                kern_common::json_str(&e.to_string())
+            ),
+        );
+    }
+    result
+}
+
+fn build_inner(args: BuildArgs) -> Result<(), Error> {
     let mut platforms: Vec<kern_oci::Platform> = Vec::new();
     for p in args.platforms {
         let p = kern_oci::Platform::parse(p).map_err(|e| Error::Build(e.to_string()))?;
@@ -1071,6 +1101,7 @@ fn build_run(
     if !quiet {
         kern_common::progress!("[1/{total}] FROM {base_ref}");
     }
+    step_event(1, total, &format!("FROM {base_ref}"));
     let (base_lower, base_cfg) = resolve_image(base_ref)?;
     let mut config = base_cfg;
 
@@ -1232,6 +1263,7 @@ fn build_run(
         if !quiet {
             kern_common::progress!("[{s}/{total}] {what}");
         }
+        step_event(s, total, &what);
     };
     let mut cmd_from_dockerfile = false;
     let mut run_mounts: Vec<crate::dockerfile::RunMount> = Vec::new();
@@ -1518,6 +1550,7 @@ fn build_layered_cached(
         if !quiet {
             kern_common::progress!("[{s}/{total}] {what}");
         }
+        step_event(s, total, &what);
     };
     // Overlay lower chain (base first); a layer dir is appended per fs-unit. `key` is the running
     // chained key; `layer_keys` are the produced layers in order (→ the tag's `.layers` manifest).

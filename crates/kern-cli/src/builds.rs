@@ -835,9 +835,14 @@ static RUN_STDOUT_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI3
 /// reaches `kern build logs`, or `None` (inherit kern's own stdout, as before) when nothing records.
 pub fn run_stdout() -> Option<std::process::Stdio> {
     use std::os::fd::FromRawFd as _;
-    let fd = RUN_STDOUT_FD.load(std::sync::atomic::Ordering::Acquire);
+    let mut fd = RUN_STDOUT_FD.load(std::sync::atomic::Ordering::Acquire);
     if fd < 0 {
-        return None;
+        // `--progress json`: stdout carries the events and nothing else, so a RUN's own stdout goes
+        // where its stderr goes (measured: `echo` inside a RUN landed between the JSON lines).
+        if kern_common::progress_mode() != kern_common::ProgressMode::Json {
+            return None;
+        }
+        fd = 2;
     }
     // A duplicate per box: `Stdio` takes ownership and closes it after the spawn, the capture keeps
     // the original until it ends.
@@ -981,7 +986,13 @@ impl Capture {
             // anyway (a sabotage of it alone is NOT caught, measured); it keeps the tee correct for a
             // caller that starts a capture without that guard.
             unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-            let mut sinks = [saved_err, if out_rd >= 0 { saved_out } else { -1 }];
+            // `--progress json`: the RUN's stdout is teed to the real STDERR, stdout being the events'.
+            let out_sink = if kern_common::progress_mode() == kern_common::ProgressMode::Json {
+                saved_err
+            } else {
+                saved_out
+            };
+            let mut sinks = [saved_err, if out_rd >= 0 { out_sink } else { -1 }];
             let mut open = if out_rd >= 0 { 2 } else { 1 };
             let mut buf = [0u8; 4096];
             let mut head_written: usize = 0;

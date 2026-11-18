@@ -385,11 +385,142 @@ pub fn env_flag(name: &str) -> bool {
 /// behaviour for a worse one. This gates the narrator, not the messenger.
 pub fn progress_wanted() -> bool {
     use std::io::IsTerminal;
+    match progress_mode() {
+        ProgressMode::Quiet | ProgressMode::Json => return false,
+        ProgressMode::Plain | ProgressMode::Tty => return true,
+        ProgressMode::Auto => {}
+    }
     match PROGRESS_TERMINAL.load(std::sync::atomic::Ordering::Acquire) {
         PROGRESS_NOT_TERMINAL => false,
         PROGRESS_IS_TERMINAL => true,
         _ => std::io::stderr().is_terminal(),
     }
+}
+
+/// How kern reports its progress: `--progress` on `kern build` and `kern compose`, or
+/// `KERN_PROGRESS` (which the flag sets for every kern it starts).
+///
+/// * `auto` (default): `tty` when stderr is a terminal, else `plain`.
+/// * `tty`: the lines, plus a live view on the terminal where a command draws one.
+/// * `plain`: the lines, never redrawn: what a log file or CI reads.
+/// * `json`: nothing on stderr from the narrator; one JSON object per event on stdout (`"schema":1`).
+/// * `quiet`: no progress at all. Errors, warnings and notes are never progress, and still arrive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressMode {
+    Auto,
+    Tty,
+    Plain,
+    Json,
+    Quiet,
+}
+
+impl ProgressMode {
+    pub const WORDS: [&'static str; 5] = ["auto", "tty", "plain", "json", "quiet"];
+
+    pub fn parse(w: &str) -> Option<Self> {
+        match w.trim() {
+            "auto" => Some(Self::Auto),
+            "tty" => Some(Self::Tty),
+            "plain" => Some(Self::Plain),
+            "json" => Some(Self::Json),
+            "quiet" => Some(Self::Quiet),
+            _ => None,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Tty => "tty",
+            Self::Plain => "plain",
+            Self::Json => "json",
+            Self::Quiet => "quiet",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Auto => 1,
+            Self::Tty => 2,
+            Self::Plain => 3,
+            Self::Json => 4,
+            Self::Quiet => 5,
+        }
+    }
+
+    fn of_code(c: u8) -> Option<Self> {
+        match c {
+            1 => Some(Self::Auto),
+            2 => Some(Self::Tty),
+            3 => Some(Self::Plain),
+            4 => Some(Self::Json),
+            5 => Some(Self::Quiet),
+            _ => None,
+        }
+    }
+}
+
+/// 0 = not decided yet (read `KERN_PROGRESS` on first use), else [`ProgressMode::code`].
+static PROGRESS_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The mode in force: what [`set_progress_mode`] set, else `KERN_PROGRESS`, else `auto`. A value
+/// `KERN_PROGRESS` does not name is `auto`: a narrator setting must never stop a command.
+pub fn progress_mode() -> ProgressMode {
+    if let Some(m) = ProgressMode::of_code(PROGRESS_MODE.load(std::sync::atomic::Ordering::Acquire)) {
+        return m;
+    }
+    let m = std::env::var("KERN_PROGRESS")
+        .ok()
+        .and_then(|v| ProgressMode::parse(&v))
+        .unwrap_or(ProgressMode::Auto);
+    PROGRESS_MODE.store(m.code(), std::sync::atomic::Ordering::Release);
+    m
+}
+
+/// Set the mode for this process (the `--progress` flag).
+pub fn set_progress_mode(m: ProgressMode) {
+    PROGRESS_MODE.store(m.code(), std::sync::atomic::Ordering::Release);
+}
+
+/// The mode with `auto` resolved: `tty` when the user's stderr is a terminal, else `plain`.
+pub fn progress_mode_resolved() -> ProgressMode {
+    use std::io::IsTerminal;
+    match progress_mode() {
+        ProgressMode::Auto => {
+            let tty = match PROGRESS_TERMINAL.load(std::sync::atomic::Ordering::Acquire) {
+                PROGRESS_NOT_TERMINAL => false,
+                PROGRESS_IS_TERMINAL => true,
+                _ => std::io::stderr().is_terminal(),
+            };
+            if tty {
+                ProgressMode::Tty
+            } else {
+                ProgressMode::Plain
+            }
+        }
+        m => m,
+    }
+}
+
+/// Write one progress EVENT as a JSON line on stdout, in `json` mode only (`body` is the object's
+/// fields after `"type"`, already JSON, e.g. `"step":1`). Every event carries `"schema":1`, its type
+/// and the time in ms; one `write` per line, so events from threads never interleave.
+pub fn progress_event(kind: &str, body: &str) {
+    use std::io::Write;
+    if progress_mode() != ProgressMode::Json {
+        return;
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let sep = if body.is_empty() { "" } else { "," };
+    let line = format!(
+        "{{\"schema\":1,\"type\":{},\"t\":{ms}{sep}{body}}}\n",
+        json_str(kind)
+    );
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
 }
 
 /// What [`progress_wanted`] answers while this process's fd 2 is NOT the stream the user is reading.
