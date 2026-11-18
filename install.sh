@@ -179,7 +179,8 @@ asset="kern-${arch}.tar.gz"
 if [ "$ver" = "latest" ]; then
   base="https://github.com/${REPO}/releases/latest/download"
 else
-  base="https://github.com/${REPO}/releases/download/${ver}"
+  # A release's tag is `v<version>`: KERN_VERSION may be given with or without the `v`.
+  base="https://github.com/${REPO}/releases/download/v${ver#v}"
 fi
 
 # --- install dir ---

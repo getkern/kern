@@ -35,7 +35,8 @@ try {
 # By default pull from the LATEST GitHub release (its Windows assets are CI-built + sha256-signed);
 # pin an exact release with KERN_VERSION=v0.6.5. GitHub's /releases/latest/download/<asset> redirects
 # to the newest release's asset of that name.
-$RelBase    = if ($env:KERN_VERSION) { "https://github.com/getkern/kern/releases/download/$env:KERN_VERSION" } else { 'https://github.com/getkern/kern/releases/latest/download' }
+# A release's tag is `v<version>`: KERN_VERSION may be given with or without the `v`.
+$RelBase    = if ($env:KERN_VERSION) { "https://github.com/getkern/kern/releases/download/v$($env:KERN_VERSION -replace '^v', '')" } else { 'https://github.com/getkern/kern/releases/latest/download' }
 $InstallDir = Join-Path $env:LOCALAPPDATA 'kern'
 $DistroName = 'kern'
 $DistroDir  = Join-Path $InstallDir 'distro'
@@ -291,17 +292,37 @@ set -u
 U=kern
 ID=1000
 say() { echo "kern: $*"; }
+# AN ACCOUNT ALREADY ON UID 1000 IS THE USER. MEASURED on a distro where someone had run `adduser`:
+# a second name on the same uid split the identity (the system answers uid 1000 with the first
+# name, the uid ranges were written for the second), and every box fell back to a single-uid map.
+other=$(awk -F: -v id="$ID" '$3 == id { print $1; exit }' /etc/passwd)
+if ! grep -q "^$U:" /etc/passwd && [ -n "$other" ]; then
+  U=$other
+fi
+# The marker holds a plain name only (kern refuses any other): a name it could not hold, no change.
+case "$U" in
+  ''|*[!a-z0-9_-]*|?????????????????????????????????*)
+    say "uid $ID is the account '$U', a name kern's marker cannot hold: kern keeps running as root here"
+    exit 0 ;;
+esac
 # The user, its group and home, and the uid ranges (the user takes root's, root the next one).
 grep -q "^$U:" /etc/passwd || echo "$U:x:$ID:$ID:kern:/home/$U:/bin/sh" >> /etc/passwd
-grep -q "^$U:" /etc/group || echo "$U:x:$ID:" >> /etc/group
+grep -q "^$U:" /etc/group || grep -q "^[^:]*:[^:]*:$ID:" /etc/group || echo "$U:x:$ID:" >> /etc/group
 grep -q "^$U:" /etc/shadow 2>/dev/null || echo "$U:!::0:::::" >> /etc/shadow
-mkdir -p "/home/$U" && chown "$ID:$ID" "/home/$U"
+H=$(awk -F: -v u="$U" '$1 == u { print $6; exit }' /etc/passwd)
+G=$(awk -F: -v u="$U" '$1 == u { print $4; exit }' /etc/passwd)
+case "$H" in /home/?*) ;; *) say "the home of '$U' is '$H', not under /home: kern keeps running as root here"; exit 0 ;; esac
+case "$G" in ''|*[!0-9]*) G=$ID ;; esac
+mkdir -p "$H" && [ ! -L "$H" ] && chown -h "$ID:$G" "$H"
 for f in /etc/subuid /etc/subgid; do
   if ! grep -q "^$U:" "$f" 2>/dev/null; then
     grep -v '^root:' "$f" 2>/dev/null > "$f.new"
     printf '%s:100000:65536\nroot:165536:65536\n' "$U" >> "$f.new"
     mv "$f.new" "$f"
   fi
+  # The same range under the uid NUMBER too, which is found whatever name the uid has.
+  r=$(grep "^$U:" "$f" | head -1 | cut -d: -f2-)
+  grep -q "^$ID:" "$f" || printf '%s:%s\n' "$ID" "$r" >> "$f"
 done
 # No way back to root from the user: root's password locked, `su` without setuid.
 sed -i 's/^root::/root:*:/' /etc/shadow
@@ -322,8 +343,8 @@ chown 0:0 /etc/kern /etc/kern/wsl-user
 # no migration through a symlinked path, `chown -h` everywhere, and a regular file is shifted only
 # when it has a single name.
 user_paths_safe() {
-  for p in "/home/$U" "/home/$U/.local" "/home/$U/.local/share" "/home/$U/.config" \
-           "/home/$U/.local/share/kern" "/home/$U/.config/kern"; do
+  for p in "$H" "$H/.local" "$H/.local/share" "$H/.config" \
+           "$H/.local/share/kern" "$H/.config/kern"; do
     [ -L "$p" ] && { say "$p is a symbolic link: not migrating through it (remove it and run install.ps1 again)"; return 1; }
   done
   return 0
@@ -337,7 +358,7 @@ if [ ! -e /etc/kern/wsl-migrated ]; then
   # Data and configuration: moved, then owner/group 0 become the user's, and every file gets its
   # own mode back afterwards, because a chown clears setuid and setgid.
   for rel in .local/share/kern .config/kern; do
-    src="/root/$rel"; dst="/home/$U/$rel"
+    src="/root/$rel"; dst="$H/$rel"
     if [ -d "$src" ] && [ ! -e "$dst" ]; then
       mkdir -p "$(dirname "$dst")"
       mv "$src" "$dst" || continue
@@ -348,13 +369,13 @@ if [ ! -e /etc/kern/wsl-migrated ]; then
       for f; do
         m=$(stat -c %a "$f"); u=$(stat -c %u "$f"); g=$(stat -c %g "$f")
         [ "$u" = 0 ] && u='"$ID"'
-        [ "$g" = 0 ] && g='"$ID"'
+        [ "$g" = 0 ] && g='"$G"'
         chown -h "$u:$g" "$f"
         [ -L "$f" ] || chmod "$m" "$f"
       done' sh {} +
   done
-  for d in "/home/$U/.local" "/home/$U/.local/share" "/home/$U/.config"; do
-    [ -d "$d" ] && [ ! -L "$d" ] && chown -h "$ID:$ID" "$d"
+  for d in "$H/.local" "$H/.local/share" "$H/.config"; do
+    [ -d "$d" ] && [ ! -L "$d" ] && chown -h "$ID:$G" "$d"
   done
   # Images: NOT moved as files, and not through `kern save`, which flattens a layer's owners to
   # root and strips its setuid bits (MEASURED: debian:bookworm-slim, 11 setuid/setgid files before,
