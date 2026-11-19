@@ -23,4 +23,7 @@ Nothing here is a commitment or a date. Shipped work is in [CHANGELOG.md](CHANGE
   from Python, Node and MCP. For pages you trust; arbitrary browsing needs the VM tier.
 - **Kubernetes pod**: kern runs in a privileged container today; next is the least privilege it
   needs.
+- **Remote machines in kern desktop**: pick a machine from `~/.ssh/config` and see its boxes,
+  sandboxes and GPUs. kern runs there as it runs here, called over plain SSH: no agent, no daemon,
+  no open port.
 - **Snapshot and warm start**: rootless CRIU, opt-in, same host.

@@ -87,6 +87,21 @@ exposes neither, which is why Docker Desktop has no GPU for containers either.
 
 [docs/INSTALL.md](INSTALL.md) has the detail and the way back to enforced caps.
 
+## Can I use kern on another machine?
+
+Over SSH, as any other command: `ssh workstation kern ps`, and `ssh -t workstation kern top` for the
+live view. Nothing listens on the remote machine: kern starts, answers and exits.
+
+- **kern has to be on the PATH of a non-interactive shell there.** Installed as root it is in
+  `/usr/local/bin`, and it is. A user install puts it in `~/.local/bin`, which a non-interactive SSH
+  command does not have on its PATH on Ubuntu: call it as `ssh workstation '~/.local/bin/kern ps'`.
+- **A box started with `-d` outlives the SSH session only with lingering on** for that user
+  (`loginctl enable-linger`): without it, systemd stops the user's services when the last session
+  ends. `kern doctor` checks it.
+- **Reuse the connection.** Measured against a remote server: 1.8 s per call with a new SSH
+  connection each time, 0.29 s with `ControlMaster auto` and `ControlPersist 60` for that host in
+  `~/.ssh/config`.
+
 ## Is it safe to run truly hostile, untrusted multi-tenant code?
 
 The boundary is the Linux kernel, so a kernel privilege-escalation bug is an escape, and an unprivileged
