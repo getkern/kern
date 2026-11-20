@@ -21,11 +21,77 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**Two commands change what they do by default. Both now behave as the same command of Docker:**
+- **`kern exec <box>` runs as the box's own user** (the image's `USER`, or `--user`);
+  `kern exec -u root <box>` enters as root. `kern compose exec` already did this.
+- **`kern up` reads every flag it is given.** `--exit-code-from S`, `--abort-on-container-exit`,
+  `--wait-timeout N`, `--build`, `--no-build` and service names were taken and not acted on, so
+  `kern up --exit-code-from tests` reported 0 whatever the tests did; they now mean what they mean in
+  `kern compose <file> up`, `--progress` is taken after `up`, and a flag the shorthand does not have is
+  refused by name. Under those flags, the progress view shows the service that ended as completed, not
+  failed.
+- **An attached `up` shows what this run printed**, as Docker's attach does. It replayed every earlier run
+  of the service kept since the stack was created: five `kern up` in a row printed a one-line service 1,
+  2, 3, 4 and 5 times. `kern compose logs` still holds every run.
+- **`kern compose up` without `-d` follows the stack whatever stdout is**, and returns when every
+  service has exited (Ctrl-C stops the stack). On a pipe or a file it used to return at once, so a
+  `up setup` meant to finish before the next step ran in parallel with it. `-d` returns at once, and
+  `--wait` implies `-d`.
+
+**A request to a `.localhost` name is read by the same code as the egress proxy's**, which refuses a
+head a service could split differently (a bare CR or LF, a folded line, two `Content-Length`s,
+`Transfer-Encoding` with `Content-Length`, two `Host`s, a request line and `Host` naming different
+hosts). A refused request ends its connection: nothing sent after it reaches a service.
+
+**The `.localhost` router runs while a published port exists and leaves within seconds of the last
+one**, in a cgroup of its own. `kern box -d -p ...` prints `url: http://<box>.kern.localhost:PORT/`
+too; `kern ps --format '{{.URL}}'`, `ps --json` and `inspect --json` carry the URL.
+
+**`FROM image:${VAR:-default}`** and the other modifiers (`${VAR-word}`, `${VAR:+word}`,
+`${VAR+word}`, nested defaults) expand as they do elsewhere; they expanded to nothing.
+
+**`compose ps` and `kern ps` show the current run**: a box restarted by its restart policy is
+`Restarting (N) X seconds ago` between two runs, and `Up` counts from its last start, not from its
+creation. A service stopped and started again is listed once.
+
+**On WSL, files on `C:\` belong to the distro's user, a box's root, and keep `chown`/`chmod`**
+(`[automount] metadata,uid=1000` in `/etc/wsl.conf`; `install.ps1` sets it on an existing distro and
+restarts it). A database keeping its data in a project folder on `C:\` could not set it up and
+restarted for hours. `kern doctor` says how `C:\` is mounted, and a box started with a writable bind
+of a directory another user owns says that its root cannot chown it.
+
+**Windows refuses the programs started from inside kern's WSL distro** (`[interop] enabled=false`; `install.ps1`
+sets it on an existing distro, and leaves a value someone wrote). `kern.exe` from Windows works as
+before; `code .` or `explorer.exe` typed in the distro does not. `kern doctor` says whether interop is
+on.
+
+**kern's WSL distro carries `zstd` and `/etc/localtime`** (UTC): images with zstd-compressed layers
+pull, and a compose file that mounts `/etc/localtime` starts. `kern doctor` says whether `zstd` is
+installed.
+
+**A restarted or stopped-and-started service no longer leaves its old network helper running.** The
+new one took over its record, and `down` stopped only the new one: helpers piled up on each restart of
+a slow-stopping service.
+
+**An unset `${VAR}` is reported once**, not once per use of a YAML anchor.
+
+**`kern build` on a terminal draws the live view `compose up` draws**: one row for the image, the step
+it is on and how long that step took last time, with what the RUNs print above it. On a pipe or in
+CI it prints its step lines (it printed none); `--progress quiet` prints nothing but the result, and
+the build's last lines when it fails; in `--progress json`, `build_step` carries `"cached"`.
+
+**kern sandbox (Node) records each call's code and output** for `kern sandbox show`, as the Python
+binding does; `transcripts: false` keeps none for one sandbox.
+
+**`kern top` counts a GPU it cannot read** (`GPU 1 · usage n/a` on WSL2) instead of `GPU none`.
+
 **`compose up` names each published service: `http://<service>.<project>.localhost`.** A router of
 your user, on the loopback addresses, forwards by `Host` to the port the service published;
 `<port>.<service>.<project>.localhost` picks a container port and `<service>.kern.localhost` the one
-project that has the service. Port 80 where an ordinary user may bind it, else 8080;
-`[kern] local_domains_port` sets it and `local_domains = false` turns it off. In `--progress json`,
+project that has the service. Port 80 where an ordinary user may bind it, else 8780 (8080 is the port
+many apps publish); `[kern] local_domains_port` sets it and `local_domains = false` turns it off.
+`kern doctor` typed in Windows checks that port from the Windows side: held by a Windows program, or
+refused by Windows, it says so and names the fix. In `--progress json`,
 one `local_url` event per service.
 
 **`--progress auto|tty|plain|json|quiet` on `kern build` and `kern compose`** (or `KERN_PROGRESS`).
@@ -94,6 +160,32 @@ is named as such, not as a missing signature.
 
 **`kern self-update` works in kern's WSL distro**: the new binary is checked as root there, and a host
 name that does not resolve is tried again over IPv4.
+
+**The WSL distro carries the released kern, byte for byte.** It had a kern built separately for it,
+the same version and different bytes, so no signature covered the binary a WSL install runs. The
+release workflow now puts the x86_64 tarball's binary in the distro and fails if the two differ.
+
+**Every release asset is signed**: the Windows `kern.exe` and the WSL distro too, not only the Linux
+tarballs. A release is published only once its signatures are on it.
+
+**`install.sh` refuses a release from 0.51.2 on that has no signature, or whose signature names
+another version** than the one asked for. `install.ps1` checks the signatures of `kern.exe`, the
+distro and an in-place update when minisign is installed (`winget install jedisct1.minisign`), with
+the same rules; without it, on an update, the kern installed before the update checks them. A
+`latest` that names a release older than these rules is not refused for them. At the end it says, file
+by file, what was checked: SHA256, a signature and by whom, or nothing (a local file, a first install,
+which trusts HTTPS from github.com).
+
+**`install.ps1` takes `KERN_WSL_DISTRO` and `KERN_INSTALL_DIR`**, to install into another distro and
+folder; `kern.exe` already reads `KERN_WSL_DISTRO`.
+
+**`install.sh` and `install.ps1` take `KERN_RELEASE_URL`**, a mirror holding one release's files (with
+`KERN_VERSION`): an internal server or an offline copy. A mirror is trusted only through the
+signatures: when nothing can check them (no minisign, no kern installed before that can), the install
+is refused.
+
+**A `COPY --from` path missing from its stage is named**, with the stage:
+`COPY --from: '/app.jar' does not exist in stage 'build'`.
 
 ## kern sandbox 0.2.53 - 2026-11-18
 
