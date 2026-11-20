@@ -19,7 +19,7 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
-## Unreleased
+## v0.56.0 - 2026-11-20
 
 **Two commands change what they do by default. Both now behave as the same command of Docker:**
 - **`kern exec <box>` runs as the box's own user** (the image's `USER`, or `--user`);
