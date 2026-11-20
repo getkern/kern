@@ -83,7 +83,7 @@ exception described below: a path that leaves the project directory.
 | From your Docker setup | kern |
 |---|---|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ multi-arch, v2 auth, gzip **+ zstd**, digest-pinned `@sha256:` refs **content-verified** |
-| **`docker-compose.yml`** | ✅ read as-is, 13 verbs, multi-file merge, `up` reconciles |
+| **`docker-compose.yml`** | ✅ read as-is, 24 verbs, multi-file merge, `up` reconciles |
 | **Dockerfile** `build` | ✅ `kern build`, daemonless: each `RUN` is a real box. `kern build --check` parses and reports, building nothing |
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ last-match-wins, `!` re-include, `**` |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load` |

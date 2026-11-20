@@ -1622,7 +1622,18 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
             crate::commands::compose_root(f)?;
         }
     } else {
-        crate::commands::adopt_git_project_root(files)?;
+        // SAID ONLY BY THE VERBS THAT READ THE FILE'S PATHS. MEASURED on WSL with Supabase (its
+        // compose file sits in `docker/` of a git clone): `exec`, `ps`, `logs` and `down` printed the
+        // note too, on every call, into the output a script reads.
+        let say = matches!(
+            action,
+            ComposeAction::Up
+                | ComposeAction::Build
+                | ComposeAction::Config
+                | ComposeAction::Run
+                | ComposeAction::Watch
+        );
+        crate::commands::adopt_git_project_root(files, say)?;
     }
     // `--profile` is DEFINED by Docker as equivalent to `COMPOSE_PROFILES`, so it is applied by
     // exporting that variable once here, at the CLI boundary, before any parsing. One assignment in a
@@ -3333,7 +3344,7 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
         // written from an `exec` landed owned by root inside a box whose workload runs as someone
         // else, and `whoami` answered differently here than there. MEASURED on a service with
         // `user: "5050"`: the workload reported 5050 and `compose exec ... id -u` reported 0.
-        // `kern exec <box>` is unchanged and remains the root way in.
+        // `kern exec <box>` does the same since 0.56.0; `-u root` is the root way in.
         return crate::commands::exec(
             &b.name,
             run_cmd,
@@ -4885,11 +4896,21 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
             .iter()
             .find(|b| b.name == *d || short_service_name(&boxes, &b.name, &pod) == *d)
             .map_or(d.as_str(), |b| b.name.as_str());
-        crate::progress::service(
-            row,
-            "exited",
-            "within the bring-up: `kern compose logs` says why",
-        );
+        // Under the abort flags the exit is the result (a test run), so the row is not a failure:
+        // a red row and a pointer to the logs beside a green exit code read as a broken stack.
+        if abort_on_exit {
+            crate::progress::service(
+                row,
+                "completed",
+                "ended: the stack stops and `up` returns the status",
+            );
+        } else {
+            crate::progress::service(
+                row,
+                "exited",
+                "within the bring-up: `kern compose logs` says why",
+            );
+        }
     }
     if !dead.is_empty() && !abort_on_exit {
         // WHY IT DIED, WHEN KERN CAN SEE WHY. A service that binds a port another service in the same
@@ -5059,21 +5080,10 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
     // the logs on a terminal and stopped the stack on Ctrl-C: MEASURED on Docker Compose 5.3.1,
     // `docker compose restart rest` and `docker compose start rest` return at once with exit 0 on a
     // terminal, and kern's `restart rest` did not return, and interrupted it left `rest` STOPPED.
-    if !detach && action == ComposeAction::Up {
-        if should_attach(detach, unsafe { libc::isatty(1) } == 1) {
-            return attach_to_stack(&mine, &boxes, &pod, file);
-        }
-        // THE SPLIT IS ANNOUNCED, because a command with two behaviours decided by a property of
-        // the caller is exactly the shape this codebase refuses to leave silent. Docker attaches
-        // either way (measured on 29.6.2: `timeout 5 sh -c 'docker compose up 2>&1 | cat'` exits
-        // 124, and so does a plain redirect and a run with stdin closed; only `-d` exits 0), so
-        // this line is where kern says it did something else and why the reader may not have
-        // noticed.
-        eprintln!(
-            "kern: note: stdout is not a terminal, so `up` returned instead of streaming the \
-             stack. `-d` says so explicitly; on a terminal it follows the logs and Ctrl-C stops \
-             the stack, as `docker compose up` does."
-        );
+    // ATTACHED WHATEVER STDOUT IS, as Docker is (since 0.56.0): `--wait` implies `-d`, as Docker's
+    // does. See [`should_attach`].
+    if action == ComposeAction::Up && should_attach(detach || wait_ready) {
+        return attach_to_stack(&mine, &boxes, &pod, file);
     }
     Ok(())
 }
@@ -5086,15 +5096,14 @@ fn local_urls_for(mine: &[&crate::compose::ComposeBox], project: &str) -> Vec<(S
     let routable: Vec<(String, String)> = mine
         .iter()
         .filter_map(|b| {
-            let short = b.name.strip_prefix(&format!("{project}-"))?;
+            if !b.name.starts_with(&format!("{project}-")) {
+                return None;
+            }
             let inst = crate::registry::find(&b.name)?;
             if !crate::localrouter::has_tcp_port(&inst.ports) {
                 return None;
             }
-            let label = match short.strip_suffix("-1") {
-                Some(s) if s == b.service => s.to_string(),
-                _ => short.to_string(),
-            };
+            let (label, _) = crate::localrouter::name_of(&b.name, project);
             Some((b.service.clone(), label))
         })
         .collect();
@@ -5481,7 +5490,12 @@ fn watch_and_abort(
     let mut who = Vec::with_capacity(mine.len());
     for b in mine {
         let pid = registry::find_ref(&b.name).map_or(0, |ins| ins.pid);
-        match crate::commands::Followed::open(docker_log_label(b, pod), b.name.clone(), pid, None) {
+        match crate::commands::Followed::open(
+            docker_log_label(b, pod),
+            b.name.clone(),
+            pid,
+            crate::commands::Replay::ThisRun,
+        ) {
             Ok(Some(f)) => who.push(f),
             Ok(None) => {}
             Err(e) => eprintln!("kern: warning: {}: {e}", b.service_name()),
@@ -5701,29 +5715,26 @@ fn wait_until_ready(
 /// with no visible symptom on the machine that writes it: an interactive `up` that returns looks
 /// like the old behaviour, and a piped `up` that attaches hangs somebody else's script.
 ///
-/// WHERE THIS DEVIATES FROM DOCKER, MEASURED rather than assumed. `docker compose up` attaches
-/// whatever stdout is: on Docker 29.6.2, `timeout 5 sh -c 'docker compose up 2>&1 | cat'` exits
-/// 124, a plain `> file` redirect exits 124, stdin closed exits 124, and only `-d` exits 0. kern
-/// returns on a pipe, and says so on stderr.
+/// AS DOCKER DOES, WHATEVER STDOUT IS: `docker compose up` attaches on a pipe or a file too (MEASURED on
+/// Docker 29.6.2: `timeout 5 sh -c 'docker compose up 2>&1 | cat'` exits 124, a plain `> file`
+/// redirect exits 124, stdin closed exits 124; only `-d` exits 0).
 ///
-/// THE REASON IS KERN'S OWN CONTRACT WITH SYSTEMD. `kern compose <file> systemd` emits a unit that
-/// is `Type=oneshot` + `RemainAfterExit=yes`, which requires `up` to EXIT: a unit whose `ExecStart`
-/// blocked would sit in `activating` until `TimeoutStartSec` and then fail, taking every deployed
-/// stack with it. Docker's equivalent unit writes `-d` or uses `Type=simple`. The generated unit now
-/// writes `-d` explicitly, so it no longer depends on this decision at all, and the deviation is
-/// recorded in docs/RUNTIME-PARITY.md.
-fn should_attach(detach: bool, stdout_is_tty: bool) -> bool {
-    !detach && stdout_is_tty
+/// kern returned on a pipe until 0.56.0, and that was a deviation that cost a real stack: docker-elk's
+/// documented flow is `up setup` (blocks until the setup service exits) and then `up -d`, and with
+/// `up setup` returning at once the setup ran in parallel with the stack, timed out, and Kibana and
+/// Logstash could not authenticate (MEASURED on 0.51.3). Scripts and CI rely on the wait.
+///
+/// The unit `kern compose <file> systemd` emits is `Type=oneshot` + `RemainAfterExit=yes` and writes
+/// `-d` explicitly (a test holds it), so it does not depend on this default.
+fn should_attach(detach: bool) -> bool {
+    !detach
 }
 
 /// Stream a just-started stack until it exits or Ctrl-C, then tear it down: `docker compose up`
 /// without `-d`.
 ///
-/// WHY A TERMINAL IS THE CONDITION, and why it is not a heuristic dressed up as one: the follow ends
-/// only when every service exits or a signal arrives, so a caller that cannot send Ctrl-C would hang
-/// forever. Every non-interactive caller kern already has - CI scripts, systemd units, the SDK,
-/// `getkern.dev`'s own unit - reaches this code with a pipe or a file on fd 1 and keeps the exact
-/// behaviour it had before. `-d` is the explicit form and works either way.
+/// It ends when every service has exited or a signal arrives, on a terminal or not (see
+/// [`should_attach`]); a caller that wants it back at once writes `-d`.
 ///
 /// CTRL-C STOPS THE STACK, as it does under Docker, rather than detaching. Leaving it running would
 /// strand a stack whose owner believes they cancelled it, and the next `up` would then fail on a box
@@ -5745,9 +5756,14 @@ fn attach_to_stack(
         // printed nothing of it. With no live pid (0 is never a registry pair) its log is replayed
         // once and the follow is done with it.
         let pid = registry::find_ref(&b.name).map_or(0, |ins| ins.pid);
-        // `None` replays the log from its start: the box was launched seconds ago, so this is
-        // everything it has printed, which is what an attached `up` shows under Docker.
-        match crate::commands::Followed::open(docker_log_label(b, pod), b.name.clone(), pid, None) {
+        // `None` replays THIS RUN's log from its start (`this_run_only`): what the box printed since
+        // this `up` started it, which is what an attached `up` shows under Docker.
+        match crate::commands::Followed::open(
+            docker_log_label(b, pod),
+            b.name.clone(),
+            pid,
+            crate::commands::Replay::ThisRun,
+        ) {
             Ok(Some(f)) => who.push(f),
             Ok(None) => {}
             Err(e) => eprintln!("kern: warning: {}: {e}", b.service_name()),
@@ -5782,21 +5798,14 @@ mod tests {
     use super::*;
     use crate::compose::ComposeBox;
 
-    /// THE FOUR CASES OF THE ATTACH DECISION, because three of them are wrong in a way nobody on
-    /// the machine that wrote them would notice.
-    ///
-    /// The one that costs the most is `(false, false)`: a piped `up` that attached would hang every
-    /// script, and the unit `kern compose <file> systemd` emits is `Type=oneshot` +
-    /// `RemainAfterExit=yes`, so it would sit in `activating` until `TimeoutStartSec` and fail.
+    /// `up` attaches unless told `-d` (or `--wait`, which implies it), on a terminal or not, as Docker.
     #[test]
-    fn up_streams_on_a_terminal_and_returns_everywhere_else() {
-        assert!(should_attach(false, true), "a bare `up` on a tty streams");
+    fn up_attaches_unless_detached_whatever_stdout_is() {
         assert!(
-            !should_attach(false, false),
-            "a bare `up` on a pipe must RETURN: a systemd unit is `oneshot` and needs the exit"
+            should_attach(false),
+            "a bare `up` follows the stack, tty or pipe"
         );
-        assert!(!should_attach(true, true), "`-d` wins on a tty");
-        assert!(!should_attach(true, false), "`-d` wins on a pipe");
+        assert!(!should_attach(true), "`-d` returns");
     }
 
     /// THE GENERATED UNIT DOES NOT DEPEND ON A DEFAULT. It is `Type=oneshot` + `RemainAfterExit`,

@@ -16,7 +16,8 @@ const COMPOSE_VERBS_WITH_PROGRESS: [&str; 6] =
 /// the rest. Other commands are returned unchanged. An unknown mode is refused.
 pub fn take_progress_flag(args: &[String]) -> Result<Vec<String>, crate::error::Error> {
     let first = args.first().map(String::as_str);
-    if !matches!(first, Some("build" | "compose")) {
+    // `up` is the `kern up` shorthand: `compose <found file> up`, so it takes the flag too.
+    if !matches!(first, Some("build" | "compose" | "up")) {
         return Ok(args.to_vec());
     }
     let compose = first == Some("compose");

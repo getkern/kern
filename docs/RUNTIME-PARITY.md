@@ -37,7 +37,7 @@ identity, environment and mount rules, decided by runc and the daemon rather tha
 | 19 | Two sources on one volume target | one mount, the LAST source | not measured | same | agree |
 | 20 | Two mappings sharing a host port | accepted, **fails at runtime** half-started | not measured | refused at `config` | kern deviates: STRICTER, before anything runs |
 | 21 | `up -d` when a service exits immediately | exit **0**, nothing said | not measured | exit **1**, names the service | kern deviates: LOUDER |
-| 22 | `up` without `-d` | attaches, streams, Ctrl-C stops the stack | not measured | same **on a terminal**; unchanged when piped | kern follows Docker where it cannot hang a script |
+| 22 | `up` without `-d` | attaches, streams, Ctrl-C stops the stack | not measured | same, on a terminal or not; `-d` returns at once | agree |
 | 23 | `run --rm web sh -c 'exit 7'` | 7, deps up, ports not published | not measured | same on all three | agree |
 | 24 | `up --wait`, four cases | 0 / 0 / 1 / 1 | not measured | same | agree |
 | 25 | `up --build` after editing the Dockerfile | the OLD image without the flag | not measured | same: the old image without the flag, the new one with it, and the service recreated only when the image changed | agree |
@@ -295,11 +295,10 @@ the service, and exits 1. A script written against Docker that ignores the statu
 that checks it now learns something true.
 
 `docker compose up` without `-d` attaches and streams every service's log, prefixed, and Ctrl-C
-stops the stack. kern does the same WHEN STDOUT IS A TERMINAL. Piped or redirected - a CI script, a
-systemd unit, the SDK - it keeps returning as soon as the stack is up, because a follow that ends
-only on a signal would hang a caller that cannot send one. `-d` is explicit and works either way.
+stops the stack. kern does the same whatever stdout is, a terminal, a pipe or a file, and returns
+when every service has ended, as Docker does. `-d` returns as soon as the stack is up.
 
-## 22b. `up` on a pipe: the deviation, and the contract that forces it
+## 22b. `up` on a pipe
 
 ```
 Docker 29.6.2, service that loops forever:
@@ -307,17 +306,17 @@ Docker 29.6.2, service that loops forever:
   timeout 5 sh -c 'docker compose up > file 2>&1'  EXIT=124
   timeout 5 sh -c 'docker compose up </dev/null 2>&1 | cat'   EXIT=124
   timeout 5 sh -c 'docker compose up -d'           EXIT=0
+
+kern v0.56.0, the same service (measured 2026-11-20):
+  timeout 5 sh -c 'kern up 2>&1 | cat'             EXIT=124
+  timeout 5 sh -c 'kern up > file 2>&1'            EXIT=124
+  timeout 5 sh -c 'kern up </dev/null 2>&1 | cat'  EXIT=124
+  timeout 5 sh -c 'kern up -d'                     EXIT=0
 ```
 
-Docker attaches whatever stdout is. kern attaches only on a terminal, and the reason is its own
-systemd integration: `kern compose <file> systemd` emits `Type=oneshot` with `RemainAfterExit=yes`,
-a shape that requires `up` to EXIT. A unit whose `ExecStart` blocked would sit in `activating` until
-`TimeoutStartSec` and then fail, and every stack deployed that way would go with it. Docker's
-equivalent unit writes `-d` or uses `Type=simple`.
-
-Two consequences, both shipped rather than assumed: the generated unit now writes `-d` explicitly,
-so it does not depend on this decision at all, and a piped `up` prints a note naming what it did.
-The decision itself is a function with a test over all four of `(detach, stdout is a tty)`.
+The same four answers. The unit `kern compose <file> systemd` emits is
+`Type=oneshot` with `RemainAfterExit=yes`, which needs `up` to exit, so it writes `-d` explicitly,
+and a test holds it.
 
 ## 23. The 12 files kern refuses
 

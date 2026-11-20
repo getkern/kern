@@ -1874,6 +1874,56 @@ fn nameservers_in(text: &str) -> Vec<String> {
     out
 }
 
+/// The pasta a box's NAT directory records, if that process is still the one recorded: its start
+/// time matches the identity kern wrote, or (an older record without one) it is a pasta at all. ONE
+/// ANSWER for `down` and for a box taking the directory over, so the two cannot disagree about which
+/// process a record names.
+fn live_recorded_pasta(dir: &std::path::Path) -> Option<i32> {
+    match recorded_pasta_identity(dir) {
+        Some((pid, started)) => {
+            // Recycled, or long gone: the record is not evidence about a live process.
+            (crate::registry::proc_starttime(pid) == started).then_some(pid)
+        }
+        None => read_pid_file(&dir.join("pasta.pid")).filter(|p| pid_is_pasta(*p)),
+    }
+}
+
+/// Stop the pasta a box's NAT directory records, before a new one takes the directory over.
+///
+/// A RESTARTED BOX REUSES ITS DIRECTORY, and the new pasta writes its pid over the old one's, after
+/// which nothing records the old process: `down` stops what `pasta.pid` names and nothing else. The
+/// old pasta normally quits with its namespace, but not when the namespace watch could not be set up
+/// (it runs with `--no-netns-quit` then). MEASURED on WSL2 with 0.51.3: four pasta processes alive
+/// 50 minutes after `down -v`, re-parented to /init, from `compose stop`+`start` of a Kafka broker
+/// and `compose restart` of Kibana and Logstash.
+fn stop_recorded_pasta(dir: &std::path::Path) {
+    if let Some(pid) = live_recorded_pasta(dir) {
+        // SAFETY: a pid this directory records and whose identity was just checked.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        reap_signalled_pastas(&[pid]);
+    }
+}
+
+/// Give pastas that were sent SIGTERM [`PASTA_STOP_BUDGET_MS`] to go, then SIGKILL what is left.
+/// ONE WAIT for `down` and for a box taking its NAT directory over.
+fn reap_signalled_pastas(signalled: &[i32]) {
+    let gone = |pid: &i32| unsafe { libc::kill(*pid, 0) } != 0 || proc_is_zombie(*pid);
+    let (mut waited, mut step) = (0u64, 1u64);
+    while waited < PASTA_STOP_BUDGET_MS && !signalled.iter().all(gone) {
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        waited += step;
+        step = (step * 2).min(8);
+    }
+    for pid in signalled {
+        // SAFETY: probing and signalling pids this function was handed, each still alive.
+        unsafe {
+            if libc::kill(*pid, 0) == 0 {
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// Stop every per-box NAT recorded under a stack's `outbound/` tree. Returns how many were signalled.
 ///
 /// THE TEARDOWN USED TO DELETE THE EVIDENCE INSTEAD OF ACTING ON IT. `kill_holder` removed
@@ -1911,17 +1961,9 @@ pub fn stop_stack_outbound_nats(stack_dir: &std::path::Path) -> usize {
         if !dir.is_dir() {
             continue;
         }
-        let pid = match recorded_pasta_identity(&dir) {
-            Some((pid, started)) => {
-                if crate::registry::proc_starttime(pid) == started {
-                    Some(pid)
-                } else {
-                    None // recycled, or long gone: this record is not evidence about a live process
-                }
-            }
-            None => read_pid_file(&dir.join("pasta.pid")).filter(|p| pid_is_pasta(*p)),
+        let Some(pid) = live_recorded_pasta(&dir) else {
+            continue;
         };
-        let Some(pid) = pid else { continue };
         // SAFETY: `pid` is positive (`read_pid_file` and `recorded_pasta_identity` both refuse
         // anything else), so this signals one process and never a group or everything.
         unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -1932,23 +1974,9 @@ pub fn stop_stack_outbound_nats(stack_dir: &std::path::Path) -> usize {
         // POLLED with its backoff and NOT SLEPT whole: the flat sleep made every `down` of a stack
         // with outbound NATs cost the full quarter second. MEASURED on this project's desktop:
         // `compose down -t 0` of three services took 258 ms, 250 of them this sleep.
-        let gone = |pid: &i32| unsafe { libc::kill(*pid, 0) } != 0 || proc_is_zombie(*pid);
-        let (mut waited, mut step) = (0u64, 1u64);
         // Steps capped at 8 ms: pasta leaves ~20 ms after SIGTERM (MEASURED here), and doubling to
         // 32 ms overshot it by up to 30 ms, which `down` paid on every other run.
-        while waited < PASTA_STOP_BUDGET_MS && !signalled.iter().all(gone) {
-            std::thread::sleep(std::time::Duration::from_millis(step));
-            waited += step;
-            step = (step * 2).min(8);
-        }
-        for pid in &signalled {
-            // SAFETY: same argument; `kill(pid, 0)` only asks whether it is still there.
-            unsafe {
-                if libc::kill(*pid, 0) == 0 {
-                    libc::kill(*pid, libc::SIGKILL);
-                }
-            }
-        }
+        reap_signalled_pastas(&signalled);
     }
     signalled.len()
 }
@@ -2092,6 +2120,8 @@ pub fn attach_box_outbound(dir: &std::path::Path, pid1: i32) -> Result<(), Strin
     if std::fs::create_dir_all(dir).is_err() {
         return Err(format!("could not create {}", dir.display()));
     }
+    // The previous attempt's pasta, if it is still alive, goes first: see [`stop_recorded_pasta`].
+    stop_recorded_pasta(dir);
     // This box is a BRIDGE member: its veth is already `eth0`, so the tap takes the other name.
     match setup_outbound_in(dir, pid1, PASTA_IF_ON_BRIDGE) {
         // `NoDns` is success HERE, unlike for a pod: the box writes its own `/etc/resolv.conf` from

@@ -6819,7 +6819,10 @@ fn interpolate_expr(expr: &str, dotenv: &crate::DotEnv) -> String {
             String::new()
         }),
         _ => val.unwrap_or_else(|| {
-            warn(&format!(
+            // ONCE PER VARIABLE, as Docker says it: a reference reached through a YAML anchor is
+            // interpolated at every use of the anchor, and MEASURED on Airflow's official compose
+            // the same sentence came out nine times for `${FERNET_KEY}`.
+            warn_once(&format!(
                 "${{{var}}} is not set (no default) - substituted empty (set it in your shell, like Docker)"
             ));
             // The empty string Docker substitutes, carrying the mark that says a REFERENCE was

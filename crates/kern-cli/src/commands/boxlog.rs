@@ -985,17 +985,25 @@ pub(crate) struct Followed {
     done: bool,
 }
 
+/// What a follow shows before it streams new lines.
+#[derive(Clone, Copy)]
+pub(crate) enum Replay {
+    /// Every run of the service, oldest first (`compose logs`), or its last `n` lines.
+    AllRuns(Option<usize>),
+    /// The newest run alone, from its start: what THIS `up` started, as Docker's attach shows it.
+    ThisRun,
+}
+
 impl Followed {
     /// Open a service's log for following, or `None` when it has produced none (never started, or
     /// started so recently the pump has not created the file yet).
     ///
-    /// `tail` bounds what is shown BEFORE the follow begins, exactly as in the single-box path:
-    /// `None` replays the whole log, `Some(n)` its last `n` lines.
+    /// `replay` says what is shown BEFORE the follow begins (see [`Replay`]).
     pub(crate) fn open(
         label: String,
         box_name: String,
         pid: i32,
-        tail: Option<usize>,
+        replay: Replay,
     ) -> Result<Option<Self>, Error> {
         use std::io::Read;
         // EVERY RUN OF THE SERVICE, OLDEST FIRST, as a container's log spans its restarts under
@@ -1008,7 +1016,14 @@ impl Followed {
             return Ok(None);
         };
         let mut all = Vec::new();
-        for older in runs.iter().take(runs.len() - 1) {
+        // MEASURED 2026-11-20: five `kern up --exit-code-from t` in a row printed the service's
+        // `hi` 1, 2, 3, 4, 5 times: each attach replayed every earlier run kept since the stack was
+        // created. `compose logs` wants them all; `up` wants the run it started.
+        let (older_runs, tail) = match replay {
+            Replay::AllRuns(tail) => (runs.len() - 1, tail),
+            Replay::ThisRun => (0, None),
+        };
+        for older in runs.iter().take(older_runs) {
             if let Ok(mut f) = std::fs::File::open(older) {
                 let _ = f.read_to_end(&mut all);
             }

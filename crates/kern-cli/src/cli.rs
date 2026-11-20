@@ -467,6 +467,10 @@ pub enum Command {
     VolumeSizes,
     /// Hidden: attach pasta to a throwaway namespace and exit with what happened (installer).
     PastaProbe,
+    /// Hidden: check a release file's signature with this binary's keys (`install.ps1` updates).
+    VerifyRelease {
+        args: Vec<String>,
+    },
     /// Hidden: owns a `--no-pod` stack's peer relays until killed. Argument is the stack's
     /// runtime directory, where the plan file lives.
     RelayHolder {
@@ -474,6 +478,8 @@ pub enum Command {
     },
     /// Hidden: the local router behind `<service>.<project>.localhost` (`crate::localrouter`).
     LocalRouter,
+    /// Hidden: the port of those names, for `kern.exe doctor` (`crate::localrouter::port_verb`).
+    RouterPort,
     /// Hidden: inotify on a sandbox workspace directory for an SDK (`crate::dirwatch`).
     WatchDir {
         root: String,
@@ -1249,9 +1255,13 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // Hidden: volume sizes for `kern top` (see `tui::VolumeSizer`).
         Some("__volume-sizes") => Command::VolumeSizes,
         Some("__pasta-probe") => Command::PastaProbe,
+        Some("__verify-release") => Command::VerifyRelease {
+            args: rest.iter().skip(1).map(|s| s.to_string()).collect(),
+        },
         // Hidden: the relay holder (spawned by `compose up --no-pod`).
         // Hidden: the local router (spawned by `compose up`).
         Some("__local-router") => Command::LocalRouter,
+        Some("__router-port") => Command::RouterPort,
         Some("__relay-holder") => Command::RelayHolder {
             dir: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
         },
@@ -1815,7 +1825,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 }
                 _ => {
                     return Err(Error::Usage(
-                        "sandbox ls|history|stats [-n N] [--failed] [--all] [--json] | sandbox show [<box>] [-n N] [--json] | sandbox keep [memory|disk|off] | sandbox clear",
+                        "sandbox ls [--json] | sandbox history [-n N] [--failed] [--all] [--json] | sandbox stats [--all] [--json] | sandbox show [<box>] [-n N] [--json] | sandbox keep [memory|disk|off] | sandbox clear",
                     ))
                 }
             }
@@ -2984,11 +2994,75 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             } else {
                 commands::ComposeAction::Up
             };
-            let no_pod = rest.contains(&"--no-pod");
-            let bridge = rest.contains(&"--bridge");
-            let force_pod = rest.contains(&"--pod");
-            let allow_device_grants = rest.contains(&"--allow-device-grants");
-            let allow_privileged = rest.contains(&"--allow-privileged");
+            // EVERY WORD IS READ, ONCE, the way the explicit form reads it: a flag the shorthand took
+            // without acting on (`kern up --exit-code-from tests` ran the stack and reported 0
+            // whatever the tests did) is a CI job green by accident. The value flags mean what they
+            // mean in `compose <file> up`; a flag neither form has is refused by name; a bare word
+            // is a service, as in `docker compose up web`.
+            let verb = rest.first().copied().unwrap_or("up");
+            let (mut no_pod, mut bridge, mut force_pod) = (false, false, false);
+            let (mut allow_device_grants, mut allow_privileged) = (false, false);
+            let (mut force_recreate, mut no_recreate, mut renew_anon_volumes) =
+                (false, false, false);
+            let (mut detach, mut remove_volumes, mut wait_ready) = (false, false, false);
+            let (mut no_deps, mut remove_orphans, mut abort_on_exit) = (false, false, false);
+            let mut wait_timeout: Option<u64> = None;
+            let mut exit_code_from: Option<String> = None;
+            let mut build_policy = commands::BuildPolicy::default();
+            let mut services: Vec<String> = Vec::new();
+            let mut words = rest.iter().skip(1).peekable();
+            while let Some(word) = words.next() {
+                let (flag, inline) = match word.split_once('=') {
+                    Some((f, v)) if f.starts_with("--") => (f, Some(v)),
+                    _ => (*word, None),
+                };
+                let plain = inline.is_none();
+                match flag {
+                    "--wait-timeout" => {
+                        wait_timeout = Some(
+                            inline_or_next(inline, &mut words)
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .ok_or(Error::Usage("up --wait-timeout N (seconds)"))?,
+                        );
+                        wait_ready = true;
+                    }
+                    "--exit-code-from" => {
+                        exit_code_from = Some(
+                            inline_or_next(inline, &mut words)
+                                .filter(|v| !v.is_empty() && !v.starts_with('-'))
+                                .ok_or(Error::Usage("up --exit-code-from <service>"))?,
+                        );
+                        abort_on_exit = true;
+                    }
+                    "--abort-on-container-exit" if plain => abort_on_exit = true,
+                    "--build" if plain => build_policy = commands::BuildPolicy::Always,
+                    "--no-build" if plain => build_policy = commands::BuildPolicy::Never,
+                    "--no-pod" if plain => no_pod = true,
+                    "--bridge" if plain => bridge = true,
+                    "--pod" if plain => force_pod = true,
+                    "--allow-device-grants" if plain => allow_device_grants = true,
+                    "--allow-privileged" if plain => allow_privileged = true,
+                    "--force-recreate" if plain => force_recreate = true,
+                    "--no-recreate" if plain => no_recreate = true,
+                    "-V" | "--renew-anon-volumes" if plain => renew_anon_volumes = true,
+                    "-d" | "--detach" if plain => detach = true,
+                    "-v" | "--volumes" if plain => remove_volumes = true,
+                    "--wait" if plain => wait_ready = true,
+                    "--no-deps" if plain => no_deps = true,
+                    "--remove-orphans" if plain => remove_orphans = true,
+                    f if f.starts_with('-') => {
+                        return Err(Error::Compose(format!(
+                            "kern {verb}: unknown flag '{f}'. The shorthand takes: -d/--detach, --wait, \
+                             --wait-timeout N, --exit-code-from S, --abort-on-container-exit, --build, \
+                             --no-build, --no-deps, --force-recreate, --no-recreate, -V/--renew-anon-volumes, \
+                             --remove-orphans, -v/--volumes (on `down`), --no-pod, --pod, --bridge, \
+                             --allow-privileged, --allow-device-grants, --progress MODE. Every other flag is \
+                             the explicit form's: `kern compose <file> {verb} ...`"
+                        )));
+                    }
+                    service => services.push(service.to_string()),
+                }
+            }
             let (files, files_from) =
                 compose_files_for_no_file(None).ok_or_else(no_compose_file_here)?;
             Command::Compose {
@@ -3000,7 +3074,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 stop_timeout: None,
                 ignore_pull_failures: false,
                 build_args: Vec::new(),
-                build_policy: commands::BuildPolicy::default(),
+                build_policy,
                 run_name: None,
                 run_entrypoint: None,
                 run_env: Vec::new(),
@@ -3012,10 +3086,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 // The shorthand carries the recreate overrides too: `kern up --force-recreate` in a
                 // directory is the same habit as the explicit form, and a flag that parses on one
                 // and not the other is a difference nobody can hold in their head.
-                recreate: match (
-                    rest.contains(&"--force-recreate"),
-                    rest.contains(&"--no-recreate"),
-                ) {
+                recreate: match (force_recreate, no_recreate) {
                     (true, true) => {
                         return Err(Error::Compose(
                             "--force-recreate and --no-recreate cannot be combined: one says \
@@ -3027,7 +3098,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     (false, true) => commands::RecreatePolicy::Never,
                     (false, false) => commands::RecreatePolicy::OnDrift,
                 },
-                renew_anon_volumes: rest.contains(&"-V") || rest.contains(&"--renew-anon-volumes"),
+                renew_anon_volumes,
                 // The `kern up`/`kern down` shorthand has no `logs` verb, so the log flags cannot be
                 // typed on it and carry their defaults rather than a parse nobody can reach.
                 log_timestamps: false,
@@ -3040,23 +3111,23 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 allow_device_grants,
                 // The shorthand takes `-d` too: `kern up -d` is the same habit as `docker compose
                 // up -d`, and without it an interactive `kern up` streams like Docker's.
-                detach: rest.contains(&"-d") || rest.contains(&"--detach"),
-                remove_volumes: rest.contains(&"-v") || rest.contains(&"--volumes"),
-                wait_ready: rest.contains(&"--wait"),
-                wait_timeout: None,
+                detach,
+                remove_volumes,
+                wait_ready,
+                wait_timeout,
                 run_cmd: Vec::new(),
                 run_rm: false,
-                no_deps: rest.contains(&"--no-deps"),
-                exit_code_from: None,
-                abort_on_exit: false,
-                remove_orphans: rest.contains(&"--remove-orphans"),
+                no_deps,
+                exit_code_from,
+                abort_on_exit,
+                remove_orphans,
                 ps_quiet: false,
                 ps_services: false,
                 ps_format: None,
                 tail: None,
                 follow: false,
                 all: false,
-                services: Vec::new(),
+                services,
                 project: None,
                 env_file: None,
                 project_root: None,
@@ -6566,8 +6637,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             &env,
             workdir.as_deref(),
             tty,
+            // THE BOX'S OWN USER BY DEFAULT, as `docker exec` uses the container's (the image's `USER`,
+            // `--user`): it entered as box root, so `kern exec app id` said uid 0 for a box whose
+            // workload runs as 1234 (MEASURED on 0.51.3). `-u root` is the way in as root.
             user.as_deref()
-                .map_or(commands::ExecAs::BoxRoot, commands::ExecAs::User),
+                .map_or(commands::ExecAs::Workload, commands::ExecAs::User),
         ),
         Command::Build {
             check,
@@ -6659,8 +6733,12 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::VolumeSizes => crate::volume::print_sizes(),
         // A hidden verb whose exit status IS its answer, and which has already cleaned up after itself.
         Command::PastaProbe => std::process::exit(crate::pod::pasta_probe_verb()),
+        Command::VerifyRelease { args } => {
+            std::process::exit(crate::selfupdate::verify_release_verb(&args))
+        }
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
         Command::LocalRouter => crate::localrouter::run(),
+        Command::RouterPort => std::process::exit(crate::localrouter::port_verb()),
         Command::WatchDir {
             root,
             rel,

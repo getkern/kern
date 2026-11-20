@@ -1938,6 +1938,56 @@ pub(crate) fn split_volume_spec(s: &str) -> Result<(String, String, bool), Error
     Ok((source.to_string(), target.to_string(), read_only))
 }
 
+/// Say so when a writable bind's source is a directory another user owns on this host: a box's root
+/// is the caller here, so it can neither chown nor chmod what is in it, and a service that does
+/// (a database setting up its data directory) fails, repeatedly, with `Operation not permitted`.
+///
+/// MEASURED on 0.51.3 (alpine, `chown 70:70` + `chmod 700` from box root): a bind of a folder on C:\
+/// under WSL (drvfs, uid=0) and a bind of a root-owned Linux directory both refused; a directory the
+/// caller owns and a named volume both worked. Supabase's database restarted for hours on the first.
+/// As root there is nothing to say: a box's root is the host's. Once per path per process.
+fn note_unownable_bind(shown: &str, canon: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid takes no arguments.
+    let me = unsafe { libc::getuid() };
+    if me == 0 {
+        return;
+    }
+    if ["/tmp", "/dev", "/run", "/proc", "/sys"]
+        .iter()
+        .any(|p| canon.starts_with(p))
+    {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(canon) else {
+        return;
+    };
+    if !meta.is_dir() || meta.uid() == me {
+        return;
+    }
+    static SAID: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if said.iter().any(|p| p == canon) {
+        return;
+    }
+    said.push(canon.to_path_buf());
+    let wsl_drive = canon.starts_with("/mnt/") && canon.components().count() >= 3;
+    eprintln!(
+        "kern: note: {shown}: {} is owned by uid {} on this host, not by you, so the box's root \
+         cannot chown or chmod what is in it; a service that does (a database setting up its data \
+         directory) fails there. A named volume does not have this limit{}",
+        canon.display(),
+        meta.uid(),
+        if wsl_drive {
+            "; on WSL, `kern doctor` says how C:\\ is mounted and install.ps1 sets it right"
+        } else {
+            ""
+        }
+    );
+}
+
 /// Turn one mount's FIELDS into a [`Volume`]: validate the target, resolve a named volume or a host
 /// path, and refuse the registry. `shown` names the spec in every error, so `-v` and `--mount` each
 /// report themselves.
@@ -2066,6 +2116,9 @@ pub(crate) fn resolve_volume(
                 }
                 if let Some(msg) = host_ipc_source_refusal(s, &canon) {
                     return Err(Error::Sandbox(msg));
+                }
+                if !read_only {
+                    note_unownable_bind(s, &canon);
                 }
                 canon.to_string_lossy().into_owned()
             }
@@ -3080,8 +3133,22 @@ fn box_lifecycle_status(b: &registry::Instance) -> &'static str {
 fn docker_state(b: &registry::Instance) -> &'static str {
     if box_lifecycle_status(b) == "paused" {
         "paused"
+    } else if current_run(b).1.is_some() {
+        "restarting"
     } else {
         "running"
+    }
+}
+
+/// The box's CURRENT run, read ONCE from its supervisor's record: `(since, Some(code))` while a
+/// `--restart` box is between an exit (`since`, Unix seconds) and its next run, `(since, None)` while
+/// a run started at `since` goes on, and the box's own start when nothing was recorded. `Up N` counts
+/// from here, as Docker's does: a box run again by `--restart` is up since that run.
+pub(crate) fn current_run(b: &registry::Instance) -> (u64, Option<i32>) {
+    match registry::box_attempt(&b.name, b.pid) {
+        Some(registry::Attempt::Running { since_ms }) => ((since_ms / 1000).max(b.started), None),
+        Some(registry::Attempt::Restarting { since_ms, code }) => (since_ms / 1000, Some(code)),
+        None => (b.started, None),
     }
 }
 
@@ -3190,7 +3257,15 @@ impl PsRow for registry::Instance {
         docker_state(self).to_string()
     }
     fn ps_status(&self, now: u64) -> String {
-        let up = format!("Up {}", human_duration(now.saturating_sub(self.started)));
+        // Docker's words for a box between two runs: `Restarting (1) 3 seconds ago`.
+        let (since, restarting) = current_run(self);
+        if let Some(code) = restarting {
+            return format!(
+                "Restarting ({code}) {} ago",
+                human_duration(now.saturating_sub(since))
+            );
+        }
+        let up = format!("Up {}", human_duration(now.saturating_sub(since)));
         match box_lifecycle_status(self) {
             "paused" => format!("{up} (Paused)"),
             "orphaned" => format!("{up} (orphaned)"),
@@ -3432,6 +3507,7 @@ fn ps_header(field: &str, compose: bool) -> String {
         ".Rootfs" => "ROOTFS",
         ".Command" => "COMMAND",
         ".Ports" => "PORTS",
+        ".URL" => "URL",
         ".Pod" => "POD",
         ".RunningFor" => "CREATED",
         ".Status" => "STATUS",
@@ -3614,6 +3690,12 @@ fn render_ps_format_ctx<R: PsRow>(tmpl: &str, b: &R, ctx: &PsCtx<'_>) -> Result<
                 out.push_str(&svc);
             }
             ".Pod" => out.push_str(b.ps_pod()),
+            // The `.localhost` URL a published port answers at; empty without one.
+            ".URL" => {
+                if let Some(u) = crate::localrouter::url_of(b.ps_name(), b.ps_pod(), b.ps_ports()) {
+                    out.push_str(&u);
+                }
+            }
             ".RunningFor" => out.push_str(&b.ps_running_for(now)),
             ".Status" => out.push_str(&b.ps_status(now)),
             ".State" => out.push_str(&b.ps_state()),
@@ -3657,7 +3739,7 @@ fn render_ps_format_ctx<R: PsRow>(tmpl: &str, b: &R, ctx: &PsCtx<'_>) -> Result<
             _ => {
                 return Err(Error::Usage(
                     "ps --format: unsupported token (supported: {{.Names}} {{.Pid}} {{.Image}} \
-                     {{.Command}} {{.Ports}} {{.Pod}} {{.Status}} {{.State}} {{.Health}} \
+                     {{.Command}} {{.Ports}} {{.URL}} {{.Pod}} {{.Status}} {{.State}} {{.Health}} \
                      {{.ExitCode}} {{.Service}} {{.RunningFor}} {{.Labels}} \
                      {{.Label \"key\"}}; prefix `table ` for a header row; use --json for more)",
                 ))
@@ -4524,7 +4606,10 @@ fn prepare_stage(
                                 let (lower, _cfg) = resolve_image(&stage_tags[src_idx])?;
                                 slot.insert(lower);
                             }
-                            (chains[&src_idx].clone(), stage_tags[src_idx].clone())
+                            // The LABEL names the source the way the Dockerfile does, for the
+                            // error a missing path gets (the stage's internal tag means nothing to
+                            // the reader).
+                            (chains[&src_idx].clone(), format!("stage '{fref}'"))
                         }
                         CopyFrom::Image(img) => {
                             if let std::collections::hash_map::Entry::Vacant(slot) =
@@ -4537,7 +4622,7 @@ fn prepare_stage(
                                 let (lower, _cfg) = resolve_image(img)?;
                                 slot.insert(lower);
                             }
-                            (image_chains[img].clone(), img.clone())
+                            (image_chains[img].clone(), format!("image '{img}'"))
                         }
                     };
                     if !pulled_from_stage {
@@ -4651,16 +4736,30 @@ fn copy_from_stage_chain(
     chain: &[String],
     src_rel: &str,
     dest: &std::path::Path,
-    _stage_tag: &str,
+    source: &str,
 ) -> Result<(), Error> {
+    // A MISSING PATH IS NAMED, WITH WHERE IT WAS LOOKED FOR. MEASURED on 0.51.3: `COPY --from=base
+    // /does-not-exist.txt /x` said only "COPY --from source does not exist in the stage's final
+    // filesystem", naming neither the path nor the stage.
+    let missing = || {
+        Error::Build(format!(
+            "COPY --from: '{src_rel}' does not exist in {source}"
+        ))
+    };
     if chain.len() >= 2 {
         // ≥2 stacked layers → cross-layer opaque is possible → read the kernel-merged view (which also
         // handles file AND directory sources uniformly, confining `src_rel` via `openat2(RESOLVE_IN_ROOT)`).
-        return merged_view_extract(chain, Extract::Entry(src_rel), dest);
+        return merged_view_extract(chain, Extract::Entry(src_rel), dest).map_err(|e| match e {
+            Error::Build(m) if m.starts_with("COPY --from source does not exist") => missing(),
+            other => other,
+        });
     }
     // Exactly one layer: it IS its own merged rootfs (no cross-layer opaque to honour). Copy directly
     // through the shared single-rootfs confine helper (canonicalize + `starts_with`, `cp -a` no-follow).
-    copy_from_stage_rootfs(std::path::Path::new(&chain[0]), src_rel, dest)
+    copy_from_stage_rootfs(std::path::Path::new(&chain[0]), src_rel, dest).map_err(|e| match e {
+        Error::Build(m) if m.contains("No such file or directory") => missing(),
+        other => other,
+    })
 }
 
 /// Copy `src_rel` OUT of a single source rootfs `src_rootfs` into `dest`, confined to it (canonicalize +
@@ -5681,8 +5780,9 @@ fn passwd_home(uid: libc::uid_t) -> Option<std::path::PathBuf> {
 }
 
 /// [`git_project_root`] for the compose files of this run, applied as the project root when the
-/// operator named none and every file is inside the same repository. Said once when it widens.
-pub(crate) fn adopt_git_project_root(files: &[String]) -> Result<(), Error> {
+/// operator named none and every file is inside the same repository. Said when it widens and `say`
+/// (the verbs that read the file's paths); applied either way.
+pub(crate) fn adopt_git_project_root(files: &[String], say: bool) -> Result<(), Error> {
     if PROJECT_ROOT.get().is_some() {
         return Ok(());
     }
@@ -5707,7 +5807,7 @@ pub(crate) fn adopt_git_project_root(files: &[String]) -> Result<(), Error> {
             return Ok(());
         }
     }
-    if repo != base {
+    if say && repo != base {
         eprintln!(
             "kern: note: compose: the project is the git repository {}, so the file's paths may \
              reach it and nothing outside it; --project-root names another",
@@ -10152,7 +10252,12 @@ fn run_terminal_verb(
                 };
                 if let Some(ins) = running {
                     // `-f`: what it wrote so far and what it writes next, through the follow.
-                    match Followed::open(label.clone(), b.name.clone(), ins.pid, tail) {
+                    match Followed::open(
+                        label.clone(),
+                        b.name.clone(),
+                        ins.pid,
+                        Replay::AllRuns(tail),
+                    ) {
                         Ok(Some(f)) => who.push(f),
                         Ok(None) => {}
                         Err(e) => eprintln!("compose logs: {}: {e}", b.service_name()),
