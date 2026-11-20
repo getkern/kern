@@ -1,13 +1,14 @@
 name: Release
-# Build static (musl) binaries for linux-x86_64 and linux-aarch64 on a version tag and attach
-# them - plus SHA256SUMS - to the GitHub Release. `install.sh` downloads from here.
+# Build static (musl) binaries for linux-x86_64 and linux-aarch64, the Windows shim and the WSL
+# rootfs on a version tag, and put them on a DRAFT GitHub Release in one step. The owner signs the
+# draft and publishes it (`scripts/sign-release.sh`). `install.sh` and `install.ps1` download from it.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to (re)build + attach assets for (e.g. v0.6.3)"
+        description: "Tag whose draft release to (re)build (e.g. v0.52.0); a published release is refused"
         required: true
 
 permissions:
@@ -128,22 +129,21 @@ jobs:
           # packaging/README.md before assuming a new file ships.
           tar -C dist -czf "${name}.tar.gz" kern
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+      # TO THE PUBLISH JOB, NOT TO THE RELEASE: every asset reaches the release in one step, as a
+      # DRAFT, so nothing is public before the owner has signed it (`scripts/sign-release.sh`).
+      - name: Hand the tarball to the publish job
+        uses: actions/upload-artifact@v4
         with:
-          # Without this a dispatch attaches to `github.ref`, which is the branch and not the release.
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
+          name: release-${{ matrix.target }}
+          path: |
             kern-${{ matrix.target }}.tar.gz
             kern-${{ matrix.target }}.tar.gz.sha256
-          fail_on_unmatched_files: true
+          if-no-files-found: error
 
   sbom:
     name: SBOM (SPDX)
     # Gated too: an SBOM attached to a release whose evidence is stale asserts a provenance the
-    # suites have not vouched for. `windows` is deliberately NOT gated - it also serves the manual
-    # backfill onto an EXISTING release, where the tag was already gated when it was cut, and
-    # `needs:` on a push-only job would make that path unrunnable.
+    # suites have not vouched for.
     needs: evidence
     # Same reasoning as `build`: a dispatch that repairs a release must be able to attach the SBOM
     # the original run never produced.
@@ -160,24 +160,24 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
-      - name: Generate SPDX SBOM (Syft) and attach to the release
+      - name: Generate SPDX SBOM (Syft) for the publish job
         uses: anchore/sbom-action@v0
         with:
           path: .
           format: spdx-json
           artifact-name: kern.spdx.json
+          # The publish job attaches it with the rest: the action finds a release by tag, which does
+          # not see a draft.
+          upload-release-assets: false
 
   windows:
-    # NOT GATED ON `evidence`, AND THIS IS THE EXEMPTION THAT DECAYS IF NOBODY WRITES IT DOWN.
-    #
-    # This job serves two paths: a tag push, and the manual backfill of Windows assets onto an
-    # ALREADY-EXISTING release. The exemption is sound only because a backfill targets a tag that was
-    # gated when it was cut, so the evidence question was already answered for it. `needs: evidence`
-    # would make the backfill unrunnable, since `evidence` is push-only.
-    #
-    # WHAT WOULD MAKE THE EXEMPTION FALSE: a backfill targeting a tag cut BEFORE the gate existed, or
-    # any new job copied from this one because it is the simpler template. A job that builds release
-    # artefacts and is not gated needs its own reason, not this one.
+    # GATED THROUGH `build`, whose x86_64 tarball it needs: the kern inside the WSL rootfs IS that
+    # tarball's binary, byte for byte. It used to compile its own (stable toolchain, not stripped):
+    # MEASURED on v0.51.3, the rootfs's /usr/local/bin/kern was 4294936 B against the signed
+    # tarball's 3522248 B, both saying 0.51.3, so a WSL install ran a binary no signature covered and
+    # `kern self-update` would not replace it (same version).
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     name: windows shim + WSL rootfs
     runs-on: ubuntu-latest
     permissions:
@@ -192,10 +192,10 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu, x86_64-unknown-linux-musl
+          targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
-      - name: Install cross tooling (mingw + musl)
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 musl-tools
+      - name: Install cross tooling (mingw)
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - name: The release tag to attach to
         id: tag
         run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
@@ -207,30 +207,96 @@ jobs:
         # --target-dir target: the shim is its OWN (workspace-excluded) crate, so by default it would
         # build into windows/kern-win/target; pin it to the repo-root target dir the Package step reads.
         run: cargo build --release --target x86_64-pc-windows-gnu --manifest-path windows/kern-win/Cargo.toml --target-dir target
-      - name: Build the kern musl binary (baked into the WSL rootfs)
-        run: cargo build --release --target x86_64-unknown-linux-musl --bin kern
+      - name: The released x86_64 tarball (its kern goes into the WSL rootfs)
+        uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64-unknown-linux-musl
+          path: linux
+      - name: Unpack the released kern
+        run: |
+          set -eu
+          cd linux
+          sha256sum -c kern-x86_64-unknown-linux-musl.tar.gz.sha256
+          tar -xzf kern-x86_64-unknown-linux-musl.tar.gz kern
       - name: Build the pre-baked WSL rootfs (Alpine + kern, in a user namespace)
         run: |
           set -eu
           # Ubuntu 24.04 runners default to AppArmor-restricted unprivileged userns; the rootfs build
           # bootstraps Alpine via `unshare -r` (no root). Relax the restriction for this runner only.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          KERN_BIN="$PWD/target/x86_64-unknown-linux-musl/release/kern" \
+          KERN_BIN="$PWD/linux/kern" \
           OUT="$PWD/kern-wsl-rootfs.tar.gz" \
           sh windows/kern-win/build-wsl-rootfs.sh
+      - name: The rootfs carries the released kern, byte for byte
+        run: |
+          set -eu
+          mkdir check
+          tar -xzf kern-wsl-rootfs.tar.gz -C check ./usr/local/bin/kern 2>/dev/null \
+            || tar -xzf kern-wsl-rootfs.tar.gz -C check usr/local/bin/kern
+          want="$(sha256sum linux/kern | cut -d' ' -f1)"
+          got="$(sha256sum check/usr/local/bin/kern | cut -d' ' -f1)"
+          echo "released kern  $want"
+          echo "rootfs kern    $got"
+          [ "$want" = "$got" ] || { echo "::error::the WSL rootfs carries a kern that is not the released one"; exit 1; }
       - name: Package + checksums (exact names install.ps1 expects)
         run: |
           set -eu
           cp target/x86_64-pc-windows-gnu/release/kern.exe kern-windows-x86_64.exe
           sha256sum kern-windows-x86_64.exe > kern-windows-x86_64.exe.sha256
           sha256sum kern-wsl-rootfs.tar.gz  > kern-wsl-rootfs.tar.gz.sha256
-      - name: Attach to the release
-        uses: softprops/action-gh-release@v2
+      - name: Hand the Windows assets to the publish job
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          files: |
+          name: release-windows
+          path: |
             kern-windows-x86_64.exe
             kern-windows-x86_64.exe.sha256
             kern-wsl-rootfs.tar.gz
             kern-wsl-rootfs.tar.gz.sha256
-          fail_on_unmatched_files: true
+          if-no-files-found: error
+
+  publish:
+    # ONE STEP PUTS EVERY ASSET ON THE RELEASE, AND A NEW RELEASE IS A DRAFT. The owner signs the
+    # draft (`sh scripts/sign-release.sh vX.Y.Z`, the key never leaves their machine) and the script
+    # publishes it, so a release is never public without its signatures. With GitHub's immutable
+    # releases on, nothing can be added or swapped after that. A draft that already exists (a
+    # dispatch rebuilding one) gets the files uploaded over; a published release is refused.
+    name: publish (draft)
+    needs: [build, windows, sbom]
+    if: >-
+      !cancelled()
+      && needs.build.result == 'success'
+      && needs.windows.result == 'success'
+      && needs.sbom.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: assets
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: kern.spdx.json
+          path: assets
+      - name: Create the draft, or update the existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          ls -l assets
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A DRAFT may be rebuilt; a PUBLISHED release is not touched: new files would not match
+            # the signatures already on it.
+            if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != true ]; then
+              echo "::error::$TAG is already published: its signed assets are not replaced"
+              exit 1
+            fi
+            gh release upload "$TAG" assets/* --clobber
+          else
+            gh release create "$TAG" assets/* --draft --verify-tag --title "$TAG" --notes ""
+          fi

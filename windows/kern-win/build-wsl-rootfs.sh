@@ -46,13 +46,21 @@ echo "== bootstrapping rootfs (alpine-base + curl + ca-certificates + passt) =="
 "$APK" --arch "$ARCH" \
   -X "$CDN/main" -X "$CDN/community" \
   -U --allow-untrusted --root "$ROOT" --initdb \
-  add alpine-base curl ca-certificates shadow-uidmap passt || echo "apk: non-fatal warnings, continuing"
+  add alpine-base curl ca-certificates shadow-uidmap passt zstd tzdata || echo "apk: non-fatal warnings, continuing"
 
 # The apk call above tolerates its cosmetic warnings, so check what must be there instead of its
 # exit code: a distro without pasta gives every pod no network, and nothing would say why.
-for need in usr/bin/pasta usr/bin/newuidmap usr/bin/curl; do
+# zstd: images with zstd-compressed layers do not pull without it (MEASURED: apache/airflow:3.4.0).
+for need in usr/bin/pasta usr/bin/newuidmap usr/bin/curl usr/bin/zstd; do
   [ -x "$ROOT/$need" ] || { echo "rootfs is missing /$need"; exit 1; }
 done
+
+# /etc/localtime: a compose file that mounts `/etc/localtime:/etc/localtime:ro` (Immich and many
+# others) needs it to exist, and kern cannot create a bind source under /etc. UTC, as a WSL distro's
+# clock is; a stack that wants a zone sets TZ.
+[ -f "$ROOT/usr/share/zoneinfo/UTC" ] || { echo "rootfs is missing /usr/share/zoneinfo/UTC"; exit 1; }
+ln -sf /usr/share/zoneinfo/UTC "$ROOT/etc/localtime"
+printf 'UTC\n' > "$ROOT/etc/timezone"
 
 echo "== installing kern =="
 install -Dm755 "$KERN_BIN" "$ROOT/usr/local/bin/kern"
@@ -111,7 +119,17 @@ systemd=false
 default=root
 [interop]
 appendWindowsPath=false
+enabled=false
+[automount]
+options = "metadata,uid=1000,gid=1000,umask=022"
 EOF
+# [interop] enabled=false: Windows refuses the programs started from inside the distro, so a process that
+# escapes a box (uid 1000 here) cannot run cmd.exe or powershell.exe as the Windows user. kern uses
+# no Windows program from Linux (MEASURED with it off: doctor, boxes, --gpus, compose with a
+# published port and its .localhost name, and kern.exe from Windows all work; cmd.exe does not).
+# [automount]: files on C:\ belong to the user boxes run as (uid 1000, below) and keep chown/chmod
+# (drvfs metadata). MEASURED on 0.51.3: mounted uid=0, a box's root could neither chown nor chmod a
+# bind of a project folder on C:\, and a database keeping its data there restarted for hours.
 
 chmod 755 "$ROOT" "$ROOT/etc" "$ROOT/home" 2>/dev/null || true
 echo "== packing $OUT =="

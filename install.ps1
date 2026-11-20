@@ -32,16 +32,49 @@ $KernPrevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 try {
 
-# By default pull from the LATEST GitHub release (its Windows assets are CI-built + sha256-signed);
+# By default pull from the LATEST GitHub release (its Windows assets are CI-built, each with a
+# `.sha256` beside it and, from 0.52.0 on, a minisign `.minisig`: see Check-Signature);
 # pin an exact release with KERN_VERSION=v0.6.5. GitHub's /releases/latest/download/<asset> redirects
 # to the newest release's asset of that name.
 # A release's tag is `v<version>`: KERN_VERSION may be given with or without the `v`.
-$RelBase    = if ($env:KERN_VERSION) { "https://github.com/getkern/kern/releases/download/v$($env:KERN_VERSION -replace '^v', '')" } else { 'https://github.com/getkern/kern/releases/latest/download' }
-$InstallDir = Join-Path $env:LOCALAPPDATA 'kern'
-$DistroName = 'kern'
+# KERN_RELEASE_URL: a mirror holding one release's files (an internal server, an offline copy), with
+# KERN_VERSION naming that release. The checks are the same, so a mirror cannot hand over a file the
+# release keys did not sign.
+if ($env:KERN_RELEASE_URL -and -not $env:KERN_VERSION) { throw "kern: KERN_RELEASE_URL names a mirror: set KERN_VERSION too (the release it holds)." }
+$RelBase    = if ($env:KERN_RELEASE_URL) { $env:KERN_RELEASE_URL.TrimEnd('/') } elseif ($env:KERN_VERSION) { "https://github.com/getkern/kern/releases/download/v$($env:KERN_VERSION -replace '^v', '')" } else { 'https://github.com/getkern/kern/releases/latest/download' }
+# KERN_WSL_DISTRO and KERN_INSTALL_DIR put a trial install somewhere else: another distro name (kern.exe
+# reads the same variable at run time) and another folder for kern.exe, so the real installer can be
+# run into a throwaway distro without touching the user's `kern`.
+$InstallDir = if ($env:KERN_INSTALL_DIR) { $env:KERN_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'kern' }
+$DistroName = if ($env:KERN_WSL_DISTRO) { $env:KERN_WSL_DISTRO } else { 'kern' }
 $DistroDir  = Join-Path $InstallDir 'distro'
 $ExePath    = Join-Path $InstallDir 'kern.exe'
 $ExeUrl     = "$RelBase/kern-windows-x86_64.exe"
+# The release keys, the same two `kern self-update`, install.sh and scripts/sign-release.sh carry (a
+# unit test in crates/kern-cli/src/selfupdate.rs fails if the copies disagree).
+$KernReleaseKeys = @('RWSuYG/qtD8AV5p5IzIqfRuCwh5eJlT7ed5+7lVKrgILE1qvIpPGv+Ej', 'RWRLQt2lFPXXsC0g2+1SPfSmOdjpxJ/f+t5DU+xPOaRNjElnisOR0Uo3')
+# Which version the signatures must name: the pinned one, or (latest) the one the first signed asset
+# names, which every other asset must then name too. And whether this release is one whose Windows
+# assets are signed (0.52.0 on): a missing signature there is refused, not skipped.
+$script:WantVersion = $null
+$script:SignedEra = $true
+if (-not $env:KERN_VERSION) {
+    # LATEST IS RESOLVED TO A VERSION, so the signature rule applies to the release that is actually
+    # served (a `latest` that is older than signed Windows assets is not refused for lacking them), and
+    # every asset's signature must then name that one version. Unanswered: treated as signed.
+    try {
+        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/getkern/kern/releases/latest' -UseBasicParsing
+        if ($rel.tag_name -match '^v(\d+\.\d+\.\d+)$') { $script:LatestVersion = $Matches[1] }
+    } catch { $script:LatestVersion = $null }
+}
+$VersionForEra = if ($env:KERN_VERSION) { $env:KERN_VERSION -replace '^v', '' } else { $script:LatestVersion }
+if ($VersionForEra) {
+    $script:WantVersion = $VersionForEra
+    $vp = $script:WantVersion -split '\.'
+    if ($vp.Count -eq 3 -and [int]$vp[0] -eq 0 -and [int]$vp[1] -lt 52) {
+        $script:SignedEra = $false
+    }
+}
 $RootfsUrl  = "$RelBase/kern-wsl-rootfs.tar.gz"
 # The standalone static-musl Linux binary (same asset the Linux installer uses) - runs as-is inside the
 # Alpine WSL distro, so an UPGRADE can swap just this file and keep the distro's image cache + boxes.
@@ -59,6 +92,19 @@ function Warn($m) { Write-Host "kern: $m" -ForegroundColor Yellow }
 # stops, the red reason stays, and the prompt returns. Write-Host runs FIRST so the readable line is
 # above the exception text.
 function Die($m)  { Write-Host "kern: $m" -ForegroundColor Red; throw "kern install aborted: $m" }
+
+# WHAT WAS CHECKED, file by file, said at the end: a reader must not have to infer from a scrolled-away
+# line whether a file was signature-checked, only hash-checked, or taken as it came.
+$script:Checks = [ordered]@{}
+function Note-Check($what, $state) {
+    if ($script:Checks.Contains($what)) { $script:Checks[$what] = "$($script:Checks[$what]); $state" }
+    else { $script:Checks[$what] = $state }
+}
+function Show-Checks {
+    if ($script:Checks.Count -eq 0) { return }
+    Info "what was checked:"
+    foreach ($k in $script:Checks.Keys) { Info "  ${k}: $($script:Checks[$k])" }
+}
 
 # If we are the post-reboot RunOnce resume, our key already fired and is gone -- but ALSO clean up any
 # leftover from an earlier aborted run, so an orphaned entry can never re-execute a remote script at
@@ -79,12 +125,16 @@ function Test-Admin {
 }
 
 # a local file next to the script (or via env) wins over downloading -- for offline/dev/test installs
-function Resolve-Local($envName, $fileName) {
+# `$fileNames`: the release asset's own name first, so the files of a release saved next to this
+# script are found as they were downloaded; older names after it.
+function Resolve-Local($envName, $fileNames) {
     $v = [Environment]::GetEnvironmentVariable($envName)
     if ($v -and (Test-Path $v)) { return $v }
     if ($PSScriptRoot) {
-        $beside = Join-Path $PSScriptRoot $fileName
-        if (Test-Path $beside) { return $beside }
+        foreach ($f in @($fileNames)) {
+            $beside = Join-Path $PSScriptRoot $f
+            if (Test-Path $beside) { return $beside }
+        }
     }
     return $null
 }
@@ -93,13 +143,22 @@ function Resolve-Local($envName, $fileName) {
 # TLS alone is not integrity: a corporate TLS-intercepting proxy or a swapped release asset would
 # otherwise hand us an arbitrary exe / rootfs. Local files (dev/offline) skip verification, and
 # KERN_SKIP_VERIFY=1 is the explicit escape hatch.
-function Fetch($url, $dest, $envName, $fileName, $what) {
+function Fetch($url, $dest, $envName, $fileName, $what, $target) {
     $local = Resolve-Local $envName $fileName
-    if ($local) { Info "using local ${what}: $local"; Copy-Item $local $dest -Force; return }
+    if ($local) {
+        Info "using local ${what}: $local"
+        Copy-Item $local $dest -Force
+        Note-Check $what 'NOT verified (local file)'
+        return
+    }
     Info "downloading $what..."
     try { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing }
     catch { Die "could not download $what from $url ($($_.Exception.Message))" }
-    if ($env:KERN_SKIP_VERIFY -eq '1') { Warn "KERN_SKIP_VERIFY=1 -- skipping checksum for $what"; return }
+    if ($env:KERN_SKIP_VERIFY -eq '1') {
+        Warn "KERN_SKIP_VERIFY=1 -- skipping checksum for $what"
+        Note-Check $what 'NOT verified (KERN_SKIP_VERIFY=1)'
+        return
+    }
     $shaFile = "$dest.sha256"
     try { Invoke-WebRequest -Uri "$url.sha256" -OutFile $shaFile -UseBasicParsing }
     catch { Die "could not download the checksum for $what ($url.sha256) -- refusing to install unverified. (KERN_SKIP_VERIFY=1 overrides.)" }
@@ -108,6 +167,181 @@ function Fetch($url, $dest, $envName, $fileName, $what) {
     Remove-Item $shaFile -ErrorAction SilentlyContinue
     if ($want -ne $got) { Die "checksum MISMATCH for ${what}: expected $want, got $got. Not installing." }
     Info "$what verified (sha256 ok)."
+    Note-Check $what 'sha256 ok'
+    Check-Signature $dest $url $target $what
+}
+
+# One minisign check of a release file, the rules in ONE place for every caller: a valid signature by
+# one of the release keys, whose signed comment names this target, this file and (when one is wanted)
+# this version. Returns the version on success, or throws with the reason.
+function Test-MinisignFile($ms, $file, $sig, $target, $asset) {
+    # Local `Continue`: minisign reports a refusal on stderr, which PS 5.1 under `Stop` turns into an
+    # error carrying minisign's own words; the reason is said below in ours.
+    $ErrorActionPreference = 'Continue'
+    $ok = $false
+    foreach ($k in $KernReleaseKeys) {
+        & $ms.Source -V -q -P $k -m $file -x $sig *> $null
+        if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+    }
+    if (-not $ok) { throw "the signature of $asset does not check out with the kern release keys: the file was changed after it was signed, or was signed by someone else" }
+    $line = Select-String -Path $sig -Pattern '^trusted comment: (.*)$' | Select-Object -First 1
+    $comment = if ($line) { $line.Matches[0].Groups[1].Value } else { '' }
+    $words = $comment -split ' '
+    if ($words -notcontains "target=$target") { throw "the signature of $asset is valid but names another target ($comment)" }
+    if ($words -notcontains "file=$asset") { throw "the signature of $asset is valid but names another file ($comment)" }
+    $v = (($words | Where-Object { $_ -like 'version=*' }) -replace '^version=', '') | Select-Object -First 1
+    if (-not $v) { throw "the signature of $asset names no version ($comment)" }
+    if ($script:WantVersion -and $v -ne $script:WantVersion) { throw "the signature of $asset is valid but names version $v, not $($script:WantVersion)" }
+    return $v
+}
+
+# THE SIGNATURE, when minisign is installed (`winget install jedisct1.minisign`). The `.sha256`
+# beside a file only proves the download matches a file on the same server; the signature proves the
+# file is a release, made with one of the two kern release keys, and its signed comment names this
+# file, this target and this version, so an older or another platform's signed file cannot stand in.
+# Without minisign it is said and skipped, as on the Linux side.
+function Check-Signature($dest, $url, $target, $what) {
+    $asset = ($url -split '/')[-1]
+    $sig = "$dest.minisig"
+    try { Invoke-WebRequest -Uri "$url.minisig" -OutFile $sig -UseBasicParsing }
+    catch {
+        if ($script:SignedEra) { Die "$what has no signature ($asset.minisig), and every release from 0.52.0 on signs it. Not installing. If the network dropped, run this again." }
+        Info "  ($what predates signed Windows assets: none to check)"
+        Note-Check $what 'signature: none (this release predates them)'
+        return
+    }
+    try {
+        $ms = Get-Command minisign.exe -ErrorAction SilentlyContinue
+        if ($ms) {
+            try { $v = Test-MinisignFile $ms $dest $sig $target $asset }
+            catch { Die "$($_.Exception.Message). Not installing." }
+            if (-not $script:WantVersion) { $script:WantVersion = $v }
+            Info "$what signature verified ($v)."
+            Note-Check $what "signature verified by minisign ($v)"
+            return
+        }
+        # NO MINISIGN: the kern that was installed BEFORE this run checks it, with the keys built into
+        # it and the same rules as `kern self-update` (see Save-Verifier). A first install, or a kern too
+        # old to check, leaves the signature unchecked, and the summary says so.
+        $v = Verify-InDistro $dest $sig $target $asset
+        if ($v) {
+            if (-not $script:WantVersion) { $script:WantVersion = $v }
+            Info "$what signature verified by the kern installed before ($v)."
+            Note-Check $what "signature verified by the kern installed before ($v)"
+            return
+        }
+        # A MIRROR IS TRUSTED ONLY THROUGH THE SIGNATURE: what came from it was not served by github.com
+        # over its HTTPS, so with nothing able to check the signature there is nothing to trust.
+        if ($env:KERN_RELEASE_URL) {
+            Die "$what came from the mirror $RelBase and its signature could not be checked ($($script:VerifierWhyNot)). A mirror is trusted only through the signatures: install minisign (winget install jedisct1.minisign) and run this again, or install from github.com."
+        }
+        Info "  (signature of $what not checked: install minisign to check it, e.g. winget install jedisct1.minisign)"
+        Note-Check $what "signature NOT verified ($($script:VerifierWhyNot)): trusting HTTPS from github.com"
+    } finally {
+        Remove-Item $sig -ErrorAction SilentlyContinue
+    }
+}
+
+# THE VERIFIER IS THE KERN INSTALLED BEFORE THIS RUN, copied out of the distro before anything is
+# replaced. Taken at check time it could already be the new binary (the in-place update swaps it before
+# kern.exe is fetched), which would be the download vouching for the files it came with.
+$script:VerifierPath = $null
+$script:VerifierWhyNot = 'first install: no kern installed before to check it'
+function Save-Verifier {
+    # LOCAL `Continue`: under the script's `Stop`, PowerShell 5.1 turns a native program's stderr
+    # behind `2>&1` into a terminating error, and a kern older than 0.52.0 answers this probe on
+    # stderr (MEASURED on Windows 10, PS 5.1: every update from 0.51.3 stopped here with exit 1).
+    $ErrorActionPreference = 'Continue'
+    $names = ((wsl.exe -l -q 2>$null) -replace "`0", '') -split "`r?`n" | ForEach-Object { $_.Trim() }
+    if ($names -notcontains $DistroName) { return }
+    # A FOLDER OF ITS OWN, random name, made by this script; and the copy's SHA256 recorded now and
+    # checked before every use, on Windows and again inside the distro on the very copy that runs. No
+    # folder is out of reach of another process of the same user, so the hash is what makes a
+    # replacement show: a verifier that changed is not used.
+    $dir = Join-Path $env:TEMP ("kern-verifier-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $path = Join-Path $dir 'kern'
+    $wpath = (wsl.exe -d $DistroName -- wslpath -u "$($path -replace '\\','/')" 2>$null | Out-String).Trim()
+    if (-not $wpath) {
+        Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+        $script:VerifierWhyNot = "the '$DistroName' distro does not start"
+        return
+    }
+    # NO SHELL QUOTING ON THE WAY IN: PowerShell 5.1 does not escape a double quote inside an argument to a
+    # native program, so `sh -c 'cp "$(command -v kern)" "$1"'` reached the distro cut apart and the copy
+    # never happened (MEASURED on Windows 10, PS 5.1). Each step is its own `--exec` with plain arguments.
+    $kp = (& wsl.exe -d $DistroName --exec sh -c 'command -v kern' 2>$null | Out-String).Trim()
+    if ($kp) { & wsl.exe -d $DistroName --exec cp $kp $wpath *> $null }
+    if (-not $kp -or -not (Test-Path $path)) {
+        Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+        $script:VerifierWhyNot = "no kern found in the '$DistroName' distro"
+        return
+    }
+    # Does it know the check? 0.52.0 on answers usage (2) to no arguments; an older kern answers 1.
+    $probeSha = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+    $null = Run-Verifier $wpath $probeSha @()
+    if ($script:VerifierCode -ne 2) {
+        Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+        $script:VerifierWhyNot = 'the kern installed before is older than 0.52.0 and cannot check signatures'
+        return
+    }
+    $script:VerifierPath = $path
+    $script:VerifierDir = $dir
+    $script:VerifierSha = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+}
+
+# Run the saved verifier inside the distro (a copy in the distro's /tmp, so a Windows folder's mount
+# options cannot stop it from executing). Returns its output; $LASTEXITCODE is its exit code.
+function Run-Verifier($wpath, $sha, $vargs) {
+    # LOCAL `Continue`: under the script's `Stop`, PowerShell 5.1 turns a native program's stderr
+    # behind `2>&1` into a terminating error, and a kern older than 0.52.0 answers this probe on
+    # stderr (MEASURED on Windows 10, PS 5.1: every update from 0.51.3 stopped here with exit 1).
+    $ErrorActionPreference = 'Continue'
+    # One `--exec` per step, arguments passed as they are (see Save-Verifier): a copy in the distro's
+    # /tmp, its SHA256 checked against the one recorded when it was saved, then run. KERN_WSL_AS_ROOT=1:
+    # a check reads two files and needs no box. The exit code is left in $script:VerifierCode (4: the
+    # copy about to run is not the verifier that was saved).
+    $script:VerifierCode = 1
+    $t = (& wsl.exe -d $DistroName --exec mktemp 2>$null | Out-String).Trim()
+    if (-not $t) { return '' }
+    try {
+        & wsl.exe -d $DistroName --exec cp $wpath $t *> $null
+        & wsl.exe -d $DistroName --exec chmod 0755 $t *> $null
+        $h = (((& wsl.exe -d $DistroName --exec sha256sum $t 2>$null | Out-String).Trim()) -split '\s+')[0]
+        if ($h -ne $sha) { $script:VerifierCode = 4; return '' }
+        $out = (& wsl.exe -d $DistroName --exec env KERN_WSL_AS_ROOT=1 $t __verify-release @vargs 2>&1 | Out-String)
+        $script:VerifierCode = $LASTEXITCODE
+        return $out
+    } finally {
+        & wsl.exe -d $DistroName --exec rm -f $t *> $null
+    }
+}
+
+# Check a release file with the saved verifier: its version on success, $null when there is none or
+# the distro cannot run it now. A refusal (exit 3) stops the install.
+function Verify-InDistro($dest, $sig, $target, $asset) {
+    # LOCAL `Continue`: under the script's `Stop`, PowerShell 5.1 turns a native program's stderr
+    # behind `2>&1` into a terminating error, and a kern older than 0.52.0 answers this probe on
+    # stderr (MEASURED on Windows 10, PS 5.1: every update from 0.51.3 stopped here with exit 1).
+    $ErrorActionPreference = 'Continue'
+    if (-not $script:VerifierPath -or -not (Test-Path $script:VerifierPath)) { return $null }
+    # A VERIFIER THAT CHANGED DURING THE INSTALL is something replacing files under this install: stop.
+    if ((Get-FileHash $script:VerifierPath -Algorithm SHA256).Hash.ToLower() -ne $script:VerifierSha) {
+        Die "the saved copy of the kern installed before was changed during the install. Not installing."
+    }
+    $w = (wsl.exe -d $DistroName -- wslpath -u "$($script:VerifierPath -replace '\\','/')" 2>$null | Out-String).Trim()
+    $f = (wsl.exe -d $DistroName -- wslpath -u "$($dest -replace '\\','/')" 2>$null | Out-String).Trim()
+    $g = (wsl.exe -d $DistroName -- wslpath -u "$($sig -replace '\\','/')" 2>$null | Out-String).Trim()
+    if (-not $w -or -not $f -or -not $g) { $script:VerifierWhyNot = "the '$DistroName' distro did not answer"; return $null }
+    $vargs = @($f, $g, $target, $asset)
+    if ($script:WantVersion) { $vargs += $script:WantVersion }
+    $out = Run-Verifier $w $script:VerifierSha $vargs
+    $code = $script:VerifierCode
+    if ($code -eq 4) { Die "the copy of the kern installed before changed on its way into the '$DistroName' distro. Not installing." }
+    if ($code -eq 0 -and $out -match 'verified (\d+\.\d+\.\d+)') { return $Matches[1] }
+    if ($code -eq 3) { Die "the kern installed before refused the signature of ${asset}: $($out.Trim()). Not installing." }
+    $script:VerifierWhyNot = "the kern installed before could not run the check (exit $code)"
+    return $null
 }
 
 # Idempotent USER-PATH add. SAME semantics as pathtool.ps1 (keep the two in sync): raw registry
@@ -195,6 +429,7 @@ function Update-DistroBinary($want) {
         $local = Resolve-Local 'KERN_BIN_LOCAL' 'kern-x86_64-unknown-linux-musl.tar.gz'
         if ($local) {
             Copy-Item $local $tgz -Force
+            Note-Check 'the kern in the distro' 'NOT verified (local file)'
         } else {
             try { Invoke-WebRequest -Uri $BinUrl -OutFile $tgz -UseBasicParsing } catch { return $false }
             if ($env:KERN_SKIP_VERIFY -ne '1') {
@@ -203,6 +438,25 @@ function Update-DistroBinary($want) {
                 $got256  = (Get-FileHash $tgz -Algorithm SHA256).Hash.ToLower()
                 Remove-Item "$tgz.sha256" -ErrorAction SilentlyContinue
                 if ($want256 -ne $got256) { return $false }
+                # The signature too, when minisign is installed: any doubt (missing, invalid, another
+                # target, file or version) falls back to the full re-import, which checks the rootfs.
+                $ms = Get-Command minisign.exe -ErrorAction SilentlyContinue
+                if ($ms) {
+                    try { Invoke-WebRequest -Uri "$BinUrl.minisig" -OutFile "$tgz.minisig" -UseBasicParsing } catch { return $false }
+                    try { $null = Test-MinisignFile $ms $tgz "$tgz.minisig" 'x86_64-unknown-linux-musl' (($BinUrl -split '/')[-1]) }
+                    catch { return $false }
+                    finally { Remove-Item "$tgz.minisig" -ErrorAction SilentlyContinue }
+                    Note-Check 'the kern in the distro' 'sha256 ok; signature verified by minisign'
+                } else {
+                    # No minisign: the kern installed before this run checks the tarball (0.52.0 on). A
+                    # refusal stops the install; a kern too old to check leaves it to the SHA256.
+                    try { Invoke-WebRequest -Uri "$BinUrl.minisig" -OutFile "$tgz.minisig" -UseBasicParsing } catch { return $false }
+                    try { $vv = Verify-InDistro $tgz "$tgz.minisig" 'x86_64-unknown-linux-musl' (($BinUrl -split '/')[-1]) }
+                    finally { Remove-Item "$tgz.minisig" -ErrorAction SilentlyContinue }
+                    if ($vv) { Note-Check 'the kern in the distro' "sha256 ok; signature verified by the kern installed before ($vv)" }
+                    elseif ($env:KERN_RELEASE_URL) { return $false }
+                    else { Note-Check 'the kern in the distro' "sha256 ok; signature NOT verified ($($script:VerifierWhyNot)): trusting HTTPS from github.com" }
+                }
             }
         }
         Remove-Item -Recurse -Force $binDir -ErrorAction SilentlyContinue
@@ -256,12 +510,19 @@ function Import-Distro {
             return
         }
         Warn "in-place update unavailable -- re-importing the distro. Cached images and boxes will be RESET (re-pulled on next use). To keep them, cancel now and run 'wsl --export kern <file.tar>' first."
+        # FETCHED AND CHECKED WHILE THE OLD DISTRO IS STILL THERE: its kern is the one that checks the
+        # new rootfs, and after the unregister there is nothing left to run it in.
+        $tar = Join-Path $env:TEMP 'kern-wsl-rootfs.tar.gz'
+        Fetch $RootfsUrl $tar 'KERN_ROOTFS_LOCAL' 'kern-wsl-rootfs.tar.gz' 'the kern WSL distro' 'x86_64-wsl-rootfs'
+        $script:RootfsFetched = $true
         wsl.exe --unregister $DistroName *> $null
         Remove-Item -Recurse -Force $DistroDir -ErrorAction SilentlyContinue
     }
     $tar = Join-Path $env:TEMP 'kern-wsl-rootfs.tar.gz'
     try {
-        Fetch $RootfsUrl $tar 'KERN_ROOTFS_LOCAL' 'kern-wsl-rootfs.tar.gz' 'the kern WSL distro'
+        if (-not $script:RootfsFetched) {
+            Fetch $RootfsUrl $tar 'KERN_ROOTFS_LOCAL' 'kern-wsl-rootfs.tar.gz' 'the kern WSL distro' 'x86_64-wsl-rootfs'
+        }
         New-Item -ItemType Directory -Force -Path $DistroDir | Out-Null
         Info "importing the kern distro (wsl --import $DistroName)..."
         wsl.exe --import $DistroName $DistroDir $tar --version 2
@@ -330,6 +591,57 @@ sed -i 's/^root::/root:*:/' /etc/shadow
 # passt: pods have no network without it. Judged by what is there afterwards, not by apk's status.
 command -v pasta >/dev/null 2>&1 || apk add -q passt >/dev/null 2>&1
 command -v pasta >/dev/null 2>&1 || say "passt is not installed (no network now?): run 'apk add passt' in the distro"
+# zstd (images with zstd-compressed layers) and /etc/localtime (compose files mount it), as a new
+# distro has them.
+command -v zstd >/dev/null 2>&1 || apk add -q zstd >/dev/null 2>&1
+[ -e /etc/localtime ] || { apk add -q tzdata >/dev/null 2>&1; [ -f /usr/share/zoneinfo/UTC ] && ln -sf /usr/share/zoneinfo/UTC /etc/localtime; }
+# FILES ON C:\ BELONG TO THE USER BOXES RUN AS, and keep a chown/chmod (drvfs `metadata`). MEASURED on
+# 0.51.3: /mnt/c mounted `uid=0`, so a box's root (this user) could neither chown nor chmod a bind
+# mount of a project folder on C:\, and a database keeping its data there (Supabase's
+# ./volumes/db/data) restarted for hours on `chown: Operation not permitted`. Applied at the restart
+# below. An [automount] section someone wrote is theirs: left as it is, and said.
+# /etc/wsl.conf: ONE merge routine for every key kern sets there (`ensure_key`), so no edit drops
+# another one or a value the user wrote.
+# ensure_key <section> <key> <value>: key=value in [section] of $WSLCONF unless the key is already set
+# there (a value someone wrote is theirs). Prints `added`, or `kept:<the value found>`.
+ensure_key() {
+  f="${WSLCONF:-/etc/wsl.conf}"
+  [ -f "$f" ] || : > "$f"
+  cur=$(awk -v s="[$1]" -v k="$2" '
+    /^[ \t]*\[/ { sect = $0; gsub(/[ \t]/, "", sect); ins = (sect == s); next }
+    ins && index($0, "=") {
+      name = substr($0, 1, index($0, "=") - 1); gsub(/^[ \t]+|[ \t]+$/, "", name)
+      if (name == k) { v = substr($0, index($0, "=") + 1); gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit }
+    }' "$f")
+  if [ -n "$cur" ]; then echo "kept:$cur"; return 0; fi
+  if awk -v s="[$1]" '{ t = $0; gsub(/[ \t]/, "", t); if (t == s) found = 1 } END { exit !found }' "$f"; then
+    awk -v s="[$1]" -v line="$2=$3" '{ print; t = $0; gsub(/[ \t]/, "", t); if (t == s) print line }' "$f" > "$f.new" && cat "$f.new" > "$f" && rm -f "$f.new"
+  else
+    printf '[%s]\n%s=%s\n' "$1" "$2" "$3" >> "$f"
+  fi
+  echo added
+}
+# NO WINDOWS PROGRAM FROM INSIDE THE DISTRO ([interop] enabled=false): a process that escapes a box is
+# this user, and with interop on it could start cmd.exe or powershell.exe as the Windows user. kern
+# uses none (MEASURED with it off: boxes, --gpus, published ports and their names, kern.exe from
+# Windows all work). appendWindowsPath=false too: with interop off, Windows' PATH entries would only
+# be listed, never run. FILES ON C:\ BELONG TO THE USER BOXES RUN AS and keep a chown/chmod (drvfs
+# `metadata`): MEASURED on 0.51.3, /mnt/c mounted uid=0 left a box's root unable to chown a bind of a
+# project folder, and a database keeping its data there restarted for hours. Applied at the restart
+# below. A value someone wrote is kept, and said.
+G=$(awk -F: -v id="$ID" '$3==id{print $4; exit}' /etc/passwd); [ -n "$G" ] || G=$ID
+AUTO="metadata,uid=$ID,gid=$G,umask=022"
+case "$(ensure_key interop enabled false)" in
+  added) say "Windows refuses the programs started from inside the distro (wsl.conf [interop] enabled=false)" ;;
+  kept:false) ;;
+  kept:*) say "/etc/wsl.conf turns interop on: a process that escapes a box can start Windows programs as you (kern doctor says)" ;;
+esac
+ensure_key interop appendWindowsPath false >/dev/null
+case "$(ensure_key automount options "\"$AUTO\"")" in
+  added) say "files on C:\\ now belong to '$U' (the user boxes run as) and keep chown/chmod: wsl.conf [automount] $AUTO" ;;
+  "kept:\"$AUTO\"") ;;
+  kept:*) say "/etc/wsl.conf has its own [automount] options, left as they are: a box's root may not chown files on C:\\ (kern doctor says)" ;;
+esac
 # The marker first: the image import below runs kern as the user, which the marker is what decides.
 mkdir -p /etc/kern && chmod 755 /etc/kern
 printf '%s\n' "$U" > /etc/kern/wsl-user
@@ -443,9 +755,15 @@ function Set-DistroUser {
             Warn "setting up the user kern runs boxes as did not finish: $($said.Trim())"
             return
         }
-        # A restart, so no process started as root before the change is left behind.
+        # WHAT THE SETUP CHANGED, said: its `kern: ...` lines (the user, the images moved, how C:\ is
+        # mounted) were only checked for the final ok and never shown.
+        foreach ($l in ($said -split "`r?`n")) {
+            if ($l -like 'kern: *') { Info ($l -replace '^kern: ', '') }
+        }
+        # A restart, so no process started as root before the change is left behind, and so the
+        # [automount] options apply.
         wsl.exe --terminate $DistroName *> $null
-        Info "kern runs its boxes as the distro's ordinary user 'kern', not root."
+        Info "kern runs its boxes as the distro's ordinary user 'kern'."
     } finally {
         Remove-Item $tmp -ErrorAction SilentlyContinue
     }
@@ -454,7 +772,7 @@ function Set-DistroUser {
 # ---- 3. shim + PATH ---------------------------------------------------------
 function Install-Shim {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Fetch $ExeUrl $ExePath 'KERN_EXE_LOCAL' 'kern.exe' 'the kern.exe bridge'
+    Fetch $ExeUrl $ExePath 'KERN_EXE_LOCAL' @('kern-windows-x86_64.exe', 'kern.exe') 'the kern.exe bridge' 'x86_64-pc-windows-gnu'
     Add-UserPath $InstallDir
     # The registry PATH reaches only NEW processes, so the shell that ran the installer still could not
     # see `kern` - while the next line invited the reader to type exactly that. `iex` runs this script
@@ -760,11 +1078,18 @@ function Verify-Install {
 # elsewhere, to an elevated window or to the post-reboot resume. It used to say that with `exit 0`,
 # which under `iex` closed the reader's window on the very line telling them to reboot.
 if (Ensure-WslEngine) {
-    Import-Distro
-    Set-DistroUser
-    Install-Shim
-    if (-not (Verify-Install)) {
-        Warn "install NOT verified - nothing above was silently accepted."
+    # FIRST, before anything is replaced: the kern installed now is the one that checks every download.
+    Save-Verifier
+    try {
+        Import-Distro
+        Set-DistroUser
+        Install-Shim
+        if (-not (Verify-Install)) {
+            Warn "install NOT verified - nothing above was silently accepted."
+        }
+        Show-Checks
+    } finally {
+        if ($script:VerifierDir) { Remove-Item -Recurse -Force $script:VerifierDir -ErrorAction SilentlyContinue }
     }
 }
 } finally {

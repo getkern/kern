@@ -12,7 +12,9 @@ kern box dev --image alpine -it -- sh
 ```
 
 The script picks your architecture (`x86_64` or `aarch64`), checks the SHA256 and puts `kern` in
-`~/.local/bin`. `kern doctor` tells you what your machine can and cannot do.
+`~/.local/bin`. It refuses a release from 0.51.2 on that carries no signature, and with `minisign`
+installed it checks the signature, which must name the file, your architecture and the version.
+`kern doctor` tells you what your machine can and cannot do.
 
 For Kern Sandbox, `pip install kern-sandbox` or `npm install kern-sandbox` is enough: on `x86_64`
 and `aarch64` each brings the same binary, into the venv or into `node_modules`.
@@ -63,16 +65,43 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
 It sets up WSL2 (one reboot, if it was not there yet) and a small Linux distro with kern inside, and
-puts `kern.exe` on your PATH. For more than a few commands, work inside the distro, where each box is
+puts `kern.exe` on your PATH. It checks the SHA256 of each download, and with minisign installed
+(`winget install jedisct1.minisign`) the signatures of `kern.exe` and the distro too; on an update
+without minisign, the kern installed before the update checks them. It ends by saying, file by file,
+what was checked. `KERN_WSL_DISTRO=<name>` and
+`KERN_INSTALL_DIR=<folder>` install into another distro and folder, for a trial next to your own. For more than a few commands, work inside the distro, where each box is
 much faster:
 
 ```powershell
 wsl -d kern
 ```
 
-In the distro kern runs boxes as its user `kern` (uid 1000), not root: a box's root is that user.
+In the distro kern runs boxes as its user `kern` (uid 1000): a box's root is that user.
 Running `install.ps1` again updates kern and converts a distro installed before this, keeping its
 images and volumes.
+
+### What install.ps1 trusts
+
+`kern.exe` carries no Authenticode signature, so Windows knows no publisher for it. Each release
+file is signed with minisign instead, with the keys `kern self-update` trusts:
+
+| | what is checked |
+|---|---|
+| first install | the SHA256 of each file, over HTTPS from github.com; the signature too when `minisign.exe` is installed |
+| update, from 0.52.0 on | the signature of the new `kern.exe`, distro and binary, checked by the kern installed before the update (no `minisign.exe` needed) |
+
+The installer ends by saying, file by file, which of these happened. `KERN_RELEASE_URL=<url>` with `KERN_VERSION`
+installs from a mirror of one release (an internal server, an offline copy); a mirror is trusted only
+through the signatures, so without minisign or a kern installed before that can check them, the
+install is refused. `install.sh` takes the same variables. To check a file by hand from
+WSL or Linux, with either release key:
+
+```sh
+minisign -Vm kern-windows-x86_64.exe -P RWSuYG/qtD8AV5p5IzIqfRuCwh5eJlT7ed5+7lVKrgILE1qvIpPGv+Ej
+minisign -Vm kern-windows-x86_64.exe -P RWRLQt2lFPXXsC0g2+1SPfSmOdjpxJ/f+t5DU+xPOaRNjElnisOR0Uo3
+```
+
+The signed comment it prints names the version, the target and the file.
 
 ### Which WSL2 distro kern uses
 
@@ -93,6 +122,29 @@ is: the `KERN_WSL_DISTRO` environment variable, then what `kern wsl use` stored,
 `--probe` is the one that answers "why does my fix not show up": it prints the version in each distro,
 so two installs disagreeing become visible. `kern doctor`, which runs inside a distro, cannot see
 across the WSL boundary and says so.
+
+### Files on `C:\` and databases
+
+In the distro, the files on `C:\` (`/mnt/c`) belong to its user `kern`, which is a box's root, and keep
+a `chown` or `chmod` (`[automount]` in `/etc/wsl.conf`, which `install.ps1` writes). A box sees only
+the folders bound into it. `kern doctor` says how `C:\` is mounted.
+
+Keep a database's data in a named volume (`volumes: [pgdata:/var/lib/postgresql/data]`) rather than in
+a folder of the project on `C:\`: its files then live in the distro's own filesystem.
+
+A file saved from Windows (an editor, Explorer) gets the default Linux mode again (`755` for files,
+owned by `kern`), whatever `chmod` gave it before. Most files do not care; one a service wants at
+`600` (a private key, `.pgpass`) is best created or fixed inside the distro, or kept in a volume.
+The same default is why `git` run inside the distro reports each file written from Windows as a mode
+change (`100644 => 100755`); `git config core.filemode false` in that repository ignores modes, as
+Git for Windows does. A file written inside the distro keeps its own mode (`644`).
+
+### Windows programs and the distro
+
+Windows refuses the programs started from inside kern's distro (`[interop] enabled=false` in
+`/etc/wsl.conf`, which `install.ps1` writes): `code .` or `explorer.exe` typed there does not run. `kern.exe` and
+`wsl -d kern` from Windows work as before. `kern doctor` says whether interop is on. With it on, a
+process that leaves a box can start Windows programs as your Windows user.
 
 ### Keep projects inside the distro, not under `/mnt/c`
 

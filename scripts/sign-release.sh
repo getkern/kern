@@ -1,16 +1,20 @@
 #!/bin/sh
-# Sign a published release's Linux tarballs and attach the signatures to it. The OWNER runs this,
-# on the machine that holds the release key: the key never leaves it, and minisign asks for its
-# password once per tarball.
+# Sign a release's assets, attach the signatures, and publish it. The OWNER runs this, on the machine
+# that holds the release key: the key never leaves it, and minisign asks for its password once per
+# file.
 #
 #   sh scripts/sign-release.sh v0.52.0
 #
-# For each published target it downloads the tarball, checks it against the release's own .sha256,
-# signs it with a trusted comment `kern self-update` and install.sh read
-# (`kern-release v1 version=X.Y.Z target=T file=F`), verifies the signature with the public keys,
-# and uploads `<tarball>.minisig` to the release (replacing an older one of the same name).
+# The release workflow leaves a new release as a DRAFT, so nothing is public before it is signed.
+# This script finds the draft (or a published release, to re-sign one), and for each asset - the two
+# Linux tarballs, the Windows shim and the WSL rootfs - downloads it, checks it against the release's
+# own .sha256, signs it with the trusted comment `kern self-update`, install.sh and install.ps1 read
+# (`kern-release v1 version=X.Y.Z target=T file=F`), verifies the signature with the public keys, and
+# uploads `<file>.minisig` (replacing an older one of the same name). When every file is signed, a
+# draft is published. With GitHub's immutable releases on, nothing can be changed after that.
 #
-#   KERN_SIGN_KEY   the secret key (default: ~/kern-keys/kern-release.key)
+#   KERN_SIGN_KEY         the secret key (default: ~/kern-keys/kern-release.key)
+#   KERN_SIGN_NO_PUBLISH  set to 1 to sign and leave the draft a draft
 #
 # Needs minisign, curl, sha256sum, python3, and a GitHub credential in git's credential helper.
 set -eu
@@ -56,18 +60,51 @@ chmod 600 "$work/auth"
 unset token
 api() { curl -fsS -H @"$work/auth" -H "Accept: application/vnd.github+json" "$@"; }
 
-api "https://api.github.com/repos/$repo/releases/tags/$tag" >"$work/release.json" || {
-  echo "sign-release: no release $tag on $repo" >&2
+# A DRAFT IS NOT FOUND BY TAG (`releases/tags/<tag>` answers only published ones), so the list is
+# read, which includes drafts for a caller with write access.
+api "https://api.github.com/repos/$repo/releases?per_page=100" >"$work/releases.json"
+python3 -I -c 'import json,sys
+hits = [r for r in json.load(open(sys.argv[1])) if r.get("tag_name") == sys.argv[2]]
+if len(hits) != 1:
+    sys.exit(1)
+json.dump(hits[0], open(sys.argv[3], "w"))' "$work/releases.json" "$tag" "$work/release.json" || {
+  echo "sign-release: no single release (draft or published) for $tag on $repo" >&2
   exit 1
 }
 release_id="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$work/release.json")"
 
-for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-  file="kern-$target.tar.gz"
-  url="https://github.com/$repo/releases/download/$tag/$file"
+draft="$(python3 -I -c 'import json,sys; print(1 if json.load(open(sys.argv[1]))["draft"] else 0)' "$work/release.json")"
+
+# The id of an asset of this release by name, or nothing.
+asset_id() {
+  python3 -I -c 'import json,sys
+for a in json.load(open(sys.argv[1])).get("assets", []):
+    if a["name"] == sys.argv[2]:
+        print(a["id"])' "$work/release.json" "$1"
+}
+
+# Download an asset through the API: a draft's assets have no public URL.
+fetch() {
+  id="$(asset_id "$1")"
+  [ -n "$id" ] || {
+    echo "sign-release: $tag has no asset $1: not signing" >&2
+    exit 1
+  }
+  curl -fsSL -H @"$work/auth" -H "Accept: application/octet-stream" \
+    "https://api.github.com/repos/$repo/releases/assets/$id" -o "$2"
+}
+
+# file and the target its signed comment names
+for pair in \
+  "kern-x86_64-unknown-linux-musl.tar.gz x86_64-unknown-linux-musl" \
+  "kern-aarch64-unknown-linux-musl.tar.gz aarch64-unknown-linux-musl" \
+  "kern-windows-x86_64.exe x86_64-pc-windows-gnu" \
+  "kern-wsl-rootfs.tar.gz x86_64-wsl-rootfs"; do
+  file="${pair%% *}"
+  target="${pair#* }"
   echo "== $file"
-  curl -fsSL "$url" -o "$work/$file"
-  curl -fsSL "$url.sha256" -o "$work/$file.sha256"
+  fetch "$file" "$work/$file"
+  fetch "$file.sha256" "$work/$file.sha256"
   want="$(awk '{print $1}' "$work/$file.sha256")"
   got="$(sha256sum "$work/$file" | awk '{print $1}')"
   [ "$want" = "$got" ] || {
@@ -91,10 +128,7 @@ for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     exit 1
   }
   # Replace an older signature of the same name: GitHub refuses a second asset with one name.
-  old_id="$(python3 -I -c 'import json,sys
-for a in json.load(open(sys.argv[1])).get("assets", []):
-    if a["name"] == sys.argv[2]:
-        print(a["id"])' "$work/release.json" "$file.minisig")"
+  old_id="$(asset_id "$file.minisig")"
   if [ -n "$old_id" ]; then
     api -X DELETE "https://api.github.com/repos/$repo/releases/assets/$old_id" >/dev/null
   fi
@@ -102,4 +136,23 @@ for a in json.load(open(sys.argv[1])).get("assets", []):
     "https://uploads.github.com/repos/$repo/releases/$release_id/assets?name=$file.minisig" >/dev/null
   echo "   signed and attached: $file.minisig"
 done
+
+if [ "$draft" = 1 ]; then
+  if [ "${KERN_SIGN_NO_PUBLISH:-}" = 1 ]; then
+    echo "done: $tag is signed and still a draft (KERN_SIGN_NO_PUBLISH=1)"
+    exit 0
+  fi
+  api -X PATCH -H "Content-Type: application/json" --data '{"draft":false}' \
+    "https://api.github.com/repos/$repo/releases/$release_id" >/dev/null
+  echo "published: $tag"
+fi
 echo "done: $tag is installable by \`kern self-update\`"
+# kern.exe carries no Authenticode signature, and Defender has removed it before. Microsoft analyses a
+# submitted file as a false positive for free; it takes the owner's Microsoft account, so it is said
+# here rather than done.
+exe_sha="$(sha256sum "$work/kern-windows-x86_64.exe" | awk '{print $1}')"
+echo
+echo "Windows: submit kern-windows-x86_64.exe as a false positive (free):"
+echo "  https://www.microsoft.com/en-us/wdsi/filesubmission"
+echo "  file sha256: $exe_sha"
+

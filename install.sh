@@ -8,6 +8,7 @@
 # Honors:
 #   KERN_INSTALL_DIR   where to install (default: ~/.local/bin, or /usr/local/bin as root)
 #   KERN_VERSION       a specific tag, e.g. v0.3.0 (default: latest)
+#   KERN_RELEASE_URL   a mirror holding that release's files (with KERN_VERSION); signatures still checked
 #   KERN_VM            macOS only: the Lima VM's name (default: kern)
 #   KERN_LIMA_ARGS     macOS only: extra `limactl start` flags for a new VM, e.g. "--vm-type qemu"
 # No dependencies beyond a POSIX shell, curl (or wget), tar, and sha256sum (optional, for
@@ -176,7 +177,13 @@ fi
 
 ver="${KERN_VERSION:-latest}"
 asset="kern-${arch}.tar.gz"
-if [ "$ver" = "latest" ]; then
+if [ -n "${KERN_RELEASE_URL:-}" ]; then
+  # A MIRROR (an internal server, an offline copy): the files of ONE release, so the version has to be
+  # named. The signature check below is the same, so a mirror cannot hand over a file the release
+  # keys did not sign.
+  [ "$ver" != latest ] || err "KERN_RELEASE_URL names a mirror: set KERN_VERSION too (the release it holds)."
+  base="${KERN_RELEASE_URL%/}"
+elif [ "$ver" = "latest" ]; then
   base="https://github.com/${REPO}/releases/latest/download"
 else
   # A release's tag is `v<version>`: KERN_VERSION may be given with or without the `v`.
@@ -214,6 +221,21 @@ fi
 # `kern self-update` trusts, and naming this file and this machine in its signed comment. Without
 # minisign it is said and skipped, as the checksum is without sha256sum.
 KERN_RELEASE_KEYS="RWSuYG/qtD8AV5p5IzIqfRuCwh5eJlT7ed5+7lVKrgILE1qvIpPGv+Ej RWRLQt2lFPXXsC0g2+1SPfSmOdjpxJ/f+t5DU+xPOaRNjElnisOR0Uo3"
+# EVERY RELEASE FROM 0.51.2 ON IS SIGNED, so one without a signature is refused rather than
+# installed: a missing `.minisig` is what a tampered release would look like, and the release
+# workflow keeps a release a draft until it is signed. An older release, pinned with KERN_VERSION,
+# predates the signatures and is installed with the line saying so.
+signed_era=1
+case "$ver" in
+  latest) ;;
+  *)
+    v="${ver#v}"
+    maj="${v%%.*}"; rest="${v#*.}"; min="${rest%%.*}"; pat="${rest#*.}"; pat="${pat%%[!0-9]*}"
+    if [ "$maj" -eq 0 ] 2>/dev/null && { [ "$min" -lt 51 ] || { [ "$min" -eq 51 ] && [ "${pat:-0}" -lt 2 ]; }; }; then
+      signed_era=""
+    fi
+    ;;
+esac
 if dl "${base}/${asset}.minisig" "${tmp}/${asset}.minisig" 2>/dev/null; then
   if command -v minisign >/dev/null 2>&1; then
     signed=""
@@ -232,14 +254,33 @@ if dl "${base}/${asset}.minisig" "${tmp}/${asset}.minisig" 2>/dev/null; then
       *) err "the signature of ${asset} is valid but names another machine (${comment}) - not installing." ;;
     esac
     case " $comment " in
-      *" file=${asset} "*) info "signature verified" ;;
+      *" file=${asset} "*) ;;
       *) err "the signature of ${asset} is valid but names another file (${comment}) - not installing." ;;
     esac
+    # THE VERSION TOO: a validly signed OLDER release served in place of the one asked for is a
+    # downgrade. Pinned: it must be that version. Latest: it must be the version the (now verified)
+    # binary reports.
+    signed_ver="$(printf '%s\n' "$comment" | tr ' ' '\n' | sed -n 's/^version=//p')"
+    if [ "$ver" = latest ]; then
+      tar -C "$tmp" -xzf "${tmp}/${asset}" kern
+      want_ver="$("${tmp}/kern" --version 2>/dev/null | awk '{print $2}')"
+      want_ver="${want_ver#v}"
+    else
+      want_ver="${ver#v}"
+    fi
+    [ -n "$signed_ver" ] && [ "$signed_ver" = "$want_ver" ] \
+      || err "the signature of ${asset} is valid but names version ${signed_ver:-none}, not ${want_ver:-unknown} - not installing."
+    info "signature verified (${signed_ver})"
+  elif [ -n "${KERN_RELEASE_URL:-}" ]; then
+    # A mirror is trusted only through the signature: it is not github.com over HTTPS.
+    err "${asset} came from the mirror ${base} and minisign is not installed to check its signature. A mirror is trusted only through the signatures: install minisign, or install from github.com."
   else
     printf "${DIM}    (signature not checked: install minisign to check it)${ZZ}\n"
   fi
+elif [ -n "$signed_era" ]; then
+  err "${asset} has no signature (${asset}.minisig), and every release from 0.51.2 on is signed - not installing. If the network dropped, run this again."
 else
-  printf "${DIM}    (this release carries no signature)${ZZ}\n"
+  printf "${DIM}    (this release predates signatures: none to check)${ZZ}\n"
 fi
 
 info "installing to ${bindir}"

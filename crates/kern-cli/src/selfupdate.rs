@@ -360,6 +360,73 @@ fn verify_file(path: &Path, sig: &Signature, keys: &[PublicKey]) -> Result<(), S
     Err("the release is signed with a key this kern does not trust: nothing replaced".to_string())
 }
 
+/// `kern __verify-release <file> <file.minisig> <target> <asset> [<version>]` (hidden): check a
+/// release file the way `self-update` checks its own download, with the keys built into this binary.
+///
+/// FOR INSTALL.PS1'S UPDATES. Windows has no minisign and PowerShell 5.1 no Ed25519, so a first install
+/// there is checked by SHA256 only; but on an UPDATE the kern already in the distro is a binary this
+/// user trusts, and it can check the next `kern.exe`, distro and tarball before anything is replaced.
+///
+/// Prints `verified <version>` and exits 0 when the signature checks out and its statement names this
+/// target, this file and (when given) this version; exits 3 with the reason otherwise. 3 and not 1,
+/// because an older kern answers 1 to a command it does not know, and the caller must tell "refused"
+/// from "this kern cannot check".
+pub(crate) fn verify_release_verb(args: &[String]) -> i32 {
+    let (file, sig, target, asset, want) = match args {
+        [f, s, t, a] => (f, s, t, a, None),
+        [f, s, t, a, v] => match Version::parse(v.trim_start_matches('v')) {
+            Some(v) => (f, s, t, a, Some(v)),
+            None => {
+                eprintln!("kern: __verify-release: {v:?} is not a version");
+                return 2;
+            }
+        },
+        _ => {
+            eprintln!(
+                "usage: kern __verify-release <file> <file.minisig> <target> <asset> [<version>]"
+            );
+            return 2;
+        }
+    };
+    match verify_release(Path::new(file), Path::new(sig), target, asset, want) {
+        Ok(v) => {
+            println!("verified {v}");
+            0
+        }
+        Err(m) => {
+            eprintln!("kern: {m}");
+            3
+        }
+    }
+}
+
+fn verify_release(
+    file: &Path,
+    sigpath: &Path,
+    target: &str,
+    asset: &str,
+    want: Option<Version>,
+) -> Result<Version, String> {
+    let keys = trusted_keys().map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(sigpath)
+        .map_err(|e| format!("the signature {} cannot be read: {e}", sigpath.display()))?;
+    let sig = Signature::decode(&text).map_err(|e| format!("the signature does not parse: {e}"))?;
+    verify_file(file, &sig, &keys)?;
+    let st = parse_statement(sig.trusted_comment())?;
+    if st.target != target {
+        return Err(format!("the signature is for {}, not {target}", st.target));
+    }
+    if st.file != asset {
+        return Err(format!("the signature is for {}, not {asset}", st.file));
+    }
+    if let Some(w) = want {
+        if st.version != w {
+            return Err(format!("asked for {w}, the signature says {}", st.version));
+        }
+    }
+    Ok(st.version)
+}
+
 /// Download `url` to `out` with curl, bounded in size and time.
 ///
 /// `https://` only, redirects included. A debug build also takes `file://`, which is how the tests
@@ -906,7 +973,8 @@ mod tests {
 
     #[test]
     fn the_installer_and_the_signing_script_carry_the_same_keys() {
-        // Three copies of one fact: this file, install.sh (checks a fresh install) and
+        // Four copies of one fact: this file, install.sh (checks a fresh install), install.ps1 (the
+        // Windows assets) and
         // scripts/sign-release.sh (checks the owner's signature before uploading it). A rotation
         // that missed one would leave an installer refusing every release, or a signing script
         // approving a key no kern trusts.
@@ -923,6 +991,66 @@ mod tests {
             );
             assert_eq!(line, want, "{file}");
         }
+        // install.ps1 checks the Windows assets with the same two, in PowerShell's spelling.
+        let ps = std::fs::read_to_string(root.join("install.ps1")).unwrap_or_default();
+        let line = ps
+            .lines()
+            .find(|l| l.starts_with("$KernReleaseKeys ="))
+            .unwrap_or_default();
+        assert_eq!(
+            line,
+            format!(
+                "$KernReleaseKeys = @('{}', '{}')",
+                RELEASE_KEYS[0].1, RELEASE_KEYS[1].1
+            ),
+            "install.ps1"
+        );
+        // And docs/INSTALL.md, which shows the reader how to check a file by hand with them.
+        let doc = std::fs::read_to_string(root.join("docs/INSTALL.md")).unwrap_or_default();
+        for (id, key) in RELEASE_KEYS {
+            assert!(
+                doc.contains(&format!("-P {key}")),
+                "docs/INSTALL.md lacks key {id}"
+            );
+        }
+    }
+
+    /// install.ps1 checks downloads with the kern that was installed BEFORE the run: saved first, used
+    /// from the saved copy, and the new rootfs fetched while the old distro still exists to run it.
+    /// Taken at check time, the verifier could already be the new binary (the in-place update swaps it
+    /// before kern.exe is fetched), vouching for the files it came with.
+    #[test]
+    fn install_ps1_checks_with_the_kern_installed_before_the_run() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ps = std::fs::read_to_string(root.join("install.ps1")).unwrap_or_default();
+        let at = |needle: &str| ps.find(needle).unwrap_or(usize::MAX);
+        // The run block: the verifier is saved before anything that replaces a file.
+        let run = at("if (Ensure-WslEngine) {");
+        let tail = &ps[run.min(ps.len())..];
+        let pos = |needle: &str| tail.find(needle).unwrap_or(usize::MAX);
+        assert!(
+            pos("Save-Verifier") < pos("Import-Distro"),
+            "Save-Verifier must run first"
+        );
+        assert!(pos("Import-Distro") < pos("Install-Shim"));
+        // The check runs the SAVED copy, never whatever `kern` the distro holds at that moment.
+        let body_start = at("function Verify-InDistro");
+        let body = &ps[body_start.min(ps.len())..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(body.contains("$script:VerifierPath"), "{body}");
+        assert!(
+            !body.contains("'kern'") && !body.contains("--exec kern"),
+            "{body}"
+        );
+        // A re-import fetches (and so checks) the new rootfs BEFORE the old distro is unregistered.
+        let reimport = at("in-place update unavailable");
+        let after = &ps[reimport.min(ps.len())..];
+        let fetch = after.find("Fetch $RootfsUrl").unwrap_or(usize::MAX);
+        let unreg = after.find("--unregister $DistroName").unwrap_or(usize::MAX);
+        assert!(
+            fetch < unreg,
+            "the rootfs must be fetched before the old distro goes"
+        );
     }
 
     #[test]
