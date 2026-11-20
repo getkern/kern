@@ -8,7 +8,7 @@
 # WHAT IT RUNS, and only when the diff calls for it:
 #   - `cargo fmt --check` and, per touched crate, `clippy -D warnings` and its UNIT tests (`--lib`, `--bins` for the CLI);
 #     the integration binaries (smoke, sandbox_run: ~2 min) only for a test name given as argument;
-#   - the five documentation gates when a `.md` changed, the seccomp coverage gate when the seccomp
+#   - every static gate CI runs (about 1.3 s), the Python binding's tests when it changed, the seccomp coverage gate when the seccomp
 #     lists changed, a YAML parse and actionlint with shellcheck (as CI) when a workflow changed.
 # The full suite, the batteries, `gates-selftest` and the pentest stay with CI and with
 # `cut-release.sh`. WHY: on 2026-11-17 a release waited two hours on CI rounds; the owner's rule since
@@ -75,11 +75,33 @@ if [ -n "$filter" ]; then
     ok "integration tests matching '$filter'"
 fi
 
-if has '\.md$'; then
-    for g in md-links docker-vocabulary flat-continuation no-ai-slop stale-numbers; do
-        python3 "scripts/$g.py" >/dev/null 2>&1 || die "scripts/$g.py (run it for the detail)"
-    done
-    ok "documentation gates"
+# EVERY STATIC GATE CI RUNS, ALWAYS: about 1.3 s together (measured 2026-11-20). They used to run here
+# only when a `.md` changed, and v0.56.0 went red on main twice in one push for a gate this script
+# never ran: `progress-is-tty-gated` (two `eprintln!` without `kern: ` in compose.rs). A gate that
+# reads Rust runs on a Rust change, so "green here" has to mean "green in CI" for all of them.
+for g in no-ai-slop stale-numbers docker-vocabulary md-links readme-blocks-complete \
+         og-card-matches-readme flat-continuation test-env-lock progress-is-tty-gated injection-declared; do
+    python3 "scripts/$g.py" >/tmp/fast-check-gate.$$ 2>&1 \
+        || { cat /tmp/fast-check-gate.$$ >&2; rm -f /tmp/fast-check-gate.$$; die "scripts/$g.py"; }
+done
+python3 scripts/tracked-paths-sane.py --self-check >/tmp/fast-check-gate.$$ 2>&1 \
+    && python3 scripts/tracked-paths-sane.py >>/tmp/fast-check-gate.$$ 2>&1 \
+    || { cat /tmp/fast-check-gate.$$ >&2; rm -f /tmp/fast-check-gate.$$; die "scripts/tracked-paths-sane.py"; }
+rm -f /tmp/fast-check-gate.$$
+ok "the static gates CI runs (11)"
+
+# THE BINDINGS' OWN TESTS, when a binding changed: CI runs the Python suite on every push, and on
+# v0.56.0 one of its tests (ETXTBSY on a kern double rewritten while the first still ran) was red on
+# main because nothing here ran it.
+if has '^bindings/python/'; then
+    (cd bindings/python && python3 -m pytest -q -p no:cacheprovider tests/ >/tmp/fast-check-py.$$ 2>&1) \
+        || { tail -30 /tmp/fast-check-py.$$ >&2; rm -f /tmp/fast-check-py.$$; die "python binding tests (bindings/python: pytest tests/)"; }
+    rm -f /tmp/fast-check-py.$$
+    ok "python binding tests"
+fi
+if has '^bindings/node/'; then
+    node --check bindings/node/index.js >/dev/null 2>&1 || die "node --check bindings/node/index.js"
+    ok "node binding parses"
 fi
 
 # Every gate's self-test case must still find the text it sabotages (milliseconds, writes nothing):
