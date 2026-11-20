@@ -3562,7 +3562,16 @@ fn abort_on_container_exit_returns_the_tests_own_status() {
         if marker.is_some_and(|m| !out.contains(m)) {
             failures.push(format!("`{cmd}`: the test's output was not shown:\n{out}"));
         }
-        if ps.contains("abortit-db") {
+        // THIS TEST'S OWN REGISTRY, not the `kern:` warning lines: `kern ps` also reports, on
+        // stderr, running boxes recorded under OTHER runtime dirs, and a second checkout running
+        // this same suite at the same time has an `abortit-db` of its own. MEASURED on 2026-11-20
+        // with another worktree's suite in parallel: 3 of 6 rounds failed on that warning while this
+        // registry listed nothing.
+        if ps
+            .lines()
+            .filter(|l| !l.starts_with("kern:"))
+            .any(|l| l.contains("abortit-db"))
+        {
             failures.push(format!("`{cmd}`: the stack was left running:\n{ps}"));
         }
     }
@@ -7583,7 +7592,8 @@ fn progress_json_is_events_on_stdout_and_nothing_else() {
         stdout.lines().all(|l| l.starts_with("{\"schema\":1,")),
         "not only events: {stdout}"
     );
-    assert!(stdout.contains("\"state\":\"running\""), "{stdout}");
+    // `started`, as Docker's `Started`: `up -d` releases a service and does not wait to see it run.
+    assert!(stdout.contains("\"state\":\"started\""), "{stdout}");
     assert!(
         stdout
             .lines()
@@ -7723,6 +7733,33 @@ fn compose_up_names_a_published_service_under_localhost() {
     });
     let page = port.map(|p| ask(&format!("web.{project}.localhost:{p}"), None, p));
     let missing = port.map(|p| ask(&format!("nope.{project}.localhost"), None, p));
+    // A REFUSED REQUEST ENDS THE CONNECTION: a valid request pipelined behind a refused one must not
+    // reach the service. One answer (the 404), then the close; never the page.
+    let pipelined = port.map(|p| {
+        ask(
+            "",
+            Some(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: nope.{project}.localhost\r\n\r\nGET / HTTP/1.1\r\nHost: web.{project}.localhost\r\n\r\n"
+                )
+                .as_bytes(),
+            ),
+            p,
+        )
+    });
+    // The request line and Host must name one host.
+    let mismatch = port.map(|p| {
+        ask(
+            "",
+            Some(
+                format!(
+                    "GET http://web.{project}.localhost/ HTTP/1.1\r\nHost: other.{project}.localhost\r\n\r\n"
+                )
+                .as_bytes(),
+            ),
+            p,
+        )
+    });
     let bare = port.map(|p| {
         ask(
             "",
@@ -7755,6 +7792,15 @@ fn compose_up_names_a_published_service_under_localhost() {
     );
     let bare = bare.unwrap_or_default();
     assert!(bare.starts_with("HTTP/1.1 400"), "{bare}");
+    let pipelined = pipelined.unwrap_or_default();
+    assert!(pipelined.starts_with("HTTP/1.1 404"), "{pipelined}");
+    assert_eq!(pipelined.matches("HTTP/1.1 ").count(), 1, "{pipelined}");
+    assert!(!pipelined.contains("page-of-web"), "{pipelined}");
+    let mismatch = mismatch.unwrap_or_default();
+    assert!(
+        mismatch.starts_with("HTTP/1.1 400") && mismatch.contains("different hosts"),
+        "{mismatch}"
+    );
 }
 
 /// `kern sandbox record` keeps a call's code and output where the history is, 0600, and `kern
@@ -8902,4 +8948,209 @@ fn a_piped_it_box_takes_its_size_from_kern_tty_size_file() {
     }
     let _ = kern().args(["stop", &held]).output();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `COPY --from` path that is not in the stage is named, with the stage, in the Dockerfile's own
+/// words, and without the FROM hint, which pointed at a line that was right. MEASURED on 0.51.3: the
+/// error named neither and the hint said "the Dockerfile must start with FROM".
+#[test]
+fn a_missing_copy_from_path_is_named_with_its_stage() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-copyfrom-missing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("Dockerfile"),
+        "FROM alpine:3.20 AS base\nRUN echo x > /present.txt\nFROM alpine:3.20\nCOPY --from=base /does-not-exist.txt /x\n",
+    )
+    .expect("Dockerfile");
+    let tag = format!("kern-copyfrom-missing-{}", std::process::id());
+    let out = kern()
+        .args(["build", "-t", &tag])
+        .arg(&dir)
+        .output()
+        .expect("build");
+    let _ = kern().args(["rmi", &tag]).output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("'/does-not-exist.txt' does not exist in stage 'base'"),
+        "{err}"
+    );
+    assert!(!err.contains("must start with FROM"), "{err}");
+}
+
+/// `kern box -d -p` names its published port `http://<box>.kern.localhost[:port]/`, and the router
+/// behind it leaves a few seconds after the last box with a published port, instead of staying on.
+#[test]
+fn a_published_box_gets_a_url_and_the_router_leaves_after_it() {
+    use std::io::{Read, Write};
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let name = format!("rt{}", std::process::id());
+    let out = kern()
+        .args([
+            "box",
+            &name,
+            "--image",
+            "busybox:1.36",
+            "-d",
+            "-p",
+            "127.0.0.1::80",
+            "--",
+        ])
+        .args([
+            "sh",
+            "-c",
+            "mkdir -p /w && echo page-of-box > /w/index.html && exec httpd -f -p 80 -h /w",
+        ])
+        .output()
+        .expect("box");
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    let url = said
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("url: "))
+        .map(str::to_string);
+    let port: Option<u16> = url.as_deref().map(|u| {
+        u.rsplit_once("localhost")
+            .and_then(|(_, r)| r.strip_prefix(':'))
+            .and_then(|r| r.trim_end_matches('/').parse().ok())
+            .unwrap_or(80)
+    });
+    let mut page = String::new();
+    if let Some(p) = port {
+        for _ in 0..50 {
+            if let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", p)) {
+                let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let _ = write!(
+                    c,
+                    "GET / HTTP/1.1\r\nHost: {name}.kern.localhost\r\nConnection: close\r\n\r\n"
+                );
+                let mut b = Vec::new();
+                let _ = c.read_to_end(&mut b);
+                page = String::from_utf8_lossy(&b).into_owned();
+                if page.contains("page-of-box") {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    let _ = kern().args(["stop", &name]).output();
+    assert!(out.status.success(), "{said}");
+    assert!(
+        url.as_deref()
+            .is_some_and(|u| u.contains(&format!("{name}.kern.localhost"))),
+        "{said}"
+    );
+    assert!(page.contains("page-of-box"), "{page}");
+    // The router leaves within a few seconds once no box publishes a port (another box with a
+    // published port keeps it on: then this only checks it still answers, which is right). Gone means
+    // its port refuses a connection.
+    let others = String::from_utf8_lossy(&kern().args(["ps"]).output().expect("ps").stdout)
+        .lines()
+        .skip(1)
+        .any(|l| l.contains("->"));
+    if let (false, Some(p)) = (others, port) {
+        let mut gone = false;
+        for _ in 0..80 {
+            if std::net::TcpStream::connect(("127.0.0.1", p)).is_err() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(gone, "the router stayed on with no published box");
+    }
+}
+
+/// A restarted service's NAT directory is taken over only after the pasta it records is stopped: the
+/// new pasta writes its pid over the old one's, and `down` stops only what the file names. MEASURED
+/// on WSL2 with 0.51.3: four pasta processes alive 50 minutes after `down -v`. The old pasta here is a
+/// stand-in that would never quit on its own (as a pasta whose namespace watch could not be set up).
+#[test]
+fn a_restarted_service_does_not_leave_its_old_pasta_behind() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let tag = format!("pst{}", std::process::id());
+    let dir = std::env::temp_dir().join(format!("kern-stale-pasta-{}", std::process::id()));
+    let xdg = dir.join("run");
+    std::fs::create_dir_all(&xdg).expect("dir");
+    let _ = std::fs::set_permissions(&xdg, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    let file = dir.join("compose.yml");
+    std::fs::write(
+        &file,
+        "services:\n  svc:\n    image: busybox:1.36\n    command: [\"sleep\", \"3600\"]\n    stop_grace_period: 1s\n  other:\n    image: busybox:1.36\n    command: [\"sleep\", \"3600\"]\n    stop_grace_period: 1s\n",
+    )
+    .expect("compose file");
+    let compose = |args: &[&str]| {
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", "-p", &tag, "-f"])
+            .arg(&file)
+            .args(args)
+            .output()
+            .expect("compose")
+    };
+    let up = compose(&["up", "-d"]);
+    let nat = xdg.join("kern/relays").join(&tag).join("outbound/svc");
+    if !up.status.success() || !nat.join("pasta.pid").exists() {
+        let _ = compose(&["down"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "SKIP: no per-service NAT here (pasta missing?): {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    // The stand-in: a long `sleep` whose command name is `pasta`, recorded as the box's NAT.
+    let stand_in = dir.join("pasta");
+    std::fs::copy("/bin/sleep", &stand_in).expect("copy sleep");
+    // ETXTBSY, NOT A KERN DEFECT: another test thread forking while `copy` still had the file open
+    // for writing leaves a child holding that descriptor, and an exec of the file then fails with
+    // "Text file busy" until it closes. MEASURED as a one-in-a-suite failure of this line at full
+    // parallelism, never alone; a short retry outlasts the other test's exec.
+    let mut spawned = Command::new(&stand_in).arg("3600").spawn();
+    for _ in 0..100 {
+        match &spawned {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                spawned = Command::new(&stand_in).arg("3600").spawn();
+            }
+            _ => break,
+        }
+    }
+    let mut old = spawned.expect("stand-in");
+    let pid = old.id();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let started = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rsplit(')').next().map(str::to_string))
+        .and_then(|rest| rest.split_whitespace().nth(19).map(str::to_string))
+        .unwrap_or_default();
+    std::fs::write(nat.join("pasta.pid"), format!("{pid}\n")).expect("pid");
+    std::fs::write(nat.join("pasta.id"), format!("{pid}:{started}")).expect("id");
+    let _ = compose(&["restart", "svc"]);
+    let mut stopped = false;
+    for _ in 0..30 {
+        if let Ok(Some(_)) = old.try_wait() {
+            stopped = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !stopped {
+        let _ = old.kill();
+        let _ = old.wait();
+    }
+    let _ = compose(&["down"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(stopped, "the old pasta outlived the restart of its service");
 }

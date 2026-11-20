@@ -704,7 +704,8 @@ fn a_bundled_config_cannot_grant_itself_a_device_and_the_operators_config_can() 
             .current_dir(&dir)
             .env("XDG_CONFIG_HOME", &dir)
             .env("XDG_RUNTIME_DIR", &dir)
-            .args(["compose", stack, verb])
+            .args(["compose", stack])
+            .args(verb.split_whitespace())
             .output()
             .expect("run kern");
         (
@@ -729,7 +730,9 @@ fn a_bundled_config_cannot_grant_itself_a_device_and_the_operators_config_can() 
         return;
     }
 
-    let (ok, text) = run_verb("stack.toml", "up");
+    // `-d`: `up` follows the stack until it exits (as Docker's does), and this asks only whether it
+    // was let start.
+    let (ok, text) = run_verb("stack.toml", "up -d");
     assert!(
         !ok,
         "a bundle that ships its own permitting kern.toml granted itself a device: {text}"
@@ -747,7 +750,7 @@ fn a_bundled_config_cannot_grant_itself_a_device_and_the_operators_config_can() 
     // for" made this control fail with the gate working perfectly. A discriminator has to be about
     // the thing under test, or the next sentence added anywhere in the driver breaks it.
     fs::write(dir.join("kern/kern.toml"), &permit).expect("permit in the operator config");
-    let (_, text) = run_verb("stack.toml", "up");
+    let (_, text) = run_verb("stack.toml", "up -d");
     assert!(
         !text.contains("asks for vgpio:"),
         "the operator's own config must be able to lift the gate: {text}"
@@ -7402,7 +7405,7 @@ fn compose_port_prints_the_published_address_and_fails_when_there_is_none() {
 
     let up = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["compose", toml.to_str().unwrap(), "up"])
+        .args(["compose", toml.to_str().unwrap(), "up", "-d"])
         .output()
         .expect("run kern");
     let up_err = String::from_utf8_lossy(&up.stderr).to_string();
@@ -7523,7 +7526,7 @@ fn the_default_wiring_separates_loopbacks_a_pod_shares_them_and_neither_reaches_
     let run_once = |extra: &[&str]| -> Option<String> {
         let mut c = kern();
         c.env("XDG_RUNTIME_DIR", &xdg)
-            .args(["compose", toml.to_str().unwrap(), "up"]);
+            .args(["compose", toml.to_str().unwrap(), "up", "-d"]);
         for a in extra {
             c.arg(a);
         }
@@ -7982,7 +7985,7 @@ fn no_pod_leaves_a_service_with_loopback_and_nothing_else() {
     // the box names it is starting, so "peerb" was in the stderr of the very command under test. An
     // assertion about what a service saw has to read only what that service printed.
     let run = |extra: &[&str]| -> (String, String) {
-        let mut args = vec!["compose", toml.to_str().unwrap(), "up"];
+        let mut args = vec!["compose", toml.to_str().unwrap(), "up", "-d"];
         args.extend_from_slice(extra);
         let out = kern()
             .env("XDG_RUNTIME_DIR", &xdg)
@@ -8148,7 +8151,7 @@ fn restarting_one_service_of_a_no_pod_stack_keeps_its_peers_reachable() {
         let _ = fs::remove_file(toml);
     };
 
-    let up = run(&["up", "--no-pod"]);
+    let up = run(&["up", "-d", "--no-pod"]);
     let up_err = String::from_utf8_lossy(&up.stderr).to_string();
     if up_err.contains("user namespaces") || up_err.contains("newuidmap") {
         eprintln!(
@@ -8501,7 +8504,7 @@ fn up_without_no_pod_on_a_no_pod_stack_is_refused_and_names_the_plan() {
         let _ = fs::remove_file(&toml);
     };
 
-    let up = run(&["up", "--no-pod"]);
+    let up = run(&["up", "-d", "--no-pod"]);
     let up_err = String::from_utf8_lossy(&up.stderr).to_string();
     if !up.status.success() || !up_err.contains("peer relay") || up_err.contains("died within") {
         eprintln!(
@@ -8515,10 +8518,10 @@ fn up_without_no_pod_on_a_no_pod_stack_is_refused_and_names_the_plan() {
     std::thread::sleep(std::time::Duration::from_millis(1200));
 
     // The refusal, against a stack that is fully up to date.
-    let plain = run(&["up"]);
+    let plain = run(&["up", "-d"]);
     let plain_err = String::from_utf8_lossy(&plain.stderr).to_string();
     // And `--no-pod` again is still a no-op rather than a second refusal.
-    let again = run(&["up", "--no-pod"]);
+    let again = run(&["up", "-d", "--no-pod"]);
     let again_ok = again.status.success();
     run(&["down"]);
     cleanup();
@@ -8629,7 +8632,7 @@ fn killing_the_relay_holder_leaves_no_pump_behind() {
     };
 
     let before_others = relay_procs(&scope).len();
-    let up = run(&["up", "--no-pod"]);
+    let up = run(&["up", "-d", "--no-pod"]);
     let up_err = String::from_utf8_lossy(&up.stderr).to_string();
     if !up.status.success() || !up_err.contains("peer relay") {
         eprintln!(
@@ -8762,7 +8765,7 @@ fn killing_one_relay_half_rebuilds_that_edge_and_leaves_the_stack_up() {
         out.lines().rev().take(n).collect::<Vec<_>>().join(" ")
     };
 
-    let up = run(&["up", "--no-pod"]);
+    let up = run(&["up", "-d", "--no-pod"]);
     let up_err = String::from_utf8_lossy(&up.stderr).to_string();
     if !up.status.success() || !up_err.contains("peer relay") {
         eprintln!(
@@ -8906,7 +8909,7 @@ fn a_shared_port_costs_only_the_service_that_binds_the_wildcard() {
         let _ = fs::remove_file(&toml);
     };
 
-    let up = run(&["up", "--no-pod"]);
+    let up = run(&["up", "-d", "--no-pod"]);
     let up_err = String::from_utf8_lossy(&up.stderr).to_string();
     if !up.status.success() || !up_err.contains("peer relay") {
         eprintln!(
@@ -9083,7 +9086,7 @@ fn a_four_service_stack_reaches_itself_without_a_pod() {
             .join(" ")
     };
 
-    let up = run(&["up", "--no-pod"]);
+    let up = run(&["up", "-d", "--no-pod"]);
     let up_err = String::from_utf8_lossy(&up.stderr).to_string();
     // SKIP ONLY FOR A HOST THAT CANNOT RUN THIS, never for a stack that came up wrong. The first
     // version skipped when the output held no "peer relay", which is also what a build that blocks
@@ -9410,6 +9413,8 @@ fn a_one_shot_service_that_exits_zero_does_not_fail_the_stack() {
         .unwrap();
         let out = kern()
             .env("XDG_RUNTIME_DIR", &xdg)
+            // Bare `up`: it follows the stack until the job has exited, which is at once here, and
+            // reports what died in the bring-up as it always did.
             .args(["compose", toml.to_str().unwrap(), "up"])
             .output()
             .expect("run kern");
@@ -9438,9 +9443,9 @@ fn a_one_shot_service_that_exits_zero_does_not_fail_the_stack() {
 
     let bad = run("bad", "3");
     let bad_err = String::from_utf8_lossy(&bad.stderr).to_string();
-    // REPORTED, AND THE COMMAND EXITS 0: `up` on a pipe returns as `up -d` does, and Docker Compose
-    // 5.3.1's `up -d` exits 0 for a service that exits at once (measured: `up -d` 0, `up -d --wait`
-    // 1). The report is the warning on stderr.
+    // REPORTED, AND THE COMMAND EXITS 0: `up` returns once the job has exited, and Docker Compose
+    // 5.3.1 exits 0 for a service that exits at once (measured: `up -d` 0, `up -d --wait` 1). The
+    // report is the warning on stderr.
     assert!(
         bad.status.success() && bad_err.contains("died within"),
         "a service that exited 3 must still be reported, and `up -d` exits 0 as Docker's does: \
@@ -9478,7 +9483,8 @@ fn compose_full_schema_brings_box_up() {
 
     let out = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["compose", toml.to_str().unwrap()])
+        // `up -d` spelled out: the bare form follows the stack until it exits, as Docker's does.
+        .args(["compose", toml.to_str().unwrap(), "up", "-d"])
         .output()
         .expect("run kern");
     if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
@@ -11595,7 +11601,7 @@ fn compose_stop_names_a_pod_only_when_there_is_one() {
         let _ = fs::remove_file(&toml);
     };
 
-    let up = run(&["up", "--no-pod"]);
+    let up = run(&["up", "-d", "--no-pod"]);
     if !up.contains("box(es) started") || up.contains("died within") {
         run(&["down"]);
         cleanup();
@@ -11700,7 +11706,7 @@ fn compose_down_removes_the_relay_directory_it_created() {
             .unwrap_or_default()
     };
 
-    let up = run(&["up", "--no-pod"]);
+    let up = run(&["up", "-d", "--no-pod"]);
     if !up.contains("peer relay(s) up") {
         run(&["down"]);
         let _ = fs::remove_dir_all(&root);
