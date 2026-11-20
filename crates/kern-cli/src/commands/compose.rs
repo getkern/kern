@@ -4960,11 +4960,13 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
                     ),
                 );
             } else if !tail.is_empty() {
-                eprintln!("  {d}, its last {} line(s):", tail.len());
+                // `kern: ` ON EVERY LINE, the service's own included: it is the one mark an SDK reads to
+                // tell kern's words from a workload's, and these lines are kern quoting the workload.
+                eprintln!("kern: {d}, its last {} line(s):", tail.len());
                 for l in &tail {
-                    eprintln!("    {l}");
+                    eprintln!("kern:   {l}");
                 }
-                eprintln!("  the rest: kern compose {file} logs {d}");
+                eprintln!("kern: the rest: kern compose {file} logs {d}");
             }
         }
         // ⛔ DOCKER'S EXIT CODE: `up` started what it was asked to start, and a container that then
