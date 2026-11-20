@@ -3935,7 +3935,12 @@ def _validate_egress_entry(entry: object, *, allow: bool) -> str:
     which = "egress_allow" if allow else "egress_deny"
     if not isinstance(entry, str):
         raise SandboxError(f"{which}: entries are str, got {type(entry).__name__}")
-    e = entry.strip()
+    # NOT STRIPPED: an entry with a space or a line break around it is refused, not cleaned. A newline
+    # inside the list kern receives is how a second entry would be smuggled in, and a value that only
+    # looks right after cleaning is not the value the caller wrote.
+    e = entry
+    if e != e.strip():
+        raise SandboxError(f"invalid {which} entry {entry!r}: it has a space or line break around it")
     if e == "*":
         if not allow:
             raise SandboxError(

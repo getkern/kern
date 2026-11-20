@@ -3189,7 +3189,11 @@ function canonicalNetwork(entry) {
 function validateEgressEntry(entry, allow) {
   const which = allow ? "egressAllow" : "egressDeny";
   if (typeof entry !== "string") throw new SandboxError(`${which}: entries are strings, got ${typeof entry}`);
-  const e = entry.trim();
+  // NOT TRIMMED: an entry with a space or a line break around it is refused, not cleaned, as in the
+  // Python binding (a newline inside the list kern receives is how a second entry would get in).
+  const e = entry;
+  if (e !== e.trim())
+    throw new SandboxError(`invalid ${allow ? "egressAllow" : "egressDeny"} entry ${JSON.stringify(entry)}: it has a space or line break around it`);
   if (e === "*") {
     if (!allow)
       throw new SandboxError(
@@ -3740,6 +3744,41 @@ function looksLikeStartupFailure(stderr) {
     if (KERN_SPEAKING.some((m) => line.startsWith(m)) || line.includes("sandbox setup failed")) return true;
   }
   return false;
+}
+
+/** Mark which box a result came from, as a hidden property: concurrent calls never trade names. */
+function withBox(result, box) {
+  Object.defineProperty(result, "_box", { value: box, enumerable: false });
+  return result;
+}
+
+/**
+ * Hand one call's code and output to `kern sandbox record`, in the background so the call returns as
+ * fast as before. Not unref'd: a script that makes one call and exits still gets it recorded. Any
+ * failure (a kern without `record`, a full disk) is dropped: a call's result never depends on its
+ * transcript. Same frame as the Python binding: `v1 <code> <stdout> <stderr>\n` then the bytes.
+ */
+function recordTranscript(kern, box, language, code, result) {
+  try {
+    const codeB = Buffer.from(String(code ?? ""), "utf8");
+    const outB = Buffer.from(String(result.stdout ?? ""), "utf8");
+    const errB = Buffer.from(String(result.stderr ?? ""), "utf8");
+    const head = Buffer.from(`v1 ${codeB.length} ${outB.length} ${errB.length}\n`, "utf8");
+    const exit = Number.isInteger(result.exitCode) ? result.exitCode : -1;
+    const child = spawn(
+      kern,
+      ["sandbox", "record", box, "--exit", String(exit), "--language", language],
+      { stdio: ["pipe", "ignore", "ignore"] },
+    );
+    child.on("error", () => {});
+    child.stdin.on("error", () => {});
+    child.stdin.end(Buffer.concat([head, codeB, outB, errB]));
+    const timer = setTimeout(() => child.kill("SIGKILL"), 15000);
+    timer.unref();
+    child.on("exit", () => clearTimeout(timer));
+  } catch {
+    /* never let a transcript fail a call */
+  }
 }
 
 function uniqueName() {
@@ -4375,6 +4414,10 @@ class Sandbox {
     // Labels on every box this sandbox starts, `{ key: "value" }` (`kern box --label`): `Sandbox.list`
     // finds sandboxes by them. Not posture (see LABEL_KEY_RE). ⚠️ Visible to local users.
     this.labels = opts.labels ?? null;
+    // Whether each call's code and output are kept for `kern sandbox show` (where the history is kept,
+    // mode 0600); `[kern] sandbox_transcripts = false` keeps none for every sandbox. As the Python
+    // binding's `transcripts`.
+    this.transcripts = opts.transcripts ?? true;
     // Destinations refused even when `egressAllow` covers them (deny wins); alone, every public host but
     // these. Needs kern 0.52 or newer (`--egress-deny`).
     this.egressDeny = opts.egressDeny ?? null;
@@ -6018,10 +6061,13 @@ class Sandbox {
         (before ? this._diff(before) : Promise.resolve([])).then(
           (files) =>
             resolve(
-              new ExecutionResult({
-                stdout, stderr, exitCode: rc, durationMs: wallMs, fault, files,
-                truncated: out.truncated || err.truncated,
-              }),
+              withBox(
+                new ExecutionResult({
+                  stdout, stderr, exitCode: rc, durationMs: wallMs, fault, files,
+                  truncated: out.truncated || err.truncated,
+                }),
+                residentCall ? this._resident : name,
+              ),
             ),
           reject,
         );
@@ -7419,7 +7465,22 @@ class Sandbox {
     return timeoutS;
   }
 
-  async runCode(code, { language = "python", timeoutS, onStdout = UNSET, onStderr = UNSET } = {}) {
+  async runCode(code, opts = {}) {
+    const result = await this._runCodeCall(code, opts);
+    return this._transcribe(opts.language ?? "python", code, result);
+  }
+
+  /**
+   * Record a call's code and output when transcripts are on and its box is known (`kern sandbox
+   * show`); return the result unchanged. As the Python binding.
+   */
+  _transcribe(language, code, result) {
+    if (this.transcripts && result && typeof result._box === "string" && result._box)
+      recordTranscript(this._kern, result._box, language, code, result);
+    return result;
+  }
+
+  async _runCodeCall(code, { language = "python", timeoutS, onStdout = UNSET, onStderr = UNSET } = {}) {
     this._requireEntered();
     // Each runner: [binary, inline-eval-flag, file-extension]. Note node evaluates with `-e`, NOT `-c`
     // (which is node's syntax-CHECK flag and would run nothing); python/sh use `-c`.
@@ -7493,7 +7554,8 @@ class Sandbox {
       const warm = await this._pool.claim({ network: this.network, deadlineS: eff });
       if (warm) {
         const before = this.trackFiles ? await this._snapshot() : null;
-        return warm.runCell(code, { deadlineS: eff, before });
+        const box = warm._name;
+        return withBox(await warm.runCell(code, { deadlineS: eff, before }), box);
       }
     }
     const uid = crypto.randomBytes(4).toString("hex");
@@ -7543,12 +7605,17 @@ class Sandbox {
       throw new SandboxError('run() takes an argv ARRAY, not a string. Use run(["sh","-c","..."]).');
     if (!Array.isArray(command) || command.length === 0)
       throw new SandboxError("run() needs a non-empty command array");
-    return this._spawn(command, {
+    const result = await this._spawn(command, {
       network: this.network,
       timeoutS: this._effTimeout(timeoutS),
       onStdout,
       onStderr,
     });
+    // The command as a shell would read it, for the transcript (Python uses `shlex.join`).
+    const shown = command
+      .map((a) => (/^[A-Za-z0-9_./:=@%+-]+$/.test(String(a)) ? String(a) : `'${String(a).replace(/'/g, "'\\''")}'`))
+      .join(" ");
+    return this._transcribe("command", shown, result);
   }
 
   /** Open a persistent, WARM Python interpreter in a long-lived box (warm-start): cells run in ONE
@@ -7961,7 +8028,14 @@ class Kernel {
     }
   }
 
-  async runCode(code, { timeoutS } = {}) {
+  async runCode(code, opts = {}) {
+    const name = this._name;
+    const result = await this._runCell(code, opts);
+    if (this._sbx.transcripts && name) recordTranscript(this._sbx._kern, name, "python", code, result);
+    return result;
+  }
+
+  async _runCell(code, { timeoutS } = {}) {
     if (!this._child) throw new SandboxError("kernel not started");
     if (this._dead) {
       const why = this._death ? `a prior cell ended it (${this._death})` : "it was closed";

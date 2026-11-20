@@ -563,3 +563,61 @@ test("fork is refused without the snapshot opt-in", async () => {
     if (prev !== undefined) process.env.KERN_SANDBOX_SNAPSHOT = prev;
   }
 });
+
+// -- TRANSCRIPTS -------------------------------------------------------------------------------------
+
+/** `kern sandbox show --json` rows in an isolated world, waited for until `want` arrive. */
+async function shownRows(env, want) {
+  let rows = [];
+  for (let i = 0; i < 100; i++) {
+    const r = spawnSync(KERN, ["sandbox", "show", "-n", "50", "--json"], { env, encoding: "utf8" });
+    rows = String(r.stdout)
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l));
+    if (rows.length >= want) break;
+    await sleep(100);
+  }
+  return rows;
+}
+
+test("each call is handed to kern as a transcript, and transcripts:false keeps none", integration, async () => {
+  const base = tmpdir("tr");
+  const run = path.join(base, "run");
+  fs.mkdirSync(run, { mode: 0o700 });
+  const keys = ["XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"];
+  const old = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  process.env.XDG_RUNTIME_DIR = run;
+  process.env.XDG_CONFIG_HOME = path.join(base, "cfg");
+  process.env.XDG_DATA_HOME = path.join(base, "data");
+  const env = { ...process.env };
+  try {
+    await withOneShot(async (sb) => {
+      await sb.runCode("print('tr-python')");
+      await sb.run(["sh", "-c", "echo tr-run; exit 3"]);
+      const k = await sb.kernel();
+      try {
+        await k.runCode("print('tr-kernel')");
+      } finally {
+        await k.close();
+      }
+    });
+    await withOneShot(async (sb) => {
+      await sb.runCode("print('tr-not-kept')");
+    }, { transcripts: false });
+    const rows = await shownRows(env, 3);
+    const byOut = Object.fromEntries(rows.map((r) => [String(r.stdout).trim(), r]));
+    assert.strictEqual(byOut["tr-python"]?.language, "python", JSON.stringify(rows));
+    assert.strictEqual(byOut["tr-python"]?.code, "print('tr-python')");
+    assert.strictEqual(byOut["tr-run"]?.exit, 3);
+    assert.strictEqual(byOut["tr-run"]?.language, "command");
+    assert.ok(byOut["tr-kernel"], JSON.stringify(rows));
+    assert.ok(!("tr-not-kept" in byOut), "transcripts:false kept a call");
+  } finally {
+    for (const k of keys) {
+      if (old[k] === undefined) delete process.env[k];
+      else process.env[k] = old[k];
+    }
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

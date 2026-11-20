@@ -139,6 +139,8 @@ export interface SandboxOptions {
    * sandboxes by them. Not posture. Keys are letters, digits and `. _ / -` (`kern.` is reserved); a
    * value is one line. Visible to local users (process list, `kern ps`): a secret belongs in `env`. */
   labels?: Record<string, string> | null;
+  /** Keep each call's code and output for `kern sandbox show` (default true; `[kern] sandbox_transcripts = false` keeps none). */
+  transcripts?: boolean;
   /** Box ports published on THIS host's loopback, for the resident box of a `persist` sandbox and for
    * every kernel() box; `getHost(port)` answers "127.0.0.1:<port kern picked>". A one-shot call's box
    * publishes nothing. Part of the posture. */
