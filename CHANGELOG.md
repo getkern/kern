@@ -19,6 +19,14 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
+## kern sandbox 0.3.0 - 2026-11-20
+
+**It carries the kern v0.56.0 binary**, and both bindings gain what v0.56.0 lists under "kern sandbox":
+labels and `Sandbox.list()`, `get_metrics()`, `set_timeout()`, `watch_dir()`, `ports` and `get_host()`,
+`start_cmd` and `ready_cmd`, `pty()`, `fork(n)`, `egress_deny`, and each call's code and output kept for
+`kern sandbox show`. An `egress_allow`/`egress_deny` entry with a space or a line break around it is
+refused, not cleaned.
+
 ## v0.56.0 - 2026-11-20
 
 **Two commands change what they do by default. Both now behave as the same command of Docker:**
