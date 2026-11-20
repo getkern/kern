@@ -233,6 +233,9 @@ impl Error {
             // A `--chown` that names no user of the image already says so; the FROM/COPY hint under it
             // is about a different mistake.
             Error::Build(msg) if msg.starts_with("COPY --chown") => None,
+            // Nor under a COPY --from that names the path and the stage it is missing from: the FROM
+            // hint there sent the reader to a line that was right.
+            Error::Build(msg) if msg.starts_with("COPY --from:") => None,
             Error::Build(msg) if msg.starts_with("no build ") => {
                 Some("run `kern builds` to list build ids".into())
             }

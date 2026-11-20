@@ -1571,14 +1571,36 @@ fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool, keep_unknown:
             continue;
         }
         let (name, next) = if b[i + 1] == b'{' {
-            match s[i + 2..].find('}') {
-                Some(rel) => (&s[i + 2..i + 2 + rel], i + 2 + rel + 1),
-                None => {
-                    out.push(b'$'); // unterminated `${` - emit literally
-                    i += 1;
-                    continue;
+            // THE MATCHING BRACE, not the first one: a default may itself hold a reference
+            // (`${BASE:-${FALLBACK}}`), and the first `}` would cut it in two.
+            let mut depth = 1usize;
+            let mut deepest = 1usize;
+            let mut k = i + 2;
+            while k < b.len() {
+                match b[k] {
+                    b'{' => {
+                        depth += 1;
+                        deepest = deepest.max(depth);
+                    }
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
+                k += 1;
             }
+            // BOUNDED NESTING: a default is substituted by calling this function again, so a file with
+            // thousands of nested `${A:-${A:-...}}` would exhaust the stack. Past 32 levels the text is
+            // kept as written (an unterminated reference already is).
+            if k >= b.len() || deepest > 32 {
+                out.push(b'$'); // unterminated, or nested past the bound - emit literally
+                i += 1;
+                continue;
+            }
+            (&s[i + 2..k], k + 1)
         } else {
             let start = i + 1;
             let mut j = start;
@@ -1590,6 +1612,32 @@ fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool, keep_unknown:
         if name.is_empty() {
             out.push(b'$');
             i += 1;
+            continue;
+        }
+        // `${VAR:-word}`, `${VAR-word}`, `${VAR:+word}`, `${VAR+word}`, Docker's modifiers. MEASURED on
+        // 0.51.3: `FROM alpine:${V:-3.20}` looked up a variable literally named `V:-3.20`, found none,
+        // and pulled `alpine:` (a 404), with or without `--build-arg V=...`; every Dockerfile of
+        // docker-elk is written that way. The word is substituted the same way as the rest.
+        if let Some((var, op, word)) = modifier(name) {
+            let set = vars.get(var);
+            if set.is_none() && keep_unknown {
+                // Not known here: left as written, for the shell (RUN) or for the build loop (ENV),
+                // which both understand the modifier.
+                out.extend_from_slice(&b[i..next]);
+            } else {
+                let word = || subst_impl(word, vars, soft, keep_unknown);
+                let value = match (op, set) {
+                    (":-", Some(v)) if !v.is_empty() => v.clone(),
+                    (":-", _) => word(),
+                    ("-", Some(v)) => v.clone(),
+                    ("-", None) => word(),
+                    (":+", Some(v)) if !v.is_empty() => word(),
+                    ("+", Some(_)) => word(),
+                    _ => String::new(),
+                };
+                out.extend_from_slice(value.as_bytes());
+            }
+            i = next;
             continue;
         }
         match vars.get(name) {
@@ -1604,8 +1652,67 @@ fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool, keep_unknown:
     String::from_utf8(out).unwrap_or_default()
 }
 
+/// Split `VAR:-word` (and `-`, `:+`, `+`) into its variable, operator and word; `None` for a plain
+/// name or anything that is not a variable followed by one of these.
+fn modifier(name: &str) -> Option<(&str, &'static str, &str)> {
+    let end = name
+        .bytes()
+        .position(|c| !(c.is_ascii_alphanumeric() || c == b'_'))?;
+    let (var, rest) = name.split_at(end);
+    if var.is_empty() {
+        return None;
+    }
+    for op in [":-", ":+", "-", "+"] {
+        if let Some(word) = rest.strip_prefix(op) {
+            return Some((var, op, word));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    /// Docker's `${VAR:-word}` family, in FROM and the other hard-substituted instructions, and left
+    /// alone for the shell in RUN when the variable is not known.
+    #[test]
+    fn the_default_and_alternate_modifiers_expand_as_dockers_do() {
+        use std::collections::HashMap;
+        let vars = |kv: &[(&str, &str)]| -> HashMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let none = vars(&[]);
+        let empty = vars(&[("V", "")]);
+        let set = vars(&[("V", "3.19"), ("B", "base")]);
+        assert_eq!(super::subst("alpine:${V:-3.20}", &none), "alpine:3.20");
+        assert_eq!(super::subst("alpine:${V:-3.20}", &empty), "alpine:3.20");
+        assert_eq!(super::subst("alpine:${V:-3.20}", &set), "alpine:3.19");
+        assert_eq!(super::subst("alpine:${V-3.20}", &empty), "alpine:");
+        assert_eq!(super::subst("alpine:${V-3.20}", &none), "alpine:3.20");
+        assert_eq!(super::subst("x${V:+-slim}", &set), "x-slim");
+        assert_eq!(super::subst("x${V:+-slim}", &empty), "x");
+        assert_eq!(super::subst("x${V+-slim}", &empty), "x-slim");
+        assert_eq!(super::subst("${X:-${B}}:1", &set), "base:1");
+        assert_eq!(super::subst("${X:-${Y:-z}}", &none), "z");
+        // RUN: an unknown variable's modifier is the shell's to apply.
+        assert_eq!(super::subst_soft("echo ${X:-d}", &none), "echo ${X:-d}");
+        assert_eq!(super::subst_soft("echo ${V:-d}", &set), "echo 3.19");
+        // Not a modifier: an unknown name expands to empty, as before.
+        assert_eq!(super::subst("a${V!x}b", &none), "ab");
+        // Nesting past the bound is kept as written instead of recursing without end.
+        let deep = format!("{}x{}", "${A:-".repeat(5000), "}".repeat(5000));
+        assert!(super::subst(&deep, &none).starts_with("${A:-"));
+        // Through the parser, the docker-elk shape.
+        let instrs = super::parse("ARG V\nFROM alpine:${V:-3.20}\n", &none).expect("parses");
+        assert!(
+            instrs
+                .iter()
+                .any(|i| matches!(i, super::Instr::From { image, .. } if image == "alpine:3.20")),
+            "{instrs:?}"
+        );
+    }
+
     /// `LABEL` REACHES THE IMAGE, in both of Docker's spellings, and `MAINTAINER` is one of them.
     ///
     /// It was parsed and dropped, with a comment saying "metadata - parsed and ignored". That is an

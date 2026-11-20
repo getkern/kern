@@ -513,7 +513,7 @@ fn copy_out_of_image(from: &str, source: &str, scratch: &Path) -> Result<PathBuf
         ))
     })?;
     let copied = scratch.join(name);
-    crate::commands::copy_from_stage_chain(&lower, &resolved, scratch, from)?;
+    crate::commands::copy_from_stage_chain(&lower, &resolved, scratch, &format!("'{from}'"))?;
     match std::fs::symlink_metadata(&copied) {
         Ok(md) if md.file_type().is_symlink() => Err(Error::Build(format!(
             "RUN --mount from={from},source={source} is a symbolic link that does not resolve \

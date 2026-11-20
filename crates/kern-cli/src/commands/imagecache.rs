@@ -1330,10 +1330,7 @@ pub(crate) fn materialize_image(
     let safe = sanitize_ref(image);
     let flat = cache.join(&safe);
     // Flat pulled image: the cache dir is the rootfs, pushed in place (no copy).
-    if flat.is_dir()
-        && !cache.join(format!("{safe}.layers")).exists()
-        && !cache.join(format!("{safe}.base")).exists()
-    {
+    if flat.is_dir() && !built_here(&cache, &safe) {
         let config = read_image_config(&cache.join(format!("{safe}.image")));
         return Ok((flat, config, None));
     }
@@ -1702,6 +1699,12 @@ const USUALLY_SETUID: [&str; 6] = [
 /// of an entry without the current mark, so a current one costs a single read.
 fn stripped_setuid(cache: &std::path::Path, safe: &str) -> Option<&'static str> {
     use std::os::unix::fs::PermissionsExt;
+    // A BUILT IMAGE IS NOT ON ANY REGISTRY: its bits are whatever its own build wrote, and the
+    // re-extraction this answer triggers is a pull that can only fail, or fetch a stranger's image of
+    // the same name.
+    if built_here(cache, safe) {
+        return None;
+    }
     let mark = std::fs::read(cache.join(format!("{safe}.setuid"))).unwrap_or_default();
     if mark == SETUID_MARK || mark == SETUID_GIVEN_UP {
         return None;
@@ -1711,6 +1714,13 @@ fn stripped_setuid(cache: &std::path::Path, safe: &str) -> Option<&'static str> 
         std::fs::symlink_metadata(dir.join(rel))
             .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o4000 == 0)
     })
+}
+
+/// Was this entry built on this machine (`kern build`, `commit`): layers of its own over a base,
+/// recorded by `<ref>.layers` or the older `<ref>.base`. Such an entry is on no registry, so nothing
+/// that repairs a cache entry by asking a registry may touch it.
+fn built_here(cache: &std::path::Path, safe: &str) -> bool {
+    cache.join(format!("{safe}.layers")).exists() || cache.join(format!("{safe}.base")).exists()
 }
 
 /// Does a cache entry's ownership match the map this caller's boxes use? Always for a non-root
@@ -1849,7 +1859,10 @@ pub(crate) fn pull_to_cache(
         // fast path: already cached (and not a forced `--pull always` re-fetch)
         // `--pull never` means NO registry, and the refresh is a registry read: an entry kept by an
         // older kern stays as it is under that flag, which is what the flag asks for.
-        if policy != PullPolicy::Never && !image_config_is_current(&cfgfile) {
+        if policy != PullPolicy::Never
+            && !built_here(&cache, &safe)
+            && !image_config_is_current(&cfgfile)
+        {
             refresh_image_config(image, &cache, &safe, &cfgfile);
         }
         return Ok((
@@ -2629,5 +2642,31 @@ mod chain_resolve_tests {
             "a loop ends, it does not hang: {looped}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod built_here_tests {
+    use super::*;
+
+    /// A built image keeps whatever bits its build wrote: it is never sent to a registry to be
+    /// "repaired", which could only fail or fetch a stranger's image of the same name.
+    #[test]
+    fn a_built_image_is_never_re_extracted_from_a_registry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kern-built-here-{}", std::process::id()));
+        let su = dir.join("img/usr/bin/su");
+        std::fs::create_dir_all(su.parent().expect("parent")).expect("dirs");
+        std::fs::write(&su, b"x").expect("su");
+        std::fs::set_permissions(&su, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        // Pulled, without its setuid bit: an older kern's entry, re-extracted.
+        assert_eq!(stripped_setuid(&dir, "img"), Some("usr/bin/su"));
+        // The same entry built here: left alone, in both spellings of "built".
+        for marker in ["img.layers", "img.base"] {
+            std::fs::write(dir.join(marker), b"x").expect("marker");
+            assert_eq!(stripped_setuid(&dir, "img"), None, "{marker}");
+            std::fs::remove_file(dir.join(marker)).expect("unmark");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

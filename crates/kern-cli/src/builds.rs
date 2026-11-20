@@ -871,6 +871,45 @@ fn write_all_fd(fd: i32, mut buf: &[u8]) -> bool {
     true
 }
 
+/// The record id of the build this process is capturing, for [`print_failed_tail`].
+static CAPTURED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// After a failed `--progress quiet` build: the last `n` lines its record kept, on stderr, so the
+/// reason is not hidden by the mode that hid the output. Nothing when nothing was captured.
+pub fn print_failed_tail(n: usize) {
+    let id = CAPTURED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(id) = id else {
+        return;
+    };
+    let Ok(text) = std::fs::read(log_path(&id)) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&text);
+    // The build's own output, not kern's lines about it: the error that ends the build is printed once,
+    // by the caller, after this.
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("error: ") && !t.starts_with("--- ")
+        })
+        .collect();
+    let tail = &lines[lines.len().saturating_sub(n)..];
+    if tail.is_empty() {
+        return;
+    }
+    eprintln!(
+        "the build's last {} line(s) (`kern build logs {id}` has all of it):",
+        tail.len()
+    );
+    for l in tail {
+        eprintln!("  {}", crate::ui::scrub(l));
+    }
+}
+
 /// RAII stderr→log tee. `start` returns `None` (build proceeds uncaptured) if the pipe/dup/fork fails -
 /// a logging problem must never fail a build.
 pub struct Capture {
@@ -888,6 +927,9 @@ impl Capture {
         }
         let dir = record_dir(id);
         mkdir_private(&dir).ok()?;
+        *CAPTURED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.to_string());
         let mut logf = open_private(&dir.join("log"), false).ok()?;
         let mut fds = [0i32; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -987,12 +1029,25 @@ impl Capture {
             // caller that starts a capture without that guard.
             unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
             // `--progress json`: the RUN's stdout is teed to the real STDERR, stdout being the events'.
-            let out_sink = if kern_common::progress_mode() == kern_common::ProgressMode::Json {
+            // `quiet`: the build's own output goes to its record (the log `kern build logs` shows) and
+            // nowhere else; a failure prints the log's last lines (`print_failed_tail`). MEASURED on
+            // 0.51.3: `--progress quiet` still printed every RUN's output. `json`, or a live view
+            // drawing on the terminal: a RUN's stdout goes where its stderr goes, never between the
+            // events nor through the view.
+            let quiet = kern_common::progress_mode() == kern_common::ProgressMode::Quiet;
+            let out_sink = if quiet {
+                -1
+            } else if kern_common::progress_mode() == kern_common::ProgressMode::Json
+                || crate::progress::board_active()
+            {
                 saved_err
             } else {
                 saved_out
             };
-            let mut sinks = [saved_err, if out_rd >= 0 { out_sink } else { -1 }];
+            let mut sinks = [
+                if quiet { -1 } else { saved_err },
+                if out_rd >= 0 { out_sink } else { -1 },
+            ];
             let mut open = if out_rd >= 0 { 2 } else { 1 };
             let mut buf = [0u8; 4096];
             let mut head_written: usize = 0;

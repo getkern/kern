@@ -352,11 +352,27 @@ fn step_event(s: usize, total: usize, what: &str, clock: Clock) -> Option<u64> {
         Clock::Timed { together } => step_clock::start(s, &format!("{what}\u{1}{together}")),
         Clock::Untimed => None,
     };
+    // `cached` AS A FIELD: the instruction is the Dockerfile's, and a reader matching on it must not
+    // find ` (cached)` glued to its end.
+    let (instruction, cached) = match what.strip_suffix(" (cached)") {
+        Some(w) => (w, true),
+        None => (what, false),
+    };
+    // The live view's row for this image (a standalone `kern build` on a terminal).
+    if crate::progress::board_active() {
+        let image = step_clock::image();
+        let last_said = step_clock::said(last, 1);
+        crate::progress::service(
+            &image,
+            "building",
+            &format!("step {s}/{total} {what}{last_said}"),
+        );
+    }
     kern_common::progress_event(
         "build_step",
         &format!(
-            "\"step\":{s},\"total\":{total},\"instruction\":{},\"last_ms\":{}",
-            kern_common::json_str(what),
+            "\"step\":{s},\"total\":{total},\"instruction\":{},\"cached\":{cached},\"last_ms\":{}",
+            kern_common::json_str(instruction),
             last.map_or("null".to_string(), |ms| ms.to_string())
         ),
     );
@@ -393,6 +409,16 @@ pub(crate) mod step_clock {
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
         format!("{image}\t{step}\t{h:016x}")
+    }
+
+    /// The image being built now, empty outside a build.
+    pub fn image() -> String {
+        CLOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|c| c.image.clone())
+            .unwrap_or_default()
     }
 
     /// The build of `image` begins.
@@ -490,8 +516,27 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
     let tag = args.tag.unwrap_or_default().to_string();
     let started = std::time::Instant::now();
     step_clock::begin(&tag);
+    // THE SAME LIVE VIEW `compose up` DRAWS, for a build on its own on a terminal: one row for the
+    // image, the step it is on and how long that step took last time; what the RUNs print goes above
+    // it. Not under `compose`, which starts its builds with `--progress json` and draws them itself.
+    let board = crate::progress::Board::start("kern build", "");
+    if board.is_some() {
+        kern_common::set_live_view(true);
+        crate::progress::service(&tag, "building", "");
+    }
     let result = build_inner(args);
     step_clock::end(result.is_ok());
+    if board.is_some() {
+        match &result {
+            Ok(()) => crate::progress::service(&tag, "completed", ""),
+            Err(e) => crate::progress::service(&tag, "failed", &e.to_string()),
+        }
+        drop(board);
+        kern_common::set_live_view(false);
+    }
+    if result.is_err() && kern_common::progress_mode() == kern_common::ProgressMode::Quiet {
+        crate::builds::print_failed_tail(15);
+    }
     // A FAILED BUILD IS AN EVENT TOO: the stream must end in an answer either way.
     if let Err(e) = &result {
         kern_common::progress_event(
@@ -912,7 +957,7 @@ fn build_multi_stage(
         // value from a previous build in this process.
         note_strategy("cached: multi-stage image unchanged".to_string());
         if !quiet {
-            kern_common::progress!("  [cached · multi-stage image unchanged]");
+            kern_common::progress_step!("  [cached · multi-stage image unchanged]");
         }
         announce_built(tag);
         return Ok(());
@@ -1245,7 +1290,7 @@ fn build_run(
         Clock::Timed { together: 1 },
     );
     if !quiet {
-        kern_common::progress!("[1/{total}] FROM {base_ref}{}", step_clock::said(last, 1));
+        kern_common::progress_step!("[1/{total}] FROM {base_ref}{}", step_clock::said(last, 1));
     }
     let (base_lower, base_cfg) = resolve_image(base_ref)?;
     let mut config = base_cfg;
@@ -1331,7 +1376,7 @@ fn build_run(
     // fallback (slower + a full base copy) never looks like "layered but big".
     if layered {
         if !quiet {
-            kern_common::progress!("  [layered · base shared, no copy]");
+            kern_common::progress_step!("  [layered · base shared, no copy]");
         }
         return build_layered_cached(quiet, tag, ctx, work, instrs, base_ref, &base_lower, config);
     }
@@ -1357,7 +1402,7 @@ fn build_run(
     );
     if flat_cache_hit(tag, &flat_key) {
         if !quiet {
-            kern_common::progress!("  [cached · flat image unchanged]");
+            kern_common::progress_step!("  [cached · flat image unchanged]");
         }
         announce_built(tag);
         return Ok(());
@@ -1411,7 +1456,7 @@ fn build_run(
             Clock::Untimed => 1,
         };
         if !quiet {
-            kern_common::progress!("[{s}/{total}] {what}{}", step_clock::said(last, together));
+            kern_common::progress_step!("[{s}/{total}] {what}{}", step_clock::said(last, together));
         }
     };
     let announce = |s: usize, what: String| announce_as(s, what, Clock::Timed { together: 1 });
@@ -1712,7 +1757,7 @@ fn build_layered_cached(
             Clock::Untimed => 1,
         };
         if !quiet {
-            kern_common::progress!("[{s}/{total}] {what}{}", step_clock::said(last, together));
+            kern_common::progress_step!("[{s}/{total}] {what}{}", step_clock::said(last, together));
         }
     };
     let announce = |s: usize, what: String| announce_as(s, what, Clock::Timed { together: 1 });
