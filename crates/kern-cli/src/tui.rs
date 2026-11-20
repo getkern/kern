@@ -3287,7 +3287,7 @@ fn help_text() -> String {
        6 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
        7 Storage    physical disks (read-only) and your named volumes\n\
        8 Sandboxes  SDK and MCP sandboxes: running now, and the ones that finished with how\n\
-     \x20                they ended (metadata only, never the output); Enter shows one\n\
+     \x20                they ended; Enter shows one (its code and output: kern sandbox show)\n\
        9 Logs       every box's output in one stream, newest at the bottom, live\n\
      \n\
      LOGS tab\n\
@@ -3369,7 +3369,7 @@ fn nav_footer(
             crate::history::keep().word()
         ),
         _ => format!(
-            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}8{d}] jump{help}"
+            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}9{d}] jump{help}"
         ),
     }
 }
@@ -3982,14 +3982,15 @@ fn nav_sandboxes(k: u8, sel: usize, mode: &mut Mode) {
     let (ended, ran) = crate::history::ended_and_ran(e);
     *mode = Mode::Overlay(format!(
         "sandbox {}\nkind     {}\nimage    {}\nended    {ended}\nran      {ran}\nexit     {}\noutcome  {}\ngpu      {}\n\n\
-         Its output is not kept: the SDK or MCP call returned it to whoever called. \
-         `kern sandbox history --json` has the same line for a script.",
+         Its code and output, when the SDK recorded them (`sandbox_transcripts`, on by default): \
+         `kern sandbox show {}`. `kern sandbox history --json` has the same line for a script.",
         e.name,
         e.kind(),
         e.image,
         e.code,
         e.outcome.word(),
-        e.gpu
+        e.gpu,
+        e.name
     ));
 }
 
@@ -4129,8 +4130,27 @@ fn human_count(n: u64) -> String {
 /// The title bar's GPU figure, on every tab: how many cards and their memory, summed. `GPU none`
 /// on a host without one, so the absence reads as a fact rather than as a figure that failed.
 fn gpu_header(p: &Palette, gpus: &[GpuStat]) -> String {
+    gpu_header_with(p, gpus, detected_cards())
+}
+
+/// The cards `kern doctor` sees (`gpu::detect`), counted ONCE per `kern top`: the header's fallback
+/// when the per-card reader finds nothing it can read. MEASURED on WSL2 with an RTX 3060: doctor said
+/// "a WSL2 GPU at /dev/dxg", `--gpus all` ran `nvidia-smi` in a box, and `top` said `GPU none`, because
+/// on WSL there is no /dev/nvidia* and the driver's NVML is a glibc library the musl distro cannot load.
+/// Two detections of one fact disagreed; the header now never contradicts doctor.
+fn detected_cards() -> usize {
+    static CARDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // WSL2 has no DRM card for its GPU: `card_count` counts the adapters behind /dev/dxg there, as
+    // `kern info` does (two ioctls, no process), so the header agrees with info and doctor.
+    *CARDS.get_or_init(crate::gpu::card_count)
+}
+
+fn gpu_header_with(p: &Palette, gpus: &[GpuStat], detected: usize) -> String {
     let (d, g, z) = (p.d, p.g, p.z);
     if gpus.is_empty() {
+        if detected > 0 {
+            return format!("{d}GPU{z} {g}{detected}{z} {d}· usage n/a{z}");
+        }
         return format!("{d}GPU none{z}");
     }
     let used: u64 = gpus.iter().filter_map(|x| x.mem_used_mib).sum();
@@ -7144,7 +7164,9 @@ mod gpu_overview_tests {
             "{jrow}"
         );
         assert_eq!(gpu_header(&p, &jet), "GPU 1");
-        assert_eq!(gpu_header(&p, &[]), "GPU none");
+        assert_eq!(gpu_header_with(&p, &[], 0), "GPU none");
+        // A card doctor sees and the per-card reader cannot read (WSL2's /dev/dxg): counted, not "none".
+        assert_eq!(gpu_header_with(&p, &[], 1), "GPU 1 · usage n/a");
         assert_eq!(gpu_header(&p, &g), "GPU 2 · 7.1G / 31.9G");
         assert_eq!(service_of("aistack-e1c0723b-llm0"), "llm0");
         assert_eq!(service_of("my-app-0a1b2c3d-api-v2"), "api-v2");

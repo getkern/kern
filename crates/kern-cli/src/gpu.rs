@@ -331,6 +331,15 @@ pub fn wsl_adapter_indices(root: &Path) -> Option<Vec<u32>> {
     }
 }
 
+/// How many GPUs this host has, by the one rule every surface uses: the DRM cards, else (WSL2, which
+/// has no DRM card for its GPU) the NVIDIA adapters behind `/dev/dxg`.
+pub fn card_count() -> usize {
+    match detect().len() {
+        0 => wsl_nvidia_adapter_count(Path::new("/")).map_or(0, |n| n as usize),
+        n => n,
+    }
+}
+
 /// How many NVIDIA adapters a WSL2 guest has, asked of `/dev/dxg` alone: `Some(0)` for a WSL2
 /// guest with none, `None` when this is not a WSL2 guest or the driver cannot be asked.
 ///

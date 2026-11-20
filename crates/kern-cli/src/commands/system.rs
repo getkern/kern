@@ -132,15 +132,16 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}exec{z} <name> [-i|-t|-it] [-u <user>] [--env K=V] [-w <dir>] [--] [CMD...]  Run CMD in a running box
                                                                      -t allocates a PTY; -i only keeps stdin attached, so
                                                                      `exec -i <box> psql … < file.sql` reaches EOF instead of hanging
-                                                                     -u <user>[:<group>] runs CMD as that account of the box (a name or a
-                                                                     number, from the box's own /etc/passwd) instead of box root
+                                                                     CMD runs as the box's own user (the image's USER, --user), like docker exec;
+                                                                     -u <user>[:<group>] picks another account of the box (a name or a number,
+                                                                     from the box's own /etc/passwd); -u root is box root
     {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=|pod=|health=] [--format T] [--no-trunc] [--last N|-n N]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
                                                                      health= is healthy|unhealthy|starting|none; --last N keeps the N newest across live and exited (implies -a), newest first
                                                                      a row is an INSTANCE, not a name: a name reused after a box exited appears once per instance, identified by PID
                                                                      the exited rows are DETACHED boxes: the exit note is written by the supervisor, which a foreground box has none of
                                                                      -a also lists `box --keep` and `kern create` boxes, which are state on disk and NOT transient: status=kept selects exactly those, and `kern start` runs one
                                                                      --last N is about boxes that RAN, so it does not list the kept ones (they outlive the boot and share no clock with a run)
-                                                                     --format fields: .Names .ID .Image .Command .Ports .Pod .Service .Status .State .Health .ExitCode .RunningFor .Labels .Label \"k\"
+                                                                     --format fields: .Names .ID .Image .Command .Ports .URL .Pod .Service .Status .State .Health .ExitCode .RunningFor .Labels .Label \"k\"
                                                                      .Status is Docker's (Up 4 seconds (healthy), Exited (3) 4 seconds ago, Created), .State the word (running, exited); `table ...` prints headers
     {c}logs{z} <name>|--all [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
                                                                      --all: every box's, one stream ordered by time, each line `box  | `; --tail is per box
@@ -178,7 +179,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
   {d}Manage boxes{z}
     {c}top{z}                                                            Interactive task manager (TUI): host, every GPU, boxes, sandboxes (finished too)
     {c}stats{z} [--json] [--no-stream] [name...]                         Per-box memory + CPU (always a snapshot; --no-stream names that, `kern top` is the live view)
-    {c}sandbox{z} ls|history|stats [-n N] [--failed] [--all] [--json]      The SDK and MCP sandboxes: running now, finished (metadata only), outcomes
+    {c}sandbox{z} ls [--json] | history [-n N] [--failed] [--all] [--json] | stats [--all] [--json]  The SDK and MCP sandboxes: running now, finished, outcomes
     {c}sandbox show{z} [<box>] [-n N] [--json]                         The code SDK sandboxes ran and their output (kept with the history)
     {c}sandbox{z} keep|clear [memory|disk|off]                             Where the finished ones are kept (default memory: until reboot), or remove them
     {c}inspect{z} <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
@@ -243,9 +244,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                         own namespace and a 127.0.0.1 no peer can reach; each further
                                                                         --bridge is another network, with no forwarding between them
     {c}pod{z} ls [--json] | {c}pod{z} rm <name>                                List pods, or remove one
-    {c}network{z} create <name> | {c}network{z} ls [--json] | {c}network{z} inspect <name> [--json] [-f T] | {c}network{z} rm <name>  A network shared BETWEEN projects, which is what a
-                                                                     compose file names with `external: true`. Services of
-                                                                     DIFFERENT files on one resolve and reach each other by name (alias: net)
+    {c}network{z} create <name> | {c}network{z} ls [--json] | {c}network{z} inspect <name> [--json] [-f T] | {c}network{z} rm <name>  A network shared between projects (compose `external: true`); alias: net
+                                                                     Services of DIFFERENT files on one resolve and reach each other by name
 
   {d}Config & storage{z}
     {c}config{z} [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml (alias: cfg)
