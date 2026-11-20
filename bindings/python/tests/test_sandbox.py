@@ -5865,8 +5865,12 @@ def _refusing_kern(tmp_path, version, *, started_bytes=False, message=True):
     by default, kern's sentence on stderr. `started_bytes` writes `[1, 0, 0, 0]` on KERN_STARTED_FD,
     which is what v0.30.1's `kern exec` MEASURABLY writes for a refusal."""
     fake = tmp_path / "kern-refuses"
+    # WRITTEN BESIDE AND RENAMED OVER: a previous double may still be running (the binding hands each
+    # call to `kern sandbox record` in the background), and opening a running executable for writing
+    # is ETXTBSY. A rename replaces the name and leaves the running file alone.
+    staged = tmp_path / "kern-refuses.new"
     say = "  echo \"kern: exec: refusing: the command could not be placed in the box's cgroup\" >&2\n"
-    fake.write_text(
+    staged.write_text(
         "#!/bin/sh\n"
         f'case "$1" in --version) echo "kern {version}"; exit 0 ;; esac\n'
         'if [ "$1" = exec ]; then\n'
@@ -5876,7 +5880,8 @@ def _refusing_kern(tmp_path, version, *, started_bytes=False, message=True):
         "fi\n"
         "exit 0\n"
     )
-    fake.chmod(0o755)
+    staged.chmod(0o755)
+    os.replace(staged, fake)
     return str(fake)
 
 
