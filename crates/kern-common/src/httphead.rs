@@ -52,7 +52,9 @@ impl Refusal {
             Refusal::ControlByte => "the request head has a control byte",
             Refusal::RequestLine => "the request line is not METHOD target HTTP/1.x",
             Refusal::ObsFold => "a header line is folded onto the one before it",
-            Refusal::FieldName => "a header line has no name, no colon, or a space before the colon",
+            Refusal::FieldName => {
+                "a header line has no name, no colon, or a space before the colon"
+            }
             Refusal::ContentLength => "Content-Length is repeated or not a number",
             Refusal::TransferEncoding => {
                 "Transfer-Encoding is repeated, not chunked, or given with Content-Length"
@@ -285,10 +287,22 @@ mod tests {
 
     #[test]
     fn a_well_formed_head_passes() {
-        assert_eq!(frame("GET / HTTP/1.1\r\nHost: a.localhost\r\nAccept: */*\r\n\r\n"), Ok(()));
-        assert_eq!(frame("POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\n"), Ok(()));
-        assert_eq!(frame("POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: Chunked\r\n\r\n"), Ok(()));
-        assert_eq!(frame("CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org:443\r\n\r\n"), Ok(()));
+        assert_eq!(
+            frame("GET / HTTP/1.1\r\nHost: a.localhost\r\nAccept: */*\r\n\r\n"),
+            Ok(())
+        );
+        assert_eq!(
+            frame("POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\n"),
+            Ok(())
+        );
+        assert_eq!(
+            frame("POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: Chunked\r\n\r\n"),
+            Ok(())
+        );
+        assert_eq!(
+            frame("CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org:443\r\n\r\n"),
+            Ok(())
+        );
         assert_eq!(frame("GET / HTTP/1.0\r\n\r\n"), Ok(()));
     }
 
@@ -340,23 +354,56 @@ mod tests {
             let (l, h) = split_head(head);
             the_host(l, h)
         };
-        assert_eq!(host("GET / HTTP/1.1\r\nHost: Web.Shop.Localhost.:8080\r\n\r\n"), Ok("web.shop.localhost".into()));
+        assert_eq!(
+            host("GET / HTTP/1.1\r\nHost: Web.Shop.Localhost.:8080\r\n\r\n"),
+            Ok("web.shop.localhost".into())
+        );
         assert_eq!(host("GET / HTTP/1.1\r\nhost: a\r\n\r\n"), Ok("a".into()));
         assert_eq!(host("GET http://a/x HTTP/1.1\r\n\r\n"), Ok("a".into()));
-        assert_eq!(host("GET http://a:80/x HTTP/1.1\r\nHost: A.\r\n\r\n"), Ok("a".into()));
-        assert_eq!(host("GET http://a/ HTTP/1.1\r\nHost: b\r\n\r\n"), Err(Refusal::HostMismatch));
-        assert_eq!(host("GET http://a@b/ HTTP/1.1\r\nHost: a\r\n\r\n"), Err(Refusal::HostMismatch));
-        assert_eq!(host("GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n"), Err(Refusal::DuplicateHost));
-        assert_eq!(host("GET / HTTP/1.1\r\nHost:   \r\n\r\n"), Err(Refusal::EmptyHost));
-        assert_eq!(host("GET / HTTP/1.1\r\nAccept: */*\r\n\r\n"), Err(Refusal::NoHost));
-        assert_eq!(host("GET / HTTP/1.1\r\nX-Forwarded-Host: a\r\n\r\n"), Err(Refusal::NoHost));
+        assert_eq!(
+            host("GET http://a:80/x HTTP/1.1\r\nHost: A.\r\n\r\n"),
+            Ok("a".into())
+        );
+        assert_eq!(
+            host("GET http://a/ HTTP/1.1\r\nHost: b\r\n\r\n"),
+            Err(Refusal::HostMismatch)
+        );
+        assert_eq!(
+            host("GET http://a@b/ HTTP/1.1\r\nHost: a\r\n\r\n"),
+            Err(Refusal::HostMismatch)
+        );
+        assert_eq!(
+            host("GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n"),
+            Err(Refusal::DuplicateHost)
+        );
+        assert_eq!(
+            host("GET / HTTP/1.1\r\nHost:   \r\n\r\n"),
+            Err(Refusal::EmptyHost)
+        );
+        assert_eq!(
+            host("GET / HTTP/1.1\r\nAccept: */*\r\n\r\n"),
+            Err(Refusal::NoHost)
+        );
+        assert_eq!(
+            host("GET / HTTP/1.1\r\nX-Forwarded-Host: a\r\n\r\n"),
+            Err(Refusal::NoHost)
+        );
     }
 
     #[test]
     fn an_absolute_target_ends_at_its_path_query_or_fragment() {
-        assert_eq!(absolute_target_host("GET http://a?x=b.com HTTP/1.1"), Some("a".into()));
-        assert_eq!(absolute_target_host("GET http://a#b.com HTTP/1.1"), Some("a".into()));
-        assert_eq!(absolute_target_host("GET http://[::1]:8080/ HTTP/1.1"), Some("::1".into()));
+        assert_eq!(
+            absolute_target_host("GET http://a?x=b.com HTTP/1.1"),
+            Some("a".into())
+        );
+        assert_eq!(
+            absolute_target_host("GET http://a#b.com HTTP/1.1"),
+            Some("a".into())
+        );
+        assert_eq!(
+            absolute_target_host("GET http://[::1]:8080/ HTTP/1.1"),
+            Some("::1".into())
+        );
         assert_eq!(absolute_target_host("GET / HTTP/1.1"), None);
     }
 }

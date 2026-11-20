@@ -4644,8 +4644,6 @@ fn known_hosts_line(port: u16, public: &str) -> Option<String> {
 /// `kern exec -u <spec>` names an account of the box.
 #[derive(Clone, Copy, Debug)]
 pub enum ExecAs<'a> {
-    /// Box root, with the caller's groups as they map into the box: what `kern exec` always did.
-    BoxRoot,
     /// The workload's own uid/gid and groups, as the registry recorded them when the box started.
     Workload,
     /// `-u <user[:group]>`, each half a name or a number, resolved against the box's CURRENT
@@ -4711,7 +4709,6 @@ pub fn exec(
     // box recreated under this name is entered as itself rather than as whoever held the name before.
     let recorded_env = registry::box_env(&inst.name, inst.pid);
     let identity = match who {
-        ExecAs::BoxRoot => ExecIdentity::default(),
         ExecAs::Workload => ExecIdentity {
             run_as: inst.run_as,
             extra_gids: inst.extra_gids.clone(),
@@ -5093,6 +5090,9 @@ fn await_box_started(
     self_gated: bool,
     // `--log-driver none`: the box keeps no log, so the next steps do not offer `kern logs`.
     keeps_log: bool,
+    // The box publishes a TCP port: only then can it have a `.localhost` URL, and only then is the
+    // registry read for it.
+    publishes_tcp: bool,
 ) -> Result<(), Error> {
     // Assembled below, on whichever path resolves the start, and printed with the start line so the
     // launcher still makes ONE write per box (see that comment).
@@ -5234,8 +5234,14 @@ fn await_box_started(
     let msg = if crate::global_env("KERN_COMPOSE_LAUNCH").is_some() {
         notices
     } else {
+        // A published port gets a name on this machine too, as a compose service does.
+        let url_line = publishes_tcp
+            .then(|| crate::localrouter::box_url(n))
+            .flatten()
+            .map(|u| format!("  url: {u}\n"))
+            .unwrap_or_default();
         format!(
-            "{notices}{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}\n  {}next: kern ps {} {logs_step}kern stop {n}{}\n",
+            "{notices}{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}\n{url_line}  {}next: kern ps {} {logs_step}kern stop {n}{}\n",
             p.g, gl.ok, p.z, p.b, p.z, p.d, p.z, p.d, gl.dot, p.z
         )
     };
@@ -5475,6 +5481,14 @@ fn supervise_box(
         }
         // Wall-clock this attempt so a box that stayed up counts as recovered (see the reset below).
         let started = std::time::Instant::now();
+        // What `ps` reports as this box's state: running since now (see `registry::Attempt`).
+        registry::set_box_attempt(
+            &inst.name,
+            inst.pid,
+            registry::Attempt::Running {
+                since_ms: registry::unix_ms(),
+            },
+        );
         // THE RUNNER'S VERDICT, CARRIED BACK. The signal that ended the workload and whether its own
         // cgroup OOM-killed it are latched in the RUNNER (it reaps the box), and the exit status that
         // reaches this supervisor carries neither: an OOM read `exit-137`, the same as a `kill -9`.
@@ -5843,6 +5857,14 @@ fn supervise_box(
                     &inst.command,
                 );
             }
+            registry::set_box_attempt(
+                &inst.name,
+                inst.pid,
+                registry::Attempt::Restarting {
+                    since_ms: registry::unix_ms(),
+                    code,
+                },
+            );
             unsafe { libc::sleep(backoff) };
             // Read at the top of the next iteration to decide whether the pre-exec gate may be
             // dropped. See the block above the loop: dropping it after a box that NEVER STARTED
@@ -6018,6 +6040,7 @@ fn run_detached(
             have_notice.then_some(notice_rd),
             outbound_pod.is_some(),
             log_cap.keep,
+            ports.iter().any(|p| !p.udp),
         );
     }
     // ── Supervisor ──

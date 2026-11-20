@@ -130,11 +130,11 @@ Neither directory can be mounted into a box.
 ```toml
 [kern]
 local_domains      = true  # compose up answers http://<service>.<project>.localhost (default true)
-local_domains_port = 8080  # the port of those names (default 80 where allowed, else 8080)
+local_domains_port = 8780  # the port of those names (default 80 where allowed, else 8780)
 ```
 
 When a compose service publishes a TCP port, `compose up` prints a name for it, e.g.
-`web: http://web.shop.localhost:8080/`, and a router of your user answers it on the loopback
+`web: http://web.shop.localhost:8780/`, and a router of your user answers it on the loopback
 addresses, forwarding by the request's `Host` to the port the service published. `.localhost`
 resolves to this machine with nothing to install (curl, browsers, systemd-resolved).
 
@@ -143,13 +143,21 @@ resolves to this machine with nothing to install (curl, browsers, systemd-resolv
 | `<service>.<project>.localhost` | the service's published port: container port 80, else 8080, 3000, 8000, 5000, else the first |
 | `<port>.<service>.<project>.localhost` | the published port of that container port |
 | `<service>-2.<project>.localhost` | replica 2 |
-| `<service>.kern.localhost` | the one running project that has that service; several are refused by name |
+| `<box>.kern.localhost` | a box by its own name, with a published port: `kern box web -d -p ...`, or a service with `container_name` |
+| `<service>.kern.localhost` | otherwise, the one running project that has that service; several are refused by name |
 
 The router listens on port 80 where the system lets an ordinary user bind it
-(`net.ipv4.ip_unprivileged_port_start` at 80 or below), otherwise on the first free port from 8080 to
-8089; `local_domains_port` fixes it. It reaches only ports your boxes already published, and leaves by
-itself about a minute after the last box with a published port. HTTP only. A service with a
-`container_name` gets no name. `local_domains = false` starts no router.
+(`net.ipv4.ip_unprivileged_port_start` at 80 or below), otherwise on the first free port from 8780 to
+8789, away from 8080, which many apps publish; `local_domains_port` fixes it. It reaches only ports your boxes already published, and leaves by
+itself within a few seconds of the last box with a published port. HTTP only. `local_domains = false` starts no router.
+
+On Windows, with kern in its WSL distro, the router is reached from Windows too, through WSL's
+`localhost` forwarding: `curl.exe http://web.shop.localhost:8780/` answers. Windows' own name
+resolver does not resolve `<name>.localhost` (`ping`, PowerShell's `Invoke-WebRequest`); there,
+`http://localhost:8780/` with a `Host: web.shop.localhost` header reaches the same service.
+`kern doctor` typed in Windows adds a row checked from the Windows side: a Windows program on the
+same port takes the names from Windows while the distro sees nothing wrong, and the row says so,
+as it says when Windows refuses to open that port, with the fix.
 
 ### Logs and retention
 

@@ -18,9 +18,11 @@
 //!
 //! It reaches only ports this user's boxes published on the host, so it opens nothing that was not
 //! open. Port 80 when the system lets an ordinary user bind it (`net.ipv4.ip_unprivileged_port_start`
-//! at 80 or below), else 8080 or the next free one; `[kern] local_domains_port` fixes it. kern has no
+//! at 80 or below), else 8780 or the next free one; `[kern] local_domains_port` fixes it. NOT 8080:
+//! MEASURED on 2026-11-20, a router on 8080 refused a second project publishing 8080 ("held by kern"),
+//! and 8080 is the port the most apps publish (Airflow, Jenkins, Keycloak). kern has no
 //! daemon, and this is not one: `compose up` starts it when a service publishes a port, and it leaves
-//! by itself a minute after the last box with a published port is gone. HTTP only: HTTPS would need
+//! by itself about 3 s after the last box with a published port is gone. HTTP only: HTTPS would need
 //! a TLS stack in kern and a certificate authority in the user's trust store.
 
 use std::io::{Read, Write};
@@ -64,9 +66,43 @@ pub fn ensure() -> Option<u16> {
         return Some(p);
     }
     let exe = std::env::current_exe().ok()?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("__local-router")
-        .stdin(std::process::Stdio::null())
+    // IN A CGROUP OF ITS OWN, NOT THE CALLER'S. Started as a child of `compose up` it landed in the
+    // cgroup of whoever ran that, a terminal's scope for instance, and closing the terminal could end
+    // it. Through the user manager it gets its own transient scope, the way kern's own unit does;
+    // without one (WSL without systemd, CI) it starts as a plain child, in its own session.
+    if kern_isolation::user_systemd_present() {
+        if let Some(p) = spawn_router(&exe, true) {
+            return Some(p);
+        }
+    }
+    spawn_router(&exe, false)
+}
+
+/// Start `kern __local-router` and wait for it to publish its port. `scoped`: through
+/// `systemd-run --scope`, which becomes the router itself once the scope exists.
+fn spawn_router(exe: &std::path::Path, scoped: bool) -> Option<u16> {
+    let mut cmd = if scoped {
+        let sr = kern_isolation::trusted_helper("systemd-run")
+            .unwrap_or_else(|| std::path::PathBuf::from("systemd-run"));
+        let mut c = std::process::Command::new(sr);
+        c.envs(kern_isolation::manager_envs())
+            .args([
+                kern_isolation::systemd_scope_mode(),
+                "--scope",
+                "--quiet",
+                "--collect",
+            ])
+            .args(kern_isolation::manager_setenv_args())
+            .arg("--")
+            .arg(exe)
+            .arg("__local-router");
+        c
+    } else {
+        let mut c = std::process::Command::new(exe);
+        c.arg("__local-router");
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     // SAFETY: `setsid` is async-signal-safe; the router must not share the terminal's session.
@@ -79,7 +115,7 @@ pub fn ensure() -> Option<u16> {
     let mut child = cmd.spawn().ok()?;
     // The router writes its state once it listens; it may also find another one already running
     // and leave, which is fine: that one's state answers.
-    for _ in 0..200 {
+    for _ in 0..300 {
         if let Some(p) = running_port() {
             return Some(p);
         }
@@ -89,6 +125,34 @@ pub fn ensure() -> Option<u16> {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     None
+}
+
+/// `kern __router-port` (hidden): the port the names answer on, for `kern.exe doctor`, which checks
+/// it from the Windows side (a port Windows reserves, or one a Windows program holds, breaks the
+/// names from Windows while everything works inside the distro). One line: `<port> running` for the
+/// router running now, `<port> idle` for the port it would take now, `off` when the names are off.
+pub fn port_verb() -> i32 {
+    if !enabled() {
+        println!("off");
+        return 0;
+    }
+    if let Some(p) = running_port() {
+        println!("{p} running");
+        return 0;
+    }
+    match candidate_ports()
+        .into_iter()
+        .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())
+    {
+        Some(p) => {
+            println!("{p} idle");
+            0
+        }
+        None => {
+            println!("none");
+            1
+        }
+    }
 }
 
 /// The ports to try, in order.
@@ -107,7 +171,7 @@ fn candidate_ports() -> Vec<u16> {
     if unprivileged <= 80 {
         v.push(80);
     }
-    v.extend(8080..8090);
+    v.extend(8780..8790);
     v
 }
 
@@ -170,16 +234,18 @@ pub fn run() -> ! {
             }
         });
     }
-    // LEAVE WHEN NOTHING IS LEFT TO ROUTE TO: two checks a minute apart that find no box publishing
-    // a port.
+    // IT LIVES AS LONG AS THERE IS A NAME TO SERVE: any box of this user with a published TCP port,
+    // from compose or `kern box -p`. Checked every second; with none for three checks in a row it
+    // leaves, so a service restarting does not take the router with it and a `down` does not leave
+    // it running for a minute.
     let mut idle = 0;
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::thread::sleep(std::time::Duration::from_secs(1));
         let any = crate::registry::list()
             .iter()
             .any(|b| has_tcp_port(&b.ports));
         idle = if any { 0 } else { idle + 1 };
-        if idle >= 2 {
+        if idle >= 3 {
             if let Ok(p) = state_path() {
                 let _ = std::fs::remove_file(p);
             }
@@ -243,12 +309,7 @@ fn route(host: &str) -> Result<(String, u16), (u16, String)> {
             ))
         }
     };
-    let ok_label = |l: &str| {
-        !l.is_empty()
-            && l.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    };
-    if !ok_label(service) || !ok_label(project) {
+    if !label_ok(service) || !label_ok(project) {
         return Err((404, format!("{h}: not a service name")));
     }
     let candidates = [
@@ -256,6 +317,10 @@ fn route(host: &str) -> Result<(String, u16), (u16, String)> {
         format!("{project}-{service}"),
     ];
     let mut found = candidates.iter().find_map(|n| crate::registry::find(n));
+    // `<box>.kern.localhost`: a box started on its own (`kern box web -d -p ...`) is named as it is.
+    if found.is_none() && project == "kern" {
+        found = crate::registry::find(service).filter(|b| has_tcp_port(&b.ports));
+    }
     if found.is_none() && project == "kern" {
         let suffix = format!("-{service}-1");
         let all: Vec<_> = crate::registry::list()
@@ -316,7 +381,14 @@ fn route(host: &str) -> Result<(String, u16), (u16, String)> {
     Ok((target, *hport))
 }
 
-fn answer(c: &mut TcpStream, status: u16, msg: &str) {
+/// Answer with `status` and END THE CONNECTION, whatever else the client sent.
+///
+/// A REFUSED REQUEST GETS NOTHING AFTER IT. A client may pipeline a second request behind the
+/// first; once the first is refused (no such name, a head this reader will not split), not one
+/// byte that follows may reach a service. So: the answer, the write side shut, whatever the client
+/// already sent read and dropped (closing with unread data would reset the connection and could
+/// destroy the answer before the client reads it), then the socket closed.
+fn refuse(c: &mut TcpStream, status: u16, msg: &str) {
     let reason = match status {
         400 => "Bad Request",
         404 => "Not Found",
@@ -329,24 +401,37 @@ fn answer(c: &mut TcpStream, status: u16, msg: &str) {
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
+    let _ = c.flush();
+    let _ = c.shutdown(std::net::Shutdown::Write);
+    let _ = c.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let mut sink = [0u8; 4096];
+    let mut drained = 0usize;
+    while drained < 64 * 1024 {
+        match c.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
 }
 
-/// One client connection: read the head, route by `Host`, forward the head and splice.
+/// One client connection: read the head, check its framing and its one host (the same reader the
+/// egress proxy uses, `kern_common::httphead`), route by that host, forward the head and splice.
+///
+/// ONLY THE FIRST REQUEST IS ROUTED: what follows on a kept-alive connection goes to the same
+/// service. A browser keeps one HTTP/1.1 connection per origin, so a page cannot steer a second
+/// request on it to another name; routing each request is the HTTPS terminator's job (HTTP/2 does
+/// share connections across names).
 fn serve(mut c: TcpStream) {
+    use kern_common::httphead;
     let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0u8; 4096];
-    let head_end = loop {
-        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break i + 4;
-        }
-        // A head that ends in a bare `\n\n` is complete for some servers and never for this reader:
-        // it is ended here so the refusal below answers at once instead of after the read timeout.
-        if let Some(i) = buf.windows(2).position(|w| w == b"\n\n") {
-            break i + 2;
+    let end = loop {
+        if let Some(i) = httphead::head_end(&buf) {
+            break i;
         }
         if buf.len() > 16 * 1024 {
-            answer(&mut c, 400, "request head too large");
+            refuse(&mut c, 400, "request head too large");
             return;
         }
         match c.read(&mut chunk) {
@@ -354,35 +439,31 @@ fn serve(mut c: TcpStream) {
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     };
-    let head = &buf[..head_end];
-    // A BARE LF IS REFUSED, as the egress proxy refuses it: a head this reader and the service split
-    // differently is how a second request is smuggled past the routing decision.
-    if crate::egress::has_bare_lf(head) {
-        answer(&mut c, 400, "a request line or header ends in a bare LF");
+    let head = &buf[..end];
+    // A HEAD THIS READER AND THE SERVICE COULD SPLIT DIFFERENTLY is refused, as the egress proxy
+    // refuses it: that disagreement is how a second request is smuggled past the routing decision.
+    if let Err(r) = httphead::framing(head) {
+        refuse(&mut c, 400, r.reason());
         return;
     }
     let text = String::from_utf8_lossy(head);
-    let hosts: Vec<&str> = text
-        .lines()
-        .skip(1)
-        .filter_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.trim().eq_ignore_ascii_case("host").then_some(v.trim())
-        })
-        .collect();
-    let [host] = hosts.as_slice() else {
-        answer(&mut c, 400, "a request must name exactly one Host");
-        return;
+    let (request_line, headers) = httphead::split_head(&text);
+    let host = match httphead::the_host(request_line, headers) {
+        Ok(h) => h,
+        Err(r) => {
+            refuse(&mut c, 400, r.reason());
+            return;
+        }
     };
-    let (addr, port) = match route(host) {
+    let (addr, port) = match route(&host) {
         Ok(t) => t,
         Err((status, msg)) => {
-            answer(&mut c, status, &msg);
+            refuse(&mut c, status, &msg);
             return;
         }
     };
     let Ok(mut up) = TcpStream::connect((addr.as_str(), port)) else {
-        answer(
+        refuse(
             &mut c,
             502,
             &format!("the service's port {port} did not answer"),
@@ -403,6 +484,64 @@ fn serve(mut c: TcpStream) {
     let _ = std::io::copy(&mut up, &mut c);
     let _ = c.shutdown(std::net::Shutdown::Write);
     let _ = t.join();
+}
+
+/// The URL of a box started on its own that publishes a TCP port, `http://<box>.kern.localhost[:port]/`,
+/// starting the router; `None` when it publishes none, its name is not a host-name label, the names
+/// are turned off, or the router could not start.
+pub fn box_url(name: &str) -> Option<String> {
+    if !label_ok(name) {
+        return None;
+    }
+    // THE CHEAP QUESTION FIRST: most boxes publish no port, and reading the config to learn whether
+    // names are on cost every `kern box -d` its parse (MEASURED: +0.13 ms per detached start).
+    let inst = crate::registry::find(name)?;
+    if !has_tcp_port(&inst.ports) || !enabled() {
+        return None;
+    }
+    ensure().map(|port| url(name, "kern", port))
+}
+
+/// The host-name label a box is reached by: in a stack (`pod` set and the box named
+/// `<pod>-<service>-<n>`) the service, or `<service>-<n>` for a replica past the first; a box on its
+/// own, its name. ONE DERIVATION, used by `compose up`'s lines, `kern ps` and `inspect`, so the URL
+/// one prints is the URL another prints. `(label, project)`.
+pub fn name_of(name: &str, pod: &str) -> (String, String) {
+    let pod = pod.trim();
+    match name
+        .strip_prefix(&format!("{pod}-"))
+        .filter(|_| !pod.is_empty())
+    {
+        Some(short) => (
+            short.strip_suffix("-1").unwrap_or(short).to_string(),
+            pod.to_string(),
+        ),
+        None => (name.to_string(), "kern".to_string()),
+    }
+}
+
+/// The URL a running box is reached at through the router that runs now, or `None` (no published TCP
+/// port, or no router running: nothing answers the name then, so nothing is printed for it).
+pub fn url_of(name: &str, pod: &str, ports: &str) -> Option<String> {
+    if !has_tcp_port(ports) {
+        return None;
+    }
+    let (label, project) = name_of(name, pod);
+    // Only a URL the router routes: the same label rule as `route`.
+    if !label_ok(&label) || !label_ok(&project) {
+        return None;
+    }
+    let port = running_port()?;
+    Some(url(&label, &project, port))
+}
+
+/// A host-name label the router answers for: 1 to 63 bytes (DNS's bound) of letters, digits, `-`
+/// and `_`. ONE rule for `route`, `box_url` and `url_of`, so a printed URL is one that routes.
+fn label_ok(l: &str) -> bool {
+    !l.is_empty()
+        && l.len() <= 63
+        && l.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// The URL a service is reached at, for the lines `compose up` prints.
@@ -446,6 +585,6 @@ mod tests {
     #[test]
     fn a_url_drops_port_80() {
         assert_eq!(url("web", "shop", 80), "http://web.shop.localhost/");
-        assert_eq!(url("web", "shop", 8080), "http://web.shop.localhost:8080/");
+        assert_eq!(url("web", "shop", 8780), "http://web.shop.localhost:8780/");
     }
 }

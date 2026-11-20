@@ -351,6 +351,90 @@ pub fn clear_box_env(name: &str, pid: i32) {
         let _ = fs::remove_file(d.join(format!("{name}-{pid}")));
     }
     clear_box_deadline(name, pid);
+    clear_box_attempt(name, pid);
+}
+
+/// Where a box's current attempt is kept (`--restart` boxes are run again in place by the same
+/// supervisor), one `<name>-<pid>` file per box: `run <since_ms>` while an attempt runs,
+/// `restarting <since_ms> <code>` between an exit and the next run. Swept with the other sidecars.
+///
+/// WHY: `ps` said "Up 16 hours (health: starting)" for a service restarting every few seconds,
+/// because the box's start time is the supervisor's, not the run's. MEASURED on Supabase and on
+/// Airflow (services that waited for an init showed "Up 2 minutes" while the init had exited 55
+/// seconds before). Docker says `Restarting (1) 3 seconds ago`, and `Up` from the current run.
+fn attempt_dir() -> io::Result<PathBuf> {
+    runtime_subdir("attempt")
+}
+
+/// A box's current attempt, as its supervisor last recorded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// A run started at this time (Unix milliseconds).
+    Running { since_ms: u64 },
+    /// The last run exited with `code` at this time, and the next one has not started yet.
+    Restarting { since_ms: u64, code: i32 },
+}
+
+impl Attempt {
+    fn render(self) -> String {
+        match self {
+            Attempt::Running { since_ms } => format!("run {since_ms}\n"),
+            Attempt::Restarting { since_ms, code } => format!("restarting {since_ms} {code}\n"),
+        }
+    }
+
+    fn parse(text: &str) -> Option<Attempt> {
+        let mut f = text.split_whitespace();
+        let kind = f.next()?;
+        let since_ms: u64 = f.next()?.parse().ok()?;
+        let a = match kind {
+            "run" => Attempt::Running { since_ms },
+            "restarting" => Attempt::Restarting {
+                since_ms,
+                code: f.next()?.parse().ok()?,
+            },
+            _ => return None,
+        };
+        f.next().is_none().then_some(a)
+    }
+}
+
+/// Record a box's current attempt (best effort: a box without the record reads as before).
+pub fn set_box_attempt(name: &str, pid: i32, a: Attempt) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(dir) = attempt_dir() else {
+        return;
+    };
+    let path = dir.join(format!("{name}-{pid}"));
+    let tmp = dir.join(format!(".{name}-{pid}.{}", std::process::id()));
+    // Created 0600 in the one call, rather than written and then chmod-ed: this runs at every start
+    // of every detached box and at every restart.
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(a.render().as_bytes()));
+    if written.is_ok() && fs::rename(&tmp, &path).is_ok() {
+        return;
+    }
+    let _ = fs::remove_file(&tmp);
+}
+
+/// A box's current attempt, `None` when none was recorded.
+pub fn box_attempt(name: &str, pid: i32) -> Option<Attempt> {
+    let dir = attempt_dir().ok()?;
+    let text = fs::read_to_string(dir.join(format!("{name}-{pid}"))).ok()?;
+    Attempt::parse(&text)
+}
+
+/// Drop a box's attempt record.
+pub fn clear_box_attempt(name: &str, pid: i32) {
+    if let Ok(d) = attempt_dir() {
+        let _ = fs::remove_file(d.join(format!("{name}-{pid}")));
+    }
 }
 
 /// Where a detached box's `--timeout` deadline is kept, one `<name>-<pid>` file per box, so
@@ -557,7 +641,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 16] = [
+const AUTHORITATIVE_DIRS: [&str; 17] = [
     "instances",
     "claims",
     "exit",
@@ -591,6 +675,9 @@ const AUTHORITATIVE_DIRS: [&str; 16] = [
     // it alive past its timeout, or name another process for `update --timeout` to signal (the pid is
     // only signalled when its start-time matches, but the deadline itself is taken as written).
     "deadline",
+    // `attempt/` holds whether each box is running or between two runs, and since when. `ps` reports
+    // it as the box's state, so a box able to write a peer's record would relabel that peer.
+    "attempt",
     // `router/` holds the local router's pid and port (`localrouter.rs`): kern prints URLs on that
     // port and signals nothing from it, but a box able to write it would point those URLs at a port
     // of its choosing, so it is kern's to write.
@@ -1069,6 +1156,13 @@ pub fn list_exited() -> Vec<ExitedBox> {
     };
     let now = now_unix();
     let mut out = Vec::new();
+    // ONE BOX PER NAME, as Docker has one container per name: an exit record of a name a box RUNNING
+    // NOW holds is an earlier box of that name, and is not listed. MEASURED on 0.51.3: after `compose
+    // stop w` and `compose start w`, `compose ps -a` listed `w` twice, "Up" and "Exited (137)", and
+    // `kern ps -a` showed the old exit in place of the running box. Filtered HERE, where every record
+    // is read anyway, and not by clearing at `register`: that read every record on every box start,
+    // MEASURED +0.35 ms per start with 134 records on this desktop.
+    let live: std::collections::HashSet<String> = list().into_iter().map(|b| b.name).collect();
     let Ok(rd) = fs::read_dir(&d) else {
         return out;
     };
@@ -1095,6 +1189,9 @@ pub fn list_exited() -> Vec<ExitedBox> {
             continue;
         };
         let (code, name, pod, command) = parse_waitexit_body(&body);
+        if !name.is_empty() && live.contains(name) {
+            continue;
+        }
         // name/pod come off DISK: scrub terminal-control bytes at the source so EVERY consumer (table,
         // `-q`, `--format`, `--json`) is safe, not just the ones that remembered. A no-op on a valid
         // `BoxName`; defence in depth if a legacy/forged record ever carried control bytes. (command is
@@ -2904,7 +3001,7 @@ pub fn prune() -> (usize, u64) {
     //
     // `clear_box_env` drops it on the normal exit path, which is the fix at the source; this is the
     // net beneath it, for the box whose supervisor was SIGKILLed and never ran its teardown.
-    for target in [health_dir(), env_dir(), deadline_dir()] {
+    for target in [health_dir(), env_dir(), deadline_dir(), attempt_dir()] {
         sweep_orphans(target, sidecar_key, &live, inst, &mut removed, &mut freed);
     }
     // `kern wait` exit sidecars of boxes whose supervisor is gone (dead-pid). Reaped here too, not
@@ -3455,6 +3552,41 @@ pub(crate) fn command_line(argv: &[String]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use super::Attempt;
+
+    #[test]
+    fn an_attempt_reads_back_as_written_and_refuses_anything_else() {
+        for a in [
+            Attempt::Running {
+                since_ms: 1_795_000_000_000,
+            },
+            Attempt::Restarting {
+                since_ms: 7,
+                code: 137,
+            },
+            Attempt::Restarting {
+                since_ms: 7,
+                code: -1,
+            },
+        ] {
+            assert_eq!(Attempt::parse(&a.render()), Some(a));
+        }
+        for bad in [
+            "",
+            "run",
+            "run x",
+            "restarting 5",
+            "restarting 5 x",
+            "run 5 6",
+            "up 5",
+        ] {
+            assert_eq!(Attempt::parse(bad), None, "{bad:?}");
+        }
+    }
 }
 
 #[cfg(test)]

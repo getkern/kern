@@ -21,26 +21,13 @@ use std::os::unix::io::FromRawFd; // for File::from_raw_fd (the pid-delivery pip
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt; // for Command::pre_exec
 
-/// "The same host", spelled ONCE. The root label's trailing dot is not part of the name and the
-/// comparison is case-insensitive, so `PyPI.ORG.` and `pypi.org` are one host - and every decision in
-/// this file that asks "is this that host?" has to agree about it. `None` for a name that normalises
-/// to nothing.
-///
-/// WHY IT IS A FUNCTION. It was written out three times: here, in `host_of_authority`'s tail, and in
-/// the `Host:`-agreement check. A cleanup pass pointed out the direction the drift would fail in,
-/// which is the reason this is worth a function: the allowlist decides "may the box reach this", and
-/// the agreement check decides "is the head's `Host:` the same host we vetted". If the second learns a
-/// folding rule the first does not (IDNA, a leading dot, odd whitespace), a `Host:` the allowlist
-/// would call DIFFERENT compares EQUAL here and the head is forwarded. Permissive is the wrong
-/// direction for a control, so the two cannot be allowed to drift apart by construction.
-fn normalized_host(host: &str) -> Option<String> {
-    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if h.is_empty() {
-        None
-    } else {
-        Some(h)
-    }
-}
+// ONE READER OF A REQUEST HEAD, shared with the local router (`localrouter.rs`): where a head ends,
+// how it is framed, which line is `Host`, what host a request line names. See `kern_common::httphead`.
+#[cfg(test)]
+use kern_common::httphead::has_bare_lf;
+pub(crate) use kern_common::httphead::{
+    head_end, host_of_authority, http_head_names_one_host, normalized_host, parse_http_host,
+};
 
 /// Is `host` covered by the allowlist? A match is an EXACT equal to an entry, or a subdomain of one
 /// (`host` ends with `.<entry>`). Case-insensitive; a trailing dot is ignored. This is the whole
@@ -310,109 +297,6 @@ pub fn parse_connect_host(line: &str) -> Option<String> {
     }
     let target = it.next()?; // host:port
     host_of_authority(target)
-}
-
-/// Parse the host of a plain-HTTP proxied request: the absolute-form request-target
-/// (`GET http://host/path …`) or, failing that, the `Host:` header. Returns the bare host.
-/// Does this request head contain a BARE LF - a `\n` not preceded by `\r`?
-///
-/// Extracted from `handle_client` so it can be asserted. The check lived inline in a function that
-/// takes a socket, so nothing could reach it: a mutation testing sweep flipped its comparison, every
-/// one of 920 tests stayed green, and the inverted form ACCEPTS a smuggled request while REJECTING
-/// well-formed CRLF. A security control with no coverage is a security control until somebody
-/// changes the line above it.
-///
-/// See the caller for why bare LF is refused rather than normalised: we terminate the head on strict
-/// CRLF while `.lines()` and the upstream may treat a lone `\n` as a line end, and that
-/// read-vs-parse-vs-upstream disagreement is request smuggling.
-pub fn has_bare_lf(head: &[u8]) -> bool {
-    head.iter()
-        .enumerate()
-        .any(|(i, &b)| b == b'\n' && (i == 0 || head[i - 1] != b'\r'))
-}
-
-pub fn parse_http_host(request_line: &str, headers: &str) -> Option<String> {
-    // absolute-form: METHOD http://host[:port]/path VERSION
-    if let Some(target) = request_line.split_whitespace().nth(1) {
-        if let Some(rest) = target
-            .strip_prefix("http://")
-            .or_else(|| target.strip_prefix("https://"))
-        {
-            let authority = rest.split('/').next().unwrap_or(rest);
-            if let Some(h) = host_of_authority(authority) {
-                return Some(h);
-            }
-        }
-    }
-    // fall back to the Host header, through the one function that recognises it
-    host_header_values(headers)
-        .next()
-        .and_then(host_of_authority)
-}
-
-/// Every `Host:` field value in a head, in order, borrowed from it.
-///
-/// ONE PLACE RECOGNISES THE HEADER. `parse_http_host`'s fallback below and the agreement check both
-/// have to find the same field, and they used to look for it with two copies of the same
-/// `split_once(':')` + `eq_ignore_ascii_case("Host")` test. Any later change to what counts as the
-/// header (an obs-fold continuation, whitespace before the colon, a `Host` in a trailer) then lands in
-/// one of them, and the check silently stops guarding the value that is actually dialled.
-///
-/// An iterator rather than a count plus a value: the only question anyone asks is "none, one, or more
-/// than one", which `next()` twice answers without a tally that could be read apart from the value.
-fn host_header_values(headers: &str) -> impl Iterator<Item = &str> {
-    headers
-        .lines()
-        .filter_map(|l| l.split_once(':'))
-        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("Host"))
-        .map(|(_, v)| v.trim())
-}
-
-/// Whether a plain-HTTP head is self-consistent about WHICH host it is for: at most one `Host:` line,
-/// and if there is one it names the same host the request-target does. `target` is the already-parsed
-/// and allowlist-vetted host (`parse_http_host`).
-///
-/// Both halves answer the same question - "could the upstream pick a different site than the one we
-/// vetted?" - and the answer must be no before the head is forwarded. A head with NO `Host:` at all is
-/// consistent by construction (HTTP/1.0 without it is legal and there is nothing to disagree with);
-/// the target was vetted, so that is the site that gets served.
-pub fn http_head_names_one_host(target: &str, headers: &str) -> bool {
-    let mut values = host_header_values(headers);
-    match (values.next(), values.next()) {
-        // NO `Host:` AT ALL is consistent by construction: HTTP/1.0 without one is legal, the target
-        // was vetted, and there is nothing that could disagree with it.
-        (None, _) => true,
-        // TWO OR MORE, whatever they say. RFC 9112 §3.2 makes such a message invalid, and the reason is
-        // this exact disagreement class: we would vet the first and an upstream may honour the last.
-        (Some(_), Some(_)) => false,
-        // ONE, so it has to be the host we vetted - normalised through `normalized_host`, which is also
-        // what the allowlist decided with, so the guard and the decision it guards cannot disagree.
-        // PRESENT-BUT-UNPARSABLE IS NOT ABSENT: `Host:   ` names no host, and forwarding a malformed
-        // field an upstream may read differently than we did is the same class as carrying two.
-        (Some(v), None) => match (host_of_authority(v), normalized_host(target)) {
-            (Some(h), Some(t)) => h == t,
-            _ => false,
-        },
-    }
-}
-
-/// The bare host of an `authority` (`host`, `host:port`, `[v6]:port`), lowercased, brackets/port
-/// stripped. Rejects an empty host.
-fn host_of_authority(authority: &str) -> Option<String> {
-    let a = authority.trim();
-    // Strip any `[userinfo@]` FIRST (RFC 3986 authority = `[userinfo@]host[:port]`). Without this, an
-    // absolute-URI like `http://allowed.com@evil.com/` would leave the vetted string holding `allowed.com`
-    // while the RFC host is `evil.com`: a mismatch between what we allowlist-check and what we would dial.
-    // `rsplit_once('@')` takes the LAST `@`, since userinfo may itself contain an (encoded) `@`.
-    let a = a.rsplit_once('@').map(|(_, h)| h).unwrap_or(a);
-    let host = if let Some(rest) = a.strip_prefix('[') {
-        // [v6]:port → v6
-        rest.split(']').next()?
-    } else {
-        // host:port → host (rsplit so a bare host with no colon works too)
-        a.rsplit_once(':').map(|(h, _)| h).unwrap_or(a)
-    };
-    normalized_host(host)
 }
 
 /// Ports the proxy will tunnel to. A domain allowlist is about reaching a web host, not arbitrary
@@ -877,7 +761,12 @@ fn handle_client(mut client: UnixStream, policy: &EgressPolicy) {
             Ok(0) => return,
             Ok(_) => {
                 head.push(byte[0]);
-                if head.ends_with(b"\r\n\r\n") {
+                // `head_end` also ends a head on a bare `\n\n`, so the refusal below answers at once
+                // instead of after the read deadline. ONLY THE TAIL IS ASKED: a terminator that was not
+                // there one byte ago can only end on this byte, and the longest one (`\n\r\n`) is three
+                // bytes, so this is `head_end`'s answer without rescanning up to 16 KiB per byte, a cost
+                // a box could set at will.
+                if head_end(&head[head.len().saturating_sub(3)..]).is_some() {
                     break;
                 }
             }
@@ -890,7 +779,9 @@ fn handle_client(mut client: UnixStream, policy: &EgressPolicy) {
     // a bare LF can carry a second `Host:` (or a second request) that we parse as one header block and vet
     // as the allowed host, while the upstream splits on the LF and honours the smuggled `Host: evil.com`.
     // Only strict CRLF framing is accepted; real clients (pip/curl/wget) always send it.
-    if has_bare_lf(&head) {
+    // AND EVERY OTHER SHAPE A SERVER COULD SPLIT DIFFERENTLY: a bare CR, a control byte, a folded or
+    // nameless header line, two lengths, a length with a chunked body (`kern_common::httphead::framing`).
+    if kern_common::httphead::framing(&head).is_err() {
         let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
         return;
     }

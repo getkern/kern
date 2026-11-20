@@ -705,7 +705,7 @@ pub fn ps(
                 // An object rather than the registry's comma-joined text, because a consumer that
                 // has to re-split a string is doing the parsing this document exists to avoid.
                 format!(
-                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"labels\":{},\"health\":{},\"status\":{}}}",
+                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"status\":{}}}",
                     json_str(&b.name),
                     b.pid,
                     json_str(&b.pod),
@@ -713,6 +713,9 @@ pub fn ps(
                     json_str(&b.command),
                     b.started,
                     json_str(&b.ports),
+                    // The `.localhost` URL its published port answers at, `null` without one.
+                    crate::localrouter::url_of(&b.name, &b.pod, &b.ports)
+                        .map_or_else(|| "null".to_string(), |u| json_str(&u)),
                     labels_json(&b.labels),
                     json_str(&registry::health_of(&b.name, b.pid)),
                     json_str(&super::box_status(b, "running")),
@@ -851,10 +854,16 @@ pub fn ps(
         let rows: Vec<(&registry::Instance, u64, String, String)> = boxes
             .iter()
             .map(|b| {
-                let up = now.saturating_sub(b.started);
+                // Up since the CURRENT run (a `--restart` box is run again in place).
+                let (since, restarting) = super::current_run(b);
+                let up = now.saturating_sub(since);
                 // A frozen box (`kern pause`) is reported as "paused" here - otherwise it looks
-                // identical to a running one in `ps`. `-` when no health check is configured.
-                let health = box_status(b, "-");
+                // identical to a running one in `ps`. `-` when no health check is configured. A box
+                // between two runs says so, with the code the last one exited with.
+                let health = match restarting {
+                    Some(code) => format!("restarting ({code})"),
+                    None => box_status(b, "-"),
+                };
                 let ports = if b.ports.is_empty() {
                     "-".to_string()
                 } else {
@@ -869,6 +878,14 @@ pub fn ps(
             .chain(std::iter::once(5)) // len("PORTS")
             .max()
             .unwrap_or(5);
+        // HEALTH is measured too, with its old 9 as the floor: `restarting (137)` is wider, and a
+        // fixed cell pushed PORTS and COMMAND out of line on exactly the row a reader is watching.
+        let hw = rows
+            .iter()
+            .map(|(_, _, h, _)| h.chars().count())
+            .chain(std::iter::once(9))
+            .max()
+            .unwrap_or(9);
         // THE NAME COLUMN IS MEASURED, NOT ASSUMED. It was a fixed 16, and every name longer than
         // that pushed PID, UPTIME, HEALTH and PORTS out of line for the whole table. A compose box is
         // named `<project>-<hash8>-<service>`, which passes 16 for any service name at all, so the
@@ -890,7 +907,7 @@ pub fn ps(
                 .chain(exited.iter().map(|e| e.name.as_str()))
                 .chain(kept.iter().map(|k| k.name.as_str())),
             16,
-            29 + pw,
+            20 + hw + pw,
         );
         // On a TTY, truncate COMMAND to the remaining width so a long command never wraps (like
         // `docker ps`); piped/non-TTY prints it whole so scripts get the full line.
@@ -899,9 +916,9 @@ pub fn ps(
         let p = crate::ui::Palette::detect();
         // The visible width before COMMAND is fixed (16+1+7+1+7+2+9+1+pw+1 = 45+pw), so the budget
         // is computed arithmetically - colour codes never enter the count.
-        let prefix_w = nw + 29 + pw;
+        let prefix_w = nw + 20 + hw + pw;
         println!(
-            "{d}{:<nw$} {:>7} {:>7}  {:<9} {:<pw$} COMMAND{z}",
+            "{d}{:<nw$} {:>7} {:>7}  {:<hw$} {:<pw$} COMMAND{z}",
             "NAME",
             "PID",
             "UPTIME",
@@ -963,7 +980,7 @@ pub fn ps(
                     "unhealthy" => p.r,
                     _ => p.d,
                 };
-                let status_cell = format!("{hc}{:<9}{}", health, p.z);
+                let status_cell = format!("{hc}{:<hw$}{}", health, p.z);
                 emit_row(
                     &name,
                     Some(b.pid),
@@ -1023,7 +1040,7 @@ pub fn ps(
                 let hc = if e.code == 0 { p.g } else { p.r };
                 // name is already scrubbed at the source (`list_exited`), so it is safe in the cell.
                 let name = format!("{b}{c}{:<nw$}{z}", e.name, b = p.b, c = p.c, z = p.z);
-                let status_cell = format!("{hc}{:<9}{}", format!("exit {}", e.code), p.z);
+                let status_cell = format!("{hc}{:<hw$}{}", format!("exit {}", e.code), p.z);
                 emit_row(
                     &name,
                     Some(e.pid),
@@ -1066,7 +1083,7 @@ pub fn ps(
                 } else {
                     p.d
                 };
-                let status_cell = format!("{hc}{:<9}{}", status, p.z);
+                let status_cell = format!("{hc}{:<hw$}{}", status, p.z);
                 let age = now.saturating_sub(k.meta.created);
                 emit_row(&name, None, &fmt_uptime(age), &status_cell, "-", &k.command);
             }
@@ -1826,7 +1843,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&gpu)
         };
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
@@ -1836,6 +1853,8 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             b.started,
             up,
             json_str(&b.ports),
+            crate::localrouter::url_of(&b.name, &b.pod, &b.ports)
+                .map_or_else(|| "null".to_string(), |u| json_str(&u)),
             labels_json(&b.labels),
             json_str(&health),
             num(mem),

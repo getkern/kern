@@ -28,6 +28,7 @@ pub const VERSION: &str = env!("KERN_VERSION");
 /// line; this is the part that fits.
 pub const TAGLINE: &str = "a fast, rootless container runtime and sandbox, no daemon";
 
+pub mod httphead;
 /// Registry credentials shared by `kern login`/`logout` and the OCI pull path.
 pub mod registry_auth;
 
@@ -583,6 +584,35 @@ pub fn set_progress_terminal(real_stderr_is_terminal: Option<bool>) {
         Some(true) => PROGRESS_IS_TERMINAL,
     };
     PROGRESS_TERMINAL.store(v, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a build's STEP LINES (`[2/5] RUN ...`) are printed: in every mode but `quiet` and `json`.
+///
+/// Not [`progress_wanted`], which answers for the decorative narration and is off when stderr is not a
+/// terminal. A step line is what a CI log or a pipe needs to show where a build is, so `auto` writes
+/// it there as `plain` does. MEASURED on 0.51.3: `kern build ... 2>&1 | cat` printed no step at all.
+pub fn build_steps_wanted() -> bool {
+    !matches!(progress_mode(), ProgressMode::Quiet | ProgressMode::Json)
+        && !LIVE_VIEW.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether a live view is drawing the steps on the terminal: the step lines are its rows then, and
+/// printing them too would say everything twice.
+static LIVE_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the live view when it starts and when it ends.
+pub fn set_live_view(on: bool) {
+    LIVE_VIEW.store(on, std::sync::atomic::Ordering::Release);
+}
+
+/// [`progress`] for a build's step lines; see [`build_steps_wanted`].
+#[macro_export]
+macro_rules! progress_step {
+    ($($arg:tt)*) => {{
+        if $crate::build_steps_wanted() {
+            eprintln!($($arg)*);
+        }
+    }};
 }
 
 /// Write one line of kern's own progress to stderr, and ONLY when [`progress_wanted`].
