@@ -106,7 +106,12 @@ fn plain_account_name(text: &str) -> Option<String> {
 
 /// Should this invocation keep root? `self-update` replaces a root-owned binary and starts no box.
 pub(crate) fn keeps_root(args: &[std::ffi::OsString], as_root_flag: bool) -> bool {
-    as_root_flag || args.get(1).is_some_and(|a| a == "self-update")
+    // `__verify-release` reads a file and its signature and starts no box: install.ps1 runs it as the
+    // distro's login user (root) on a copy in /tmp, which a move to the kern user would refuse.
+    as_root_flag
+        || args
+            .get(1)
+            .is_some_and(|a| a == "self-update" || a == "__verify-release")
 }
 
 /// The leaf this process moves into, under the delegation root. A cgroup with processes cannot give
@@ -362,6 +367,22 @@ pub(crate) fn enter_as_user_if_kern_distro() {
             acct.name
         );
     }
+    // ROOT'S FOLDERS ARE NOT THE USER'S. MEASURED on WSL (0.51.3 and 0.56.0): after `wsl -d kern` and
+    // `cd ~`, the login's home is `/root` (700), and `kern build .` there answered "build context '.'
+    // is not a directory". Said here, where the identity changes, so every verb names the real cause.
+    // SAFETY: a NUL-terminated literal; `access` checks with the real ids, which are the user's now.
+    if unsafe { libc::access(c".".as_ptr(), libc::R_OK | libc::X_OK) } != 0 {
+        let here = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        eprintln!(
+            "kern: warning: '{}' cannot read this folder ({here}): in this distro kern works as that \
+             user, so a build, a compose file or a mount from here fails. Work in {} or in a folder \
+             on C:\\ (/mnt/c/...)",
+            acct.name,
+            acct.home.display()
+        );
+    }
     let mut again = std::process::Command::new(&exe);
     again.args(args.iter().skip(1));
     if let Some(arg0) = args.first() {
@@ -445,9 +466,11 @@ mod tests {
     }
 
     #[test]
-    fn only_self_update_or_the_flag_keeps_root() {
+    fn only_self_update_the_signature_check_or_the_flag_keeps_root() {
         let a = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
         assert!(keeps_root(&a(&["kern", "self-update"]), false));
+        assert!(keeps_root(&a(&["kern", "__verify-release"]), false));
+        assert!(!keeps_root(&a(&["kern", "box", "__verify-release"]), false));
         assert!(keeps_root(&a(&["kern", "ps"]), true));
         assert!(!keeps_root(&a(&["kern", "ps"]), false));
         assert!(!keeps_root(&a(&["kern", "box", "self-update"]), false));

@@ -822,6 +822,114 @@ fn forward(target: &Target, translated: &[String]) -> std::io::Result<std::proce
         .status()
 }
 
+// ---------------------------------------------------------------------------------------------
+// `kern doctor` from Windows: one more row, the `.localhost` names seen from WINDOWS.
+//
+// WHY HERE. The router behind `<service>.<project>.localhost` binds the loopback of the WSL VM, so
+// inside the distro it binds and the doctor there is green whatever Windows does with that port.
+// What Windows does decides the other side, `curl.exe` and the browser: MEASURED on 2026-11-20, a
+// Windows program listening on 8780 took the names from Windows, while the distro saw nothing
+// wrong. The distro cannot look (interop is off), and this bridge runs on Windows: it asks the
+// distro for the port (`kern __router-port`) and tries it from here.
+// NOT "A RESERVED RANGE BREAKS IT": MEASURED the same day, a range added with `netsh int ipv4 add
+// excludedportrange` (an administered one, `*`) still let a program bind 8780 and the names
+// answered from Windows. So the row says what the bind says (access denied), not why.
+
+/// What the port looks like from Windows. Pure input to `router_row`, so the wording is tested.
+#[derive(Debug, PartialEq)]
+enum PortSeen {
+    RouterAnswers,
+    Free,
+    Reserved,
+    HeldByOther,
+    Unchecked(String),
+}
+
+/// Only a plain `kern doctor`, with no argument, gets the row: any other form (`--apparmor-profile`
+/// prints a profile on stdout) stays what the Linux side printed, byte for byte.
+fn is_plain_doctor(args: &[String]) -> bool {
+    matches!(args, [only] if only == "doctor")
+}
+
+/// `kern __router-port` prints `<port> running`, `<port> idle`, `off` or `none`.
+fn parse_router_port(out: &str) -> Option<u16> {
+    let mut f = out.split_whitespace();
+    let port = f.next()?.parse().ok()?;
+    matches!(f.next(), Some("running" | "idle")).then_some(port)
+}
+
+/// The row, in the shape the Linux doctor prints its rows.
+fn router_row(port: u16, seen: &PortSeen) -> String {
+    const FIX: &str = "add `local_domains_port = <port>` under [kern] in ~/.config/kern/kern.toml \
+                       inside the distro";
+    match seen {
+        PortSeen::RouterAnswers => format!(
+            "  \u{2714} names .localhost from Windows: kern's router answers on 127.0.0.1:{port}"
+        ),
+        PortSeen::Free => format!(
+            "  \u{2714} names .localhost from Windows: port {port} is free here, so they reach kern"
+        ),
+        PortSeen::Reserved => format!(
+            "  ! names .localhost from Windows: Windows refuses to open port {port} here (access \
+             denied), so curl.exe and the browser may not reach kern\n      {FIX}"
+        ),
+        PortSeen::HeldByOther => format!(
+            "  ! names .localhost from Windows: a Windows program holds port {port}, so curl.exe \
+             and the browser reach it, not kern\n      {FIX}"
+        ),
+        PortSeen::Unchecked(why) => format!(
+            "  ! names .localhost from Windows: port {port} could not be checked ({})",
+            short(why)
+        ),
+    }
+}
+
+/// Try the port from Windows: a request kern's router answers in its own words (`kern: ` opens
+/// every body it writes), else a bind, whose refusal tells a reserved port from a held one.
+fn probe_port(port: u16) -> PortSeen {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::Duration;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    if let Ok(mut c) = TcpStream::connect_timeout(&addr, Duration::from_millis(1500)) {
+        let _ = c.set_read_timeout(Some(Duration::from_millis(2000)));
+        let _ = c.set_write_timeout(Some(Duration::from_millis(2000)));
+        let _ = c.write_all(
+            b"GET / HTTP/1.1\r\nHost: kern-doctor-probe.kern.localhost\r\nConnection: close\r\n\r\n",
+        );
+        let mut buf = Vec::new();
+        let _ = (&mut c).take(8192).read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        return if text.starts_with("HTTP/1.1 ") && text.contains("\r\n\r\nkern: ") {
+            PortSeen::RouterAnswers
+        } else {
+            PortSeen::HeldByOther
+        };
+    }
+    match TcpListener::bind(addr) {
+        Ok(_) => PortSeen::Free,
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => PortSeen::Reserved,
+        Err(e) if e.kind() == ErrorKind::AddrInUse => PortSeen::HeldByOther,
+        Err(e) => PortSeen::Unchecked(e.to_string()),
+    }
+}
+
+/// After a plain `kern doctor` went through: the Windows-side row. Silent when the distro's kern
+/// predates `__router-port` (an older kern answers with an error, which is not parsed) or when
+/// the names are off.
+fn doctor_windows_rows(target: &Target) {
+    // The same way to reach kern as every forwarded command (cached path, else the login-shell
+    // trampoline), so the doctor row asks the kern the user's commands reach.
+    let argv = forward_argv(target, &["__router-port".to_string()]);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = wsl_query(&refs);
+    let Some(port) = out.as_deref().and_then(parse_router_port) else {
+        return;
+    };
+    println!("\nfrom Windows (kern.exe):");
+    println!("{}", router_row(port, &probe_port(port)));
+}
+
 /// The one-shot Windows install command - quoted in both "distro missing" messages, so the URL
 /// lives in exactly one place.
 const INSTALL_HINT: &str =
@@ -887,7 +995,12 @@ fn main() {
                 );
                 continue;
             }
-            Ok(s) => exit(s.code().unwrap_or(1)),
+            Ok(s) => {
+                if is_plain_doctor(&args) {
+                    doctor_windows_rows(&target);
+                }
+                exit(s.code().unwrap_or(1))
+            }
             Err(e) => {
                 clear_cache(); // wsl.exe not even spawnable - force a fresh probe next time
                 eprintln!("kern: could not invoke WSL2: {e}. Is WSL installed? Try: wsl -l -v");
@@ -909,6 +1022,84 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_windows_router_row_is_only_added_to_a_plain_doctor() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_plain_doctor(&a(&["doctor"])));
+        assert!(!is_plain_doctor(&a(&["doctor", "--json"])));
+        assert!(!is_plain_doctor(&a(&["doctor", "--format", "json"])));
+        assert!(!is_plain_doctor(&a(&["ps"])));
+        assert!(!is_plain_doctor(&a(&["doctor", "--apparmor-profile"])));
+        assert!(!is_plain_doctor(&a(&[])));
+    }
+
+    #[test]
+    fn the_router_port_is_read_only_from_its_own_answer() {
+        assert_eq!(parse_router_port("8780 running\n"), Some(8780));
+        assert_eq!(parse_router_port("8781 idle"), Some(8781));
+        assert_eq!(parse_router_port("off"), None);
+        assert_eq!(parse_router_port("none"), None);
+        assert_eq!(
+            parse_router_port("error: unknown command '__router-port'"),
+            None
+        );
+        assert_eq!(parse_router_port("8780"), None);
+    }
+
+    #[test]
+    fn a_reserved_or_held_port_names_the_fix_and_a_good_one_does_not() {
+        for bad in [PortSeen::Reserved, PortSeen::HeldByOther] {
+            let r = router_row(8780, &bad);
+            assert!(r.starts_with("  ! names .localhost from Windows"), "{r}");
+            assert!(r.contains("local_domains_port"), "{r}");
+            assert!(r.contains("8780"), "{r}");
+        }
+        for good in [PortSeen::RouterAnswers, PortSeen::Free] {
+            let r = router_row(8780, &good);
+            assert!(
+                r.starts_with("  \u{2714} names .localhost from Windows"),
+                "{r}"
+            );
+            assert!(!r.contains("local_domains_port"), "{r}");
+        }
+        assert!(router_row(8780, &PortSeen::Reserved).contains("access denied"));
+        assert!(router_row(8780, &PortSeen::HeldByOther).contains("holds"));
+    }
+
+    #[test]
+    fn the_probe_tells_kerns_router_from_another_program_and_from_a_free_port() {
+        use std::io::{Read, Write};
+        // Another program: answers HTTP, but not in kern's words.
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = other.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            if let Ok((mut c, _)) = other.accept() {
+                let mut b = [0u8; 512];
+                let _ = c.read(&mut b);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+            }
+        });
+        assert_eq!(probe_port(p), PortSeen::HeldByOther);
+        let _ = t.join();
+        // kern's router: its refusal body opens with `kern: `.
+        let router = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = router.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            if let Ok((mut c, _)) = router.accept() {
+                let mut b = [0u8; 512];
+                let _ = c.read(&mut b);
+                let _ = c.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\nkern: no box\n");
+            }
+        });
+        assert_eq!(probe_port(p), PortSeen::RouterAnswers);
+        let _ = t.join();
+        // Nothing there: free.
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = free.local_addr().unwrap().port();
+        drop(free);
+        assert_eq!(probe_port(p), PortSeen::Free);
+    }
     #[test]
     fn bare_path() {
         assert_eq!(win_to_wsl(r"C:\Users\me\proj"), "/mnt/c/Users/me/proj");

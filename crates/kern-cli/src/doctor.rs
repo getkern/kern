@@ -297,6 +297,8 @@ fn rows() -> Vec<R> {
     // Optional feature: multi-uid mapping.
     results.push(check_uid_range());
     results.extend(check_gpu());
+    results.extend(check_wsl_drive());
+    results.extend(check_wsl_interop());
     results.extend(check_tools());
     results.push(check_duplicate_installs());
     // How full the two stores are: the disk kern's data lives on, and the (RAM) log store.
@@ -1091,6 +1093,99 @@ fn check_identity() -> R {
     }
 }
 
+/// On WSL: how `C:\` (`/mnt/c`) is mounted, which decides what a box can do with a folder bound from it.
+///
+/// MEASURED on 0.51.3 (Supabase, PGDATA a bind of ./volumes/db/data on C:\): mounted `uid=0` without
+/// `metadata`, its files were nobody's in the box, and a box's root could neither chown nor chmod
+/// them; the database restarted for hours. With `metadata,uid=<the user>` they are the user's, which
+/// is a box's root, and keep a chown/chmod. A box still sees only what is bound into it.
+fn check_wsl_drive() -> Option<R> {
+    if !crate::commands::in_wsl() {
+        return None;
+    }
+    let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let opts = info.lines().find_map(|l| {
+        let (pre, post) = l.split_once(" - ")?;
+        (pre.split_whitespace().nth(4) == Some("/mnt/c")).then(|| post.to_string())
+    })?;
+    // SAFETY: getuid takes no arguments.
+    Some(drive_verdict(&opts, unsafe { libc::getuid() }))
+}
+
+/// On WSL: whether Windows programs start from inside this distro (`[interop]` in /etc/wsl.conf).
+///
+/// With interop on, a process that escapes a box (uid 1000 of the distro) can start cmd.exe or
+/// powershell.exe as the Windows user. kern starts no Windows program (MEASURED with interop off:
+/// boxes, --gpus, published ports and their names, kern.exe from Windows all work).
+///
+/// THE REFUSAL IS WINDOWS'. MEASURED on 2026-11-20 with interop off, as uid 1000: `/run/WSL/N_interop`
+/// is still there and world-writable, binfmt `WSLInterop` still reads enabled, and cmd.exe through
+/// binfmt, through `/init` directly and with `WSL_INTEROP` pointed at each socket all end in
+/// "UtilAcceptVsock: accept4 failed 110": Windows never answers. So the line says what was measured,
+/// that Windows refuses, not that nothing in the distro can ask.
+fn check_wsl_interop() -> Option<R> {
+    if !crate::commands::in_wsl() {
+        return None;
+    }
+    let conf = std::fs::read_to_string("/etc/wsl.conf").unwrap_or_default();
+    Some(interop_verdict(&conf))
+}
+
+/// The verdict on interop from the text of /etc/wsl.conf: off only when `[interop]` says
+/// `enabled=false` (WSL's default is on).
+fn interop_verdict(conf: &str) -> R {
+    let mut in_interop = false;
+    let mut off = false;
+    for line in conf.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_interop = l.eq_ignore_ascii_case("[interop]");
+            continue;
+        }
+        if in_interop {
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("enabled") {
+                    off = v.trim().eq_ignore_ascii_case("false");
+                }
+            }
+        }
+    }
+    if off {
+        R::ok("WSL interop: off in /etc/wsl.conf: Windows refuses this distro's programs".into())
+    } else {
+        R::Warn(
+            "WSL interop: on, a process that escapes a box can start Windows programs as you"
+                .into(),
+            "kern needs none: add `enabled=false` under [interop] in /etc/wsl.conf (install.ps1 \
+             does), then `wsl --terminate <distro>`"
+                .into(),
+        )
+    }
+}
+
+/// The verdict on `/mnt/c` from its mountinfo tail (`<fstype> <source> <options>`), for `uid`.
+fn drive_verdict(tail: &str, uid: u32) -> R {
+    let opts: Vec<&str> = tail
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .collect();
+    let metadata = opts.contains(&"metadata");
+    let mine = opts.contains(&format!("uid={uid}").as_str());
+    if metadata && mine {
+        R::ok_note(
+            "C:\\ (/mnt/c): its files are yours, a box's root, and keep chown/chmod (metadata)",
+            "a box sees only the folders bound into it",
+        )
+    } else {
+        R::Warn(
+            "C:\\ (/mnt/c): a box's root cannot chown or chmod a folder bound from it".into(),
+            "it is mounted without metadata or as another user, so a database keeping its data \
+             there fails: run install.ps1 again (it sets [automount] in /etc/wsl.conf), or keep \
+             that data in a named volume"
+                .into(),
+        )
+    }
+}
+
 /// `r` with `suffix` appended to its message.
 fn with_suffix(r: R, suffix: &str) -> R {
     match r {
@@ -1113,13 +1208,13 @@ fn identity_verdict(uid: u32, in_kern_distro: bool, user: Option<&str>) -> R {
         ),
         (uid, true) => R::Ok(
             format!(
-                "identity: kern runs as {} (uid {uid}), not root: a box's root is uid {uid} of this distro",
+                "identity: kern runs as {} (uid {uid}): a box's root is uid {uid} of this distro",
                 user.unwrap_or("its user")
             ),
             format!(
                 "kern started as root here gives root up first; an escape from a box would be uid \
-                 {uid}: no capability, no other distro's disk, but the Windows files under /mnt/c \
-                 that kern itself reads"
+                 {uid}: no capability, no other distro's disk, but every file of C:\\ this Windows \
+                 user can open (WSL's file server answers uid {uid})"
             ),
         ),
         (uid, false) => R::Ok(
@@ -2046,6 +2141,14 @@ fn check_tools() -> Vec<R> {
         // Required for the OCI pull path.
         tool_req("tar", "kern pull / --image", "install GNU tar >= 1.27"),
         tool_req("curl", "kern pull / --image", "install curl"),
+        // Images whose layers are zstd-compressed (some official ones are, e.g. apache/airflow 3.4)
+        // do not pull without it, and the pull only said so at the first such image.
+        tool_opt(
+            "zstd",
+            "kern pull of images with zstd-compressed layers",
+            "",
+            "install zstd (apt install zstd / dnf install zstd / apk add zstd); gzip images pull without it",
+        ),
         // Optional, per-feature.
         tool_opt(
             "mkfs.ext4",
@@ -2668,6 +2771,44 @@ fn which(bin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Interop is off only when `[interop]` says so; WSL's default is on.
+    #[test]
+    fn wsl_interop_is_off_only_when_the_interop_section_says_so() {
+        let off = "[boot]\nsystemd=false\n[interop]\nappendWindowsPath=false\nenabled=false\n";
+        let on_default = "[interop]\nappendWindowsPath=false\n";
+        let elsewhere = "[interop]\nappendWindowsPath=false\n[other]\nenabled=false\n";
+        assert!(matches!(super::interop_verdict(off), super::R::Ok(..)));
+        assert!(matches!(
+            super::interop_verdict(on_default),
+            super::R::Warn(..)
+        ));
+        assert!(matches!(
+            super::interop_verdict(elsewhere),
+            super::R::Warn(..)
+        ));
+        assert!(matches!(super::interop_verdict(""), super::R::Warn(..)));
+    }
+
+    /// The two mounts WSL2 gives `C:\`, as /proc/self/mountinfo tails them.
+    #[test]
+    fn a_wsl_drive_is_judged_by_metadata_and_its_owner() {
+        let drvfs_root = "9p C:\\ rw,dirsync,aname=drvfs;path=C:\\;uid=0;gid=0;symlinkroot=/mnt/,mmap,access=client";
+        let drvfs_mine = "9p C:\\ rw,dirsync,aname=drvfs;path=C:\\;uid=1000;gid=1000;metadata;umask=22;symlinkroot=/mnt/,mmap";
+        assert!(matches!(
+            super::drive_verdict(drvfs_root, 1000),
+            super::R::Warn(..)
+        ));
+        assert!(matches!(
+            super::drive_verdict(drvfs_mine, 1000),
+            super::R::Ok(..)
+        ));
+        // The user's own mount but not theirs: still a warning.
+        assert!(matches!(
+            super::drive_verdict(drvfs_mine, 1001),
+            super::R::Warn(..)
+        ));
+    }
+
     #[test]
     fn the_verdict_tally_inflects_and_omits_a_zero() {
         use super::tally;
@@ -3902,7 +4043,7 @@ mod tests {
         let host_root = identity_verdict(0, false, None);
         assert!(matches!(host_root, R::Ok(..)) && msg(&host_root).contains("this host's root"));
         let wsl_user = identity_verdict(1000, true, Some("kern"));
-        assert!(msg(&wsl_user).contains("kern (uid 1000), not root"));
+        assert!(msg(&wsl_user).contains("kern runs as kern (uid 1000): a box"));
         assert!(msg(&identity_verdict(1000, false, None)).contains("rootless"));
     }
 
