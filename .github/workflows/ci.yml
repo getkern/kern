@@ -427,7 +427,12 @@ jobs:
         run: |
           # The gate stays BARE: piping into `tee` would hand the step tee's exit status and a failed
           # `compose up` would read as a pass. Capture first, show second, assert third.
-          ./target/debug/kern compose examples/compose/compose-webstack.toml up > /tmp/up.log 2>&1 || {
+          #
+          # `-d`: since v0.56.0 an `up` without it follows the stack until every service has ended, as
+          # Docker's does, and this stack is a server and a cache that never end. Without `-d` this step
+          # waited out GitHub's six-hour limit on every run from 4ca386e on. `-d` still holds the web
+          # service for the cache's health probe and says so, which is the line asserted below.
+          ./target/debug/kern compose examples/compose/compose-webstack.toml up -d > /tmp/up.log 2>&1 || {
             cat /tmp/up.log >&2; exit 1
           }
           cat /tmp/up.log

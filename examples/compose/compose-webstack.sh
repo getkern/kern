@@ -2,7 +2,7 @@
 # Bring up a richer `kern compose` stack - a cache with a health check + a web front-end that
 # waits for that health - then reach it from the host and tear it all down.
 #
-#   kern compose <file>          bring the stack up, in dependency + HEALTH order
+#   kern compose <file> up -d    bring the stack up, in dependency + HEALTH order
 #   kern compose <file> down     stop every box and remove the stack's shared pod
 #
 # `kern compose` topologically sorts by dependency, starts each box detached, and for a
@@ -40,7 +40,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "==> bringing up the stack (cache must go HEALTHY before web starts):"
-"$kern" compose "$stack"
+# `-d`: without it `up` follows the stack until every service ends, as Docker's does, and a server
+# and a cache never end, so the steps below would never run.
+"$kern" compose "$stack" up -d
 
 echo
 echo "==> kern ps - note the HEALTH column on 'cache' and the published PORT on 'web':"
