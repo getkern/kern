@@ -152,23 +152,33 @@ jobs:
       && (needs.evidence.result == 'success' || needs.evidence.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
-      contents: write # anchore/sbom-action attaches the SBOM to the tag's release
+      contents: read
     # The dependency tree is identical across targets (one Cargo.lock), so the SBOM is generated
-    # once for the whole project rather than per matrix target. On a tag push the action attaches
-    # kern.spdx.json to the release itself (upload-release-assets defaults to true).
+    # once for the whole project rather than per matrix target; the audit checks it on the other one.
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
-      - name: Generate SPDX SBOM (Syft) for the publish job
-        uses: anchore/sbom-action@v0
+      # From the crate graph the release binary links, not a scan of the checkout: Syft listed the
+      # fuzz/dev crates, windows/kern-win, bindings and the workflow actions as kern's components.
+      - name: Generate SPDX SBOM (sbom-attest) for the publish job
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          cargo install sbom-attest --version 0.4.0 --locked
+          sbom-attest generate --package getkern --target x86_64-unknown-linux-musl --locked --name kern --product-version "${TAG#v}" --spdx kern.spdx.json
+      - name: Fail if the SBOM disagrees with the build
+        uses: Mattbusel/sbom-attest@v0.4.0
         with:
-          path: .
-          format: spdx-json
-          artifact-name: kern.spdx.json
-          # The publish job attaches it with the rest: the action finds a release by tag, which does
-          # not see a draft.
-          upload-release-assets: false
+          sbom: kern.spdx.json
+          package: getkern
+          target: aarch64-unknown-linux-musl
+      # The publish job attaches it with the rest.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kern.spdx.json
+          path: kern.spdx.json
+          if-no-files-found: error
 
   windows:
     # GATED THROUGH `build`, whose x86_64 tarball it needs: the kern inside the WSL rootfs IS that
