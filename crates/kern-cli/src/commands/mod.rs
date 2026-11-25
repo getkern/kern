@@ -451,6 +451,10 @@ pub struct BoxRunArgs<'a> {
     pub log_max_file: Option<u32>,
     /// `--log-driver none`: keep no log of the box's output.
     pub log_none: bool,
+    /// `--log-driver journald`: every line also goes to the systemd journal.
+    pub log_journald: bool,
+    /// A `--log-driver` was given; without one, `[kern] log_driver` decides.
+    pub log_driver_given: bool,
     /// `--log-streams` (internal, the Docker API server's): keep stdout and stderr apart in the log.
     pub log_streams: bool,
     /// `--memory-reservation`: cgroup `memory.low`, a soft floor.

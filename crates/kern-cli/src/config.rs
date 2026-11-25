@@ -276,6 +276,9 @@ pub struct KernSettings {
     /// `history_dir` - the sandbox history when it is kept on disk. Absent means `data_dir`'s
     /// `history/`.
     pub history_dir: Option<std::path::PathBuf>,
+    /// `log_driver` - the log driver of a box that names none, as `daemon.json`'s `log-driver`:
+    /// `json-file`/`local` (the file, the default), `journald` (the file and the journal), `none`.
+    pub log_driver: Option<String>,
 }
 
 /// The `[kern]` keys that place a part of kern's data on a disk, with what each holds: one table
@@ -369,6 +372,11 @@ pub(crate) const SETTABLE_KERN_KEYS: &[(&str, SettingKind, &str)] = &[
         "history_dir",
         SettingKind::Path,
         "the sandbox history kept on disk (default data_dir's history/)",
+    ),
+    (
+        "log_driver",
+        SettingKind::Word(&["json-file", "local", "journald", "none"]),
+        "the log driver of a box that names none (default json-file; journald also writes the journal)",
     ),
     (
         "publish_bind",
@@ -1262,6 +1270,11 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
         }
         "sandbox_transcripts" => k.sandbox_transcripts = Some(value_bool(v)?),
         "local_domains" => k.local_domains = Some(value_bool(v)?),
+        "log_driver" => {
+            let d = value_string(v)?;
+            crate::cli::log_driver_flags(&d).map_err(|e| format!("[kern] log_driver = {e}"))?;
+            k.log_driver = Some(d);
+        }
         "data_dir" | "images_dir" | "volumes_dir" | "logs_dir" | "history_dir" => {
             let raw = value_string(v)?;
             let dir = Some(check_data_dir(&raw).map_err(|e| format!("[kern] {key} = {e}"))?);

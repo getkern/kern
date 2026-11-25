@@ -486,8 +486,15 @@ pub fn info() -> Result<(), Error> {
     // EACH PART WITH WHERE ITS PLACE COMES FROM: the default (the data dir), or its own key.
     let set_by = |key: &str| crate::config::dir_setting(key).is_some();
     if let (Some(data), Some(cache)) = (data, cache) {
+        // AS ROOT, the default is root's home; a server keeps container data in `/var/lib`, where
+        // Docker keeps its own, and one command puts it there. Said, not done: an existing root
+        // install has its images and volumes at the default place.
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
         let why = if set_by("data_dir") {
             "[kern] data_dir"
+        } else if root {
+            "default; on a server `kern config set data_dir /var/lib/kern` keeps it where Docker keeps its"
         } else {
             "default; `kern config set data_dir <path>` moves it all"
         };
@@ -552,6 +559,16 @@ pub fn info() -> Result<(), Error> {
     } else {
         format!("in {logs_at} (default, on disk: kept across reboots)")
     };
+    let driver = k.and_then(|k| k.log_driver.clone());
+    row(
+        "log driver",
+        &match driver {
+            Some(d) => format!("{d} ([kern] log_driver; `--log-driver` on a box wins)"),
+            None => "json-file (default; journald also writes the systemd journal: \
+                     `kern config set log_driver journald` or `--log-driver journald`)"
+                .to_string(),
+        },
+    );
     row(
         "box logs",
         &format!(

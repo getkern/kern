@@ -211,6 +211,10 @@ pub enum Command {
         log_max_file: Option<u32>,
         /// `--log-driver none`: the box's output is not kept (Docker's driver of that name).
         log_none: bool,
+        /// `--log-driver journald`: every line also goes to the journal.
+        log_journald: bool,
+        /// A `--log-driver` was given: `[kern] log_driver` applies only when it was not.
+        log_driver_given: bool,
         /// `--log-streams`: written by the Docker API server, never typed by hand. The log records
         /// which of its bytes came from stderr, so `docker logs` answers the two apart.
         log_streams: bool,
@@ -4391,6 +4395,8 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut log_max_size: Option<u64> = None;
     let mut log_max_file: Option<u32> = None;
     let mut log_none = false;
+    let mut log_journald = false;
+    let mut log_driver_given = false;
     let mut log_streams = false;
     let mut memory_reservation: Option<u64> = None;
     let mut cpu_weight: Option<u64> = None;
@@ -5513,18 +5519,12 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--log-streams" => log_streams = true,
                 "--log-driver" => {
                     i += 1;
-                    match rest.get(i).map(|v| v.to_string()).as_deref() {
-                        Some("none") => log_none = true,
-                        Some("json-file" | "local") => log_none = false,
-                        Some(other) => {
-                            return Err(Error::Cli(format!(
-                                "--log-driver {other}: kern keeps a box's output in a local file \
-                                 (`kern logs`) or, with `none`, keeps nothing; it does not ship it \
-                                 to another place. Accepted: json-file, local, none"
-                            )))
-                        }
-                        None => return Err(Error::Usage("--log-driver <json-file|local|none>")),
-                    }
+                    log_driver_given = true;
+                    let v = rest.get(i).map(|v| v.to_string());
+                    (log_none, log_journald) = log_driver_flags(v.as_deref().ok_or(
+                        Error::Usage("--log-driver <json-file|local|journald|none>"),
+                    )?)
+                    .map_err(|e| Error::Cli(format!("--log-driver {e}")))?;
                 }
                 // A SIZE, AND NOT ZERO. `memory.low = 0` is the kernel's default (no protection), so
                 // accepting a `0` would let a file ask for something and get nothing, which reads as
@@ -5888,6 +5888,8 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             log_max_size,
             log_max_file,
             log_none,
+            log_journald,
+            log_driver_given,
             log_streams,
             memory_reservation,
             cpu_weight,
@@ -7156,6 +7158,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             log_max_size,
             log_max_file,
             log_none,
+            log_journald,
+            log_driver_given,
             log_streams,
             memory_reservation,
             cpu_weight,
@@ -7359,6 +7363,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     log_max_size,
                     log_max_file,
                     log_none,
+                    log_journald,
+                    log_driver_given,
                     log_streams,
                     memory_reservation,
                     cpu_weight,
@@ -7875,8 +7881,36 @@ fn parse_self_update(args: &[&str]) -> Result<crate::selfupdate::Request, Error>
     }
 }
 
+/// A log driver's name as the two switches a box carries: `(keep nothing, also to the journal)`.
+/// The drivers Docker has and kern keeps a local file for (`json-file`, `local`), `journald` (that
+/// file too, and the journal), and `none`. Shipping elsewhere (`syslog`, `fluentd`, ...) is refused by
+/// name, not dropped.
+pub(crate) fn log_driver_flags(d: &str) -> Result<(bool, bool), String> {
+    match d {
+        "none" => Ok((true, false)),
+        "json-file" | "local" => Ok((false, false)),
+        "journald" => Ok((false, true)),
+        other => Err(format!(
+            "{other}: kern keeps a box's output in a local file (`kern logs`), also sends it to the \
+             systemd journal with journald, or with none keeps nothing; it does not ship it to another \
+             place. Accepted: json-file, local, journald, none"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The log drivers a box takes, and the one way to ship output elsewhere refused by name.
+    #[test]
+    fn log_drivers_map_to_keep_and_journal() {
+        assert_eq!(log_driver_flags("json-file"), Ok((false, false)));
+        assert_eq!(log_driver_flags("local"), Ok((false, false)));
+        assert_eq!(log_driver_flags("journald"), Ok((false, true)));
+        assert_eq!(log_driver_flags("none"), Ok((true, false)));
+        assert!(log_driver_flags("syslog").is_err_and(|e| e.contains("journald")));
+    }
+
     use super::*;
 
     /// Every `--ulimit` name the usage line advertises resolves, and nothing else does.

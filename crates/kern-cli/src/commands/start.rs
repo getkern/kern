@@ -3289,14 +3289,37 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The box's own flag first, then `[kern] log_max_size` / `log_max_file`, then kern's default:
     // Docker's order (`--log-opt` over `daemon.json` over the built-in). A `kern.toml` that does not
     // parse leaves the built-in in force rather than failing a box over its log.
+    // `[kern] log_driver` for a box that names none, as `daemon.json`'s `log-driver` for a
+    // container: read here, at the start, and not by the argument parser, which reads no file.
+    let (log_none, log_journald) = if args.log_driver_given {
+        (args.log_none, args.log_journald)
+    } else {
+        crate::config::load_cached(None)
+            .ok()
+            .and_then(|c| c.kern.log_driver.clone())
+            .and_then(|d| crate::cli::log_driver_flags(&d).ok())
+            .unwrap_or((args.log_none, args.log_journald))
+    };
     let log_cap = crate::commands::boxlog::LogCap {
         streams: args.log_streams,
+        journald: log_journald,
         ..crate::commands::boxlog::LogCap::resolve(
             args.log_max_size,
             args.log_max_file,
-            !args.log_none,
+            !log_none,
         )
     };
+    // JOURNALD THAT IS NOT THERE IS A REFUSAL, as Docker refuses the container: a box started with a
+    // driver that silently did nothing would leave the journal empty on the day it is read. WSL
+    // without systemd, a container, a host without journald have no socket.
+    if log_cap.journald && !std::path::Path::new(crate::commands::boxlog::JOURNAL_SOCKET).exists() {
+        return Err(Error::Sandbox(format!(
+            "--log-driver journald: there is no systemd journal here ({} is missing: WSL without \
+             systemd, a container, a host without journald). Use the default driver (`kern logs` \
+             reads it), or `kern config set log_driver json-file` if the config chose journald",
+            crate::commands::boxlog::JOURNAL_SOCKET
+        )));
+    }
     // THE RECORD IS WRITTEN HERE: past every argument-coherence refusal and immediately before the
     // box is launched.
     //
@@ -3423,10 +3446,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 )
             },
             bridges: registry::encode_bridges(&spec.pod_bridges),
-            log_driver: if log_cap.keep {
-                String::new()
-            } else {
+            log_driver: if !log_cap.keep {
                 "none".to_string()
+            } else if log_cap.journald {
+                "journald".to_string()
+            } else {
+                String::new()
             },
             landlock_rw: spec.landlock_rw.join(","),
             labels: registry::encode_labels(args.labels),
@@ -6038,10 +6063,12 @@ fn run_detached(
             Some(e) => format!("{} deny {}", e.allow.join(","), e.deny.join(",")),
         },
         bridges: registry::encode_bridges(&spec.pod_bridges),
-        log_driver: if log_cap.keep {
-            String::new()
-        } else {
+        log_driver: if !log_cap.keep {
             "none".to_string()
+        } else if log_cap.journald {
+            "journald".to_string()
+        } else {
+            String::new()
         },
         landlock_rw: spec.landlock_rw.join(","),
         labels: labels.to_string(),

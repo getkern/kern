@@ -5509,6 +5509,13 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     // service, exit 0, where `docker run --log-driver none --log-opt max-size=1m`
                     // is refused (125). `kern box` follows the second and a stack the first.
                     "none" => b.log_driver_none = true,
+                    // JOURNALD IS HONOURED: the journal gets every line, the file stays for
+                    // `kern logs`; options other than kern's two are named as above.
+                    "journald" => {
+                        b.log_driver_journald = true;
+                        b.log_max_size = max_size.clone();
+                        b.log_max_file = max_file.clone();
+                    }
                     other_drv => warn(&format!(
                         "service '{name}': 'logging: {other_drv}' has no kern equivalent - output is \
                          captured locally and read with `kern logs`, never shipped to a log server"

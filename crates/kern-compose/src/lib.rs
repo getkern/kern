@@ -419,6 +419,9 @@ pub struct ComposeBox {
     /// Compose `logging: {driver: none}` → `--log-driver none`: the service's output is not kept,
     /// as Docker keeps none for that driver.
     pub log_driver_none: bool,
+    /// Compose `logging: {driver: journald}` → `--log-driver journald`: the output also goes to the
+    /// systemd journal, the file kept for `kern logs`.
+    pub log_driver_journald: bool,
     /// Compose `mem_reservation:` → `--memory-reservation` (cgroup `memory.low`, a soft floor).
     pub memory_reservation: Option<String>,
     /// Compose `pull_policy:` → `--pull` (`always` / `never` / `missing`).
@@ -962,6 +965,8 @@ impl ComposeBox {
         }
         if self.log_driver_none {
             cmd.arg("--log-driver").arg("none");
+        } else if self.log_driver_journald {
+            cmd.arg("--log-driver").arg("journald");
         }
         if let Some(v) = &self.memory_reservation {
             cmd.arg("--memory-reservation").arg(v);
@@ -1667,6 +1672,7 @@ impl ComposeBox {
             runtime_nvidia,
             no_new_privs,
             log_driver_none,
+            log_driver_journald,
         );
         if o.uid_range_explicit_false {
             self.uid_range_explicit_false = true;
@@ -2139,7 +2145,11 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             }
             "log_max_size" => b.log_max_size = Some(val.trim().trim_matches('"').to_string()),
             "log_max_file" => b.log_max_file = Some(val.trim().trim_matches('"').to_string()),
-            "log_driver" => b.log_driver_none = val.trim().trim_matches('"') == "none",
+            "log_driver" => {
+                let d = val.trim().trim_matches('"');
+                b.log_driver_none = d == "none";
+                b.log_driver_journald = d == "journald";
+            }
             "dns" => b.dns = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "dns_search" => b.dns_search = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "dns_opt" | "dns_options" => {

@@ -1171,9 +1171,9 @@ fn create_argv_gated(
     if let Some(lc) = host.and_then(|h| h.get("LogConfig")) {
         match lc.get("Type").and_then(Value::as_str) {
             None | Some("" | "json-file" | "local") => {}
-            Some("none") => {
+            Some(d @ ("none" | "journald")) => {
                 argv.push("--log-driver".into());
-                argv.push("none".into());
+                argv.push(d.into());
             }
             Some(other) => warnings.push(format!(
                 "log driver {other:?}: kern keeps a box's output for `docker logs` (json-file)"

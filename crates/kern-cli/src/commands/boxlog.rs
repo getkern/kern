@@ -211,6 +211,11 @@ pub(crate) struct LogCap {
     /// came from, so `docker logs` can answer them apart. Off everywhere else, where the pump keeps
     /// its single pipe exactly as before. See [`streams_path`].
     pub(crate) streams: bool,
+    /// `--log-driver journald`: every line ALSO goes to the systemd journal, tagged with the box's
+    /// name, as Docker's journald driver tags a container's; the file is kept, so `kern logs` reads
+    /// the box as before (Docker's "dual logging"). The pump reads the bytes then, instead of
+    /// splicing them past userspace, and takes stdout and stderr on two pipes for their priority.
+    pub(crate) journald: bool,
 }
 
 impl Default for LogCap {
@@ -223,6 +228,7 @@ impl Default for LogCap {
             files: 2,
             keep: true,
             streams: false,
+            journald: false,
         }
     }
 }
@@ -282,6 +288,7 @@ impl PartialCap {
             files: self.files.unwrap_or(base.files),
             keep: self.keep,
             streams: base.streams,
+            journald: base.journald,
         }
     }
 }
@@ -766,7 +773,9 @@ fn pump_capped_streams(sources: &mut [(i32, u8)], path: &std::path::Path, cap: L
     let mut log = CappedLog::open(path, cap);
     // A /dev/null sink for the no-log case and disk-full overflow: the pipe must still be drained.
     let void = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-    let mut use_splice = true;
+    // `--log-driver journald`: the bytes have to pass through here to reach the journal too.
+    let mut journal = cap.journald.then(|| Journal::for_log(path)).flatten();
+    let mut use_splice = journal.is_none();
     let mut scratch = [0u8; 64 * 1024]; // read+write fallback buffer (splice-unsupported fs)
                                         // Set when there is nowhere left to put the bytes. The pipe is still drained - see the note on
                                         // this function about what leaving instead costs the workload.
@@ -851,6 +860,9 @@ fn pump_capped_streams(sources: &mut [(i32, u8)], path: &std::path::Path, cap: L
         } else {
             let n = unsafe { libc::read(rd, scratch.as_mut_ptr().cast(), scratch.len()) };
             if n > 0 {
+                if let Some(j) = journal.as_mut() {
+                    j.feed(stream, &scratch[..n as usize]);
+                }
                 match log.as_mut() {
                     Some(l) => l.write(&scratch[..n as usize]),
                     None => {
@@ -864,9 +876,87 @@ fn pump_capped_streams(sources: &mut [(i32, u8)], path: &std::path::Path, cap: L
             }
         }
     }
+    if let Some(j) = journal.as_mut() {
+        j.flush();
+    }
     if void >= 0 {
         unsafe { libc::close(void) };
     }
+}
+
+/// The systemd journal's socket: where `--log-driver journald` sends a box's lines.
+pub(crate) const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
+
+/// The journal as a box's log driver: lines in, one journal entry each, with the box's name as
+/// `CONTAINER_NAME` and `SYSLOG_IDENTIFIER` (Docker's journald driver sets both), and stdout at
+/// priority 6 (info), stderr at 3 (err), as Docker's does. Native protocol on a datagram socket, no
+/// library: `KEY=value` lines, one entry per datagram. A send that fails is dropped: the file keeps
+/// the line, and a box never waits on the journal.
+struct Journal {
+    sock: std::os::unix::net::UnixDatagram,
+    name: String,
+    /// A line not yet ended, per stream (stdout, stderr).
+    pending: [Vec<u8>; 2],
+}
+
+/// The longest line sent as one entry; a longer one is sent in pieces of this size.
+const JOURNAL_LINE_MAX: usize = 16 * 1024;
+
+impl Journal {
+    /// The journal for the box whose log is `path` (`<name>-<pid>.log`).
+    fn for_log(path: &std::path::Path) -> Option<Self> {
+        let file = path.file_name()?.to_str()?;
+        let key = crate::registry::split_log_file(file)?.0;
+        let name = key.rsplit_once('-').map_or(key, |(n, _)| n).to_string();
+        let sock = std::os::unix::net::UnixDatagram::unbound().ok()?;
+        sock.connect(JOURNAL_SOCKET).ok()?;
+        Some(Self {
+            sock,
+            name,
+            pending: [Vec::new(), Vec::new()],
+        })
+    }
+
+    fn feed(&mut self, stream: u8, bytes: &[u8]) {
+        let i = usize::from(stream == STREAM_STDERR);
+        self.pending[i].extend_from_slice(bytes);
+        while let Some(at) = self.pending[i].iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.pending[i].drain(..=at).collect();
+            self.send(i, &line[..line.len() - 1]);
+        }
+        while self.pending[i].len() >= JOURNAL_LINE_MAX {
+            let part: Vec<u8> = self.pending[i].drain(..JOURNAL_LINE_MAX).collect();
+            self.send(i, &part);
+        }
+    }
+
+    /// What is left without a newline at the end of the box's output.
+    fn flush(&mut self) {
+        for i in 0..2 {
+            let rest = std::mem::take(&mut self.pending[i]);
+            if !rest.is_empty() {
+                self.send(i, &rest);
+            }
+        }
+    }
+
+    fn send(&self, stream: usize, line: &[u8]) {
+        let _ = self.sock.send(&journal_entry(&self.name, stream == 1, line));
+    }
+}
+
+/// One journal entry in the native protocol. `MESSAGE` is written in the binary form (name, newline,
+/// little-endian length, bytes), which takes any byte; the other fields are plain `KEY=value` lines.
+fn journal_entry(name: &str, stderr: bool, line: &[u8]) -> Vec<u8> {
+    let mut e = Vec::with_capacity(line.len() + name.len() * 2 + 96);
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    e.extend_from_slice(format!("PRIORITY={}\n", if stderr { 3 } else { 6 }).as_bytes());
+    e.extend_from_slice(format!("SYSLOG_IDENTIFIER={name}\nCONTAINER_NAME={name}\n").as_bytes());
+    e.extend_from_slice(b"MESSAGE\n");
+    e.extend_from_slice(&(line.len() as u64).to_le_bytes());
+    e.extend_from_slice(line);
+    e.push(b'\n');
+    e
 }
 
 /// Interpose a byte-capped pump between the workload's stdout/stderr and the on-disk log. Creates a
@@ -891,7 +981,7 @@ pub(crate) unsafe fn start_log_pump(path: &std::path::Path, cap: LogCap) -> Opti
     }
     let (rd, wr) = (fds[0], fds[1]);
     let mut efds = [-1i32; 2];
-    if cap.streams && libc::pipe2(efds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+    if (cap.streams || cap.journald) && libc::pipe2(efds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
         efds = [-1, -1];
     }
     let (erd, ewr) = (efds[0], efds[1]);
@@ -1940,6 +2030,47 @@ pub(crate) fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
 }
 
 #[cfg(test)]
+mod journald_tests {
+    use super::*;
+
+    /// One entry per LINE, a line split across two reads joined first, the stream's priority on it,
+    /// the box's name as identifier, and what is left without a newline sent at the end.
+    #[test]
+    fn the_journal_gets_one_entry_per_line_with_the_box_name_and_the_streams_priority() {
+        let (tx, rx) = std::os::unix::net::UnixDatagram::pair().expect("pair");
+        let mut j = Journal {
+            sock: tx,
+            name: "web".into(),
+            pending: [Vec::new(), Vec::new()],
+        };
+        j.feed(STREAM_STDOUT, b"uno\ndu");
+        j.feed(STREAM_STDOUT, b"e\n");
+        j.feed(STREAM_STDERR, b"errore\n");
+        j.feed(STREAM_STDOUT, b"senza-a-capo");
+        j.flush();
+        let mut got = Vec::new();
+        rx.set_nonblocking(true).expect("nonblocking");
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = rx.recv(&mut buf) {
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got.len(), 4, "one entry per line");
+        let msg = |e: &[u8]| -> Vec<u8> {
+            let at = e.windows(8).position(|w| w == b"MESSAGE\n").expect("MESSAGE") + 8;
+            let len = u64::from_le_bytes(e[at..at + 8].try_into().expect("len")) as usize;
+            e[at + 8..at + 8 + len].to_vec()
+        };
+        assert_eq!(msg(&got[0]), b"uno");
+        assert_eq!(msg(&got[1]), b"due", "a line split across reads is joined");
+        assert_eq!(msg(&got[2]), b"errore");
+        assert_eq!(msg(&got[3]), b"senza-a-capo", "the tail is sent at the end");
+        let text = |e: &[u8]| String::from_utf8_lossy(e).into_owned();
+        assert!(text(&got[0]).contains("PRIORITY=6\n") && text(&got[2]).contains("PRIORITY=3\n"));
+        assert!(text(&got[0]).contains("SYSLOG_IDENTIFIER=web\nCONTAINER_NAME=web\n"));
+    }
+}
+
+#[cfg(test)]
 mod run_log_retention_tests {
     /// The earlier runs of one container are listed oldest first, and only the last
     /// `KEPT_RUN_LOGS` of them stay beside the current one; another box's logs are not touched.
@@ -2065,6 +2196,7 @@ mod rotation_tests {
                     files,
                     keep: true,
                     streams: false,
+                    journald: false,
                 },
             )
             .expect("the log opens");
@@ -2136,6 +2268,7 @@ mod rotation_tests {
                 files: 2,
                 keep: true,
                 streams: false,
+                journald: false,
             }
         );
     }
@@ -2719,6 +2852,7 @@ mod compaction_tests {
                 files: 2,
                 keep: true,
                 streams: false,
+                journald: false,
             },
         )
         .expect("the log opens");
@@ -2754,6 +2888,7 @@ mod compaction_tests {
                 files: 2,
                 keep: true,
                 streams: false,
+                journald: false,
             },
         )
         .expect("the log opens");
@@ -2853,6 +2988,7 @@ mod compaction_tests {
                 files: 2,
                 keep: true,
                 streams: false,
+                journald: false,
             },
         )
         .expect("the log opens");
@@ -3307,6 +3443,7 @@ mod stream_tests {
             files: 2,
             keep: true,
             streams: true,
+            journald: false,
         }
     }
 
