@@ -16606,6 +16606,66 @@ fn a_kept_box_starts_again_on_the_layer_it_left_and_an_ordinary_box_does_not() {
 /// No such file or directory"). Two boxes sharing one overlay upperdir is the outcome that was
 /// never acceptable, and the name claim is what prevents it - this asserts the claim covers the
 /// kept layer too, not just the registry entry.
+/// A RENAMED BOX IS NOT A LOST ONE. `ps` warns about a box that runs with no record (its registry
+/// wiped), finding it by its cgroup directory and its supervisor's command line, and both still
+/// carry the name the box started with. MEASURED on 0.56.0: `rename r r2` then `ps` warned that
+/// `r` ran with no record, about the box listed as `r2`. Only this test's own box is asserted on:
+/// the cgroup scan is host-wide, and a parallel test's box in another runtime dir is fair game.
+#[test]
+fn ps_does_not_call_a_renamed_box_lost() {
+    if !a_box_can_start("renameps") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    if !kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull")
+        .status
+        .success()
+    {
+        eprintln!("skip: the base image is not available here");
+        return;
+    }
+    let old = format!("itrn{}", std::process::id());
+    let new = format!("{old}b");
+    let out = kern()
+        .args([
+            "box",
+            &old,
+            "-d",
+            "--image",
+            "alpine:3.19",
+            "--",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("run kern box");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let renamed = kern()
+        .args(["rename", &old, &new])
+        .output()
+        .expect("run kern rename");
+    let ps = kern().args(["ps"]).output().expect("run kern ps");
+    let _ = kern().args(["rm", "-f", &new]).output();
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    let err = String::from_utf8_lossy(&ps.stderr);
+    assert!(
+        !err.contains(&format!("  {old} ")),
+        "the renamed box was reported as running without a record:\n{err}"
+    );
+    assert!(String::from_utf8_lossy(&ps.stdout).contains(&new));
+}
+
 #[test]
 fn twenty_concurrent_starts_of_one_kept_box_run_exactly_one() {
     if !a_box_can_start("keeprace") {

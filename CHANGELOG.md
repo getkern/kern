@@ -37,6 +37,12 @@ image and execs into it: `--mount`, `exec -i`, and `docker events` for the conta
 container keeps its filesystem until `docker rm` (a kept box), so the `docker start` of a reopen
 runs it again on the same files; `--rm` containers and a Testcontainers run's stay in memory.
 
+**`kern ps` no longer calls a renamed box lost.** After `kern rename r r2`, `ps` warned that a box
+`r` was running with no record, about the box it listed as `r2`: the cgroup directory and the
+supervisor's command line keep the name a box started with. A box is now recognised by the cgroup
+directory or the supervisor pid its record names; a box whose record really is gone is still
+reported.
+
 **A pull records the image's repository digest, and `kern images --digests` shows it.** It is the
 digest of the manifest the registry answered for the reference (the index of a multi-arch image),
 what Docker lists as `RepoDigests` and what `name@sha256:...` pulls the same image again by:

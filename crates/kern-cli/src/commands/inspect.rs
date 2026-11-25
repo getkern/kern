@@ -382,12 +382,27 @@ pub fn ps(
     // Silent when the two agree, which is every ordinary run, and silent under `--quiet`/`--format`,
     // whose callers are parsing.
     if !quiet && format.is_none() && filters.is_empty() {
-        let known: std::collections::HashSet<&str> =
-            boxes.iter().map(|b| b.name.as_str()).collect();
+        // A BOX IS KNOWN BY ITS IDENTITY, NOT ITS NAME. The cgroup's directory and a supervisor's
+        // command line carry the name the box STARTED with, and `kern rename` changes the record
+        // only: MEASURED on 0.56.0, `rename r r2` then `ps` warned that a box `r` ran with no
+        // record, about the box listed right under it as `r2`. So a candidate is also known by the
+        // cgroup directory a record names, or by the supervisor pid a record has.
+        let known: std::collections::HashSet<&str> = live.iter().map(|b| b.name.as_str()).collect();
+        let known_cgroups: std::collections::HashSet<&str> = live
+            .iter()
+            .filter_map(|b| std::path::Path::new(&b.cgroup).file_name()?.to_str())
+            .collect();
+        let known_pids: std::collections::HashSet<u32> = live
+            .iter()
+            .filter_map(|b| u32::try_from(b.pid).ok())
+            .collect();
         let cg_candidates = kern_isolation::live_box_cgroups();
         let mut lost: Vec<(String, u32)> = cg_candidates
             .iter()
-            .filter(|(tag, _)| !known.contains(tag.as_str()))
+            .filter(|(tag, pid)| {
+                !known.contains(tag.as_str())
+                    && !known_cgroups.contains(format!("kern-box-{tag}-{pid}").as_str())
+            })
             .cloned()
             .collect();
         // FALLBACK, and only when the first channel had nothing to say. A host without cgroup
@@ -418,7 +433,7 @@ pub fn ps(
         if cg_candidates.is_empty() {
             lost = kern_isolation::live_box_supervisors_via_proc()
                 .into_iter()
-                .filter(|(tag, _)| !known.contains(tag.as_str()))
+                .filter(|(tag, pid)| !known.contains(tag.as_str()) && !known_pids.contains(pid))
                 .collect();
         }
         if !lost.is_empty() {
