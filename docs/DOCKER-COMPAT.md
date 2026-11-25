@@ -467,8 +467,9 @@ cannot raise a hard limit, so `ulimits: nofile: 9999999` runs with the most the 
 here) and kern prints a warning, through its socket too (`docker run` prints it). Docker refuses the
 value and the container does not start.
 
-**`ptrace` stays denied.** `strace` and `gdb` inside a box fail with `Operation not permitted`, where
-Docker allows ptrace on kernels from 4.8.
+**`ptrace` works in a box, `process_vm_readv` does not.** `strace` and `gdb` run as under Docker and
+Podman (measured, the same `strace -f true` on all three); `process_vm_readv`/`writev` answer `EPERM`,
+which Docker lifts only with `--cap-add SYS_PTRACE`. The sandbox postures deny `ptrace` too.
 
 **Through kern's socket a container is on one network.** A `docker compose` service on two networks
 is refused by name; `kern compose` runs the same file. `docker pull --platform` keeps one entry per

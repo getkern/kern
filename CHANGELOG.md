@@ -105,6 +105,12 @@ made through kern's socket) starts at once: the launcher held its layer, so the 
 failed and ran a second later, and `docker run -d --restart always` took 1.4 s with a restart counted
 that never happened (now about 190 ms and 0).
 
+**`ptrace` works in a box.** `strace`, `gdb` and profilers failed with `Operation not permitted`
+where Docker's and Podman's default profiles permit `ptrace`; a box permits it now, and the sandbox
+SDKs, the MCP server and `--security-profile untrusted` still deny it (with the kill).
+`process_vm_readv`/`writev` stay refused. A `kern exec` entering a box cannot be read or attached to
+before its command runs.
+
 **`kern compat docker -- <command>` points programs that use the Docker API at kern.** It put kern's
 `docker` first in PATH and nothing else, so Testcontainers, docker-py or the real `docker` by its full
 path reached whatever Docker the machine had, or nothing. The command now gets `DOCKER_HOST` on kern's

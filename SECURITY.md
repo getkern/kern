@@ -140,9 +140,14 @@ Verified on this desktop, the string arrives outside.
 
 ### What a denied syscall returns
 The filter has two verdicts for a whole syscall. Real escape vectors (kexec, module load/unload, the mount API, `bpf`,
-`ptrace`, `setns`/`unshare`/`pivot_root`) answer **`EPERM`**, as Docker's default filter answers them, so
-software that probes one (a browser's or bubblewrap's `unshare`, a debugger's `ptrace`) reports it or
-goes on instead of dying. `--security-opt seccomp-deny=kill` makes them **kill** the caller with
+`process_vm_readv`/`writev`, `setns`/`unshare`/`pivot_root`) answer **`EPERM`**, as Docker's default filter answers them, so
+software that probes one (a browser's or bubblewrap's `unshare`) reports it or goes on instead of dying.
+`ptrace` itself is **permitted** in a box, as Docker's and Podman's default profiles permit it, so `strace`,
+`gdb` and profilers work. It reaches the processes of the box's own pid namespace (every box has one, shared
+with nothing) that share its uid and are dumpable; a `kern exec` child is not dumpable from its fork to its
+`execve`, so the box cannot read its descriptors or attach to it while it is still kern (the class of runc's
+CVE-2016-9962, attacked in `pentest/pentest-ptrace.sh`). `CAP_SYS_PTRACE` stays dropped. Under the kill
+verdict below, `ptrace` is denied again. `--security-opt seccomp-deny=kill` makes them **kill** the caller with
 `SIGSYS` instead, and so do `--security-profile untrusted` and every sandbox the SDKs start: the kill
 is the verdict a supervisor reads as "this code tried to leave" (`escape_blocked`). `kern exec` and a
 health probe get the box's own verdict. Twelve, in eight
@@ -170,7 +175,8 @@ inside a box on x86_64, kernel 7.0:
 |---|---|
 | `io_uring_setup` (denied, degrade set) | `-1 EPERM`, process survives, also under `seccomp-deny=kill` |
 | syscall number 998 (exists on no kernel) | `-1 ENOSYS`, process survives |
-| `kexec_load`, `bpf`, `mount`, `ptrace` (denied) | `-1 EPERM`, process survives; killed by `SIGSYS` (exit 159) under `seccomp-deny=kill` |
+| `kexec_load`, `bpf`, `mount` (denied) | `-1 EPERM`, process survives; killed by `SIGSYS` (exit 159) under `seccomp-deny=kill` |
+| `ptrace(PTRACE_TRACEME)` | `0` in a box; killed by `SIGSYS` (exit 159) under `seccomp-deny=kill` and `--security-profile untrusted` |
 | the same calls with no kern filter (control) | a *different* errno, never `ENOSYS` |
 So the errno discloses nothing: a filtered call is byte-identical to one this kernel does not
 implement. What is cheap to enumerate is the **permitted** set, and always was, since a permitted
