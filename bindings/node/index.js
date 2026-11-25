@@ -2951,6 +2951,13 @@ function credentialInside(real) {
 function validateMount(source, target) {
   if (typeof target !== "string" || !target.startsWith("/"))
     throw new MountRefused(`mount target must be an absolute path in the box, got ${JSON.stringify(target)}`);
+  // A `:` in the target is a mode written the `-v` way ("/m:ro"), mounted at a directory literally
+  // named `/m:ro`. Mirrors the Python binding.
+  if (target.includes(":"))
+    throw new MountRefused(
+      `mount target must not contain ':', got ${JSON.stringify(target)}; for a read-only mount ` +
+        `write the target as an array: { [source]: [${JSON.stringify(target.split(":")[0])}, "ro"] }`,
+    );
   if (target.split("/").some((c) => c === ".."))
     throw new MountRefused(`mount target must not contain '..': ${JSON.stringify(target)}`);
   const normTarget = "/" + target.split("/").filter((c) => c && c !== ".").join("/");
@@ -4516,8 +4523,12 @@ class Sandbox {
           ro = false;
         }
         const [real, tgt] = validateMount(source, target);
+        const norm = "/" + tgt.split("/").filter((c) => c && c !== ".").join("/");
+        // Two sources on one target: kern refuses the box; said here, before anything starts.
+        if (boundTargets.has(norm))
+          throw new MountRefused(`two mounts name the same target ${JSON.stringify(norm)}; keep one`);
         this._mountArgs.push(...mountArgs(real, tgt, ro));
-        boundTargets.add("/" + tgt.split("/").filter((c) => c && c !== ".").join("/"));
+        boundTargets.add(norm);
       }
     }
     // A caller who binds their own directory at /tmp gets it: the default tmpfs would be mounted OVER

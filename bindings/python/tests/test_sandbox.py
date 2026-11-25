@@ -524,6 +524,21 @@ def test_an_ordinary_mount_target_is_still_accepted(target, tmp_path):
     _cfg(mounts={str(tmp_path): target})
 
 
+def test_a_mode_written_into_the_target_is_refused_with_the_tuple_to_use(tmp_path):
+    # `"/m:ro"` was mounted at a directory literally named `/m:ro`: read-only nowhere.
+    with pytest.raises(MountRefused, match=r"\('/m', 'ro'\)"):
+        _cfg(mounts={str(tmp_path): "/m:ro"})
+    _cfg(mounts={str(tmp_path): ("/m", "ro")})
+
+
+def test_two_mounts_on_one_target_are_refused_before_anything_starts(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    with pytest.raises(MountRefused, match="same target"):
+        _cfg(mounts={str(a): "/m", str(b): "/m/"})
+
+
 @pytest.mark.parametrize(
     "source,target",
     [

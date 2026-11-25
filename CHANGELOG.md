@@ -193,6 +193,9 @@ prints one JSON line per box (it printed the word `json`), and `--format` says `
   build cache inside it is still what `RUN --mount=type=cache` mounts. The SDKs refused it already.
 - **A `kern.toml` that is not text stops a box from starting**, as one that does not parse and names a
   data place does, instead of a warning and the default place.
+- **The SDKs refuse a mount target with a `:` and two mounts on one target**, with `MountRefused`
+  before anything starts: `"/m:ro"` was mounted at a directory named `/m:ro`, read-only nowhere; the
+  message names the tuple (`("/m", "ro")`, Node `["/m", "ro"]`).
 - **The SDKs raise `MountRefused` for a mount kern refuses** (a data dir or image cache moved in
   `kern.toml`), where they returned a `startup_failed` result.
 - **A mount on `/etc/resolv.conf`, `/etc/hosts` or `/etc/hostname` is shown as mounted**, in a box and

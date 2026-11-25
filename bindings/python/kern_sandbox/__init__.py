@@ -3649,6 +3649,14 @@ def _validate_mount_lexical(source: str, target: str) -> tuple[str, str]:
             raise MountRefused(f"mount {label} must not contain a newline: {value!r}")
     if not target.startswith("/"):
         raise MountRefused(f"mount target must be an absolute path in the box, got {target!r}")
+    # A `:` IN THE TARGET is almost always a mode written the `-v` way (`"/m:ro"`), and it was mounted
+    # at a directory literally named `/m:ro`: read-only nowhere, and the code found nothing at `/m`.
+    # MEASURED (Grok's round 18, case s01). The mode is the tuple's second item.
+    if ":" in target:
+        raise MountRefused(
+            f"mount target must not contain ':', got {target!r}; for a read-only mount write "
+            f"the target as a tuple: {{source: ({target.split(':', 1)[0]!r}, 'ro')}}"
+        )
     if any(c == ".." for c in target.split("/")):
         raise MountRefused(f"mount target must not contain '..': {target!r}")
     norm_target = "/" + "/".join(c for c in target.split("/") if c and c != ".")
@@ -5030,8 +5038,14 @@ class Sandbox:
                 else:
                     target, ro = spec, False
                 real, tgt = _validate_mount(source, target)
+                norm = "/" + "/".join(c for c in tgt.split("/") if c and c != ".")
+                # TWO SOURCES ON ONE TARGET: kern refuses the box ("duplicate mount point"), and the
+                # caller got that back as a `startup_failed` result. Said here, as the other mount
+                # mistakes are, before anything starts.
+                if norm in bound_targets:
+                    raise MountRefused(f"two mounts name the same target {norm!r}; keep one")
                 self._mount_args += _mount_args(real, tgt, ro)
-                bound_targets.add("/" + "/".join(c for c in tgt.split("/") if c and c != "."))
+                bound_targets.add(norm)
         # A caller who binds their own directory at /tmp gets it: the default tmpfs would be mounted
         # over their bind, so the files they passed would be invisible to the code they are running.
         # An explicit `tmpfs=` wins too - both are the caller saying what /tmp is.

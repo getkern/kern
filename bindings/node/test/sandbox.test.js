@@ -4436,3 +4436,18 @@ test("the mount scan has no accepting budget and reads names as bytes", () => {
     fs.rmSync(d, { recursive: true, force: true });
   }
 });
+
+test("a mode written into the target, and two mounts on one target, are refused before anything starts", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "kern-mnt-"));
+  const a = path.join(d, "a");
+  const b = path.join(d, "b");
+  fs.mkdirSync(a);
+  fs.mkdirSync(b);
+  try {
+    assert.throws(() => new kern.Sandbox({ mounts: { [a]: "/m:ro" } }), (e) => e.name === "MountRefused" && /\["\/m", "ro"\]/.test(e.message));
+    assert.throws(() => new kern.Sandbox({ mounts: { [a]: "/m", [b]: "/m/" } }), (e) => e.name === "MountRefused" && /same target/.test(e.message));
+    new kern.Sandbox({ mounts: { [a]: ["/m", "ro"] } });
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
