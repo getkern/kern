@@ -1382,6 +1382,114 @@ fn image_history(bin: &Path, name: &str) -> Response {
     json_response(200, format!("[{}]", rows.join(",")))
 }
 
+/// `POST /images/load`: the archive the client sends, streamed into `kern load` on its stdin, so an
+/// image of any size is loaded without the body being held here. Docker's answer is a JSON line per
+/// loaded image (`Loaded image: <name>`), with `quiet` or without.
+pub(crate) fn image_load(
+    _req: &Request,
+    bin: &Path,
+    r: &mut std::io::BufReader<UnixStream>,
+    framing: crate::Framing,
+) -> Response {
+    let child = Command::new(bin)
+        .arg("load")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return error(500, &format!("cannot run {}: {e}", bin.display())),
+    };
+    // Its output read while the body is written, so a load that speaks early cannot fill a pipe
+    // and stop reading the body.
+    let drain = |p: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            if let Some(mut p) = p {
+                let _ = p.read_to_end(&mut v);
+            }
+            v
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let copied = match child.stdin.take() {
+        Some(mut sin) => crate::copy_body(r, framing, &mut sin),
+        None => Err("kern load took no stdin"),
+    };
+    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+    let out = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
+    let err = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
+    if let Err(why) = copied {
+        return error(400, why);
+    }
+    if code != 0 {
+        return error(500, &kern_error(&err));
+    }
+    let lines: Vec<String> = out
+        .lines()
+        .chain(err.lines())
+        .filter_map(|l| l.trim().strip_prefix("loaded '")?.strip_suffix('\''))
+        .map(|name| {
+            format!(
+                "{{\"stream\":{}}}\n",
+                json_str(&format!("Loaded image: {name}\n"))
+            )
+        })
+        .collect();
+    Response::Full {
+        status: 200,
+        content_type: "application/json",
+        body: lines.concat().into_bytes(),
+        extra: Vec::new(),
+    }
+}
+
+/// `DELETE /images/{name}`: `kern rmi`, `force` as `-f`. Docker's answer lists what went: the tag,
+/// then the image. An image a container uses is 409 without `force`, as Docker answers it.
+fn image_remove(bin: &Path, name: &str, req: &Request) -> Response {
+    let Some(i) = cached_image(bin, name) else {
+        return error(404, &format!("No such image: {name}"));
+    };
+    let n = i.get("image").and_then(Value::as_str).unwrap_or(name);
+    let mut args = vec!["rmi"];
+    if req.flag("force") {
+        args.push("-f");
+    }
+    args.push(n);
+    let (code, _out, err) = kern(bin, &args);
+    if code != 0 {
+        let msg = kern_error(&err);
+        return error(
+            if msg.starts_with("conflict:") {
+                409
+            } else {
+                500
+            },
+            &msg,
+        );
+    }
+    json_response(
+        200,
+        format!(
+            "[{{\"Untagged\":{}}},{{\"Deleted\":{}}}]",
+            json_str(n),
+            json_str(&format!("sha256:{}", id_of(n)))
+        ),
+    )
+}
+
 /// `GET /images/{name}/json`.
 fn image_inspect(bin: &Path, name: &str) -> Response {
     let Some(i) = cached_image(bin, name) else {
@@ -1943,12 +2051,7 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
                     }) => {
                         let feeder = stdin.and_then(|sin| feed_stdin(w, sin));
                         pump(w, out, err, tty);
-                        // The workload is done: a feeder still reading the client is woken by this
-                        // end closing for reading.
-                        if let Some(f) = feeder {
-                            let _ = w.socket().shutdown(std::net::Shutdown::Read);
-                            let _ = f.join();
-                        }
+                        end_feed(w, feeder);
                     }
                     Err(_) => {}
                 }
@@ -2386,14 +2489,10 @@ fn exec_start(bin: &Path, id: &str, req: &Request) -> Response {
             let err = child.stderr.take();
             let feeder = child.stdin.take().and_then(|sin| feed_stdin(w, sin));
             pump(w, out, err, tty);
-            let code = exit_code(&mut child);
-            // The command is done: a feeder still reading the client is woken by this end of the
-            // connection closing for reading, which only this server's reads see.
-            if let Some(f) = feeder {
-                let _ = w.socket().shutdown(std::net::Shutdown::Read);
-                let _ = f.join();
-            }
-            exec_finish(&id, code);
+            // The exit is recorded BEFORE the feeder ends: a client that has read the end of the
+            // output asks for the code at once, and the feeder may wait for that client to go.
+            exec_finish(&id, exit_code(&mut child));
+            end_feed(w, feeder);
         }),
     }
 }
@@ -2402,25 +2501,31 @@ fn exec_start(bin: &Path, id: &str, req: &Request) -> Response {
 /// closes its sending side (`CloseWrite`), which is the command's end of input. The connection's
 /// read timeout is for requests: an interactive shell's stdin may stay quiet for hours, so a
 /// timeout here is waiting, not an end.
-fn feed_stdin(
-    w: &mut crate::Out,
-    mut sin: std::process::ChildStdin,
-) -> Option<std::thread::JoinHandle<()>> {
+fn feed_stdin(w: &mut crate::Out, sin: std::process::ChildStdin) -> Option<Feeder> {
     let mut sock = w.socket().try_clone().ok()?;
     let early = w.take_input();
-    std::thread::Builder::new()
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen_end = Arc::clone(&ended);
+    let handle = std::thread::Builder::new()
         .name("kern-serve-stdin".into())
         .spawn(move || {
-            if !early.is_empty() && sin.write_all(&early).is_err() {
-                return;
+            // `None` once the workload stopped reading its stdin: what the client still sends is
+            // read and dropped, so the connection is not closed under it (see [`end_feed`]).
+            let mut sink = Some(sin);
+            if !early.is_empty() && sink.as_mut().is_some_and(|s| s.write_all(&early).is_err()) {
+                sink = None;
             }
             let mut buf = [0u8; 16 * 1024];
+            let mut ended_at: Option<std::time::Instant> = None;
             loop {
                 match sock.read(&mut buf) {
                     Ok(0) => return,
                     Ok(n) => {
-                        if sin.write_all(&buf[..n]).is_err() {
-                            return;
+                        if sink
+                            .as_mut()
+                            .is_some_and(|s| s.write_all(&buf[..n]).is_err())
+                        {
+                            sink = None;
                         }
                     }
                     Err(e)
@@ -2432,9 +2537,52 @@ fn feed_stdin(
                         ) => {}
                     Err(_) => return,
                 }
+                if seen_end.load(Ordering::Acquire) {
+                    let at = *ended_at.get_or_insert_with(std::time::Instant::now);
+                    if at.elapsed() >= DRAIN {
+                        return;
+                    }
+                }
             }
         })
-        .ok()
+        .ok()?;
+    Some(Feeder { handle, ended })
+}
+
+/// The thread carrying a client's stdin to a workload, and the flag that says the workload ended.
+struct Feeder {
+    handle: std::thread::JoinHandle<()>,
+    ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The longest a connection is held after the output ended, for its client to hang up.
+const DRAIN: Duration = Duration::from_secs(2);
+
+/// The workload is done and its output sent: stop the feeder, the one way for every caller.
+///
+/// ⛔ NOT BY CLOSING UNDER THE CLIENT. MEASURED: `head -c 20M /dev/zero | docker exec -i c true`
+/// exited 1 with "connection reset by peer" where Docker exits 0. `true` reads none of its stdin,
+/// the client was still sending it, and a socket closed with bytes unread resets the connection
+/// before the client reads the end of the output. On a handed-over connection the end of the output
+/// is sent first (our side closed for writing), and what the client still sends is dropped until
+/// it hangs up, which it does once it has read that end; [`DRAIN`] bounds a client that does not.
+/// A chunked answer has more to write after this (its last chunk), so there the feeder is only
+/// woken, as before.
+fn end_feed(w: &mut crate::Out, feeder: Option<Feeder>) {
+    let Some(f) = feeder else {
+        return;
+    };
+    if w.hijacked() {
+        let _ = w.flush();
+        let _ = w.socket().shutdown(std::net::Shutdown::Write);
+        f.ended.store(true, Ordering::Release);
+        let _ = w
+            .socket()
+            .set_read_timeout(Some(Duration::from_millis(100)));
+    } else {
+        let _ = w.socket().shutdown(std::net::Shutdown::Read);
+    }
+    let _ = f.handle.join();
 }
 
 /// `GET /exec/{id}/json`.
@@ -2684,6 +2832,9 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
         }
         ("GET", ["images", rest @ .., "history"]) if !rest.is_empty() => {
             image_history(bin, &rest.join("/"))
+        }
+        ("DELETE", ["images", rest @ ..]) if !rest.is_empty() => {
+            image_remove(bin, &rest.join("/"), req)
         }
         ("POST", ["containers", id, "exec"]) => {
             let Some(name) = resolve(bin, id) else {

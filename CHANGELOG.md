@@ -48,6 +48,13 @@ printed the stream's frame headers; such a run is now a foreground box with the 
 with `-t`, a terminal. `docker ps -a` lists created containers, and those whose start failed, as
 `Created`, so Testcontainers' cleanup finds them.
 
+**`docker load` and `docker rmi` through kern's Docker API.** `docker load` was refused as "a
+chunked body that does not parse" for any image over 4 MiB, the cap on a request body; its archive
+now streams into `kern load` with no cap (7.8 MB in 51 ms), and a body over the cap elsewhere says
+it is. `docker rmi` is `kern rmi`, `-f` included, an image a container uses answered 409. A command
+that leaves its stdin unread (`head -c 20M /dev/zero | docker exec -i c true`) exits with its own
+code, as with Docker; it ended the whole server with SIGPIPE, and then the connection was reset.
+
 **`kern image history` and `docker history` list an image's steps.** Newest first, as Docker
 lists them: a pulled or loaded image's own history, each step that made a layer with that layer's
 compressed size from the manifest (what a pull downloads; kern unpacks the layers into one tree and

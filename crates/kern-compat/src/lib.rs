@@ -111,10 +111,86 @@ fn strip_version(path: &str) -> &str {
 /// What reading one request ended in.
 enum Read1 {
     Request(Request),
+    /// `POST /images/load`, its body left on the connection: an image archive is as large as the
+    /// image, so it is streamed to `kern load` rather than read into memory under [`MAX_BODY`].
+    Load(Request, Framing),
     /// The client closed between requests.
     Closed,
     /// A malformed request: answered 400, then the connection ends.
     Bad(&'static str),
+}
+
+/// How a body is framed on the connection.
+#[derive(Clone, Copy)]
+pub(crate) enum Framing {
+    Length(u64),
+    Chunked,
+}
+
+/// Copy a body framed as `f` from the connection to `w`, without holding it: the bytes copied, or
+/// why the body did not arrive whole. A write that fails (the reader ended early) stops the copy
+/// and is reported apart, as `Ok(Err(..))`, since the body is then not the reason.
+pub(crate) fn copy_body(
+    r: &mut BufReader<UnixStream>,
+    f: Framing,
+    w: &mut dyn Write,
+) -> Result<Result<u64, std::io::Error>, &'static str> {
+    let chunk = |r: &mut BufReader<UnixStream>, n: u64, w: &mut dyn Write| {
+        let mut left = n;
+        let mut buf = [0u8; 64 * 1024];
+        while left > 0 {
+            let want = buf.len().min(usize::try_from(left).unwrap_or(buf.len()));
+            let got = match r.read(&mut buf[..want]) {
+                Ok(0) | Err(_) => return Err("the body ends before its length"),
+                Ok(g) => g,
+            };
+            if let Err(e) = w.write_all(&buf[..got]) {
+                return Ok(Err(e));
+            }
+            left -= got as u64;
+        }
+        Ok(Ok(n))
+    };
+    match f {
+        Framing::Length(n) => chunk(r, n, w),
+        Framing::Chunked => {
+            let mut total = 0u64;
+            loop {
+                let mut size_line = String::new();
+                if r.by_ref().take(1024).read_line(&mut size_line).is_err() {
+                    return Err("a chunk size line that does not parse");
+                }
+                let size_hex = size_line
+                    .trim()
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim();
+                let Ok(size) = u64::from_str_radix(size_hex, 16) else {
+                    return Err("a chunk size line that does not parse");
+                };
+                if size == 0 {
+                    loop {
+                        let mut t = String::new();
+                        if r.by_ref().take(8192).read_line(&mut t).is_err() {
+                            return Err("the chunked body ends inside its trailers");
+                        }
+                        if t == "\r\n" || t.is_empty() {
+                            return Ok(Ok(total));
+                        }
+                    }
+                }
+                match chunk(r, size, w)? {
+                    Ok(n) => total += n,
+                    Err(e) => return Ok(Err(e)),
+                }
+                let mut crlf = [0u8; 2];
+                if r.read_exact(&mut crlf).is_err() || &crlf != b"\r\n" {
+                    return Err("a chunk not ended by CRLF");
+                }
+            }
+        }
+    }
 }
 
 /// Read one request: the head up to its blank line (strictly framed), then its body by
@@ -175,10 +251,14 @@ fn read_request(r: &mut BufReader<UnixStream>) -> Read1 {
             }
         }
     }
-    let body = if chunked {
+    let (raw_path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+    let streamed = method == "POST" && strip_version(raw_path) == "/images/load";
+    let body = if streamed {
+        Vec::new()
+    } else if chunked {
         match read_chunked(r) {
-            Some(b) => b,
-            None => return Read1::Bad("a chunked body that does not parse"),
+            Ok(b) => b,
+            Err(why) => return Read1::Bad(why),
         }
     } else {
         let n = content_length.unwrap_or(0);
@@ -191,7 +271,6 @@ fn read_request(r: &mut BufReader<UnixStream>) -> Read1 {
         }
         b
     };
-    let (raw_path, raw_query) = target.split_once('?').unwrap_or((target, ""));
     let query = raw_query
         .split('&')
         .filter(|kv| !kv.is_empty())
@@ -200,7 +279,7 @@ fn read_request(r: &mut BufReader<UnixStream>) -> Read1 {
             (percent_decode(k, true), percent_decode(v, true))
         })
         .collect();
-    Read1::Request(Request {
+    let req = Request {
         method: method.to_string(),
         path: strip_version(raw_path).to_string(),
         query,
@@ -208,38 +287,39 @@ fn read_request(r: &mut BufReader<UnixStream>) -> Read1 {
         upgrade,
         close,
         peer: None,
-    })
+    };
+    if streamed {
+        let framing = if chunked {
+            Framing::Chunked
+        } else {
+            Framing::Length(content_length.unwrap_or(0) as u64)
+        };
+        return Read1::Load(req, framing);
+    }
+    Read1::Request(req)
 }
 
-/// A `Transfer-Encoding: chunked` body, bounded by [`MAX_BODY`].
-fn read_chunked(r: &mut BufReader<UnixStream>) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
-    loop {
-        let mut size_line = String::new();
-        r.by_ref().take(1024).read_line(&mut size_line).ok()?;
-        let size_hex = size_line.trim().split(';').next()?.trim();
-        let size = usize::from_str_radix(size_hex, 16).ok()?;
-        if size == 0 {
-            // Trailers, then the blank line.
-            loop {
-                let mut t = String::new();
-                r.by_ref().take(8192).read_line(&mut t).ok()?;
-                if t == "\r\n" || t.is_empty() {
-                    return Some(body);
-                }
+/// A `Transfer-Encoding: chunked` body, bounded by [`MAX_BODY`]: [`copy_body`] into memory, a
+/// body over the cap said as such (MEASURED: a 7.8 MB `docker load` was answered "a chunked body
+/// that does not parse", which sent the reader looking for a fault in the client).
+fn read_chunked(r: &mut BufReader<UnixStream>) -> Result<Vec<u8>, &'static str> {
+    struct Capped(Vec<u8>);
+    impl Write for Capped {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.0.len() + b.len() > MAX_BODY {
+                return Err(std::io::Error::other("over the cap"));
             }
+            self.0.extend_from_slice(b);
+            Ok(b.len())
         }
-        if body.len() + size > MAX_BODY {
-            return None;
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
-        let at = body.len();
-        body.resize(at + size, 0);
-        r.read_exact(&mut body[at..]).ok()?;
-        let mut crlf = [0u8; 2];
-        r.read_exact(&mut crlf).ok()?;
-        if &crlf != b"\r\n" {
-            return None;
-        }
+    }
+    let mut body = Capped(Vec::new());
+    match copy_body(r, Framing::Chunked, &mut body)? {
+        Ok(_) => Ok(body.0),
+        Err(_) => Err("a body longer than 4 MiB"),
     }
 }
 
@@ -283,6 +363,11 @@ pub(crate) struct Out {
 }
 
 impl Out {
+    /// The connection was handed over (`101`): the answer is the raw stream, nothing follows it.
+    pub(crate) fn hijacked(&self) -> bool {
+        !self.chunked
+    }
+
     /// A second handle on the same connection, framing the same way.
     pub(crate) fn try_clone(&self) -> std::io::Result<Out> {
         Ok(Out {
@@ -453,6 +538,13 @@ fn serve_connection(stream: UnixStream, kern: &Path) {
                 let _ = write_response(&mut w, api::error(400, why), false, &[]);
                 return;
             }
+            // The connection ends after a load: its body was read by the load itself, and one that
+            // stopped early leaves the rest of it on the connection.
+            Read1::Load(req, framing) => {
+                let resp = api::image_load(&req, kern, &mut r, framing);
+                let _ = write_response(&mut w, resp, false, &[]);
+                return;
+            }
             Read1::Request(mut req) => {
                 req.peer = peer.clone();
                 let resp = api::handle(&req, kern);
@@ -524,6 +616,16 @@ fn monotonic_secs() -> u64 {
 /// long (systemd starts it again at the next one). Every request is run by the `kern` binary at
 /// `kern`. `Err` says why it could not serve.
 pub fn serve(listen: Listen, kern: PathBuf, idle: Option<Duration>) -> Result<(), String> {
+    // ⛔ A PIPE WHOSE READER ENDED IS AN ERROR HERE, NOT THE SERVER'S DEATH. kern's `main` restores
+    // SIGPIPE's default, which suits a command in a pipeline and kills a server: MEASURED,
+    // `head -c 20M /dev/zero | docker exec -i c true` ended this process with SIGPIPE (exit 141) as
+    // `true` left the rest of its stdin unread, and with it every attached run and session it
+    // served. Ignored, a write to that pipe fails and the feeder stops. Every process this server
+    // starts is kern, whose `main` restores the default again, so no workload inherits this.
+    // SAFETY: setting a signal's disposition to SIG_IGN has no precondition.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     let (listener, shown) = match listen {
         Listen::Path(p) => (bind(&p)?, p.display().to_string()),
         Listen::Inherited(fd) => (inherited(fd)?, format!("fd {fd} from systemd")),
@@ -654,6 +756,78 @@ fn inherited(fd: RawFd) -> Result<UnixListener, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{copy_body, read_chunked, Framing};
+    use std::io::{BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    /// The far end of a connection that has `bytes` on it and is then closed for writing.
+    fn conn(bytes: &[u8]) -> BufReader<UnixStream> {
+        let (mut a, b) = UnixStream::pair().expect("pair");
+        let owned = bytes.to_vec();
+        std::thread::spawn(move || {
+            let _ = a.write_all(&owned);
+            let _ = a.shutdown(std::net::Shutdown::Write);
+        });
+        BufReader::new(b)
+    }
+
+    /// A body is copied as framed, by length or in chunks, past any cap; a body that stops short
+    /// or a chunk that does not parse is said as such; a reader that stops early is reported apart.
+    #[test]
+    fn a_body_is_copied_as_framed_and_its_faults_are_named() {
+        let big = vec![7u8; 5 * 1024 * 1024];
+        let mut out = Vec::new();
+        let n = copy_body(&mut conn(&big), Framing::Length(big.len() as u64), &mut out);
+        assert!(matches!(n, Ok(Ok(len)) if len == big.len() as u64) && out == big);
+
+        let mut out = Vec::new();
+        let r = copy_body(
+            &mut conn(b"5\r\nhello\r\n3;x=y\r\nabc\r\n0\r\n\r\n"),
+            Framing::Chunked,
+            &mut out,
+        );
+        assert!(matches!(r, Ok(Ok(8))) && out == b"helloabc");
+
+        let mut out = Vec::new();
+        assert!(copy_body(&mut conn(b"abc"), Framing::Length(10), &mut out).is_err());
+        assert!(copy_body(&mut conn(b"zz\r\n"), Framing::Chunked, &mut out).is_err());
+        assert!(copy_body(&mut conn(b"3\r\nabcXY"), Framing::Chunked, &mut out).is_err());
+
+        struct Gone;
+        impl Write for Gone {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(matches!(
+            copy_body(&mut conn(b"abc"), Framing::Length(3), &mut Gone),
+            Ok(Err(_))
+        ));
+    }
+
+    /// A chunked request body over the cap is refused AS over the cap, not as unparseable.
+    #[test]
+    fn a_chunked_body_over_the_cap_says_so() {
+        let mut wire = Vec::new();
+        for _ in 0..5 {
+            wire.extend_from_slice(b"100000\r\n");
+            wire.extend(std::iter::repeat_n(1u8, 0x100000));
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        assert_eq!(
+            read_chunked(&mut conn(&wire)).err(),
+            Some("a body longer than 4 MiB")
+        );
+        assert_eq!(
+            read_chunked(&mut conn(b"2\r\nok\r\n0\r\n\r\n")).ok(),
+            Some(b"ok".to_vec())
+        );
+    }
+
     /// A stream body in HTTP/1.1 chunks: one write, one chunk; an empty write writes nothing (an
     /// empty chunk would END the body); `finish` writes the terminator. After a `101` the bytes go
     /// as they are.
@@ -767,6 +941,11 @@ mod tests {
                         outcomes[0] += 1;
                         assert!(req.body.len() <= MAX_BODY, "case {case}: body over the cap");
                         let _ = kern_common::json::parse(&String::from_utf8_lossy(&req.body));
+                    }
+                    // The server ends the connection after a load, its body read by the load.
+                    Read1::Load(..) => {
+                        outcomes[0] += 1;
+                        break;
                     }
                     Read1::Closed => {
                         outcomes[1] += 1;
