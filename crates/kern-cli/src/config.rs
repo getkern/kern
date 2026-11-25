@@ -1666,6 +1666,18 @@ pub fn load(path: Option<&str>) -> Result<KernConfig, String> {
     load_impl(path, crate::global_env("KERN_CONFIG"), &default_path())
 }
 
+thread_local! {
+    static LOAD_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, Result<std::rc::Rc<KernConfig>, String>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Forget what [`load_cached`] read, after this process itself changed `kern.toml` (`kern top`
+/// moving `data_dir`), so every path resolved after the change sees the new value.
+pub(crate) fn forget_cached() {
+    LOAD_CACHE.with(|c| c.borrow_mut().clear());
+}
+
 /// [`load`], memoised for the life of this process.
 ///
 /// MEASURED BOTTLENECK. A 200-service compose stack whose services name a profile opened
@@ -1685,13 +1697,7 @@ pub fn load(path: Option<&str>) -> Result<KernConfig, String> {
 /// Thread-local rather than a global lock: this is a one-shot CLI, the cache is per-thread state with
 /// no sharing, and there is no lock to contend or to deadlock on.
 pub fn load_cached(path: Option<&str>) -> Result<std::rc::Rc<KernConfig>, String> {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::rc::Rc;
-    thread_local! {
-        static CACHE: RefCell<HashMap<String, Result<Rc<KernConfig>, String>>> =
-            RefCell::new(HashMap::new());
-    }
     let key = format!(
         "{}\u{1}{}",
         path.unwrap_or_default(),
@@ -1699,7 +1705,7 @@ pub fn load_cached(path: Option<&str>) -> Result<std::rc::Rc<KernConfig>, String
             .map(|v| v.to_string_lossy().into_owned())
             .unwrap_or_default()
     );
-    CACHE.with(|c| {
+    LOAD_CACHE.with(|c| {
         // Borrow, look up, DROP the borrow before loading: `load` runs arbitrary parsing code and a
         // borrow held across it would be a `RefCell` panic waiting for the first re-entrant caller.
         if let Some(hit) = c.borrow().get(&key) {

@@ -106,9 +106,93 @@ pub fn config_set(args: &[String]) -> Result<(), Error> {
         p.z
     );
     if let Some(old) = moved_from {
-        say_what_stays(&old, value.trim());
+        let new = std::path::PathBuf::from(value.trim());
+        let cache = new.join("cache");
+        let mut note = format!(
+            "kern's data now lives in {}, its images in {}.",
+            new.display(),
+            cache.display()
+        );
+        let stays = what_stays(&old, (&new, &cache));
+        if !stays.is_empty() {
+            note.push('\n');
+            note.push_str(&stays);
+        }
+        print_dim(&note);
     }
     Ok(())
+}
+
+/// Lines of plain text, printed dim, as the notes after a `config` change are.
+fn print_dim(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let p = crate::ui::Palette::detect();
+    for l in text.lines() {
+        if l.starts_with("  ") {
+            println!("{l}");
+        } else {
+            println!("{}{l}{}", p.d, p.z);
+        }
+    }
+}
+
+/// Move kern's data to `to` (`None` = back to the default place), with every check
+/// `kern config set|unset data_dir` makes, and say what stays at the old place and how to move it.
+/// For `kern top`, which shows the text in its own pane instead of printing it.
+pub(crate) fn change_data_dir(to: Option<&str>) -> Result<String, Error> {
+    let (old, new) = match to {
+        Some(v) => {
+            let (kind, _) = settable("data_dir")?;
+            let toml = crate::config::kern_value_toml(kind, v)
+                .map_err(|e| Error::Config(format!("data_dir: {e}")))?;
+            crate::config::check_kern_value("data_dir", &toml).map_err(Error::Config)?;
+            let old = prepare_data_dir(v)?;
+            crate::config::set_kern_key("data_dir", Some(&toml)).map_err(Error::Config)?;
+            let new = std::path::PathBuf::from(v.trim());
+            let cache = new.join("cache");
+            (old, (new, cache))
+        }
+        None => {
+            refuse_while_boxes_run("unset it")?;
+            let old = data_roots();
+            crate::config::set_kern_key("data_dir", None).map_err(Error::Config)?;
+            let base = |var, rel| crate::xdg_base(var, rel).map(|b| b.join("kern"));
+            match (
+                base("XDG_DATA_HOME", ".local/share"),
+                base("XDG_CACHE_HOME", ".cache"),
+            ) {
+                (Some(d), Some(c)) => (old, (d, c)),
+                _ => return Ok("kern's data is back at its default place".into()),
+            }
+        }
+    };
+    crate::config::forget_cached();
+    let mut msg = format!(
+        "kern's data now lives in {}, its images in {}.",
+        new.0.display(),
+        new.1.display()
+    );
+    let stays = what_stays(&old, (&new.0, &new.1));
+    if !stays.is_empty() {
+        msg.push('\n');
+        msg.push_str(&stays);
+    }
+    Ok(msg)
+}
+
+/// A `data_dir` change writes where boxes no longer look for their state: refused while any runs.
+fn refuse_while_boxes_run(what: &str) -> Result<(), Error> {
+    let running = crate::registry::list();
+    if running.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "data_dir: {} box(es) are running and keep writing where kern's data is now; stop them \
+         first (kern stop --all), then {what}",
+        running.len()
+    )))
 }
 
 /// The data and cache roots in force, `(data, cache)`, as every path of kern resolves them now.
@@ -130,14 +214,7 @@ fn prepare_data_dir(
     value: &str,
 ) -> Result<(Option<std::path::PathBuf>, Option<std::path::PathBuf>), Error> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    let running = crate::registry::list();
-    if !running.is_empty() {
-        return Err(Error::Config(format!(
-            "data_dir: {} box(es) are running and keep writing where kern's data is now; stop them \
-             first (kern stop --all), then set it",
-            running.len()
-        )));
-    }
+    refuse_while_boxes_run("set it")?;
     let dir = crate::config::check_data_dir(value)
         .map_err(|e| Error::Config(format!("data_dir: {e}")))?;
     std::fs::DirBuilder::new()
@@ -201,43 +278,39 @@ fn prepare_data_dir(
 /// After a `data_dir` change: what is at the old place stays there, said with the command that
 /// moves it. kern does not move it itself, as Docker does not move its `data-root`: copying
 /// gigabytes of images between disks is the operator's call, and a half-finished move is worse
-/// than none.
-fn say_what_stays(old: &(Option<std::path::PathBuf>, Option<std::path::PathBuf>), new: &str) {
-    let p = crate::ui::Palette::detect();
+/// than none. Empty when nothing is left behind.
+fn what_stays(
+    old: &(Option<std::path::PathBuf>, Option<std::path::PathBuf>),
+    new: (&std::path::Path, &std::path::Path),
+) -> String {
     let count = |d: &std::path::Path, sub: &str| -> usize {
         std::fs::read_dir(d.join(sub))
             .map(|r| r.flatten().count())
             .unwrap_or(0)
     };
-    let new = std::path::Path::new(new);
-    if let Some(data) = old.0.as_deref().filter(|d| d.is_dir() && *d != new) {
-        println!(
-            "{}kern's data now lives in {}, its images in {}. What is at {} stays there ({} kept \
-             boxes, {} volumes); with no box running, move it with:{}",
-            p.d,
-            new.display(),
-            new.join("cache").display(),
+    let (new_data, new_cache) = new;
+    let mut out = String::new();
+    if let Some(data) = old.0.as_deref().filter(|d| d.is_dir() && *d != new_data) {
+        out.push_str(&format!(
+            "What is at {} stays there ({} kept boxes, {} volumes); with no box running, move it \
+             with:\n  mkdir -p {} && mv {}/* {}/\n",
             data.display(),
             count(data, "boxes"),
             count(data, "volumes"),
-            p.z
-        );
-        println!("  mv {}/* {}/", data.display(), new.display());
+            new_data.display(),
+            data.display(),
+            new_data.display()
+        ));
     }
-    if let Some(cache) = old
-        .1
-        .as_deref()
-        .filter(|c| c.is_dir() && *c != new.join("cache").as_path())
-    {
-        println!(
-            "{}and the images (or pull them again):{}\n  mkdir -p {} && mv {}/* {}/",
-            p.d,
-            p.z,
-            new.join("cache").display(),
+    if let Some(cache) = old.1.as_deref().filter(|c| c.is_dir() && *c != new_cache) {
+        out.push_str(&format!(
+            "and the images (or pull them again):\n  mkdir -p {} && mv {}/* {}/\n",
+            new_cache.display(),
             cache.display(),
-            new.join("cache").display()
-        );
+            new_cache.display()
+        ));
     }
+    out.trim_end().to_string()
 }
 
 /// `kern config unset <key>`: remove one `[kern]` key, so kern's default is in force again. A key
@@ -256,14 +329,13 @@ pub fn config_unset(args: &[String]) -> Result<(), Error> {
         return Ok(());
     }
     if key == "data_dir" {
-        let running = crate::registry::list();
-        if !running.is_empty() {
-            return Err(Error::Config(format!(
-                "data_dir: {} box(es) are running and keep writing where kern's data is now; stop \
-                 them first (kern stop --all), then unset it",
-                running.len()
-            )));
-        }
+        let msg = change_data_dir(None)?;
+        println!(
+            "{}unset{} {key}  {}(kern's default again){}",
+            p.g, p.z, p.d, p.z
+        );
+        print_dim(&msg);
+        return Ok(());
     }
     if key == "sandbox_history" {
         // Back to the default place FIRST, so the rows move with the setting.

@@ -74,6 +74,8 @@ enum Mode {
     PickKind,
     /// Where the sandbox history is kept (Sandboxes tab `m`): memory / disk / off, or clear it.
     PickHistory,
+    /// Where kern keeps its data (Storage tab `m`): the mounted disks it could go to, and a typed path.
+    PickData { choices: Vec<DataChoice>, sel: usize },
     /// A destructive action awaiting `y`/`n`.
     Confirm {
         prompt: String,
@@ -90,6 +92,7 @@ enum Pending {
     PruneImages,                         // reclaim orphaned build layers
     DeleteBuild(String),                 // build id
     StopBox(String),                     // box name, from the Boxes tab
+    MoveData(Option<String>),            // new data_dir (None = the default place), Storage `m`
     // THE BULK ACTIONS CARRY THEIR TARGETS, not just a count, and that is deliberate: the list is
     // re-read every tick, so an action that re-derived "everything" at confirm time could act on a
     // set the operator never saw. What was on screen when they pressed `D` is what gets deleted.
@@ -298,6 +301,8 @@ impl Field {
 /// What a submitted [`Form`] does.
 enum Submit {
     CreateVolume,
+    /// A typed `data_dir` (Storage `m`, then `e`): goes to the same confirmation as a picked disk.
+    DataDir,
     /// Rename and/or re-quota an existing named volume (Storage tab `e`).
     EditVolume {
         orig_name: String,
@@ -760,6 +765,39 @@ pub fn run() -> Result<(), crate::error::Error> {
                     break;
                 }
             }
+            // Where kern keeps its data: arrows choose, Enter asks to move there, `e` types a path.
+            Mode::PickData { choices, sel } => match key {
+                [0x1b, b'[', b'A'] | [b'k'] => {
+                    mode = Mode::PickData {
+                        sel: sel.saturating_sub(1),
+                        choices,
+                    }
+                }
+                [0x1b, b'[', b'B'] | [b'j'] => {
+                    mode = Mode::PickData {
+                        sel: (sel + 1).min(choices.len()),
+                        choices,
+                    }
+                }
+                [b'\r'] | [b'\n'] => match choices.get(sel) {
+                    Some(c) if c.current => {
+                        mode = Mode::Overlay(format!(
+                            "data dir\nkern's data is already there: {}",
+                            c.shown
+                        ))
+                    }
+                    Some(c) => {
+                        mode = Mode::Confirm {
+                            prompt: move_data_prompt(&c.shown),
+                            action: Pending::MoveData(c.path.clone()),
+                        }
+                    }
+                    None => mode = Mode::Form(data_dir_form()),
+                },
+                [b'e'] => mode = Mode::Form(data_dir_form()),
+                _ if is_quit(key) && key != [0x1b] => break,
+                _ => {}
+            },
             // The live log of one box: its lifecycle keys act on it, the rest go back.
             Mode::BoxLog { name, text } => match box_log_key(key, name, text, &snap.rows) {
                 None => break,
@@ -806,6 +844,23 @@ pub fn run() -> Result<(), crate::error::Error> {
             Mode::Form(form) => match handle_form_key(form, key) {
                 FormOutcome::Stay(f) => mode = Mode::Form(f),
                 FormOutcome::Cancel => {}
+                FormOutcome::Submit(f) if matches!(f.submit, Submit::DataDir) => {
+                    let path = f.fields.first().map(|x| x.value.trim().to_string());
+                    match path.filter(|v| !v.is_empty()) {
+                        Some(v) => {
+                            mode = Mode::Confirm {
+                                prompt: move_data_prompt(&v),
+                                action: Pending::MoveData(Some(v)),
+                            }
+                        }
+                        None => {
+                            mode = Mode::Form(Form {
+                                error: Some("type an absolute path, e.g. /mnt/data/kern".into()),
+                                ..f
+                            })
+                        }
+                    }
+                }
                 FormOutcome::Submit(f) => match apply_form(&f) {
                     Ok(()) => dirty = true,
                     Err(e) => {
@@ -1147,6 +1202,12 @@ fn nav_profiles(
 /// Storage-tab action keys: new / delete / inspect / prune named volumes (the persistent data layer).
 fn nav_storage(k: u8, sel: usize, vols: &[crate::volume::VolInfo], mode: &mut Mode) {
     match k {
+        b'm' => {
+            *mode = Mode::PickData {
+                choices: data_choices(),
+                sel: 0,
+            }
+        }
         b'n' => *mode = Mode::Form(new_volume_form()),
         b'e' => {
             if let Some(v) = vols.get(sel) {
@@ -1329,6 +1390,12 @@ fn perform_pending(action: Pending) -> Option<String> {
         },
         // A refused stop is worth showing for the same reason as the others: the box stays on the
         // list after a `y`, and without the reason that reads as the key having done nothing.
+        // SUCCESS IS SHOWN TOO: what stays at the old place, and the command that moves it, is the
+        // part of this change the operator has to act on.
+        Pending::MoveData(to) => Some(match crate::commands::change_data_dir(to.as_deref()) {
+            Ok(msg) => format!("data dir moved\n{msg}"),
+            Err(e) => format!("data dir not moved\n{e}"),
+        }),
         Pending::StopBox(name) => {
             quiet_io(|| crate::commands::stop(std::slice::from_ref(&name), false))
                 .err()
@@ -2105,6 +2172,8 @@ fn handle_form_key(mut form: Form, key: &[u8]) -> FormOutcome {
 /// Carry out a submitted form: create the volume, or write the profile back to `kern.toml`.
 fn apply_form(form: &Form) -> Result<(), String> {
     match &form.submit {
+        // Turned into a confirmation by the caller before it gets here.
+        Submit::DataDir => Ok(()),
         Submit::CreateVolume => {
             let name = form.fields[0].value.trim();
             if name.is_empty() {
@@ -3649,7 +3718,7 @@ fn present_devices(kind: &str) -> Vec<String> {
     }
 }
 
-/// `(used, total)` bytes on the filesystem that backs the kern data root - `statvfs("/")`, matching
+/// `(used, total)` bytes on the filesystem that backs the kern data root (see [`data_root_measured`]), matching
 /// `df` (used = blocks − free). This is the disk where images / volumes / vdisks physically live.
 ///
 /// ONE IMPLEMENTATION, in [`crate::commands::fs_usage`]. This was a private copy here, and
@@ -3657,7 +3726,19 @@ fn present_devices(kind: &str) -> Vec<String> {
 /// wrapper is how `kern top` and a generated config come to state different totals for the same
 /// disk; the shared one also does its arithmetic checked, which this one did not.
 fn host_disk() -> Option<(u64, u64)> {
-    crate::commands::fs_usage("/")
+    crate::commands::fs_usage(&data_root_measured().to_string_lossy())
+}
+
+/// The directory whose filesystem holds kern's data: the data root as every path resolves it
+/// (`[kern] data_dir` or the XDG default), or its nearest existing parent before kern made it.
+/// It was `/`, which on a host with the data on a second disk or an SD card measured the wrong disk
+/// in the header and in the "Disk N % full" alert.
+fn data_root_measured() -> std::path::PathBuf {
+    let root = crate::kern_xdg_root("XDG_DATA_HOME", ".local/share")
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    root.ancestors()
+        .find(|a| a.exists())
+        .map_or_else(|| std::path::PathBuf::from("/"), std::path::Path::to_path_buf)
 }
 
 /// The host's logical CPU count (per-CPU lines in `/proc/stat`), resolved once - the core count is
@@ -3709,7 +3790,8 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
         .as_ref()
         .and_then(|d| crate::commands::fs_fill(&d.to_string_lossy()))
         .map_or(0, |(pct, _)| pct);
-    let disk_fill = crate::commands::fs_fill("/").map_or(0, |(pct, _)| pct);
+    let disk_fill = crate::commands::fs_fill(&data_root_measured().to_string_lossy())
+        .map_or(0, |(pct, _)| pct);
     let (load1, cores) = host_load_cores();
     let (docker_api, https) = services();
     (
@@ -3918,6 +4000,10 @@ fn render(
                 keys.join("  ")
             )
         }
+        Mode::PickData { choices, sel } => {
+            s.push_str(&data_pane(p, choices, *sel, width));
+            format!("{d}[{z}↑↓{d}] choose   [{z}⏎{d}] move here   [{z}e{d}] type a path   [{z}Esc{d}] back{z}")
+        }
         Mode::Confirm { prompt, .. } => {
             s.push_str(&confirm_pane(p, prompt));
             format!("{d}[{z}y{d}] yes   [{z}any other{d}] no{z}")
@@ -4014,6 +4100,7 @@ fn help_text() -> String {
      STORAGE tab\n\
        n  new         e  edit         d  delete        Enter  details\n\
        p  prune unused      D  remove ALL volumes and their data\n\
+       m  move kern's data (images, volumes, kept boxes) to another disk, asks first\n\
      \n\
      HEALTH colors:  green = healthy   red = unhealthy   dim = starting or no check\n\
      Destructive actions (stop / delete / prune) ask y / n first.\n\
@@ -4056,7 +4143,7 @@ fn nav_footer(
                 " [e]dit [d]elete [D]elete-all [⏎]info"
             };
             format!(
-                "{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}n{d}]ew{ops} [{z}p{d}]rune   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+                "{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}n{d}]ew{ops} [{z}p{d}]rune   [{z}m{d}]ove data   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
             )
         }
         TAB_SANDBOXES => format!(
@@ -4323,6 +4410,308 @@ fn form_pane(p: &Palette, form: &Form, width: usize, body_rows: usize) -> String
 }
 
 /// The confirm pane: a centred prompt for a destructive action.
+/// One place kern's data could live: a mounted disk, the directory on it, and what it would take.
+#[derive(Clone, Debug, PartialEq)]
+struct DataChoice {
+    /// The `data_dir` to set, or `None` for the default place (the disk the home directory is on).
+    path: Option<String>,
+    /// The directory as shown and as the confirmation names it.
+    shown: String,
+    mount: String,
+    fstype: String,
+    source: String,
+    free: u64,
+    total: u64,
+    /// kern's data is in exactly this directory now.
+    current: bool,
+    /// kern's data is on this disk now, in another directory (shown, so the row reads true).
+    elsewhere_here: Option<String>,
+    /// Why this disk cannot take it as it is, and what to do; `None` when it can.
+    problem: Option<String>,
+}
+
+/// A mount from `/proc/self/mountinfo` that could hold kern's data: a block device, mounted
+/// read-write, the whole filesystem (not a bind of a subdirectory), not a boot or snap mount.
+#[derive(Debug, PartialEq)]
+struct MountRow {
+    dev: String,
+    mount: String,
+    fstype: String,
+    source: String,
+}
+
+/// Parse `/proc/self/mountinfo` into the mounts that could take kern's data, one per device (the
+/// shortest mount point wins when a device is mounted twice). Pure, for the tests.
+fn data_mounts(mountinfo: &str) -> Vec<MountRow> {
+    let unescape = |s: &str| {
+        s.replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\134", "\\")
+    };
+    let mut out: Vec<MountRow> = Vec::new();
+    for line in mountinfo.lines() {
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        let f: Vec<&str> = pre.split(' ').collect();
+        let g: Vec<&str> = post.split(' ').collect();
+        let (Some(dev), Some(root), Some(mnt), Some(opts), Some(fstype), Some(source)) = (
+            f.get(2),
+            f.get(3),
+            f.get(4),
+            f.get(5),
+            g.first(),
+            g.get(1),
+        ) else {
+            continue;
+        };
+        let mount = unescape(mnt);
+        let skip_place = ["/boot", "/efi", "/snap", "/var/snap", "/proc", "/sys", "/dev"]
+            .iter()
+            .any(|p| mount == *p || mount.starts_with(&format!("{p}/")));
+        if *root != "/"
+            || !source.starts_with("/dev/")
+            || source.starts_with("/dev/loop")
+            || matches!(*fstype, "squashfs" | "iso9660" | "udf")
+            || opts.split(',').any(|o| o == "ro")
+            || skip_place
+        {
+            continue;
+        }
+        let row = MountRow {
+            dev: (*dev).to_string(),
+            mount,
+            fstype: (*fstype).to_string(),
+            source: unescape(source),
+        };
+        match out.iter_mut().find(|r| r.dev == row.dev) {
+            Some(r) if row.mount.len() < r.mount.len() => *r = row,
+            Some(_) => {}
+            None => out.push(row),
+        }
+    }
+    out
+}
+
+/// The disks kern's data could go to, the one it is on now marked, each with what it would take.
+/// Read when `m` is pressed, not every frame.
+fn data_choices() -> Vec<DataChoice> {
+    use std::os::unix::fs::MetadataExt;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let dev_of = |p: &std::path::Path| std::fs::metadata(p).ok().map(|m| m.dev());
+    let now = dev_of(&data_root_measured());
+    let root = crate::kern_xdg_root("XDG_DATA_HOME", ".local/share");
+    let home = crate::xdg_var("HOME");
+    let home_dev = home.as_deref().and_then(dev_of);
+    let default_dir = crate::xdg_base("XDG_DATA_HOME", ".local/share").map(|b| b.join("kern"));
+    let mut out: Vec<DataChoice> = data_mounts(&mountinfo)
+        .into_iter()
+        .map(|m| {
+            let mdev = dev_of(std::path::Path::new(&m.mount));
+            let is_home_disk = mdev.is_some() && mdev == home_dev;
+            let (path, shown) = match (&default_dir, is_home_disk) {
+                (Some(d), true) => {
+                    // `~` for the home directory, so the default fits its column whole.
+                    let full = d.display().to_string();
+                    let short = home
+                        .as_deref()
+                        .and_then(|h| d.strip_prefix(h).ok())
+                        .map_or(full, |rest| format!("~/{}", rest.display()));
+                    (None, format!("{short} (default)"))
+                }
+                _ => {
+                    let dir = std::path::Path::new(&m.mount).join("kern");
+                    (Some(dir.display().to_string()), dir.display().to_string())
+                }
+            };
+            let (used, total) = crate::commands::fs_usage(&m.mount).unwrap_or((0, 0));
+            let problem = data_choice_problem(&m, path.as_deref());
+            let dir = path
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| default_dir.clone());
+            let on_disk = mdev.is_some() && mdev == now;
+            let current = on_disk && dir.is_some() && dir == root;
+            let elsewhere_here = (on_disk && !current)
+                .then(|| root.as_ref().map(|r| r.display().to_string()))
+                .flatten();
+            DataChoice {
+                path,
+                shown,
+                mount: m.mount,
+                fstype: m.fstype,
+                source: m.source,
+                free: total.saturating_sub(used),
+                total,
+                current,
+                elsewhere_here,
+                problem,
+            }
+        })
+        .collect();
+    // The disk it is on first, then the others by free space.
+    out.sort_by(|a, b| {
+        let here = |c: &DataChoice| c.current || c.elsewhere_here.is_some();
+        here(b).cmp(&here(a)).then(b.free.cmp(&a.free))
+    });
+    out
+}
+
+/// What stops a disk from taking kern's data as it is, said with what to do. Decided from what can be
+/// read without writing; `kern config set data_dir` still proves the directory before it is used.
+fn data_choice_problem(m: &MountRow, path: Option<&str>) -> Option<String> {
+    if matches!(
+        m.fstype.as_str(),
+        "vfat" | "msdos" | "exfat" | "ntfs" | "ntfs3" | "fuseblk"
+    ) {
+        return Some(format!(
+            "{} keeps no file modes or symlinks: format it ext4 to use it",
+            m.fstype
+        ));
+    }
+    let dir = std::path::Path::new(path?);
+    if dir.exists() {
+        return None;
+    }
+    let parent = dir.parent()?;
+    let c = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+    let writable = unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0;
+    (!writable).then(|| {
+        format!(
+            "not writable by you: sudo mkdir {} && sudo chown $USER {}",
+            dir.display(),
+            dir.display()
+        )
+    })
+}
+
+/// The DATA line: where kern keeps its data now, on which disk, and how full that disk is.
+fn data_line(p: &Palette) -> String {
+    let (c, d, z) = (p.c, p.d, p.z);
+    let root = crate::kern_xdg_root("XDG_DATA_HOME", ".local/share")
+        .map_or_else(|| "?".to_string(), |r| r.display().to_string());
+    let measured = data_root_measured();
+    let free = crate::commands::fs_usage(&measured.to_string_lossy())
+        .map(|(u, t)| format!("{} free of {}", human_bytes(t.saturating_sub(u)), human_bytes(t)))
+        .unwrap_or_default();
+    format!("{c}{root}{z}  {d}{free}{z}")
+}
+
+/// The disk picker for kern's data.
+fn data_pane(p: &Palette, choices: &[DataChoice], sel: usize, width: usize) -> String {
+    let (b, d, g, y, z) = (p.b, p.d, p.g, p.y, p.z);
+    let mut s = format!(
+        "\n  {b}where kern keeps its data{z}  {d}images, volumes, kept boxes, builds{z}\n  {d}moving it is \
+         like Docker's data-root: what is there stays, with the command that moves it{z}\n\n"
+    );
+    let running = crate::registry::list().len();
+    if running > 0 {
+        s.push_str(&format!(
+            "  {y}{running} box(es) running: stop them first (kern stop --all), the move is refused \
+             while one writes to the old place{z}\n\n"
+        ));
+    }
+    // Cut the TEXT, before colour is added: cutting a coloured line counts the escape codes as
+    // columns and drops the newline with them, which glued the next row onto this one.
+    let room = width.saturating_sub(8).max(20);
+    let cut = |t: &str| -> String { crate::ui::scrub(t).chars().take(room).collect() };
+    for (i, ch) in choices.iter().enumerate() {
+        let (mark, col) = sel_marker(p, i == sel);
+        let now = if ch.current {
+            format!("  {g}● now{z}")
+        } else if ch.elsewhere_here.is_some() {
+            format!("  {g}● here{z}")
+        } else {
+            String::new()
+        };
+        let shown: String = cut(&ch.shown).chars().take(36).collect();
+        s.push_str(&format!(
+            "{mark}{col}{shown:<36}{z} {d}{:<6} {:>7} free of {:<7}{z}{now}\n",
+            cut(&ch.fstype),
+            human_bytes(ch.free),
+            human_bytes(ch.total),
+        ));
+        let mut detail = format!("{} on {}", ch.source, ch.mount);
+        if let Some(at) = &ch.elsewhere_here {
+            detail.push_str(&format!(", data now at {at}"));
+        }
+        s.push_str(&format!("      {d}{}{z}\n", cut(&detail)));
+        if let Some(why) = &ch.problem {
+            s.push_str(&format!("      {y}{}{z}\n", cut(why)));
+        }
+    }
+    let (mark, col) = sel_marker(p, sel >= choices.len());
+    s.push_str(&format!("{mark}{col}type another path…{z}\n"));
+    let idle = unmounted_partitions();
+    if !idle.is_empty() {
+        s.push_str(&format!(
+            "\n  {d}{}{z}\n",
+            cut(&format!(
+                "not mounted, so not offered: {}. Mount one (your file manager does) and press m again",
+                idle.join(", ")
+            ))
+        ));
+    }
+    s
+}
+
+/// Partitions of at least 1 GiB that are not mounted and not swap, as `name size`: the disks a user
+/// expects in the list and does not find there, named so the reason is on screen.
+fn unmounted_partitions() -> Vec<String> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let swaps = std::fs::read_to_string("/proc/swaps").unwrap_or_default();
+    let used = |name: &str| {
+        let dev = format!("/dev/{name}");
+        mountinfo
+            .lines()
+            .any(|l| l.split(" - ").nth(1).and_then(|p| p.split(' ').nth(1)) == Some(dev.as_str()))
+            || swaps.lines().any(|l| l.split_whitespace().next() == Some(dev.as_str()))
+    };
+    let Ok(dir) = std::fs::read_dir("/sys/class/block") else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u64)> = dir
+        .flatten()
+        .filter(|e| e.path().join("partition").exists())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let sectors: u64 = std::fs::read_to_string(e.path().join("size"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            let bytes = sectors.checked_mul(512)?;
+            (bytes >= 1 << 30 && !used(&name)).then_some((name, bytes))
+        })
+        .collect();
+    out.sort();
+    out.into_iter()
+        .map(|(n, b)| format!("{n} {}", human_bytes(b)))
+        .collect()
+}
+
+/// The confirmation for a move of kern's data.
+fn move_data_prompt(to: &str) -> String {
+    format!(
+        "move kern's data to {}? new images, volumes and boxes go there; what is at the old place \
+         stays  (y/n)",
+        crate::ui::scrub(to)
+    )
+}
+
+/// A one-field form for a typed `data_dir`.
+fn data_dir_form() -> Form {
+    Form {
+        title: "kern's data directory".into(),
+        fields: vec![Field::text("path", "absolute, e.g. /mnt/data/kern")],
+        active: 0,
+        submit: Submit::DataDir,
+        error: None,
+        show_advanced: false,
+    }
+}
+
 fn confirm_pane(p: &Palette, prompt: &str) -> String {
     let (b, y, z) = (p.b, p.y, p.z);
     format!("\n\n  {y}⚠{z}  {b}{prompt}{z}\n")
@@ -4714,6 +5103,9 @@ fn storage_table(
         max_rows = max_rows.saturating_sub(3).max(1);
     }
 
+    // WHERE THE DATA IS, and the key that moves it: the disk images, volumes and kept boxes fill.
+    s.push_str(&format!("\n  {b}DATA{z} {}  {d}[m] to move it to another disk{z}\n", data_line(p)));
+    max_rows = max_rows.saturating_sub(2).max(1);
     s.push_str(&format!(
         "\n  {d}named volumes, persistent and shared: {z}{c}kern box -v NAME:/data …{z}  {d}(per-box vdisks are in Profiles){z}\n\n"
     ));
@@ -6575,6 +6967,8 @@ mod tests {
 
     #[test]
     fn storage_shows_infinity_for_unlimited_quota() {
+        // The DATA line resolves kern's data root, which reads the config.
+        let _g = crate::env_guard();
         // A volume with no quota is UNLIMITED - show `∞`, not an ambiguous `-`. A capped one shows the
         // human size. (The bug: `-` read as "unset/error" instead of "no cap".)
         let vols = [
@@ -6787,6 +7181,46 @@ mod tests {
             Mode::Nav => panic!("`s` acted immediately instead of asking"),
             _ => panic!("`s` must open a confirmation, and opened something else"),
         }
+    }
+
+    /// The disks offered for kern's data: real block devices mounted read-write, one row per device,
+    /// no boot, snap, loop or read-only mounts, and no bind mount of a subdirectory.
+    #[test]
+    fn data_mounts_keep_the_disks_a_user_could_move_kern_to() {
+        let mi = "\
+22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+30 22 259:1 / /boot/efi rw,relatime shared:2 - vfat /dev/nvme0n1p1 rw
+31 22 7:3 / /snap/core/1 ro,nodev shared:3 - squashfs /dev/loop3 ro
+40 22 179:1 / /media/alex/SD\\040CARD rw,nosuid shared:4 - ext4 /dev/mmcblk0p1 rw
+41 22 179:1 /sub /mnt/bind rw shared:4 - ext4 /dev/mmcblk0p1 rw
+42 22 8:1 / /mnt/usb rw shared:5 - exfat /dev/sda1 rw
+43 22 8:17 / /mnt/ro ro shared:6 - ext4 /dev/sdb1 ro
+44 22 0:50 / /run/user/1000 rw shared:7 - tmpfs tmpfs rw
+45 22 179:1 / /media/alex/SD\\040CARD/again rw shared:4 - ext4 /dev/mmcblk0p1 rw
+";
+        let got: Vec<(String, String)> = data_mounts(mi)
+            .into_iter()
+            .map(|m| (m.mount, m.fstype))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("/".to_string(), "ext4".to_string()),
+                ("/media/alex/SD CARD".to_string(), "ext4".to_string()),
+                ("/mnt/usb".to_string(), "exfat".to_string()),
+            ]
+        );
+        let usb = MountRow {
+            dev: "8:1".into(),
+            mount: "/mnt/usb".into(),
+            fstype: "exfat".into(),
+            source: "/dev/sda1".into(),
+        };
+        assert!(
+            data_choice_problem(&usb, Some("/mnt/usb/kern"))
+                .is_some_and(|w| w.contains("format it ext4")),
+            "a FAT/exFAT card is offered with what it takes, not as a place that works"
+        );
     }
 
     /// A PASTE IS NOT A CONFIRMATION. Text pasted into top reached it as keys, and `systemd` in a
