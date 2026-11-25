@@ -41,7 +41,21 @@ try {
 # KERN_VERSION naming that release. The checks are the same, so a mirror cannot hand over a file the
 # release keys did not sign.
 if ($env:KERN_RELEASE_URL -and -not $env:KERN_VERSION) { throw "kern: KERN_RELEASE_URL names a mirror: set KERN_VERSION too (the release it holds)." }
-$RelBase    = if ($env:KERN_RELEASE_URL) { $env:KERN_RELEASE_URL.TrimEnd('/') } elseif ($env:KERN_VERSION) { "https://github.com/getkern/kern/releases/download/v$($env:KERN_VERSION -replace '^v', '')" } else { 'https://github.com/getkern/kern/releases/latest/download' }
+# THE VERSION IS ASKED ONCE, and every download then comes from THAT release. `latest` used to be
+# resolved here for the signature rule and then again by each download (`releases/latest/download`),
+# and once more by Get-TargetVersion: a release published in between made the files name one version
+# and the rule expect another, and the install was refused. Unanswered: `latest/download`, treated as
+# signed, as before.
+$script:TargetVersion = $null
+if ($env:KERN_VERSION) {
+    $script:TargetVersion = $env:KERN_VERSION -replace '^v', ''
+} elseif (-not $env:KERN_RELEASE_URL) {
+    try {
+        $rel = Invoke-RestMethod -TimeoutSec 8 -Uri 'https://api.github.com/repos/getkern/kern/releases/latest' -UseBasicParsing
+        if ($rel.tag_name -match '^v(\d+\.\d+\.\d+)$') { $script:TargetVersion = $Matches[1] }
+    } catch { $script:TargetVersion = $null }
+}
+$RelBase    = if ($env:KERN_RELEASE_URL) { $env:KERN_RELEASE_URL.TrimEnd('/') } elseif ($script:TargetVersion) { "https://github.com/getkern/kern/releases/download/v$($script:TargetVersion)" } else { 'https://github.com/getkern/kern/releases/latest/download' }
 # KERN_WSL_DISTRO and KERN_INSTALL_DIR put a trial install somewhere else: another distro name (kern.exe
 # reads the same variable at run time) and another folder for kern.exe, so the real installer can be
 # run into a throwaway distro without touching the user's `kern`.
@@ -58,18 +72,8 @@ $KernReleaseKeys = @('RWSuYG/qtD8AV5p5IzIqfRuCwh5eJlT7ed5+7lVKrgILE1qvIpPGv+Ej',
 # assets are signed (0.52.0 on): a missing signature there is refused, not skipped.
 $script:WantVersion = $null
 $script:SignedEra = $true
-if (-not $env:KERN_VERSION) {
-    # LATEST IS RESOLVED TO A VERSION, so the signature rule applies to the release that is actually
-    # served (a `latest` that is older than signed Windows assets is not refused for lacking them), and
-    # every asset's signature must then name that one version. Unanswered: treated as signed.
-    try {
-        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/getkern/kern/releases/latest' -UseBasicParsing
-        if ($rel.tag_name -match '^v(\d+\.\d+\.\d+)$') { $script:LatestVersion = $Matches[1] }
-    } catch { $script:LatestVersion = $null }
-}
-$VersionForEra = if ($env:KERN_VERSION) { $env:KERN_VERSION -replace '^v', '' } else { $script:LatestVersion }
-if ($VersionForEra) {
-    $script:WantVersion = $VersionForEra
+if ($script:TargetVersion) {
+    $script:WantVersion = $script:TargetVersion
     $vp = $script:WantVersion -split '\.'
     if ($vp.Count -eq 3 -and [int]$vp[0] -eq 0 -and [int]$vp[1] -lt 52) {
         $script:SignedEra = $false
@@ -195,50 +199,66 @@ function Test-MinisignFile($ms, $file, $sig, $target, $asset) {
     return $v
 }
 
+# One minisign check of a downloaded release file, WITHOUT deciding what to do about the outcome:
+# Check-Signature (the files of an install) and Update-DistroBinary (the in-place swap) both ask it,
+# so which verifier is used, which version it must name and what a mirror needs are written once.
+# The two used to carry their own copy and already differed (a missing signature was fatal in one
+# and a fall-back in the other for the same release). State: verified, unchecked, none or refused.
+function Get-ReleaseSignature($dest, $url, $target) {
+    $asset = ($url -split '/')[-1]
+    $sig = "$dest.minisig"
+    try { Invoke-WebRequest -Uri "$url.minisig" -OutFile $sig -UseBasicParsing }
+    catch { return @{ State = 'none'; Asset = $asset } }
+    try {
+        $ms = Get-Command minisign.exe -ErrorAction SilentlyContinue
+        if ($ms) {
+            try { $v = Test-MinisignFile $ms $dest $sig $target $asset }
+            catch { return @{ State = 'refused'; Asset = $asset; Why = $_.Exception.Message } }
+            if (-not $script:WantVersion) { $script:WantVersion = $v }
+            return @{ State = 'verified'; Asset = $asset; Version = $v; By = 'minisign' }
+        }
+        # NO MINISIGN: the kern that was installed BEFORE this run checks it, with the keys built into
+        # it and the same rules as `kern self-update` (see Save-Verifier); a refusal there stops the
+        # install. A first install, or a kern too old to check, leaves it unchecked.
+        $v = Verify-InDistro $dest $sig $target $asset
+        if ($v) {
+            if (-not $script:WantVersion) { $script:WantVersion = $v }
+            return @{ State = 'verified'; Asset = $asset; Version = $v; By = 'the kern installed before' }
+        }
+        return @{ State = 'unchecked'; Asset = $asset; Why = $script:VerifierWhyNot }
+    } finally {
+        Remove-Item $sig -ErrorAction SilentlyContinue
+    }
+}
+
 # THE SIGNATURE, when minisign is installed (`winget install jedisct1.minisign`). The `.sha256`
 # beside a file only proves the download matches a file on the same server; the signature proves the
 # file is a release, made with one of the two kern release keys, and its signed comment names this
 # file, this target and this version, so an older or another platform's signed file cannot stand in.
 # Without minisign it is said and skipped, as on the Linux side.
 function Check-Signature($dest, $url, $target, $what) {
-    $asset = ($url -split '/')[-1]
-    $sig = "$dest.minisig"
-    try { Invoke-WebRequest -Uri "$url.minisig" -OutFile $sig -UseBasicParsing }
-    catch {
-        if ($script:SignedEra) { Die "$what has no signature ($asset.minisig), and every release from 0.52.0 on signs it. Not installing. If the network dropped, run this again." }
-        Info "  ($what predates signed Windows assets: none to check)"
-        Note-Check $what 'signature: none (this release predates them)'
-        return
-    }
-    try {
-        $ms = Get-Command minisign.exe -ErrorAction SilentlyContinue
-        if ($ms) {
-            try { $v = Test-MinisignFile $ms $dest $sig $target $asset }
-            catch { Die "$($_.Exception.Message). Not installing." }
-            if (-not $script:WantVersion) { $script:WantVersion = $v }
-            Info "$what signature verified ($v)."
-            Note-Check $what "signature verified by minisign ($v)"
-            return
+    $r = Get-ReleaseSignature $dest $url $target
+    switch ($r.State) {
+        'none' {
+            if ($script:SignedEra) { Die "$what has no signature ($($r.Asset).minisig), and every release from 0.52.0 on signs it. Not installing. If the network dropped, run this again." }
+            Info "  ($what predates signed Windows assets: none to check)"
+            Note-Check $what 'signature: none (this release predates them)'
         }
-        # NO MINISIGN: the kern that was installed BEFORE this run checks it, with the keys built into
-        # it and the same rules as `kern self-update` (see Save-Verifier). A first install, or a kern too
-        # old to check, leaves the signature unchecked, and the summary says so.
-        $v = Verify-InDistro $dest $sig $target $asset
-        if ($v) {
-            if (-not $script:WantVersion) { $script:WantVersion = $v }
-            Info "$what signature verified by the kern installed before ($v)."
-            Note-Check $what "signature verified by the kern installed before ($v)"
-            return
+        'refused' { Die "$($r.Why). Not installing." }
+        'verified' {
+            Info "$what signature verified by $($r.By) ($($r.Version))."
+            Note-Check $what "signature verified by $($r.By) ($($r.Version))"
         }
-        # A MIRROR IS TRUSTED ONLY THROUGH THE SIGNATURE: what came from it was not served by github.com
-        # over its HTTPS, so with nothing able to check the signature there is nothing to trust.
-        if ($env:KERN_RELEASE_URL) {
-            Die "$what came from the mirror $RelBase and its signature could not be checked ($($script:VerifierWhyNot)). A mirror is trusted only through the signatures: install minisign (winget install jedisct1.minisign) and run this again, or install from github.com."
+        default {
+            # A MIRROR IS TRUSTED ONLY THROUGH THE SIGNATURE: what came from it was not served by
+            # github.com over its HTTPS, so with nothing able to check the signature there is nothing
+            # to trust.
+            if ($env:KERN_RELEASE_URL) {
+                Die "$what came from the mirror $RelBase and its signature could not be checked ($($r.Why)). A mirror is trusted only through the signatures: install minisign (winget install jedisct1.minisign) and run this again, or install from github.com."
+            }
+            Info "  (signature of $what not checked: install minisign to check it, e.g. winget install jedisct1.minisign)"
+            Note-Check $what "signature NOT verified ($($r.Why)): trusting HTTPS from github.com"
         }
-        Info "  (signature of $what not checked: install minisign to check it, e.g. winget install jedisct1.minisign)"
-        Note-Check $what "signature NOT verified ($($script:VerifierWhyNot)): trusting HTTPS from github.com"
-    } finally {
-        Remove-Item $sig -ErrorAction SilentlyContinue
     }
 }
 
@@ -408,13 +428,8 @@ Fix that, then re-run this installer.
 
 # ---- 2. import kern's own distro --------------------------------------------
 # The version this installer targets: KERN_VERSION if pinned, else the latest GitHub release tag.
-function Get-TargetVersion {
-    if ($env:KERN_VERSION) { return ($env:KERN_VERSION -replace '^v', '') }
-    try {
-        $t = (Invoke-RestMethod -TimeoutSec 8 https://api.github.com/repos/getkern/kern/releases/latest).tag_name
-        return ($t -replace '^v', '')
-    } catch { return $null }
-}
+# The version resolved once at the top (see $script:TargetVersion), never asked again.
+function Get-TargetVersion { return $script:TargetVersion }
 
 # Upgrade the kern binary INSIDE the existing distro WITHOUT re-importing it - so the image cache and
 # boxes (which live in the distro's own filesystem) survive an update. The pre-baked distro is Alpine
@@ -438,24 +453,21 @@ function Update-DistroBinary($want) {
                 $got256  = (Get-FileHash $tgz -Algorithm SHA256).Hash.ToLower()
                 Remove-Item "$tgz.sha256" -ErrorAction SilentlyContinue
                 if ($want256 -ne $got256) { return $false }
-                # The signature too, when minisign is installed: any doubt (missing, invalid, another
-                # target, file or version) falls back to the full re-import, which checks the rootfs.
-                $ms = Get-Command minisign.exe -ErrorAction SilentlyContinue
-                if ($ms) {
-                    try { Invoke-WebRequest -Uri "$BinUrl.minisig" -OutFile "$tgz.minisig" -UseBasicParsing } catch { return $false }
-                    try { $null = Test-MinisignFile $ms $tgz "$tgz.minisig" 'x86_64-unknown-linux-musl' (($BinUrl -split '/')[-1]) }
-                    catch { return $false }
-                    finally { Remove-Item "$tgz.minisig" -ErrorAction SilentlyContinue }
-                    Note-Check 'the kern in the distro' 'sha256 ok; signature verified by minisign'
-                } else {
-                    # No minisign: the kern installed before this run checks the tarball (0.52.0 on). A
-                    # refusal stops the install; a kern too old to check leaves it to the SHA256.
-                    try { Invoke-WebRequest -Uri "$BinUrl.minisig" -OutFile "$tgz.minisig" -UseBasicParsing } catch { return $false }
-                    try { $vv = Verify-InDistro $tgz "$tgz.minisig" 'x86_64-unknown-linux-musl' (($BinUrl -split '/')[-1]) }
-                    finally { Remove-Item "$tgz.minisig" -ErrorAction SilentlyContinue }
-                    if ($vv) { Note-Check 'the kern in the distro' "sha256 ok; signature verified by the kern installed before ($vv)" }
-                    elseif ($env:KERN_RELEASE_URL) { return $false }
-                    else { Note-Check 'the kern in the distro' "sha256 ok; signature NOT verified ($($script:VerifierWhyNot)): trusting HTTPS from github.com" }
+                # The signature, by the one check every download uses: any doubt (missing in a release that
+                # signs, refused, unchecked from a mirror) falls back to the full re-import, which checks
+                # the rootfs and stops there if it must.
+                $r = Get-ReleaseSignature $tgz $BinUrl 'x86_64-unknown-linux-musl'
+                switch ($r.State) {
+                    'verified' { Note-Check 'the kern in the distro' "sha256 ok; signature verified by $($r.By) ($($r.Version))" }
+                    'none' {
+                        if ($script:SignedEra) { return $false }
+                        Note-Check 'the kern in the distro' 'sha256 ok; signature: none (this release predates them)'
+                    }
+                    'unchecked' {
+                        if ($env:KERN_RELEASE_URL) { return $false }
+                        Note-Check 'the kern in the distro' "sha256 ok; signature NOT verified ($($r.Why)): trusting HTTPS from github.com"
+                    }
+                    default { return $false }
                 }
             }
         }
