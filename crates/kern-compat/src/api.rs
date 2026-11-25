@@ -252,6 +252,9 @@ pub(crate) struct Created {
     stdin: bool,
     /// `Tty` (`docker run -t`): a terminal, and the attach is one raw stream, not frames.
     tty: bool,
+    /// What the create asked for that kern does not apply: Docker's `Warnings`, which the client
+    /// prints, so a setting is never dropped in silence.
+    warnings: Vec<String>,
 }
 
 static CREATED: Mutex<Option<HashMap<String, Created>>> = Mutex::new(None);
@@ -858,6 +861,171 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
         c.extend(cmd);
         cmd = c;
     }
+    // THE REST OF `HostConfig`, AND `StopSignal`/`StopTimeout`, as the `kern box` flags of the same
+    // meaning. MEASURED before: only Memory and NanoCpus were read, and every other limit or setting
+    // a client sent was accepted and dropped: `docker run --pids-limit 32` through the socket ran
+    // with kern's default and 100 forks all succeeded, where Docker refused the 33rd. A field kern has
+    // no flag for is a `Warning` in the answer, which the client prints.
+    let mut warnings: Vec<String> = Vec::new();
+    let num = |k: &str| {
+        host.and_then(|h| h.get(k))
+            .and_then(Value::as_i64)
+            .filter(|n| *n > 0)
+    };
+    let text = |k: &str| {
+        host.and_then(|h| h.get(k))
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+    };
+    let mut flag_n = |flag: &str, v: Option<i64>| {
+        if let Some(v) = v {
+            argv.push(flag.into());
+            argv.push(v.to_string());
+        }
+    };
+    flag_n("--pids-limit", num("PidsLimit"));
+    flag_n("--shm-size", num("ShmSize"));
+    flag_n("--memory-reservation", num("MemoryReservation"));
+    flag_n("--io-weight", num("BlkioWeight").map(|w| w * 10));
+    // `MemorySwap` is memory PLUS swap in Docker; kern's knob is the swap alone.
+    if let (Some(total), Some(mem)) = (num("MemorySwap"), num("Memory")) {
+        if total > mem {
+            argv.push("--memory-swap-max".into());
+            argv.push((total - mem).to_string());
+        }
+    }
+    // `--cpu-quota` / `--cpu-period` are a CPU count, as `--cpus` is.
+    if let (Some(q), Some(p)) = (num("CpuQuota"), num("CpuPeriod")) {
+        if num("NanoCpus").is_none() {
+            argv.push("--cpus".into());
+            argv.push(format!("{:.3}", q as f64 / p as f64));
+        }
+    }
+    if let Some(c) = text("CpusetCpus") {
+        argv.push("--cpuset-cpus".into());
+        argv.push(c.to_string());
+    }
+    if host
+        .and_then(|h| h.get("ReadonlyRootfs"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        argv.push("--read-only".into());
+    }
+    if host.and_then(|h| h.get("Init")).and_then(Value::as_bool) == Some(true) {
+        argv.push("--init".into());
+    }
+    for (field, flag) in [
+        ("ExtraHosts", "--add-host"),
+        ("Dns", "--dns"),
+        ("DnsSearch", "--dns-search"),
+        ("DnsOptions", "--dns-option"),
+        ("CapDrop", "--cap-drop"),
+        ("GroupAdd", "--group-add"),
+    ] {
+        for v in strings(host.and_then(|h| h.get(field))) {
+            argv.push(flag.into());
+            argv.push(v);
+        }
+    }
+    for (k, v) in host
+        .and_then(|h| h.get("Sysctls"))
+        .and_then(Value::as_object)
+        .unwrap_or_default()
+    {
+        argv.push("--sysctl".into());
+        argv.push(format!("{k}={}", v.as_str().unwrap_or_default()));
+    }
+    for (path, opts) in host
+        .and_then(|h| h.get("Tmpfs"))
+        .and_then(Value::as_object)
+        .unwrap_or_default()
+    {
+        let opts = opts.as_str().unwrap_or_default();
+        argv.push("--tmpfs".into());
+        argv.push(if opts.is_empty() {
+            path.clone()
+        } else {
+            format!("{path}:{opts}")
+        });
+    }
+    for u in host
+        .and_then(|h| h.get("Ulimits"))
+        .and_then(Value::as_array)
+        .unwrap_or_default()
+    {
+        let (Some(name), Some(soft)) = (
+            u.get("Name").and_then(Value::as_str),
+            u.get("Soft").and_then(Value::as_i64),
+        ) else {
+            continue;
+        };
+        let hard = u.get("Hard").and_then(Value::as_i64).unwrap_or(soft);
+        argv.push("--ulimit".into());
+        argv.push(format!("{name}={soft}:{hard}"));
+    }
+    if let Some(lc) = host.and_then(|h| h.get("LogConfig")) {
+        match lc.get("Type").and_then(Value::as_str) {
+            None | Some("" | "json-file" | "local") => {}
+            Some("none") => {
+                argv.push("--log-driver".into());
+                argv.push("none".into());
+            }
+            Some(other) => warnings.push(format!(
+                "log driver {other:?}: kern keeps a box's output for `docker logs` (json-file)"
+            )),
+        }
+        let opt = |k: &str| {
+            lc.get("Config")
+                .and_then(|c| c.get(k))
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(v) = opt("max-size") {
+            argv.push("--log-max-size".into());
+            argv.push(v.to_string());
+        }
+        if let Some(v) = opt("max-file") {
+            argv.push("--log-max-file".into());
+            argv.push(v.to_string());
+        }
+    }
+    if let Some(sig) = body
+        .get("StopSignal")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        argv.push("--stop-signal".into());
+        argv.push(sig.to_string());
+    }
+    if let Some(t) = body
+        .get("StopTimeout")
+        .and_then(Value::as_i64)
+        .filter(|n| *n >= 0)
+    {
+        argv.push("--stop-timeout".into());
+        argv.push(t.to_string());
+    }
+    for (field, what) in [
+        ("CpuShares", "a relative CPU share"),
+        ("OomScoreAdj", "an OOM score adjustment"),
+        ("CpuRealtimePeriod", "a realtime CPU period"),
+    ] {
+        if num(field).is_some() {
+            warnings.push(format!(
+                "HostConfig.{field} ({what}) is not applied by kern's Docker API"
+            ));
+        }
+    }
+    if host
+        .and_then(|h| h.get("OomKillDisable"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        warnings.push(
+            "HostConfig.OomKillDisable is not applied: kern's boxes keep the OOM killer".into(),
+        );
+    }
     // `Healthcheck`, as `kern box --health-*`: what `depends_on: condition: service_healthy` waits on.
     // MEASURED before: it was not read, the box had no check, and the docker compose client refused
     // the stack ("container ... has no healthcheck configured"). Docker's durations are nanoseconds;
@@ -921,6 +1089,7 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
         auto_remove,
         stdin: flag("OpenStdin"),
         tty: flag("Tty"),
+        warnings,
     })
 }
 
@@ -3696,13 +3865,22 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                     net_remember(&name, &c.argv);
                     let session = in_session(&c.labels);
                     crate::events::publish(&event_of("create", &name, &c, None));
+                    let warnings = c.warnings.clone();
                     created_put(&name, c);
                     if let (true, Some(owner)) = (session, req.peer.clone()) {
                         session_track(bin, &name, owner);
                     }
                     json_response(
                         201,
-                        format!("{{\"Id\":{},\"Warnings\":[]}}", json_str(&id_of(&name))),
+                        format!(
+                            "{{\"Id\":{},\"Warnings\":[{}]}}",
+                            json_str(&id_of(&name)),
+                            warnings
+                                .iter()
+                                .map(|w| json_str(w))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
                     )
                 }
                 Err(e) => error(400, &e),
@@ -4725,6 +4903,42 @@ mod tests {
         for bad in ["", "..", ".x", "a/b", "a b"] {
             assert!(tty_file(bad).is_none(), "{bad:?}");
         }
+    }
+
+    /// The rest of `HostConfig` reaches the box: limits, mounts, names, resolvers, signals; a field
+    /// kern has no flag for is a warning. MEASURED before: only Memory and NanoCpus were read, and
+    /// `--pids-limit 32` through the socket let 100 forks through.
+    #[test]
+    fn host_config_limits_and_settings_reach_the_box() {
+        let b = body(
+            r#"{"Image":"x","StopSignal":"SIGINT","StopTimeout":3,"HostConfig":{"PidsLimit":32,"ShmSize":67108864,"Memory":104857600,"MemorySwap":209715200,"CpusetCpus":"0-1","ReadonlyRootfs":true,"Init":true,"ExtraHosts":["db:10.0.0.5"],"Dns":["9.9.9.9"],"CapDrop":["NET_RAW"],"Sysctls":{"net.core.somaxconn":"1024"},"Tmpfs":{"/run":"rw,size=64k"},"Ulimits":[{"Name":"nofile","Soft":1024,"Hard":2048}],"LogConfig":{"Type":"json-file","Config":{"max-size":"10m"}},"CpuShares":512}}"#,
+        );
+        let c = create_argv("n", &b).expect("translates");
+        let a = c.argv.join(" ");
+        for want in [
+            "--pids-limit 32",
+            "--shm-size 67108864",
+            "--memory-swap-max 104857600",
+            "--cpuset-cpus 0-1",
+            "--read-only",
+            "--init",
+            "--add-host db:10.0.0.5",
+            "--dns 9.9.9.9",
+            "--cap-drop NET_RAW",
+            "--sysctl net.core.somaxconn=1024",
+            "--tmpfs /run:rw,size=64k",
+            "--ulimit nofile=1024:2048",
+            "--log-max-size 10m",
+            "--stop-signal SIGINT",
+            "--stop-timeout 3",
+        ] {
+            assert!(a.contains(want), "{want} missing: {a}");
+        }
+        assert!(
+            c.warnings.iter().any(|w| w.contains("CpuShares")),
+            "{:?}",
+            c.warnings
+        );
     }
 
     /// Docker's `Healthcheck` (nanosecond durations, `CMD-SHELL` or `CMD`) as `kern box --health-*`

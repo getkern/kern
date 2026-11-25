@@ -157,6 +157,13 @@ through, that would leave the destination is refused. The Docker API serves
 container that has been created and not started (how Testcontainers copies its files) is in place
 when its command starts.
 
+**What a Docker client asks for at create reaches the box.** Through kern's socket only the memory
+and CPU limits were read; every other setting was accepted and dropped (`docker run --pids-limit 32`
+let a hundred forks through). The pids limit, `/dev/shm` size, swap, cpuset, CPU quota, read-only
+root, init, extra hosts, resolvers, dropped capabilities, groups, sysctls, tmpfs mounts, ulimits,
+log options, stop signal and timeout are now the box's flags, and what kern does not apply
+(`--cpu-shares`, `--oom-score-adj`, `--oom-kill-disable`) is printed by the client as a warning.
+
 **`depends_on: condition: service_healthy` through kern's socket.** A container's `Healthcheck`
 was not read, so the box had no check and the `docker compose` client refused the stack ("has no
 healthcheck configured"); it is the box's `--health-*` now, durations rounded up to whole seconds.
