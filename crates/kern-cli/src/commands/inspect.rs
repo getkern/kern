@@ -2468,6 +2468,39 @@ fn log_head<W: std::io::Write>(
     // `logs` reads the whole file. Either way `f` ends positioned at EOF so `--follow` streams NEW
     // appends without re-printing. (Narrow race on `--tail N -f` of an actively-appending box: a line
     // written between the tail read and the re-seek to EOF can be skipped - acceptable for a log tail.)
+    // THE EARLIER RUNS OF ONE CONTAINER FIRST, oldest first, as `docker logs` reads a restarted
+    // container's: each run's rotated half and then its file. With `--tail` the count is the last
+    // run's alone (stated in `kern logs --help`).
+    if tail.is_none() && crate::commands::boxlog::runs_are_one_container(name) {
+        let current = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(registry::split_log_file)
+            .map(|(k, _)| k.to_string())
+            .unwrap_or_default();
+        let dir = registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;
+        for key in crate::commands::boxlog::runs_with_logs(name) {
+            if key == current {
+                continue;
+            }
+            for suffix in [".1", ""] {
+                let p = dir.join(format!("{key}.log{suffix}"));
+                let Ok(content) = std::fs::read(&p) else {
+                    continue;
+                };
+                let map = |e| Error::Sandbox(format!("writing log: {e}"));
+                if timestamps || window.0.is_some() || window.1.is_some() || frames {
+                    let mut s = crate::commands::boxlog::Stamper::new(&p, 0)
+                        .with_window(window.0, window.1, timestamps)
+                        .with_frames(frames);
+                    s.push(w, &content).map_err(map)?;
+                    s.flush(w).map_err(map)?;
+                } else {
+                    w.write_all(&content).map_err(map)?;
+                }
+            }
+        }
+    }
     let shown: Vec<u8> = match tail {
         Some(n) => {
             let t = tail_file(&mut f, n)?;
@@ -3799,6 +3832,9 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
     let mut failures: Vec<String> = Vec::new();
     for name in names {
+        // Asked BEFORE the stop below, which removes a restarting box's unit: whether its runs are
+        // one container, whose earlier runs' logs (kept for `kern logs`) go with it.
+        let one_container = crate::commands::boxlog::runs_are_one_container(name);
         if let Some(inst) = registry::find_ref(name) {
             if !force {
                 failures.push(format!(
@@ -3839,6 +3875,9 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
         let records = registry::clear_exited_named(name, None);
         for pid in &records {
             crate::commands::boxlog::remove_run_logs(&format!("{name}-{pid}"));
+        }
+        if one_container {
+            crate::commands::boxlog::remove_logs_of(name);
         }
         if !kept && !records.is_empty() {
             println!("{name}");

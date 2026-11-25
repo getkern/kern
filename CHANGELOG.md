@@ -129,6 +129,11 @@ timed-out cell, a destroyed persistent sandbox and a killed kernel cell with `ke
 record listed it as `Exited (137)` for an hour; a cell that ended by itself left nothing. They use
 `kern rm -f`, the same teardown with the record removed.
 
+**`kern logs` and `docker logs` of a restarted container show every run.** A `--restart always`
+container systemd runs again (and any kept box) kept only its last run's log: six runs gave six lines
+under Docker, one through `kern logs` and none through kern's socket. The earlier runs' logs stay,
+the last 16 of them, and are read oldest first before the current one; `kern rm` takes them all.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

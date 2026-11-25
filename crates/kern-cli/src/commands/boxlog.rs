@@ -1822,6 +1822,61 @@ pub(crate) fn earlier_runs(name: &str, tail: Option<usize>) -> Vec<u8> {
 /// ([`registry::split_log_file`]) is `<name>-<pid>`, even when the run's active `.log` is gone and
 /// only a rotated generation or an index is left. Best effort: a file that is gone already is the
 /// wanted state.
+/// How many earlier runs of one container keep their logs, beside the current one: a `--restart
+/// always` box that starts again every second would otherwise leave a file per run for good.
+pub(crate) const KEPT_RUN_LOGS: usize = 16;
+
+/// The runs of `name` that have a log here (`<name>-<pid>` keys), oldest first by their main
+/// file's modification time.
+pub(crate) fn runs_with_logs(name: &str) -> Vec<String> {
+    let (Ok(dir), prefix) = (registry::logs_dir(), format!("{name}-")) else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut runs: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for e in rd.flatten() {
+        let fname = e.file_name();
+        let Some((key, suffix)) = fname.to_str().and_then(registry::split_log_file) else {
+            continue;
+        };
+        let ours = suffix.is_empty()
+            && key
+                .strip_prefix(&prefix)
+                .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+        if ours {
+            let t = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            runs.push((t, key.to_string()));
+        }
+    }
+    runs.sort();
+    runs.into_iter().map(|(_, k)| k).collect()
+}
+
+/// Keep the logs of `current` and of the last [`KEPT_RUN_LOGS`] runs of `name` before it.
+pub(crate) fn prune_run_logs(name: &str, current: &str) {
+    let earlier: Vec<String> = runs_with_logs(name)
+        .into_iter()
+        .filter(|k| k != current)
+        .collect();
+    let excess = earlier.len().saturating_sub(KEPT_RUN_LOGS);
+    for key in earlier.iter().take(excess) {
+        remove_run_logs(key);
+    }
+}
+
+/// Is `name` ONE container across its runs, as Docker counts it: a kept box (`--keep`, every
+/// container made through kern's socket) or one systemd runs again (`--restart always`)? Its runs
+/// then share one log, as `docker logs` reads one container's.
+pub(crate) fn runs_are_one_container(name: &str) -> bool {
+    crate::keepbox::dir_of(name).is_some_and(|d| crate::keepbox::read(&d).is_some())
+        || crate::commands::has_managed_unit(name)
+}
+
 pub(crate) fn remove_logs_of(name: &str) {
     let (Ok(dir), prefix) = (registry::logs_dir(), format!("{name}-")) else {
         return;
@@ -1879,6 +1934,62 @@ pub(crate) fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
         }
     }
     Ok(newest.map(|(_, p)| p))
+}
+
+#[cfg(test)]
+mod run_log_retention_tests {
+    /// The earlier runs of one container are listed oldest first, and only the last
+    /// `KEPT_RUN_LOGS` of them stay beside the current one; another box's logs are not touched.
+    #[test]
+    fn earlier_runs_are_kept_up_to_the_bound_and_listed_oldest_first() {
+        let _g = crate::env_guard();
+        let base = std::env::temp_dir().join(format!("kern-runlogs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("kern/logs")).expect("logs dir");
+        let prev = crate::global_env("XDG_RUNTIME_DIR");
+        struct Restore(Option<std::ffi::OsString>, std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+                    None => crate::unset_global_env("XDG_RUNTIME_DIR"),
+                }
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _restore = Restore(prev, base.clone());
+        crate::set_global_env("XDG_RUNTIME_DIR", &base);
+        let logs = base.join("kern/logs");
+        let runs = super::KEPT_RUN_LOGS + 5;
+        for i in 0..runs {
+            let f = logs.join(format!("web-{}.log", 100 + i));
+            std::fs::write(&f, format!("run {i}\n")).expect("write");
+            std::fs::write(logs.join(format!("web-{}.log.idx", 100 + i)), b"").expect("idx");
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000 + i as u64);
+            std::fs::File::options()
+                .write(true)
+                .open(&f)
+                .and_then(|h| h.set_modified(t))
+                .expect("mtime");
+        }
+        std::fs::write(logs.join("web-x-7.log"), b"another box").expect("write");
+        let listed = super::runs_with_logs("web");
+        assert_eq!(listed.len(), runs, "{listed:?}");
+        assert_eq!(
+            listed.first().map(String::as_str),
+            Some("web-100"),
+            "oldest first"
+        );
+        let current = format!("web-{}", 100 + runs - 1);
+        super::prune_run_logs("web", &current);
+        let kept = super::runs_with_logs("web");
+        assert_eq!(kept.len(), super::KEPT_RUN_LOGS + 1, "{kept:?}");
+        assert!(kept.contains(&current));
+        assert!(!kept.contains(&"web-100".to_string()), "the oldest went");
+        assert!(!logs.join("web-100.log.idx").exists(), "with its index");
+        assert!(logs.join("web-x-7.log").exists(), "another box's log stays");
+    }
 }
 
 #[cfg(test)]

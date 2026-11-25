@@ -1088,8 +1088,18 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance, oom: bool
         );
         let _ = fs::write(d.join(format!("{pid}-{starttime}")), body);
     }
+    // THE LOGS OF EARLIER RUNS STAY when the runs are ONE container (kept, or restarted by its
+    // unit), as `docker logs` of a restarted container shows every run: MEASURED before, six runs
+    // of a `--restart always` container gave Docker six lines and kern one (zero through the
+    // socket). Only the last few are kept, so a box that restarts every second has a bound.
+    let one = crate::commands::boxlog::runs_are_one_container(&b.name);
     for old in clear_exited_named(&b.name, Some((pid, starttime))) {
-        crate::commands::boxlog::remove_run_logs(&format!("{}-{old}", b.name));
+        if !one {
+            crate::commands::boxlog::remove_run_logs(&format!("{}-{old}", b.name));
+        }
+    }
+    if one {
+        crate::commands::boxlog::prune_run_logs(&b.name, &format!("{}-{pid}", b.name));
     }
 }
 

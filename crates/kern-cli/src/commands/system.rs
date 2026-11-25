@@ -147,6 +147,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}logs{z} <name>|--all [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
                                                                      --all: every box's, one stream ordered by time, each line `box  | `; --tail is per box
                                                                      --since/--until take 10m, 1h30m, unix seconds, or RFC3339 UTC; a line the index cannot place in time is kept
+                                                                     a kept or --restart always box shows its earlier runs too (the last 16); --tail N counts the last run
                                                                      -t: the recorded time per line, bucketed from 100 ms; `-` where none was recorded
                                                                      -f is a diagnostic stream, not an audit log: under load it may drop a line, never reorder time
     {c}stop{z} [-t N] <name>... | --all                                  Stop box(es), or all; -t: seconds before the kill

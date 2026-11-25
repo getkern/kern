@@ -2753,6 +2753,11 @@ fn unit_active_state(unit: &str) -> Option<String> {
 /// (Docker's `restarting`), and how many times it ran it again (Docker's `RestartCount`, which the
 /// box's own supervisor cannot count: each run is a new one). `None` for a name with no kern unit,
 /// which costs one `stat`; one `systemctl show` otherwise.
+/// Does `name` have a unit kern wrote (`--restart always|unless-stopped`)? One `stat` and a read.
+pub(crate) fn has_managed_unit(name: &str) -> bool {
+    managed_unit_path(name).is_some_and(|p| is_kern_managed_unit(&p))
+}
+
 pub(crate) fn managed_unit_runs(name: &str) -> Option<(bool, u32)> {
     let path = managed_unit_path(name)?;
     if !is_kern_managed_unit(&path) {
