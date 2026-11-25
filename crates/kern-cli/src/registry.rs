@@ -191,6 +191,12 @@ pub struct Instance {
     /// gone). `None` for a box with no dedicated cgroup or an older entry (the path is empty too, so
     /// liveness falls back to the supervisor pid). [Self::cgroup]
     pub cgroup_id: Option<(u64, u64)>,
+    /// `--rm`: the box leaves nothing a later reader can find when it ends, a `kern stop` or
+    /// `kern kill` included. `rm=1` on the wire; a record without the line (an older kern) is
+    /// `false`, which keeps the exit record as before. MEASURED: a stopped `--rm` box stayed in
+    /// `ps -a` as `exit 137` (0.56.0 the same), because `stop` wrote the record and only the
+    /// supervisor knew the box was `--rm`.
+    pub auto_remove: bool,
     /// Derived at LOAD time (never serialised): the supervisor pid is dead, but the recorded [`cgroup`]
     /// is still populated - the box's PID 1 / `-p` forwarder outlived the supervisor. Such a box stays
     /// VISIBLE in `kern ps` (marked `orphaned`) and REAPABLE by `kern stop`/`gc` via `cgroup.kill`,
@@ -1957,7 +1963,7 @@ pub fn forget_stop_record(name: &str, pid: i32) {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\ngpus={}\ntimeout={}\nbridges={}\nlogdriver={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\ngpus={}\ntimeout={}\nbridges={}\nlogdriver={}\nrm={}\n",
         inst.name,
         inst.pid,
         inst.pid1_recorded,
@@ -2003,6 +2009,7 @@ fn encode(inst: &Instance) -> String {
         inst.timeout_s,
         one_line(&inst.bridges),
         one_line(&inst.log_driver),
+        u8::from(inst.auto_remove),
     )
 }
 
@@ -3458,6 +3465,7 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut egress, mut landlock_rw) = (String::new(), String::new());
     let mut bridges = String::new();
     let mut log_driver = String::new();
+    let mut auto_remove = false;
     let (mut memory_max, mut pids_max) = (None, None);
     let mut labels = String::new();
     let (mut stop_signal, mut stop_grace) = (0i32, 0u64);
@@ -3527,6 +3535,7 @@ fn parse(body: &str) -> Option<Instance> {
             "egress" => egress = v.to_string(),
             "bridges" => bridges = v.to_string(),
             "logdriver" => log_driver = v.to_string(),
+            "rm" => auto_remove = v == "1",
             "landlock" => landlock_rw = v.to_string(),
             // empty string (uncapped) parses to None; a bad value is ignored, not fatal
             "memory_max" => memory_max = v.parse().ok(),
@@ -3658,6 +3667,7 @@ fn parse(body: &str) -> Option<Instance> {
         posture_corrupt,
         cgroup,
         cgroup_id,
+        auto_remove,
         // Never serialised: this is a LIVENESS verdict, derived by `load_live` after comparing the
         // supervisor pid against the recorded cgroup. A freshly parsed record carries no verdict yet.
         orphaned: false,
@@ -4493,6 +4503,7 @@ mod tests {
     #[test]
     fn workdir_roundtrips_and_an_entry_written_without_it_still_loads() {
         let inst = Instance {
+            auto_remove: false,
             name: "wd".into(),
             pid: 11,
             pid1_recorded: 12,
@@ -4770,6 +4781,7 @@ mod tests {
     #[test]
     fn encode_parse_roundtrips_0_6_7_fields() {
         let inst = Instance {
+            auto_remove: false,
             name: "rt".into(),
             pid: 7,
             pid1_recorded: 8,
@@ -4921,6 +4933,25 @@ mod tests {
     /// still populated) from an exited one. It must survive a round trip, and an entry written by an
     /// OLDER kern - no `cgroup=` line - must still load with an empty path (read as "no orphan signal",
     /// so liveness falls back to the supervisor pid), never vanish from the registry.
+    /// `--rm` IS ON THE RECORD, so a `stop` that ends the box knows to leave nothing behind; a record
+    /// written before the field reads as a box without `--rm`, as it was.
+    #[test]
+    fn auto_remove_roundtrips_and_an_older_entry_is_not_rm() {
+        let body = "name=r\npid=7\npid1=8\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\nrm=1\n";
+        let got = parse(body).expect("parse");
+        assert!(got.auto_remove, "rm=1 must read as --rm");
+        let wire = encode(&got);
+        assert!(
+            wire.contains("\nrm=1\n"),
+            "rm must survive the round trip: {wire}"
+        );
+        assert!(parse(&wire).is_some_and(|i| i.auto_remove));
+        let older = "name=o\npid=3\npid1=0\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\n";
+        assert!(!parse(older).expect("an older entry loads").auto_remove);
+        let off = parse(&wire.replace("\nrm=1\n", "\nrm=0\n")).expect("parse");
+        assert!(!off.auto_remove);
+    }
+
     #[test]
     fn cgroup_field_roundtrips_and_an_older_entry_defaults_empty() {
         let body = "name=cg\npid=7\npid1=8\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\ncgroup=/sys/fs/cgroup/kern.slice/kern-box-cg-9\ncgroupid=42:1337\n";
@@ -5176,6 +5207,7 @@ mod tests {
         let pid = std::process::id() as i32; // THIS process is alive → is_alive true
         let mk = |name: &str, p: i32| {
             register(&Instance {
+                auto_remove: false,
                 name: name.to_string(),
                 pid: p,
                 pid1_recorded: 0,
@@ -5260,6 +5292,7 @@ mod tests {
         let old = format!("rn-old-{pid}");
         let new = format!("rn-new-{pid}");
         let path = register(&Instance {
+            auto_remove: false,
             name: old.clone(),
             pid,
             pid1_recorded: 0,
@@ -5347,6 +5380,7 @@ mod tests {
         let name = format!("clm-reg-{}", std::process::id());
         let pid = std::process::id() as i32;
         let path = register(&Instance {
+            auto_remove: false,
             name: name.clone(),
             pid,
             pid1_recorded: 0,

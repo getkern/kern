@@ -2568,6 +2568,20 @@ fn narrate_stop(line: &str) {
     }
 }
 
+/// The exit record a `stop` (or `kill`) writes for the box it ended, since its supervisor is killed
+/// before it can write its own. A `--rm` box gets the HIDDEN record its supervisor would have written
+/// (`registry::set_box_exit_removed`, with its log's key): a waiter already waiting still reads the
+/// code, and nothing is left in `ps -a`. MEASURED before: a stopped or killed `--rm` box stayed listed
+/// as `exit 137`, 0.56.0 the same, while Docker removes it.
+fn record_stop_exit(b: &registry::Instance, code: i32) {
+    if b.auto_remove {
+        let log_key = format!("{}-{}", b.name, b.pid);
+        registry::set_box_exit_removed(b.pid, b.starttime, code, Some(&log_key));
+    } else {
+        registry::set_box_exit(b.pid, b.starttime, code, b);
+    }
+}
+
 pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     stop_with_grace(names, all, None, crate::commands::DeafInit::Kill)
 }
@@ -2832,7 +2846,7 @@ pub fn stop_with_grace(
         // Without this branch `kern stop <name>` answered "no running box" while the port stayed bound.
         if b.orphaned {
             let reaped = registry::reap_orphan(b);
-            registry::set_box_exit(b.pid, b.starttime, 137, b);
+            record_stop_exit(b, 137);
             crate::history::record_stopped(b, 137);
             registry::clear_health(&b.name, b.pid);
             // The environment sidecar has the same lifetime as the health one: cleared together so a
@@ -2950,7 +2964,7 @@ pub fn stop_with_grace(
         // answers like Docker instead of "no exit code recorded". The code is the box's REAL one when
         // it shut itself down inside the grace: a workload that traps the signal and exits 0 has to
         // read as `exited (0)`, not as the SIGKILL we never sent it. See `Teardown`.
-        registry::set_box_exit(b.pid, b.starttime, outcome.exit_code(), b);
+        record_stop_exit(b, outcome.exit_code());
         crate::history::record_stopped(b, outcome.exit_code());
         // AND THE KEPT RECORD, FOR THE SAME REASON, in the same place: the sentence above says the
         // supervisor never records its own code under a `stop`, and the kept record is the one that

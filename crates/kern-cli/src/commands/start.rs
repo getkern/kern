@@ -3148,6 +3148,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         let inst = registry::Instance {
             name: name.as_str().to_string(),
             pid,
+            auto_remove: args.rm,
             pid1_recorded: 0,
             pid1_starttime: 0,
             rootfs: spec.root.clone(),
@@ -6221,6 +6222,7 @@ fn run_detached(
     let mut inst = registry::Instance {
         name: name.as_str().to_string(),
         pid,
+        auto_remove: rm,
         pid1_recorded: 0,
         pid1_starttime: 0,
         rootfs: spec.root.clone(),

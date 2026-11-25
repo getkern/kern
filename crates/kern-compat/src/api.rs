@@ -2709,6 +2709,11 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 return error(404, &format!("No such container: {id}"));
             };
             if created_get(&name).is_some() {
+                // A created container does not run: Docker's `kill` answers 409 (and the CLI exits
+                // 1), its `stop` and `restart` 304. MEASURED before: `docker kill` of one exited 0.
+                if *verb == "kill" {
+                    return error(409, &format!("Container {name} is not running"));
+                }
                 return Response::Full {
                     status: 304,
                     content_type: "text/plain",
@@ -2828,6 +2833,29 @@ mod tests {
         json::parse(s).unwrap_or(Value::Null)
     }
 
+    /// The tests that drive `handle` through a fake `kern` take this, so no two write one at once.
+    static FAKE_KERN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A fake `kern` at `dir/kern` running `script`, ready to exec. MEASURED: a script written while
+    /// another test thread forked failed to start with ETXTBSY (the child held the write fd for an
+    /// instant), only in a parallel run; the exec is retried here until the file is free.
+    fn fake_kern(dir: &Path, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::create_dir_all(dir);
+        let bin = dir.join("kern");
+        assert!(std::fs::write(&bin, script).is_ok());
+        assert!(std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).is_ok());
+        for _ in 0..200 {
+            match Command::new(&bin).arg("__probe").output() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                _ => break,
+            }
+        }
+        bin
+    }
+
     #[test]
     fn a_session_peer_is_this_process_until_it_ends() {
         let me = Peer::of(std::process::id() as i32);
@@ -2935,13 +2963,10 @@ mod tests {
     /// as Docker does; one without it stays created, as Docker leaves it.
     #[test]
     fn a_refused_start_removes_a_rm_container_and_wakes_its_wait() {
+        let _g = FAKE_KERN.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("kern-compat-refused-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let bin = dir.join("kern");
         let script = "#!/bin/sh\ncase \"$1\" in\n box) echo 'cache dir: Permission denied (os error 13)' >&2; exit 1;;\n ps) echo '[]';;\nesac\nexit 0\n";
-        assert!(std::fs::write(&bin, script).is_ok());
-        use std::os::unix::fs::PermissionsExt;
-        assert!(std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).is_ok());
+        let bin = fake_kern(&dir, script);
         let start = |name: &str| Request {
             method: "POST".into(),
             path: format!("/containers/{name}/start"),
@@ -3012,18 +3037,15 @@ mod tests {
     /// `KILL` (the kill with no grace), and a container that does not run answers 409, not 304.
     #[test]
     fn a_kill_passes_its_signal_and_a_stopped_one_is_409() {
-        use std::os::unix::fs::PermissionsExt;
+        let _g = FAKE_KERN.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("kern-compat-kill-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let bin = dir.join("kern");
         let argv_log = dir.join("argv");
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n ps) echo '[{{\"name\":\"kd-kill1\",\"status\":\"running\"}}]';;\n \
              kill) echo \"$*\" >> {log}; [ \"$4\" = kd-gone ] && {{ echo \"no running box named 'kd-gone'\" >&2; exit 1; }};;\nesac\nexit 0\n",
             log = argv_log.display()
         );
-        assert!(std::fs::write(&bin, script).is_ok());
-        assert!(std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).is_ok());
+        let bin = fake_kern(&dir, &script);
         let kill = |id: &str, query: Vec<(String, String)>| Request {
             method: "POST".into(),
             path: format!("/containers/{id}/kill"),
@@ -3048,11 +3070,22 @@ mod tests {
         let logged = std::fs::read_to_string(&argv_log).unwrap_or_default();
         assert_eq!(logged, "kill -s HUP kd-kill1\nkill -s KILL kd-kill1\n");
         // A name the fake lists as not running: rewrite its listing to include it.
-        let script2 = std::fs::read_to_string(&bin)
-            .unwrap_or_default()
-            .replace("kd-kill1", "kd-gone");
-        assert!(std::fs::write(&bin, script2).is_ok());
+        let script2 = script.replace("kd-kill1", "kd-gone");
+        let bin = fake_kern(&dir, &script2);
         assert_eq!(status(handle(&kill("kd-gone", Vec::new()), &bin)), 409);
+        // Created and never started: 409 for `kill`, as Docker answers, and still 304 for `stop`.
+        let b = body(r#"{"Image":"alpine:3.21","Cmd":["true"]}"#);
+        let Ok(c) = create_argv("kd-created", &b) else {
+            panic!("create")
+        };
+        created_put("kd-created", c);
+        assert_eq!(status(handle(&kill("kd-created", Vec::new()), &bin)), 409);
+        let stop = Request {
+            path: "/containers/kd-created/stop".into(),
+            ..kill("kd-created", Vec::new())
+        };
+        assert_eq!(status(handle(&stop, &bin)), 304);
+        drop(created_take("kd-created"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

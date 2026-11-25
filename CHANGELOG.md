@@ -104,6 +104,14 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**A `--rm` box ended by `kern stop` or `kern kill` is removed, as Docker removes it.** It stayed in
+`ps -a` as `exit 137` (0.56.0 the same), because the stop wrote the exit record and only the box's
+supervisor knew the box was `--rm`. The record of a running box now says so (`rm=1`; one written by
+an older kern reads as before), and a stop of such a box leaves only the hidden record a waiter reads
+its code from. `docker stop` of a `--rm` container through kern's API is the same. And `docker kill`
+of a container created and never started answers 409, as Docker does; it answered 304 and the CLI
+exited 0.
+
 **`kern --help` names `kern version`, and the shell completions offer `compat`, `proxy` and
 `unshare`.** The check that compares the completions with the reference stopped reading at the
 first `OPTIONS` it met, inside `create [OPTIONS] IMAGE`, so half of the reference was never compared.

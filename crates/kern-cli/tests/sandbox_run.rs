@@ -19834,3 +19834,87 @@ fn kill_is_at_once_and_kill_s_signals_the_init_only() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&xdg);
 }
+
+/// A `--rm` box ended by `kern stop` or `kern kill` leaves nothing in `ps -a`, as Docker removes it;
+/// one without `--rm` stays listed, as before. MEASURED before: both `--rm` boxes stayed as
+/// `exit 137` (0.56.0 the same), because `stop` wrote the visible record.
+#[test]
+fn a_rm_box_stopped_or_killed_leaves_no_row() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "rmstop");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-rmstop-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let k = || {
+        let mut c = kern();
+        c.env("XDG_RUNTIME_DIR", &xdg);
+        c
+    };
+    let script = "trap '' TERM; while :; do /bin/busybox sleep 0.05; done";
+    let start = |name: &str, rm: bool| {
+        let mut args = vec!["box", name, "--rootfs", rootfs, "-d"];
+        if rm {
+            args.push("--rm");
+        }
+        args.extend(["--", "/bin/busybox", "sh", "-c", script]);
+        k().args(&args).output().expect("box")
+    };
+    let first = start("rmstop1", true);
+    if String::from_utf8_lossy(&first.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(start("rmkill1", true).status.success());
+    assert!(start("keep1", false).status.success());
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(k()
+        .args(["stop", "-t", "0", "rmstop1"])
+        .output()
+        .expect("stop")
+        .status
+        .success());
+    assert!(k()
+        .args(["kill", "rmkill1"])
+        .output()
+        .expect("kill")
+        .status
+        .success());
+    assert!(k()
+        .args(["stop", "-t", "0", "keep1"])
+        .output()
+        .expect("stop")
+        .status
+        .success());
+    let ps = k().args(["ps", "-a"]).output().expect("ps");
+    let ps = String::from_utf8_lossy(&ps.stdout);
+    let row = |n: &str| ps.lines().any(|l| l.split_whitespace().next() == Some(n));
+    assert!(
+        !row("rmstop1"),
+        "a stopped --rm box must leave no row:\n{ps}"
+    );
+    assert!(
+        !row("rmkill1"),
+        "a killed --rm box must leave no row:\n{ps}"
+    );
+    assert!(
+        row("keep1"),
+        "a stopped box without --rm stays listed:\n{ps}"
+    );
+    let _ = k().args(["rm", "keep1"]).output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}

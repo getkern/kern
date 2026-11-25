@@ -1768,6 +1768,7 @@ mod net_resource_tests {
 
     fn inst(name: &str, pid: i32, pod: &str) -> registry::Instance {
         registry::Instance {
+            auto_remove: false,
             name: name.to_string(),
             pid,
             pid1_recorded: 0,
@@ -4737,6 +4738,7 @@ mod label_filter_tests {
 
     fn inst_with(labels: &str) -> registry::Instance {
         registry::Instance {
+            auto_remove: false,
             name: "b".into(),
             pid: 1,
             pid1_recorded: 0,
@@ -4872,6 +4874,7 @@ mod drift_tests {
     }
     fn inst(hash: &str) -> registry::Instance {
         registry::Instance {
+            auto_remove: false,
             name: "a".into(),
             pid: 1,
             pid1_recorded: 0,
