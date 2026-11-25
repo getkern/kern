@@ -743,6 +743,10 @@ pub fn run() -> Result<(), crate::error::Error> {
             continue;
         };
         let key = &key_owned[..];
+        let was_confirm = matches!(mode, Mode::Confirm { .. });
+        // More input already here with this key: it came in one burst, which a paste is and a
+        // person answering a prompt is not.
+        let burst = !keyq.is_empty() || input_pending(fd);
 
         // Dispatch by mode. `mem::replace` takes ownership so a modal can transition cleanly back to
         // Nav; an edit that stays in the modal puts it back. `dirty` = the action changed on-disk
@@ -766,7 +770,7 @@ pub fn run() -> Result<(), crate::error::Error> {
             },
             // Confirm a destructive action: `y` performs it, anything else cancels.
             Mode::Confirm { action, .. } => {
-                if matches!(key.first(), Some(b'y' | b'Y')) {
+                if confirms(key, burst) {
                     // A destructive action that was refused must say so. `mode` was reset to `Nav` by
                     // the `replace` above, so setting the overlay here is what the other arms do too.
                     if let Some(err) = perform_pending(action) {
@@ -845,6 +849,15 @@ pub fn run() -> Result<(), crate::error::Error> {
                     &mut mode,
                 );
             }
+        }
+        // A PROMPT JUST OPENED: what was typed before it was drawn is not an answer to it. Without
+        // this, text pasted into top was read as keys, and `systemd` in it was `s` (stop this box?)
+        // followed by `y` (yes): a pasted command line stopped the selected box (MEASURED, a box
+        // killed with 137 by pasting `sudo systemd-run ...` into a running top).
+        if !was_confirm && matches!(mode, Mode::Confirm { .. }) {
+            keyq.clear();
+            // SAFETY: tcflush on stdin only discards bytes the terminal has queued for us.
+            unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
         }
         // A mutating action re-reads the lists at once (the stopped box vanishes, the new volume
         // appears) but leaves the CPU% baselines alone - re-sampling over the sub-second gap since
@@ -1072,6 +1085,23 @@ fn box_log_key(key: &[u8], name: String, text: String, rows: &[Row]) -> Option<(
         mode = Mode::BoxLog { name, text };
     }
     Some((mode, changed))
+}
+
+/// Does this key confirm a destructive prompt? Only a lone `y`/`Y` typed on its own: one that came
+/// with more input in the same burst is part of a paste, and a paste is not an answer.
+fn confirms(key: &[u8], burst: bool) -> bool {
+    matches!(key, [b'y' | b'Y']) && !burst
+}
+
+/// Is more input waiting on `fd` right now? A zero-timeout `poll`, no read.
+fn input_pending(fd: i32) -> bool {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, zero timeout.
+    unsafe { libc::poll(&mut p, 1, 0) > 0 && p.revents & libc::POLLIN != 0 }
 }
 
 /// What the live log pane shows for a box: a title naming it, then the END of its newest log.
@@ -6757,6 +6787,17 @@ mod tests {
             Mode::Nav => panic!("`s` acted immediately instead of asking"),
             _ => panic!("`s` must open a confirmation, and opened something else"),
         }
+    }
+
+    /// A PASTE IS NOT A CONFIRMATION. Text pasted into top reached it as keys, and `systemd` in a
+    /// pasted command line was `s` then `y`: stop the selected box, yes. Measured: a box killed (137).
+    #[test]
+    fn a_y_inside_a_burst_does_not_confirm() {
+        assert!(confirms(b"y", false), "a y typed on its own confirms");
+        assert!(confirms(b"Y", false));
+        assert!(!confirms(b"y", true), "a y with more input behind it is a paste");
+        assert!(!confirms(b"n", false));
+        assert!(!confirms(b"yes", false), "only the single key");
     }
 
     /// `s` ON A BOX'S LOG STOPS THAT BOX (after asking), and it only closed the pane.
