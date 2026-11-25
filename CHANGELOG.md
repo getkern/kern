@@ -111,6 +111,21 @@ SDKs, the MCP server and `--security-profile untrusted` still deny it (with the 
 `process_vm_readv`/`writev` stay refused. A `kern exec` entering a box cannot be read or attached to
 before its command runs.
 
+**`--privileged` runs a container runtime: docker-in-docker, BuildKit, a nested kern.** It relaxed
+the seccomp filter and kept `CAP_SYS_ADMIN`, and docker:dind stopped at its first container: the
+cgroup was read-only, `NET_ADMIN` was gone, runc found no sysfs to mount, no `/dev/tty` to bind, and
+the keyring answered `EPERM`. A `--privileged` box now has every capability in its own user
+namespace, a cgroup tree one level below its caps, a sysfs of its own, `/dev/tty` when its terminal is
+its own or none, and the keyring refused with `ENOSYS`. The caps still hold and the host's devices
+and kernel settings stay out (`pentest/pentest-privileged.sh`, 11 cases). A `kern exec` into it has
+the box's capabilities. Through kern's socket `HostConfig.Privileged` is granted under
+`compose_privileged`, and `inspect` reports it.
+
+**A box behind pasta can forward TCP.** The old pasta sends a segment with no flags in the middle of a
+connection; a socket's stack drops it, but connection tracking called it invalid, so a NAT in the box
+(docker-in-docker's bridge) did not translate it back, the box answered RST and pasta closed the
+connection. kern drops such a segment before connection tracking now, as every socket does.
+
 **`docker compose` through kern's socket runs a service on several networks.** It was refused by
 name, so a file with a `front` and a `back` network needed `kern compose`. A project's networks are now
 bridges of one pod: a service on both reaches a peer of each (aliases included), a service on one does

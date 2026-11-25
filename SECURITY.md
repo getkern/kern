@@ -189,11 +189,32 @@ on filter **refuses** the mount API - `mount`, `umount2`, `pivot_root`, `setns` 
 reconfiguration family - so a box cannot re-mount its root writable OR `umount` the cgroup masks to
 reach the host hierarchy, whatever caps it holds.
 
-### Nested boxes (`--privileged`)
-By default a full `kern box` cannot run inside another; its namespaces are refused (`EPERM`).
-`--privileged` relaxes
-**exactly five** syscalls, `unshare`, `setns`, `mount`, `umount2` and `pivot_root`, so a nested box
-can create its own namespaces and rootfs.
+### Boxes that run a container runtime (`--privileged`)
+By default a full `kern box` cannot run inside another, and neither can docker-in-docker or BuildKit:
+their namespaces are refused (`EPERM`). `--privileged` makes the box one a runtime runs in:
+
+- seccomp relaxes **exactly five** syscalls, `unshare`, `setns`, `mount`, `umount2` and
+  `pivot_root`; the keyring stays denied, with `ENOSYS` instead of `EPERM`, the one refusal runc
+  steps over (a kernel without keys). It is not opened because the kernel's owner check on a key
+  compares the uid, and the box's root has the operator's: an open `keyctl` would hand the box the
+  operator's keys by serial number;
+- every capability in the box's OWN user namespace, which acts on the box's namespaces only;
+- a cgroup tree it may write, one level BELOW the cgroup that carries its `memory.max` and
+  `pids.max`, so nothing it writes lifts them;
+- a sysfs of its own network namespace on `/sys`, because the kernel lets a user namespace mount a
+  sysfs only where one is fully visible;
+- `/dev/tty` when the box's terminal is its own (`-t`) or none (detached, or through kern's Docker
+  socket), where it answers `ENXIO`. A foreground box launched from a terminal keeps none: there it
+  would be the operator's terminal.
+
+What Docker's `--privileged` also is, and a rootless box is not: the host's devices (a
+`--privileged` box has a plain box's device nodes), and writes to the host's kernel settings
+(`/proc/sys`, `sysrq-trigger`, sysfs knobs), which belong to the host's root. MEASURED by
+`pentest/pentest-privileged.sh`, 11 cases with positive controls: 200 MiB under a 64 MiB cap is
+killed from a cgroup the box made with `memory.max` at `max`, 200 forks under a 64 cap stop below it,
+and docker:28-dind runs a container with its bridge network out, a build and an exec;
+moby/buildkit run as the box's root builds, and a nested `kern run` runs. BuildKit's rootless mode
+does not: its `newuidmap` cannot map a range from inside the box.
 
 **Rootless-only, and gated on the effective mapping rather than the caller's euid:** it is honoured
 only when the box's root maps to an unprivileged host uid, decided by reading `/proc/self/uid_map`

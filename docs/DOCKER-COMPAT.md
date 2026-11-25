@@ -170,8 +170,12 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
   boxes, not only those made through the socket.
 - A box run attached and ended without `--rm` is listed from kern's own exit record (or its kept
   layer) until `docker rm`, as any other container; a restarted server finds it there.
-- What kern refuses without a flag is refused here by name with a 400: `Privileged`, `Devices`,
-  `CapAdd`, `SecurityOpt`, `VolumesFrom`, `Links`, and the host's pid, ipc or uts namespace. A GPU
+- What kern refuses without a flag is refused here by name with a 400: `Devices`, `CapAdd`,
+  `SecurityOpt`, `VolumesFrom`, `Links`, and the host's pid, ipc or uts namespace. `Privileged` is
+  `kern box --privileged` when the operator has set `compose_privileged` in their own `kern.toml`
+  (the gate a compose file's `privileged: true` passes), refused naming that key otherwise. Measured:
+  `docker run -d --privileged docker:28-dind`, then inside it a container reaching the internet over
+  dind's bridge, a `docker build` and a `docker exec`. A GPU
   (`docker run --gpus all|N|device=I`, a compose `deploy` reservation) is `kern box --gpus` when the
   operator has set `allow_gpu_grants` (or `allow_device_grants`) in their own `kern.toml`, the gate
   `kern compose` reads, and is refused naming that key otherwise: a Docker client can no more grant
@@ -472,6 +476,12 @@ Measured with canaries: a service on every interface answered on the host's LAN 
 cannot raise a hard limit, so `ulimits: nofile: 9999999` runs with the most the host gives (1048576
 here) and kern prints a warning, through its socket too (`docker run` prints it). Docker refuses the
 value and the container does not start.
+
+**`--privileged` is a box a container runtime runs in, not the host's root.** Every capability in the
+box's own user namespace, a cgroup tree below its caps, a sysfs; not the host's devices, and the
+host's kernel settings refuse it (see [SECURITY.md](../SECURITY.md)). An image's `VOLUME` gets no
+anonymous volume: docker-in-docker's `/var/lib/docker` stays in the box's layer, where its `dockerd`
+falls back to the `vfs` driver; `-v <name>:/var/lib/docker` gives it `overlay2`.
 
 **`ptrace` works in a box, `process_vm_readv` does not.** `strace` and `gdb` run as under Docker and
 Podman (measured, the same `strace -f true` on all three); `process_vm_readv`/`writev` answer `EPERM`,
