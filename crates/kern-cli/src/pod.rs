@@ -2238,7 +2238,7 @@ pub fn sweep_own_outbound(root: &std::path::Path) {
 }
 
 /// Locate the `pasta` binary (part of passt), or `None` if it isn't installed.
-fn which_pasta() -> Option<PathBuf> {
+pub(crate) fn which_pasta() -> Option<PathBuf> {
     crate::global_env("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|d| d.join("pasta"))

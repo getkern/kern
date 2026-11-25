@@ -299,6 +299,7 @@ fn rows() -> Vec<R> {
     results.extend(check_gpu());
     results.extend(check_wsl_drive());
     results.extend(check_local_https());
+    results.extend(check_pasta());
     results.extend(check_wsl_interop());
     results.extend(check_docker_link());
     results.extend(check_windows_row());
@@ -440,18 +441,13 @@ pub fn info() -> Result<(), Error> {
     // pasta Ubuntu 24.04 ships, a closed port hangs a client until its timeout. One fork and a
     // namespace made for the question.
     if which("pasta") {
-        row(
-            "pasta tcp",
-            &match kern_isolation::nft::probe() {
-                Ok(()) => "a closed port is refused within about a second, and a lost SYN \
-                           costs one retry as under Docker, with any pasta"
-                    .to_string(),
-                Err(e) => format!(
-                    "as pasta does it ({e}): under a pasta before 2025-02, a closed port waits \
-                     for the client's timeout and a lost SYN costs two seconds"
-                ),
-            },
-        );
+        let rules = kern_isolation::nft::probe();
+        let (_, msg, _) = pasta_verdict(pasta_date(), rules.is_ok());
+        let detail = match rules {
+            Ok(()) => msg,
+            Err(e) => format!("{msg} ({e})"),
+        };
+        row("pasta tcp", &detail);
     }
     row(
         "box memory",
@@ -1137,6 +1133,147 @@ fn check_identity() -> R {
 /// HTTPS for the `.localhost` names, once `kern proxy trust` turned it on. No row while it is off:
 /// it is opt-in, and off is not something to fix. On with the authority in no store, a browser
 /// refuses every page, which is the one state worth a warning.
+/// The day passt fixed the two TCP behaviours kern's rules mend (`kern_isolation::nft`): the
+/// later of `db2c91ae` (2025-01-21, the ACK on every RST) and `722d347c` (2025-02-03, a SYN retry
+/// does not reset an outbound connection).
+const PASTA_FIXED: (u32, u32, u32) = (2025, 2, 3);
+
+/// The build date a pasta version string carries: passt's own `2026_10_02...`, Debian's and
+/// Ubuntu's `0.0~git20240220...`, Fedora's `0^20250217...`, Arch's `2025_02_17...`. PURE.
+fn pasta_build_date(text: &str) -> Option<(u32, u32, u32)> {
+    let b = text.as_bytes();
+    let num = |s: &[u8]| -> Option<u32> {
+        s.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(s).ok()?.parse().ok())
+            .flatten()
+    };
+    let valid = |y: u32, m: u32, d: u32| {
+        (2020..2100).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d)
+    };
+    for i in 0..b.len() {
+        // `YYYY_MM_DD`
+        if i + 10 <= b.len() && b[i + 4] == b'_' && b[i + 7] == b'_' {
+            if let (Some(y), Some(m), Some(d)) = (
+                num(&b[i..i + 4]),
+                num(&b[i + 5..i + 7]),
+                num(&b[i + 8..i + 10]),
+            ) {
+                if valid(y, m, d) {
+                    return Some((y, m, d));
+                }
+            }
+        }
+        // `YYYYMMDD` after `git` or `^`, so a commit hash's digits are not read as a date.
+        let after = |p: &[u8]| i >= p.len() && &b[i - p.len()..i] == p;
+        if i + 8 <= b.len() && (after(b"git") || after(b"^")) {
+            if let (Some(y), Some(m), Some(d)) = (
+                num(&b[i..i + 4]),
+                num(&b[i + 4..i + 6]),
+                num(&b[i + 6..i + 8]),
+            ) {
+                if valid(y, m, d) {
+                    return Some((y, m, d));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The build date of the pasta on PATH, kept in kern's cache against that binary's identity (device,
+/// inode, size, modification time): asking costs a `pasta --version` and, for Ubuntu's, a
+/// `dpkg-query`, MEASURED at 14-17 ms, as much again as the rest of `kern info`. A changed binary is
+/// a new identity, and asked again.
+fn pasta_date() -> Option<(u32, u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let bin = crate::pod::which_pasta()?;
+    let m = std::fs::metadata(&bin).ok()?;
+    let id = format!("{}:{}:{}:{}", m.dev(), m.ino(), m.size(), m.mtime());
+    let cache = crate::kern_xdg_root("XDG_CACHE_HOME", ".cache").map(|r| r.join("pasta-date"));
+    if let Some(text) = cache.as_ref().and_then(|c| std::fs::read_to_string(c).ok()) {
+        if let Some(rest) = text.strip_prefix(&format!("{id}\t")) {
+            return pasta_build_date(rest.trim());
+        }
+    }
+    let date = pasta_date_asked();
+    if let Some(c) = cache {
+        let shown = date.map_or_else(String::new, |(y, mo, d)| format!("{y}_{mo:02}_{d:02}"));
+        let _ = std::fs::write(c, format!("{id}\t{shown}\n"));
+    }
+    date
+}
+
+/// [`pasta_date`] asked of pasta and its package: `pasta --version` first, else the package that
+/// installed it (Ubuntu's prints "pasta unknown version"; its package says `0.0~git20240220`).
+fn pasta_date_asked() -> Option<(u32, u32, u32)> {
+    let out = |prog: &str, args: &[&str]| {
+        std::process::Command::new(prog)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    out("pasta", &["--version"])
+        .and_then(|v| pasta_build_date(v.lines().next().unwrap_or_default()))
+        .or_else(|| {
+            [
+                ("dpkg-query", &["-W", "-f", "${Version}", "passt"][..]),
+                ("rpm", &["-q", "--qf", "%{VERSION}", "passt"][..]),
+                ("pacman", &["-Q", "passt"][..]),
+            ]
+            .iter()
+            .find_map(|(p, a)| out(p, a).and_then(|v| pasta_build_date(&v)))
+        })
+}
+
+/// One sentence about the pasta here and kern's TCP rules for it, for `doctor` and `info`. PURE:
+/// `date` the pasta's build date if known, `rules` whether the rules can be installed here.
+fn pasta_verdict(date: Option<(u32, u32, u32)>, rules: bool) -> (bool, String, String) {
+    let shown = date.map_or_else(
+        || "pasta (build date unknown)".to_string(),
+        |(y, m, d)| format!("pasta {y}-{m:02}-{d:02}"),
+    );
+    let fixed = date.is_some_and(|d| d >= PASTA_FIXED);
+    match (fixed, rules) {
+        (true, _) => (true, format!("{shown}: refuses a closed port at once"), String::new()),
+        (false, true) => (
+            true,
+            format!("{shown}: a closed port is refused within about a second (kern's TCP rules)"),
+            "a passt from 2025-02 on refuses it at once (13 ms measured): your distribution's newer \
+             package, or passt.top/builds"
+                .to_string(),
+        ),
+        (false, false) => (
+            false,
+            format!(
+                "{shown} with no nftables for kern's TCP rules: a closed port waits for the client's \
+                 timeout"
+            ),
+            "a passt from 2025-02 on (your distribution's newer package, or passt.top/builds), or \
+             a kernel with nf_tables, which kern's rules need"
+                .to_string(),
+        ),
+    }
+}
+
+/// `doctor`'s row for the pasta that gives every box its NAT. None without pasta (the network row
+/// says that).
+fn check_pasta() -> Option<R> {
+    if !which("pasta") {
+        return None;
+    }
+    let (good, msg, note) = pasta_verdict(pasta_date(), kern_isolation::nft::probe().is_ok());
+    Some(if good {
+        R::ok_note(&msg, &note)
+    } else {
+        R::Warn(msg, note)
+    })
+}
+
 fn check_local_https() -> Option<R> {
     let s = crate::localtls::summary()?;
     let port = s.port.map(|p| format!(", port {p}")).unwrap_or_default();
@@ -2876,6 +3013,44 @@ pub(crate) fn which(bin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The build date is read off every way a pasta says it, and a commit hash is not taken for one.
+    #[test]
+    fn a_pasta_build_date_is_read_off_its_version() {
+        use super::pasta_build_date as d;
+        assert_eq!(
+            d("pasta 2026_10_02.cba3570-22-g885c39e"),
+            Some((2026, 10, 2))
+        );
+        assert_eq!(d("0.0~git20240220.1e6f92b-1"), Some((2024, 2, 20)));
+        assert_eq!(d("0^20250217.ga1e48a0-1.fc41"), Some((2025, 2, 17)));
+        assert_eq!(d("passt 2025_02_17.a1e48a0-1"), Some((2025, 2, 17)));
+        assert_eq!(d("pasta unknown version"), None);
+        assert_eq!(
+            d("0.0~git.20240220"),
+            None,
+            "the digits must follow `git` or `^`"
+        );
+        assert_eq!(d("abc 20240220"), None);
+    }
+
+    /// The verdict: a fixed pasta is fine with or without the rules; an older or undated one is
+    /// fine with them, and a warning without them, since a closed port then hangs.
+    #[test]
+    fn the_pasta_verdict_follows_its_date_and_the_rules() {
+        use super::pasta_verdict as v;
+        let new = Some((2026, 10, 2));
+        let old = Some((2024, 2, 20));
+        assert!(v(new, true).0 && v(new, false).0);
+        let (ok, msg, note) = v(old, true);
+        assert!(ok && msg.contains("2024-02-20") && note.contains("passt.top"));
+        assert!(!v(old, false).0);
+        assert!(!v(None, false).0 && v(None, true).0);
+        assert!(
+            v(Some((2025, 2, 3)), false).0,
+            "the day of the fix is fixed"
+        );
+    }
+
     /// Interop is off only when `[interop]` says so; WSL's default is on.
     #[test]
     fn wsl_interop_is_off_only_when_the_interop_section_says_so() {
