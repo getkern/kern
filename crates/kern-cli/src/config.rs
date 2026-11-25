@@ -3553,7 +3553,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&d);
         let f = d.join("kern.toml");
         crate::set_global_env("KERN_CONFIG", &f);
-        let mut check = |body: &str| {
+        let check = |body: &str| {
             std::fs::write(&f, body).expect("write");
             forget_cached();
             unread_data_place()
