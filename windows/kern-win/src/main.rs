@@ -1523,8 +1523,14 @@ mod tests {
     #[test]
     fn only_proxy_trust_and_untrust_are_taken_here() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(parse_proxy(&a(&["proxy", "trust"])), Some(ProxyAction::Trust));
-        assert_eq!(parse_proxy(&a(&["proxy", "untrust"])), Some(ProxyAction::Untrust));
+        assert_eq!(
+            parse_proxy(&a(&["proxy", "trust"])),
+            Some(ProxyAction::Trust)
+        );
+        assert_eq!(
+            parse_proxy(&a(&["proxy", "untrust"])),
+            Some(ProxyAction::Untrust)
+        );
         assert_eq!(parse_proxy(&a(&["proxy", "status"])), None);
         assert_eq!(parse_proxy(&a(&["proxy"])), None);
         assert_eq!(parse_proxy(&a(&["proxy", "trust", "x"])), None);

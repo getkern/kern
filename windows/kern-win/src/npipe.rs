@@ -29,6 +29,7 @@ pub(crate) fn run(_wsl_prefix: Vec<String>) -> i32 {
 }
 
 /// `<pid>-<creation time>`: a process key that a reused pid cannot match.
+#[cfg(windows)]
 pub(crate) fn peer_key(pid: u32, created: u64) -> String {
     format!("{pid}-{created}")
 }

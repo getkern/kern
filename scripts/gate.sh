@@ -75,14 +75,23 @@ fi
 # it failed `cargo fmt --check` and carried 3 clippy errors on main, unnoticed, while shipping as
 # `kern.exe` to every Windows user. A crate that ships is a crate that is linted.
 #
-# NO `--target x86_64-pc-windows-gnu` HERE, deliberately: clippy for that target needs the mingw
-# toolchain, which a Linux dev box may not have, and the lints that matter are not target-specific -
-# the crate is `std`-only and has no `cfg(windows)` branches. The release workflow builds the real
-# Windows target; this checks the source everyone edits. Its tests run natively for the same reason.
+# The native run checks the source everyone edits, and its tests run natively. It does not reach the
+# `cfg(windows)` code (the named pipe of `kern compat docker pipe`), so the Windows target is linted
+# too WHEN ITS TARGET IS INSTALLED (`rustup target add x86_64-pc-windows-gnu`), and skipped by name
+# when not: each half holds what the other cannot see. MEASURED: a helper used only by the Windows
+# code failed the native clippy as dead code, and only the Windows target would have caught the
+# opposite case. The release workflow builds the real Windows binary.
 step "cargo fmt --check (kern-win)" \
     cargo fmt --manifest-path windows/kern-win/Cargo.toml --check
 step "cargo clippy (kern-win)" \
     cargo clippy --manifest-path windows/kern-win/Cargo.toml --all-targets
+if rustup target list --installed 2>/dev/null | grep -q x86_64-pc-windows-gnu; then
+    step "cargo clippy (kern-win, windows)" \
+        cargo clippy --manifest-path windows/kern-win/Cargo.toml --target x86_64-pc-windows-gnu --all-targets
+else
+    printf '  %-34s %s\n' "cargo clippy (kern-win, windows)" \
+        "SKIP  target not installed: rustup target add x86_64-pc-windows-gnu"
+fi
 step "cargo test (kern-win)" \
     env -u KERN_BIN cargo test --manifest-path windows/kern-win/Cargo.toml
 echo "docs"
