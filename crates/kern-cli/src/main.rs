@@ -320,6 +320,7 @@ mod logview;
 mod network;
 mod nopod;
 mod openat2;
+mod pidfd;
 mod pod;
 mod ports;
 mod progress;

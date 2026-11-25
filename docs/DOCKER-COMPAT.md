@@ -101,7 +101,7 @@ set TESTCONTAINERS_RYUK_DISABLED=true
 | Request | Becomes |
 |---|---|
 | `containers/create`, `start` | `kern box <name> -d ...`, run at the start; the image, command, entrypoint, env, labels, workdir, user, hostname, published ports (`PortBindings`, `PublishAllPorts`), binds, memory, CPUs, `AutoRemove`, `NetworkMode` default, bridge, host or none |
-| `attach`, then `start` (`docker run` without `-d`) | `kern box` in the foreground: stdout and stderr come back apart, and the box's exit code is the run's |
+| `attach`, then `start` (`docker run` without `-d`) | `kern box -d`, its log followed (`kern logs --frames -f`, stdout and stderr apart), and the box's exit code from `kern wait` is the run's |
 | `exec`, `exec/{id}/start`, `exec/{id}/json` | `kern exec`, stdout and stderr apart, the exit code, `-t`, `-u`, `-w`, env, detached, and stdin (`-i`) on a hijacked connection, ending when the client closes its side |
 | `logs` (`stdout`, `stderr`, `follow`, `tail`, `since`, `timestamps`) | `kern logs`: stdout and stderr apart for a container made through the socket |
 | `json` (list and inspect), `wait`, `stop`, `kill`, `restart`, `DELETE` | `kern ps`, `inspect --json`, `wait`, `stop`, `kill`, `restart`, `rm`; the list's `label`, `name` (a substring, `^`/`$` anchors), `id` and `status` filters, and any other filter refused by name rather than ignored |
@@ -131,8 +131,14 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
   run made, which kern removes when the run ends. A kept box starts in about 25 ms here against 5 ms,
   most of it copying `/etc/hosts` into a layer on disk. `docker start` of a stopped container that kept
   nothing says so instead of starting it.
-- A container started attached (`docker run` without `-d`) is a box this server runs: the server does
-  not leave on idle while one runs, and stopping the server stops it, as stopping `dockerd` does.
+- A container started attached (`docker run` without `-d`) is a detached box like any other, so it
+  outlives the server and its client (measured: the server killed during a run, the box finished
+  and logged every line; a dev container still `Up` after a server restart). The attach follows the
+  box's log, stdout and stderr apart, and the exit code comes from `kern wait`; a `--rm` one is
+  removed once its output has been read, by the server, so one whose server stopped mid-run is left
+  exited until `docker rm`. Against running it in the foreground, `docker run --rm alpine true`
+  shows no difference the measurement can see (21.1 and 21.8 ms, medians of 40 paired runs, the
+  interval of the difference -0.05 to +1.2 ms).
 - Testcontainers' reaper (Ryuk) is refused, as above; with `TESTCONTAINERS_RYUK_DISABLED=true` each
   test removes its own containers, as the `with` block does.
 - `--mount` (`HostConfig.Mounts`) becomes kern's `--mount`, of type `bind`, `volume` or `tmpfs`, read-only
@@ -146,8 +152,8 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
   keeps one stream, and its `logs` come back as stdout.
 - A container's id is derived from its box name, the same every time, and `docker ps` lists kern's
   boxes, not only those made through the socket.
-- A box run attached and ended without `--rm` is remembered by the server until `docker rm`; kern
-  itself keeps nothing of a foreground box once it ends, and a restarted server knows nothing of it.
+- A box run attached and ended without `--rm` is listed from kern's own exit record (or its kept
+  layer) until `docker rm`, as any other container; a restarted server finds it there.
 - What kern refuses without a flag is refused here by name with a 400: `Privileged`, `Devices`,
   `DeviceRequests` (GPUs), `CapAdd`, `SecurityOpt`, `VolumesFrom`, `Links`, and the host's pid, ipc or
   uts namespace. An endpoint that is not translated (networks, volumes, build) answers 501 and says

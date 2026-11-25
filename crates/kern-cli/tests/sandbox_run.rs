@@ -16551,7 +16551,9 @@ fn a_kept_box_starts_again_on_the_layer_it_left_and_an_ordinary_box_does_not() {
         "a name that is really not there keeps its own sentence:\n{missing}"
     );
     fs::write(&rec, &good).expect("restore the record");
-    let (said, ok) = run(&["start", &name]);
+    // `-a`: started and followed to its end, so the `rm` below meets a stopped box (a plain
+    // `start` returns once it runs, as `docker start` does).
+    let (said, ok) = run(&["start", "-a", &name]);
     assert!(ok, "the restored record must start again:\n{said}");
 
     // AND THE DEFAULT IS UNCHANGED: the same box without `--keep` leaves nothing to start.

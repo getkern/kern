@@ -1001,29 +1001,42 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, name: &str, pod: &str, 
     }
 }
 
-/// Remove every exit record (`waitexit`) of a box named `name` whose process is gone, and say how
-/// many there were: what `kern rm` does to an exited box, as `docker rm` removes an exited container
-/// from `docker ps -a`. A record of a live process is left alone.
-pub fn clear_exited_named(name: &str) -> usize {
+/// The `(pid, starttime)` of every box in the registry now: what an exit record is checked against.
+///
+/// NOT WHETHER THE PROCESS IS ALIVE. A supervisor writes its box's exit record, leaves the registry,
+/// then still cleans up (shm, scratch, the log pump) before it exits: MEASURED about 10 ms. Asked
+/// of the process, that window had the box neither running nor exited, so `kern wait` right after
+/// a box that ends at once said "no running box and no exit record" (every time, on this desktop),
+/// and kern's Docker API answered an attached `docker run true` with 255.
+fn registered_pairs(boxes: &[Instance]) -> std::collections::HashSet<(i32, u64)> {
+    boxes.iter().map(|b| (b.pid, b.starttime)).collect()
+}
+
+/// Remove every exit record (`waitexit`) of a box named `name` whose process is gone, and return
+/// the pids of those runs: what `kern rm` does to an exited box, as `docker rm` removes an exited
+/// container from `docker ps -a`; the caller removes those runs' logs with them. A record of a live
+/// process is left alone.
+pub fn clear_exited_named(name: &str) -> Vec<i32> {
     let Ok(d) = waitexit_dir() else {
-        return 0;
+        return Vec::new();
     };
     let Ok(rd) = fs::read_dir(&d) else {
-        return 0;
+        return Vec::new();
     };
-    let mut cleared = 0;
+    let mut cleared = Vec::new();
+    let registered = registered_pairs(&list());
     for e in rd.flatten() {
         let Some((pid, starttime)) = waitexit_split(&e.file_name()) else {
             continue;
         };
-        if is_alive(pid, starttime) {
+        if registered.contains(&(pid, starttime)) {
             continue;
         }
         let named = fs::read_to_string(e.path())
             .ok()
             .is_some_and(|body| body.lines().nth(1) == Some(name));
         if named && fs::remove_file(e.path()).is_ok() {
-            cleared += 1;
+            cleared.push(pid);
         }
     }
     cleared
@@ -1208,11 +1221,18 @@ pub struct ExitedBox {
 const WAITEXIT_SHOW_SECS: u64 = 3600;
 
 /// Every exited box still holding a `waitexit` sidecar within the display window, NEWEST first. A
-/// sidecar whose `(pid, starttime)` is somehow still alive is skipped - it is a live box, already in
-/// [`list`], not an exited one. One older than [`WAITEXIT_SHOW_SECS`] is REAPED here (read-time
+/// sidecar whose `(pid, starttime)` is still REGISTERED is skipped - it is a live box, already in
+/// [`list`], not an exited one; a supervisor that has left the registry and is still exiting is
+/// exited (see [`registered_pairs`]). One older than [`WAITEXIT_SHOW_SECS`] is REAPED here (read-time
 /// self-heal, mirroring `list()`), so `ps -a` shows the recent, not history. A bare-code sidecar from
 /// an older kern has no name/pod/command; it still lists, named by its pid, rather than silently vanish.
 pub fn list_exited() -> Vec<ExitedBox> {
+    list_exited_among(&list())
+}
+
+/// [`list_exited`] against a registry snapshot the caller already holds (`boxes` is [`list`]'s),
+/// so one `ps -a` reads the registry once and its running and exited rows cannot disagree.
+pub fn list_exited_among(boxes: &[Instance]) -> Vec<ExitedBox> {
     let Ok(d) = waitexit_dir() else {
         return Vec::new();
     };
@@ -1224,7 +1244,10 @@ pub fn list_exited() -> Vec<ExitedBox> {
     // `kern ps -a` showed the old exit in place of the running box. Filtered HERE, where every record
     // is read anyway, and not by clearing at `register`: that read every record on every box start,
     // MEASURED +0.35 ms per start with 134 records on this desktop.
-    let live: std::collections::HashSet<String> = list().into_iter().map(|b| b.name).collect();
+    // One registry snapshot for both questions: which names run, and which records belong to a box
+    // still registered (see `registered_pairs` for why that, and not the process, decides).
+    let registered = registered_pairs(boxes);
+    let live: std::collections::HashSet<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
     let Ok(rd) = fs::read_dir(&d) else {
         return out;
     };
@@ -1232,7 +1255,7 @@ pub fn list_exited() -> Vec<ExitedBox> {
         let Some((pid, starttime)) = waitexit_split(&e.file_name()) else {
             continue;
         };
-        if is_alive(pid, starttime) {
+        if registered.contains(&(pid, starttime)) {
             continue;
         }
         // mtime BEFORE the body read: a stale record is reaped without paying to read it.
@@ -1967,15 +1990,14 @@ pub fn rename(old: &str, new: &str, pid: i32) -> io::Result<()> {
         return Err(e);
     }
     if let Ok(l) = logs_dir() {
-        // THE LOG IS NO LONGER ONE FILE. It has a rotated generation (`.log.1`) and a time index
-        // (`.log.idx`), and a rename that moved only the head would leave `kern logs` reading the new
-        // name's log with the old name's index sitting beside it - orphaned for the sweep, and gone
-        // as far as `logs -t` is concerned. Every suffix moves together or the set stops agreeing.
-        for suffix in ["", ".idx", ".1", ".1.idx"] {
-            let _ = fs::rename(
-                l.join(format!("{old}-{pid}.log{suffix}")),
-                l.join(format!("{new}-{pid}.log{suffix}")),
-            );
+        // THE LOG IS NO LONGER ONE FILE. It has rotated generations (`.log.N`), a time index
+        // (`.log.idx`) and a stream record (`.log.streams`), and a rename that moved only the head
+        // would leave `kern logs` reading the new name's log with the old name's index sitting
+        // beside it - orphaned for the sweep, and gone as far as `logs -t` is concerned. Every
+        // file moves together or the set stops agreeing; which files they are is
+        // `run_log_files`'s to say, not a list here.
+        for (from, suffix) in run_log_files(&l, &format!("{old}-{pid}")) {
+            let _ = fs::rename(from, l.join(format!("{new}-{pid}.log{suffix}")));
         }
     }
     if let Ok(h) = health_dir() {
@@ -3199,21 +3221,46 @@ fn expire_ended_logs_in(
     (removed, freed)
 }
 
-/// The box key a file in the logs dir belongs to: `<key>.log`, its rotated generation `<key>.log.1`
-/// and either one's time index `<key>.log.idx`.
+/// The box key a file in the logs dir belongs to: `<key>.log` and every `<key>.log.<suffix>` (see
+/// [`split_log_file`]).
 ///
 /// A KEY, NOT A SUFFIX, because the log stopped being a single file and the sweep that only knew
 /// `<key>.log` silently kept everything else forever: a box that ran for an hour left its index
 /// behind at 16 bytes per 100 ms, and a rotated generation left a whole capped log. `None` means
 /// "not this directory's business" and the file is left alone rather than force-removed.
 fn log_key(fname: &str) -> Option<&str> {
-    let base = fname.strip_suffix(".idx").unwrap_or(fname);
-    // `.log.<n>` is a rotated generation; `<n>` is always digits, so no box name is mistaken for one.
-    let base = match base.rsplit_once('.') {
-        Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => head,
-        _ => base,
+    split_log_file(fname).map(|(key, _)| key)
+}
+
+/// A file of the logs dir as `(key, suffix)`: `<key>.log` followed by nothing (the log) or by a
+/// `.`-suffix (`.idx`, `.streams`, a rotated `.N`, `.N.idx`). THE ONE RULE for which files are a
+/// run's: the expiry ([`log_key`]), the removal and the rename ([`run_log_files`]) all read it. They
+/// kept a list each, and when `--log-streams` added `.streams`, two of the three did not learn it.
+///
+/// The LAST `.log` that ends the name or is followed by a `.` ends the key, because a box name may
+/// hold `.log` and no suffix does; `web-1.logged` is no log at all.
+pub(crate) fn split_log_file(fname: &str) -> Option<(&str, &str)> {
+    let (at, _) = fname.rmatch_indices(".log").find(|(i, _)| {
+        let rest = &fname[i + 4..];
+        rest.is_empty() || rest.starts_with('.')
+    })?;
+    let key = &fname[..at];
+    (!key.is_empty()).then(|| (key, &fname[at + 4..]))
+}
+
+/// Every file of one run's log in `dir` (`key` is `<name>-<pid>`, the exact run), with what
+/// follows `<key>.log` in its name.
+pub(crate) fn run_log_files(dir: &Path, key: &str) -> Vec<(PathBuf, String)> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
     };
-    base.strip_suffix(".log")
+    rd.flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let (k, suffix) = split_log_file(name.to_str()?)?;
+            (k == key).then(|| (e.path(), suffix.to_string()))
+        })
+        .collect()
 }
 
 /// The box key a PLAIN `<name>-<pid>` sidecar belongs to: the whole file name.
@@ -5438,6 +5485,7 @@ mod sweep_key_tests {
             "web-1234.log.1",
             "web-1234.log.idx",
             "web-1234.log.1.idx",
+            "web-1234.log.streams",
         ] {
             assert_eq!(log_key(f), Some("web-1234"), "{f}");
         }

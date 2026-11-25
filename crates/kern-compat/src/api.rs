@@ -825,7 +825,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
 }
 
 /// `GET /containers/json`: running boxes, `all=1` the exited ones too, `filters={"label":[...]}`.
-/// `inspect` of a foreground box that ended, from this server's record of it.
+/// `inspect` of a box started for an attach that has ended, from this server's record of it.
 fn inspect_ended(name: &str, r: &Run) -> Response {
     let c = &r.created;
     json_response(
@@ -1127,19 +1127,8 @@ fn logs(bin: &Path, name: &str, req: &Request) -> Response {
         content_type: "application/vnd.docker.multiplexed-stream",
         upgrade: false,
         writer: Box::new(move |w: &mut crate::Out| {
-            let child = Command::new(&bin)
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn();
-            let Ok(mut child) = child else { return };
-            if let Some(out) = child.stdout.take() {
-                if !copy_frames(out, w, wanted) {
-                    let _ = child.kill();
-                }
-            }
-            let _ = child.wait();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            kern_frames(&bin, &args, w, wanted);
         }),
     }
 }
@@ -1591,21 +1580,24 @@ fn pump(w: &crate::Out, out: Option<ChildStdout>, err: Option<ChildStderr>, raw:
 // ---------------------------------------------------------------------------------------------
 // attach: a container's output on the connection (`docker run` without `-d`).
 
-type Pipes = (Option<ChildStdout>, Option<ChildStderr>);
+/// What a start hands the attach waiting for it: the box has started, and the attach is to follow
+/// its log. Dropping this sender, once the log has been followed to its end, is what tells the run
+/// that its output has been read (a `--rm` box is removed only then).
+type Started = mpsc::Sender<()>;
 
-/// The attaches waiting for their container's start, which hands each the box's two pipes.
-static ATTACHED: Mutex<Option<HashMap<String, mpsc::Sender<Pipes>>>> = Mutex::new(None);
+/// The attaches waiting for their container's start.
+static ATTACHED: Mutex<Option<HashMap<String, mpsc::Sender<Started>>>> = Mutex::new(None);
 
-fn attached_take(name: &str) -> Option<mpsc::Sender<Pipes>> {
+fn attached_take(name: &str) -> Option<mpsc::Sender<Started>> {
     ATTACHED
         .lock()
         .ok()
         .and_then(|mut g| g.as_mut().and_then(|m| m.remove(name)))
 }
 
-/// A box this server runs in the foreground for an attach. kern keeps no record of a foreground
-/// box once it ends, so this one does: the exit code for `wait` (also for a `--rm` box, which is
-/// gone), and for a box without `--rm` what `inspect`, `ps -a` and `rm` need.
+/// A box this server started for an attach (`docker run` without `-d`): the exit code for `wait`
+/// (also for a `--rm` box, which is gone), and for a box without `--rm` what `inspect`, `ps -a`
+/// and `rm` need once it has ended.
 #[derive(Clone)]
 struct Run {
     created: Created,
@@ -1615,7 +1607,7 @@ struct Run {
 
 static RUNS: Mutex<Option<HashMap<String, Run>>> = Mutex::new(None);
 
-/// Woken each time a foreground box ends.
+/// Woken each time a box started for an attach ends.
 static RUN_ENDED: Condvar = Condvar::new();
 
 /// How long the exit code of an ended `--rm` box is kept for a late `wait`.
@@ -1651,9 +1643,9 @@ fn run_end(name: &str, code: i32) {
     RUN_ENDED.notify_all();
 }
 
-/// Whether a box this server runs in the foreground for an attach is still running. Such a box is
-/// this process's child and ends with it, so the server does not leave on idle while one runs,
-/// as `dockerd` does not leave its containers.
+/// Whether a box this server started for an attach is still running. The box does not depend on
+/// this process, but what follows its end does: the exit code `wait` answers, the `die` event, and
+/// the removal of a `--rm` one; so the server does not leave on idle while one runs.
 pub(crate) fn runs_alive() -> bool {
     RUNS.lock().ok().is_some_and(|g| {
         g.as_ref()
@@ -1669,7 +1661,7 @@ fn run_forget(name: &str) {
     }
 }
 
-/// An ended foreground box without `--rm`: what kern no longer lists.
+/// An ended box started for an attach, without `--rm`: what this server recorded of it.
 fn run_ended(name: &str) -> Option<Run> {
     RUNS.lock().ok().and_then(|g| {
         g.as_ref()
@@ -1693,7 +1685,7 @@ fn runs_ended() -> Vec<(String, Run)> {
         .unwrap_or_default()
 }
 
-/// The exit code of `name` if this server runs it in the foreground, waiting for its end; `None`
+/// The exit code of `name` if this server started it for an attach, waiting for its end; `None`
 /// when it is not one of those.
 fn run_exit(name: &str) -> Option<i32> {
     let mut g = RUNS.lock().ok()?;
@@ -1796,12 +1788,18 @@ fn wait(bin: &Path, name: String) -> Response {
     }
 }
 
-/// `POST /containers/{id}/attach`. Before the start (as `docker run` does it) the box will run in
-/// the foreground with its stdout and stderr apart; after it, kern's log of the box is followed,
-/// which is one stream (kern keeps a box's output as one).
+/// `POST /containers/{id}/attach`: kern's log of the box, followed, in Docker's frames with stdout
+/// and stderr apart (`--log-streams`). Before the start (as `docker run` does it), from the box's
+/// first byte, once the start has said the box runs; after it, from now on unless `logs=1`.
 fn attach(bin: &Path, name: &str, req: &Request) -> Response {
+    // Both streams unless the client named its own: an attach that asks for neither is how the
+    // CLI's older clients spoke, and it always meant both.
+    let wanted = match (req.flag("stdout"), req.flag("stderr")) {
+        (false, false) => (true, true),
+        named => named,
+    };
     if created_get(name).is_some() {
-        let (to, from) = mpsc::channel::<Pipes>();
+        let (to, from) = mpsc::channel::<Started>();
         match ATTACHED.lock() {
             Ok(mut g) => {
                 g.get_or_insert_with(HashMap::new)
@@ -1809,114 +1807,135 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
             }
             Err(_) => return error(500, "the attach table is unusable"),
         }
+        let (bin, name) = (bin.to_path_buf(), name.to_string());
         return Response::Stream {
             status: 200,
             content_type: "application/vnd.docker.multiplexed-stream",
             upgrade: req.upgrade,
             writer: Box::new(move |w: &mut crate::Out| {
                 // Ends without a word when the container is removed instead of started.
-                if let Ok((out, err)) = from.recv() {
-                    pump(w, out, err, false);
+                if let Ok(done) = from.recv() {
+                    kern_frames(&bin, &["logs", "--frames", "-f", &name], w, wanted);
+                    drop(done);
                 }
             }),
         };
     }
-    // Both streams unless the client named its own: an attach that asks for neither is how the
-    // CLI's older clients spoke, and it always meant both.
-    let wanted = match (req.flag("stdout"), req.flag("stderr")) {
-        (false, false) => (true, true),
-        named => named,
-    };
-    let mut args: Vec<String> = vec![
-        "logs".into(),
-        "--frames".into(),
-        "-f".into(),
-        name.to_string(),
-    ];
-    if !req.flag("logs") {
-        args.push("--tail".into());
-        args.push("0".into());
-    }
-    let mut cmd = Command::new(bin);
-    cmd.args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    // From now on, unless the client asked for what was logged before (`logs=1`).
+    let from_now = !req.flag("logs");
+    let (bin, name) = (bin.to_path_buf(), name.to_string());
     Response::Stream {
         status: 200,
         content_type: "application/vnd.docker.multiplexed-stream",
         upgrade: req.upgrade,
         writer: Box::new(move |w: &mut crate::Out| {
-            let Ok(mut child) = cmd.spawn() else { return };
-            if let Some(out) = child.stdout.take() {
-                let _ = copy_frames(out, w, wanted);
+            let mut args = vec!["logs", "--frames", "-f"];
+            if from_now {
+                args.extend(["--tail", "0"]);
             }
-            let _ = child.kill();
-            let _ = child.wait();
+            args.push(&name);
+            kern_frames(&bin, &args, w, wanted);
         }),
     }
 }
 
-/// Start a created container in the foreground and hand its pipes to the attach waiting for it, so
-/// the box's stdout and stderr stay apart and its exit code is the process's.
-fn start_attached(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Pipes>) -> Response {
-    use std::os::unix::process::CommandExt;
-    let mut argv = c.argv.clone();
-    if argv.get(2).map(String::as_str) == Some("-d") {
-        argv.remove(2);
-    }
-    // The box says when it has started on a pipe of its own (`KERN_READY_FD`): its stdout and
-    // stderr are the container's. Without the pipe it still runs, and the start answers at once.
-    let ready = ReadyPipe::new();
-    let mut cmd = Command::new(bin);
-    cmd.args(&argv)
+/// Run `kern <args>` (a `logs --frames` command) and forward its frames onto `w`, the streams in
+/// `wanted` only, until it ends; killed when the client goes away first.
+fn kern_frames(bin: &Path, args: &[&str], w: &mut crate::Out, wanted: (bool, bool)) {
+    let Ok(mut child) = Command::new(bin)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(r) = &ready {
-        let wr = std::os::fd::AsRawFd::as_raw_fd(&r.write_end);
-        cmd.env("KERN_READY_FD", wr.to_string());
-        // SAFETY: between fork and exec only `fcntl`, async-signal-safe, on a descriptor this
-        // process owns: the write end, made inheritable in this child alone (it is close-on-exec
-        // everywhere else, so no other child of this server holds it).
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::fcntl(wr, libc::F_SETFD, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            run_end(name, 125);
-            return error(500, &format!("cannot run kern box: {e}"));
-        }
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
     };
-    // The attach may have gone: then the pipes close and the box's writes fail, as a closed
-    // terminal's do.
-    let _ = to.send((child.stdout.take(), child.stderr.take()));
-    // Answered once the box runs, as Docker answers a start: a client that inspects the container
-    // next finds it running, and the `start` event goes out when it is true.
-    if ready.is_some_and(|r| r.started(&mut child)) {
-        crate::events::publish(&event_of("start", name, c, None));
+    if let Some(out) = child.stdout.take() {
+        if !copy_frames(out, w, wanted) {
+            let _ = child.kill();
+        }
     }
-    let watched = name.to_string();
-    let created = c.clone();
+    let _ = child.wait();
+}
+
+/// Start a created container that an attach waits on (`docker run` without `-d`), and tell the
+/// attach to follow it.
+///
+/// DETACHED, like every other container: it used to run in the foreground as this server's child,
+/// and so ended with this server (stopping it, a crash, an upgrade) while Docker's outlives its client.
+/// Its stdout and stderr are its log's, apart (`--log-streams`), and the attach follows that log
+/// from its first byte; the exit code comes from `kern wait`. Both wake when the box leaves the
+/// registry, not on a timer, so a command that ends at once pays no poll interval.
+///
+/// `--rm` IS DONE HERE, after the attach has followed the whole log: kern's own `--rm` removes the
+/// log at the exit, and a box that ends at once could be gone before the follow had opened it.
+fn start_attached(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Started>) -> Response {
+    if let Err(e) = start_detached(bin, name, c, &without_rm(&c.argv)) {
+        run_end(name, 125);
+        return e;
+    }
+    // The attach may have gone: then `done` is dropped at once, and nothing waits on it.
+    let (done, read) = mpsc::channel::<()>();
+    let _ = to.send(done);
+    let (bin, watched, created) = (bin.to_path_buf(), name.to_string(), c.clone());
     let reaper = std::thread::Builder::new()
         .name("kern-serve-run".into())
         .spawn(move || {
-            let code = exit_code(&mut child);
-            run_end(&watched, code);
+            // THE FOLLOW ENDS WHEN THE BOX DOES, so it is waited for first and the one `kern
+            // wait` after it answers at once from the exit record, instead of a second `kern`
+            // resident for the box's life. Bounded: past it (a long run, or a client that keeps
+            // the connection and stops reading) the `kern wait` is the one that waits.
+            let _ = read.recv_timeout(FOLLOW_FIRST);
+            let code = kern_wait_code(&bin, &watched);
             crate::events::publish(&event_of("die", &watched, &created, Some(code)));
+            // Removed before the run ends here, so the server does not leave on idle with the
+            // removal undone, and `wait?condition=removed` answers once it is true.
+            if created.auto_remove {
+                let _ = kern(&bin, &["rm", &watched]);
+            }
+            run_end(&watched, code);
         });
     if reaper.is_err() {
         run_end(name, -1);
     }
     no_content()
+}
+
+/// How long a run's end is left to its attach's follow before `kern wait` waits for it.
+const FOLLOW_FIRST: Duration = Duration::from_secs(60);
+
+/// `kern box -d` of a created container, which returns once the box has started, and its `start`
+/// event. The `Err` is the answer to give.
+fn start_detached(bin: &Path, name: &str, c: &Created, argv: &[&str]) -> Result<(), Response> {
+    let (code, _, err) = kern(bin, argv);
+    if code != 0 {
+        return Err(error(500, &kern_error(&err)));
+    }
+    crate::events::publish(&event_of("start", name, c, None));
+    Ok(())
+}
+
+/// A `kern box` argv without its `--rm`, which stands among the flags (before the workload's `--`)
+/// and nowhere else: a workload argument spelled `--rm` is the workload's.
+fn without_rm(argv: &[String]) -> Vec<&str> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut in_flags = true;
+    for a in argv {
+        if in_flags && a == "--" {
+            in_flags = false;
+        } else if in_flags && a == "--rm" {
+            continue;
+        }
+        out.push(a.as_str());
+    }
+    out
+}
+
+/// The exit code of `name` from `kern wait`, -1 when it says none.
+fn kern_wait_code(bin: &Path, name: &str) -> i32 {
+    let (_, out, _) = kern(bin, &["wait", name]);
+    out.trim().parse().unwrap_or(-1)
 }
 
 /// `docker start` of a container that has run already. Running: `running`, Docker's 304. Stopped
@@ -1977,70 +1996,6 @@ fn event_of(
         image: c.image.clone(),
         labels: c.labels.clone(),
         exit,
-    }
-}
-
-/// The readiness pipe of a foreground box (`KERN_READY_FD`): kern writes one byte on it once the
-/// box is registered with its PID 1 and its gates are released.
-struct ReadyPipe {
-    read_end: std::os::fd::OwnedFd,
-    write_end: std::os::fd::OwnedFd,
-}
-
-impl ReadyPipe {
-    fn new() -> Option<Self> {
-        use std::os::fd::FromRawFd;
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `pipe2` writes two descriptors into the local array; both close-on-exec.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return None;
-        }
-        // SAFETY: both were just returned by `pipe2` and are owned by nothing else.
-        let (read_end, write_end) = unsafe {
-            (
-                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
-                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
-            )
-        };
-        Some(Self {
-            read_end,
-            write_end,
-        })
-    }
-
-    /// Wait for the byte, or for the box to end without it. The write end is closed here first, so
-    /// only the box holds it. No time limit: the start of a box whose image is being fetched takes
-    /// what the fetch takes, as Docker's start does.
-    fn started(self, child: &mut std::process::Child) -> bool {
-        use std::os::fd::AsRawFd;
-        let Self {
-            read_end,
-            write_end,
-        } = self;
-        drop(write_end);
-        let fd = read_end.as_raw_fd();
-        loop {
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one pollfd owned here, count 1, 50 ms: a byte wakes it at once, and between
-            // wakes the child's exit is looked at.
-            let n = unsafe { libc::poll(&mut pfd, 1, 50) };
-            if n > 0 {
-                let mut b = [0u8; 1];
-                // SAFETY: one byte into a local buffer from the pipe's read end.
-                let got = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
-                return got == 1 && b[0] == b'1';
-            }
-            if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                return false;
-            }
-            if !matches!(child.try_wait(), Ok(None)) {
-                return false;
-            }
-        }
     }
 }
 
@@ -2422,13 +2377,9 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 }
                 None => {
                     let argv: Vec<&str> = c.argv.iter().map(String::as_str).collect();
-                    let (code, _, err) = kern(bin, &argv);
-                    if code == 0 {
-                        // `kern box -d` returns once the box has started.
-                        crate::events::publish(&event_of("start", &name, &c, None));
-                        no_content()
-                    } else {
-                        error(500, &kern_error(&err))
+                    match start_detached(bin, &name, &c, &argv) {
+                        Ok(()) => no_content(),
+                        Err(e) => e,
                     }
                 }
             };
@@ -2830,6 +2781,22 @@ mod tests {
         let exited = ListFilters::parse(&list_req(r#"{"status":["exited"]}"#)).unwrap();
         assert!(exited.wants_exited());
         assert!(exited.keeps("x", false, &other) && !exited.keeps("x", true, &other));
+    }
+
+    /// An attached run's `--rm` is this server's: taken out of the flags, never out of the
+    /// workload's arguments.
+    #[test]
+    fn without_rm_drops_the_flag_and_keeps_the_workloads_own() {
+        let argv: Vec<String> = [
+            "box", "n", "-d", "--rm", "--image", "x", "--", "rm", "--rm", "f",
+        ]
+        .iter()
+        .map(|a| (*a).to_string())
+        .collect();
+        assert_eq!(
+            without_rm(&argv),
+            ["box", "n", "-d", "--image", "x", "--", "rm", "--rm", "f"]
+        );
     }
 
     /// `HostConfig.Mounts` as kern's `--mount`: the workspace bind Dev Containers always sends, a

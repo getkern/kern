@@ -357,8 +357,9 @@ pub fn ps(
     let live_names: std::collections::HashSet<String> =
         live.iter().map(|b| b.name.clone()).collect();
     let boxes: Vec<registry::Instance> = live
-        .into_iter()
+        .iter()
         .filter(|b| ps_matches(b, filters) && named(&b.name))
+        .cloned()
         .collect();
     // ASK THE KERNEL TOO, because the registry is the one source that can be erased while the boxes it
     // describes keep running. `$XDG_RUNTIME_DIR/kern/instances` is swept by `systemd-tmpfiles`, cleared
@@ -504,20 +505,13 @@ pub fn ps(
             .then(a.name.cmp(&b.name))
     });
     let exited: Vec<registry::ExitedBox> = if want_exited {
-        // Exclude any pid that is ALSO a live box: between a box's `waitexit` write (its last act) and
-        // its instance-record unregister there is a window where both artefacts exist; without this a
-        // box could momentarily appear in BOTH sections of one `ps -a`.
-        // Dedup on the FULL (pid, starttime) identity, not pid alone: a fresh live box that recycled a
-        // within-window exited box's pid must not hide that exited row (different starttime).
-        let live: std::collections::HashSet<(i32, u64)> =
-            boxes.iter().map(|b| (b.pid, b.starttime)).collect();
-        registry::list_exited()
+        // AGAINST THIS `ps`'s OWN SNAPSHOT, UNFILTERED: between a box's `waitexit` write and its
+        // unregister both artefacts exist, and a record of a box in `live` is left out by
+        // `list_exited_among`, on the full (pid, starttime) identity, so no box appears in BOTH
+        // sections of one `ps -a`; a running box a `--filter` hides is still running, not exited.
+        registry::list_exited_among(&live)
             .into_iter()
-            .filter(|e| {
-                !live.contains(&(e.pid, e.starttime))
-                    && exited_matches(e, filters)
-                    && named(&e.name)
-            })
+            .filter(|e| exited_matches(e, filters) && named(&e.name))
             // ONE BOX, ONE ROW, for a name that has a kept layer. The exit record is transient (an
             // hour, or `kern gc`) and the kept record is durable and now carries the same code (the
             // supervisor records it), so printing both put one box in two sections of one `ps -a`
@@ -2035,12 +2029,15 @@ pub fn rename(old: &str, new: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// The longest `kern wait` sleeps with nothing to wake it: the poll it had.
+const WAIT_FLOOR_MS: i32 = 100;
+
 /// `kern wait <box>...` - block until each box exits, then print its exit code, one per line, in
 /// argument order (Docker `wait`). A box that has ALREADY exited answers at once from its exit
 /// record, for as long as `kern ps -a` still lists it; past that window, and for an interactive
 /// `-it` box (never registered, no supervisor to record a code), there is nothing to answer with.
-/// The command itself returns 0 unless a name doesn't resolve. Polls the registry every 100 ms - no
-/// daemon, no busy-spin.
+/// The command itself returns 0 unless a name doesn't resolve. Woken when the box leaves the
+/// registry (inotify), with a 100 ms poll as the floor - no daemon, no busy-spin.
 pub fn wait(names: &[String]) -> Result<(), Error> {
     for name in names {
         let Some(inst) = registry::find_ref(name) else {
@@ -2065,8 +2062,12 @@ pub fn wait(names: &[String]) -> Result<(), Error> {
         // a still-live box read as gone. The supervisor (self-exit) and `stop`/`kill` both write the
         // `(pid,starttime)`-keyed exit sidecar before the box leaves `list()`, so once the pair is gone
         // the code is already recorded. The read is NON-consuming, so parallel/repeat waiters all see it.
+        //
+        // WOKEN AT THE REMOVAL, by inotify on the registry (`BoxWaiter`), with the old 100 ms poll
+        // as the floor: an attached `docker run` paid that poll on every command that ends at once.
+        let waiter = crate::commands::boxlog::BoxWaiter::new(None);
         while registry::pair_alive(&inst.name, inst.pid) {
-            unsafe { libc::usleep(100_000) }; // 100 ms poll
+            waiter.wait(WAIT_FLOOR_MS);
         }
         match registry::box_exit(inst.pid, inst.starttime) {
             Some(code) => println!("{code}"),
@@ -3581,13 +3582,23 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
         // and a box with no `--keep` layer is then removed by exactly that, stopped or exited.
         let kept =
             crate::keepbox::dir_of(name).is_some_and(|d| std::fs::symlink_metadata(d).is_ok());
+        // ITS LOGS GO WITH IT, as `docker rm` removes a container's log: they stayed in the
+        // runtime dir until the hour-long expiry, and kern's Docker API removes a `docker run --rm`
+        // box this way once it has read the box's output.
         let records = registry::clear_exited_named(name);
-        if !kept && records > 0 {
+        for pid in &records {
+            crate::commands::boxlog::remove_run_logs(&format!("{name}-{pid}"));
+        }
+        if !kept && !records.is_empty() {
             println!("{name}");
             continue;
         }
         match crate::keepbox::remove(name) {
-            Ok(()) => println!("removed kept box '{}{name}{}'", p.c, p.z),
+            Ok(()) => {
+                // Every run of a kept box left a log: none of them outlives the box.
+                crate::commands::boxlog::remove_logs_of(name);
+                println!("removed kept box '{}{name}{}'", p.c, p.z)
+            }
             // `-f` on a name that is not there: said, and not a failure, as docker answers it.
             Err(e) if force => eprintln!("kern: '{name}': {e}"),
             Err(e) => failures.push(format!("'{name}': {e}")),

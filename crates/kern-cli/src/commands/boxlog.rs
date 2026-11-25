@@ -959,12 +959,156 @@ pub(crate) unsafe fn start_log_pump(path: &std::path::Path, cap: LogCap) -> Opti
         libc::_exit(0);
     }
     // The parent keeps only the write ends (dup2'd onto 1/2 by the caller, then closed).
+    PUMP_PID.store(pid, std::sync::atomic::Ordering::Release);
     libc::close(rd);
     if erd >= 0 {
         libc::close(erd);
     }
     Some((wr, if ewr >= 0 { ewr } else { wr }))
 }
+
+/// The log pump this process forked ([`start_log_pump`]), 0 for none. One per supervisor: it
+/// outlives every `--restart` attempt and ends with the box.
+static PUMP_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// How long a supervisor waits for its pump to finish the log. The pump only drains what its pipe
+/// still holds (at most [`PUMP_SPLICE_CHUNK`]) into a file; a process that somehow still held a
+/// write end must not keep the supervisor, and so the box's name, up past this.
+const PUMP_FINISH_MS: i32 = 2000;
+
+/// Let go of the log pump's pipes: fds 1 and 2 of the supervisor ARE them, and a pipe's reader sees
+/// EOF only when the last write end closes, which was this process's exit. Called as soon as the box
+/// has ended, so the pump drains and exits while the rest of the teardown runs; nothing this process
+/// writes after its box has ended is the box's output. Idempotent.
+pub(crate) fn release_log_pump() {
+    if PUMP_PID.load(std::sync::atomic::Ordering::Acquire) <= 0 {
+        return;
+    }
+    // SAFETY: `open`/`dup2`/`close` on descriptors this process owns; a failed open leaves 1/2 as
+    // they are, and [`finish_log_pump`]'s bounded wait then simply times out.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if null >= 0 {
+            libc::dup2(null, 1);
+            libc::dup2(null, 2);
+            libc::close(null);
+        }
+    }
+}
+
+/// End the log pump BEFORE the supervisor leaves the registry, so a box that is no longer
+/// registered is a box whose log is complete.
+///
+/// THE PUMP COULD ONLY END AFTER THE SUPERVISOR ([`release_log_pump`] says why), so a follower
+/// that stopped when the box left the registry could stop before the last bytes reached the file;
+/// it was the 200 ms poll of `kern logs -f` that hid it, and a follow that wakes at the removal
+/// (see [`BoxWaiter`]) needs it to be true. Releases the pipes if that was not done yet, waits for
+/// the pump (bounded), and reaps it.
+pub(crate) fn finish_log_pump() {
+    release_log_pump();
+    let pid = PUMP_PID.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if pid <= 0 {
+        return;
+    }
+    match crate::pidfd::PidFd::open(pid) {
+        Some(p) => {
+            let _ = p.wait_exit(PUMP_FINISH_MS);
+        }
+        None => {
+            for _ in 0..PUMP_FINISH_MS {
+                // SAFETY: `waitpid` on this process's own child, non-blocking.
+                if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
+                    return;
+                }
+                // SAFETY: `usleep` takes an integer and has no other effect.
+                unsafe { libc::usleep(1000) };
+            }
+        }
+    }
+    // SAFETY: reaping this process's own child, non-blocking: a pump still running past the bound
+    // is left to finish on its own.
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+}
+
+/// What a waiter for a box sleeps on: an entry leaving the registry (inotify on the instances dir)
+/// and, for a follow, the log changing (inotify on the file, and on its directory for a rotation),
+/// or a floor timer, whichever is first. `kern logs -f` and `kern wait` both.
+///
+/// THEY POLLED, 200 and 100 ms, so output reached a follower late, and the end of a box was seen
+/// late, by up to that much; an attached `docker run` over kern's Docker API is a follow and a wait,
+/// and paid both on every command. The end is the entry's REMOVAL, not the supervisor's exit: the
+/// supervisor still cleans up after it leaves the registry (MEASURED about 10 ms), and both callers
+/// test the registry. Without inotify, the floor is the old poll exactly; a supervisor that died
+/// without removing its entry is found by the caller's liveness check at the floor.
+pub(crate) struct BoxWaiter {
+    inotify: Option<std::os::fd::OwnedFd>,
+}
+
+impl BoxWaiter {
+    /// Watch the registry, and `log` (with its directory) when given.
+    pub(crate) fn new(log: Option<&std::path::Path>) -> Self {
+        use std::os::fd::FromRawFd;
+        // SAFETY: `inotify_init1` takes flags and returns a new descriptor or -1.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        // SAFETY: a descriptor just returned to this process and owned by nothing else.
+        let inotify = (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        let w = Self { inotify };
+        if let Ok(reg) = registry::dir() {
+            w.add(
+                &reg,
+                libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_ONLYDIR,
+            );
+        }
+        if let Some(path) = log {
+            w.watch(path);
+            if let Some(dir) = path.parent() {
+                w.add(dir, libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ONLYDIR);
+            }
+        }
+        w
+    }
+
+    /// Watch the log now at `path`: after a rotation it is a new inode.
+    pub(crate) fn watch(&self, path: &std::path::Path) {
+        self.add(
+            path,
+            libc::IN_MODIFY | libc::IN_CLOSE_WRITE | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF,
+        );
+    }
+
+    fn add(&self, path: &std::path::Path, mask: u32) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let (Some(fd), Ok(c)) = (
+            self.inotify.as_ref(),
+            std::ffi::CString::new(path.as_os_str().as_bytes()),
+        ) else {
+            return;
+        };
+        // SAFETY: a live inotify descriptor and a NUL-terminated path; a failure adds no watch,
+        // and the floor timer still wakes the waiter.
+        unsafe { libc::inotify_add_watch(fd.as_raw_fd(), c.as_ptr(), mask) };
+    }
+
+    /// Sleep until something may have changed, at most `floor_ms`. The events are drained, not
+    /// read: the caller reads the file and the registry, which are the truth. Created before the
+    /// caller's first check, so a change between that check and this sleep is already queued.
+    pub(crate) fn wait(&self, floor_ms: i32) {
+        use std::os::fd::AsRawFd;
+        let mut fds = [libc::pollfd {
+            fd: self.inotify.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        if crate::eintr::poll(&mut fds, floor_ms) > 0 {
+            let mut buf = [0u8; 4096];
+            while crate::eintr::read(fds[0].fd, buf.as_mut_ptr().cast(), buf.len()) > 0 {}
+        }
+    }
+}
+
+/// The longest a follow sleeps with nothing to wake it.
+const FOLLOW_FLOOR_MS: i32 = 200;
 
 /// Open the box log for direct (uncapped) append - the fallback when the capped pump can't start.
 pub(crate) fn open_log_direct(path: &std::path::Path) -> Option<i32> {
@@ -1076,8 +1220,9 @@ pub(crate) fn tail_file(f: &mut std::fs::File, n: usize) -> Result<Vec<u8>, Erro
     Ok(tail_lines(&buf, n).to_vec())
 }
 
-/// Stream new appends of an already-open log to stdout, FOLLOWING THE NAME ACROSS ROTATIONS, polling
-/// every 200 ms until the box `(name, pid)` leaves the registry. Panic-free; a stdout write error (a
+/// Stream new appends of an already-open log to stdout, FOLLOWING THE NAME ACROSS ROTATIONS, woken by
+/// a [`BoxWaiter`] (a write, a rotation, the box leaving the registry, a 200 ms floor) until the box
+/// `(name, pid)` leaves the registry. Panic-free; a stdout write error (a
 /// closed pipe) ends the follow quietly. Shared by `kern attach` and `kern logs -f`.
 ///
 /// 🔴 IT USED TO FOLLOW AN INODE, AND A ROTATION ENDED THE STREAM IN SILENCE. `rotate` renames the
@@ -1100,6 +1245,7 @@ pub(crate) fn follow_log(
     use std::io::{Read, Write};
     let mut buf = [0u8; 8192];
     let mut data = crate::ui::data_out();
+    let waiter = BoxWaiter::new(Some(path));
     if let Some(s) = stamper.as_mut() {
         s.follow_live();
         if let Some(i) = fd_inode(&f) {
@@ -1154,12 +1300,19 @@ pub(crate) fn follow_log(
                         }
                     }
                     std::mem::swap(&mut f, &mut next);
+                    waiter.watch(path);
                     continue; // read the new generation at once rather than after a poll
                 }
             }
         }
         // Exact (name,pid) pair: a duplicate same-name entry must not make a live box read as exited.
         if !registry::pair_alive(name, pid) {
+            // ONE LAST READ: the log is complete once the box has left the registry
+            // (`finish_log_pump`), and bytes written after the read at the top of this turn would
+            // otherwise be lost.
+            if !drain(&mut f, &mut stamper) {
+                return Ok(());
+            }
             // The box is gone, so a line still waiting for a newline will never get one: print it.
             if let Some(s) = stamper.as_mut() {
                 // A second handle on the same stateless writer: the one above is held by `drain`.
@@ -1169,7 +1322,7 @@ pub(crate) fn follow_log(
             }
             return Ok(());
         }
-        unsafe { libc::usleep(200_000) }; // 200 ms - cheap follow poll
+        waiter.wait(FOLLOW_FLOOR_MS);
     }
 }
 
@@ -1418,7 +1571,7 @@ impl<W: std::io::Write> std::io::Write for PrefixWriter<'_, W> {
 ///
 /// WHY POLLING AND NOT A READER PER SERVICE. A log file never blocks: a read at EOF returns 0
 /// immediately, so one pass over N files costs N cheap reads and the loop sleeps 200 ms between
-/// passes, the same cadence the single-box follow already uses. A thread per service would buy
+/// passes, the floor of the single-box follow. A thread per service would buy
 /// nothing (there is nothing to block on) and would need a lock around stdout to keep lines whole.
 ///
 /// ORDERING WITHIN A PASS is by service, not by timestamp: kern's box logs carry no per-line clock,
@@ -1486,7 +1639,7 @@ pub(crate) fn follow_many(
         if ended || stop.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
-        unsafe { libc::usleep(200_000) }; // 200 ms - the cadence `follow_log` already uses
+        unsafe { libc::usleep(200_000) }; // 200 ms - the floor `follow_log` wakes at with no event
     }
 }
 
@@ -1582,37 +1735,39 @@ pub(crate) fn earlier_runs(name: &str, tail: Option<usize>) -> Vec<u8> {
     last_lines(&text, n - newest_lines).to_vec()
 }
 
-/// Remove every run log of `name` and its index, as Docker removes a container's log with the
-/// container: called by `compose down` and by a recreation, so the next life of the service starts
-/// with an empty history. Best effort: a file that is gone already is the wanted state.
+/// Remove every run log of `name`, as Docker removes a container's log with the container: called
+/// by `compose down`, a recreation and `kern rm` of a kept box, so the next life starts with an
+/// empty history. One pass over the logs dir: a file belongs to a run of `name` when its key
+/// ([`registry::split_log_file`]) is `<name>-<pid>`, even when the run's active `.log` is gone and
+/// only a rotated generation or an index is left. Best effort: a file that is gone already is the
+/// wanted state.
 pub(crate) fn remove_logs_of(name: &str) {
-    for p in logs_oldest_first(name).unwrap_or_default() {
-        let mut idx = p.clone().into_os_string();
-        idx.push(".idx");
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(PathBuf::from(idx));
-    }
-}
-
-/// Remove one run's log, `<key>.log` with its index and every rotated generation (`<key>.log.N`,
-/// `<key>.log.N.idx`). `key` is `<name>-<pid>`: the exact run, never another run of the same name.
-pub(crate) fn remove_run_logs(key: &str) {
-    let Ok(dir) = registry::logs_dir() else {
+    let (Ok(dir), prefix) = (registry::logs_dir(), format!("{name}-")) else {
         return;
     };
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return;
     };
-    let active = format!("{key}.log");
-    let generations = format!("{key}.log.");
     for e in rd.flatten() {
-        let name = e.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name == active || name.starts_with(&generations) {
+        let fname = e.file_name();
+        let ours = fname
+            .to_str()
+            .and_then(registry::split_log_file)
+            .and_then(|(key, _)| key.strip_prefix(&prefix))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+        if ours {
             let _ = std::fs::remove_file(e.path());
         }
+    }
+}
+
+/// Remove one run's log: every file [`registry::run_log_files`] names for `key` (`<name>-<pid>`).
+pub(crate) fn remove_run_logs(key: &str) {
+    let Ok(dir) = registry::logs_dir() else {
+        return;
+    };
+    for (path, _) in registry::run_log_files(&dir, key) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1940,8 +2095,8 @@ impl Stamper {
     /// fixed window of a file it already measured, and any mark appended after that measurement
     /// describes bytes past the end of what it will print.
     ///
-    /// Per CHUNK and not per line, so the cost is bounded by the 200 ms poll rather than by the number
-    /// of lines: the index of an hour-long box is half a megabyte, and re-reading it per line would
+    /// Per CHUNK and not per line, so the cost is bounded by the follow's wakes rather than by the
+    /// number of lines: the index of an hour-long box is half a megabyte, and re-reading it per line would
     /// turn printing a busy tail into an O(lines x index) crawl. The chunk was read from the log
     /// BEFORE this call, and the pump writes a mark only after the bytes it marks, so every mark this
     /// chunk needs is already on disk when we read it here.
@@ -2864,6 +3019,46 @@ mod log_cap_precedence_tests {
         let base = LogCap::default();
         let cap = LogCap::pick(Some(0), Some(0), Some(0), Some(0), true).with_base(base);
         assert_eq!(cap, base);
+    }
+}
+
+#[cfg(test)]
+mod run_file_tests {
+    use super::*;
+
+    /// One run's files are every file the pump and a rotation write for it, and none of another
+    /// run's, of the same name or of a name that starts like it.
+    #[test]
+    fn a_runs_files_are_all_of_its_own_and_none_of_another() {
+        let d = std::env::temp_dir().join(format!("kern-runfiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("dir");
+        let mine = [
+            "web-12.log",
+            "web-12.log.idx",
+            "web-12.log.streams",
+            "web-12.log.1",
+            "web-12.log.1.idx",
+            "web-12.log.2",
+        ];
+        let others = [
+            "web-123.log",
+            "web-12.logx",
+            "web-12.logger-5.log",
+            "web-13.log.streams",
+        ];
+        for f in mine.iter().chain(others.iter()) {
+            std::fs::write(d.join(f), b"x").expect("write");
+        }
+        let mut got: Vec<String> = registry::run_log_files(&d, "web-12")
+            .into_iter()
+            .map(|(_, suffix)| format!("web-12.log{suffix}"))
+            .collect();
+        got.sort();
+        let mut want: Vec<String> = mine.iter().map(|s| (*s).to_string()).collect();
+        want.sort();
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 

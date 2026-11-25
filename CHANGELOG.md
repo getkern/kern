@@ -37,6 +37,13 @@ image and execs into it: `--mount`, `exec -i`, and `docker events` for the conta
 container keeps its filesystem until `docker rm` (a kept box), so the `docker start` of a reopen
 runs it again on the same files; `--rm` containers and a Testcontainers run's stay in memory.
 
+**`kern logs -f` and `kern wait` wake when the box writes or ends, not on a timer.** They polled every
+200 and 100 ms; measured on a box that lives 250 ms, `logs -f` returned after 251 ms instead of 402,
+and `wait` after 251 ms instead of 302. A box's supervisor now finishes its log before it leaves
+the registry, so a follower that stops there has the last line. `kern wait`, `ps -a` and `rm`
+right after a box that ended at once saw it neither running nor exited for about 10 ms; they see its
+exit record now. `kern rm` of an exited box removes its logs too, as `docker rm` does.
+
 **`kern start` starts a kept box detached, as `docker start` does, and `start -a` follows it.** A box
 kept from a foreground `kern box --keep` ran again in the foreground and `kern start` did not return
 until it ended, which its own help ("-a follows its output") does not say; `start -a` of such a box

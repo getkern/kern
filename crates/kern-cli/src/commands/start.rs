@@ -3280,7 +3280,6 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // THE WORKLOAD WAITS FOR ITS FILTER: armed after `HeldNat`, which `--egress-allow` never meets
     // (it refuses `--pod`), so the two never compete for the one gate a box has.
     let mut egress_gate = egress_pending.as_ref().and_then(|_| EgressGate::arm());
-    let mut ready_fd = ready_fd_from_env();
     let result = run_in_sandbox_with(
         &spec,
         alive_fd,
@@ -3316,13 +3315,6 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             }
             if let Some(nat) = held_nat.as_mut() {
                 nat.release(pid1);
-            }
-            // Started: registered with its PID 1, its gates released. Not for a box whose egress
-            // pump failed, which is about to be stopped.
-            if egress_failed.is_none() {
-                if let Some(fd) = ready_fd.take() {
-                    signal_ready(fd);
-                }
             }
             // No terminal on this path, so nothing to swap: see `run_in_sandbox_with`'s `on_started`.
             None
@@ -3364,7 +3356,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     cleanup_scratch(scratch.as_deref());
     let _ = std::fs::remove_dir_all(&vdisk_work);
     if let Some((_, Some(path))) = &reg_state {
-        registry::unregister(path);
+        leave_registry(path);
     }
     // THE ENVIRONMENT SIDECAR GOES WITH THE BOX. `set_box_env` writes `env/<name>-<pid>` for every
     // box so `kern exec` and the healthcheck can read an environment they cannot get from
@@ -5406,40 +5398,12 @@ fn print_cap_notices(notices: &str) {
     let _ = std::io::Write::write_all(&mut std::io::stderr(), notices.as_bytes());
 }
 
-/// `KERN_READY_FD`: a pipe a caller of a FOREGROUND `kern box` hands it, to learn when the box has
-/// started, which a `-d` launcher learns from its own readiness pipe. kern-serve's attached
-/// `docker run` answers its `start` only then, as Docker does, and sends the `start` event
-/// Dev Containers waits for; its stdout and stderr are the container's, so they cannot carry it.
-/// Internal, like `KERN_GATE_FD`. Only a descriptor above stderr that is a pipe is taken, so a
-/// stray value can never make kern write into one of its own files; the box's workload never sees
-/// the variable (its environment is the image's and the caller's `-e`), nor the descriptor, which
-/// the box's descriptor sweep closes.
-fn ready_fd_from_env() -> Option<libc::c_int> {
-    let fd: libc::c_int = crate::global_env_str("KERN_READY_FD")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    if fd <= 2 {
-        return None;
-    }
-    // SAFETY: `fstat` writes only into the local `st`; a closed or invalid `fd` answers -1.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
-        return None;
-    }
-    Some(fd)
-}
-
-/// One byte on the readiness pipe, then closed: the caller reads "started" once, and a later
-/// attempt of the same process cannot write to whatever file reuses the number.
-fn signal_ready(fd: libc::c_int) {
-    // SAFETY: `fd` is the pipe `ready_fd_from_env` checked, taken out of its `Option` so this runs
-    // once; the write is one byte from a static buffer.
-    unsafe {
-        let _ = libc::write(fd, b"1".as_ptr().cast(), 1);
-        libc::close(fd);
-    }
+/// Leave the registry with the box's log complete: the log pump finishes first
+/// ([`crate::commands::boxlog::finish_log_pump`]), so a `kern logs -f` that stops at the removal has
+/// every line. The one way a box's supervisor leaves the registry at the end of its box.
+fn leave_registry(path: &std::path::Path) {
+    crate::commands::boxlog::finish_log_pump();
+    registry::unregister(path);
 }
 
 /// Should a box that just exited `code` be started again? The whole restart policy, as a pure
@@ -6013,8 +5977,8 @@ fn supervise_box(
             // shape. `attempt` is >= 1 here (incremented above): 1, 2, 4, 8, 16, then 30 s thereafter.
             let backoff = (1u32 << attempt.saturating_sub(1).min(5)).min(30);
             // THE RUN THAT JUST ENDED IS RECORDED BEFORE THE BACKOFF, overwritten by the next one and
-            // by the final one below. While this supervisor is alive no reader shows it (`ps -a`
-            // skips a live record); it is what a stop arriving between two runs reports, where
+            // by the final one below. While the box is registered no reader shows it (`ps -a`
+            // skips the record of a registered box); it is what a stop arriving between two runs reports, where
             // before it found no record and the service read as exit 0. MEASURED against Docker:
             // `up --abort-on-container-exit` on an `on-failure:3` service that exits 1 stops the
             // stack at the first exit, and the service's status is 1.
@@ -6339,6 +6303,8 @@ fn run_detached(
         outbound_pod,
         egress.as_ref(),
     );
+    // The box has ended: its log pump drains and exits while the rest of the teardown runs.
+    crate::commands::boxlog::release_log_pump();
     // Box is gone - cancel the sidecars and reap them (they're our children; setsid doesn't change
     // parentage) so we don't leave brief zombies behind before this supervisor exits.
     if let Some(tp) = timeout_pid {
@@ -6348,7 +6314,7 @@ fn run_detached(
     }
     stop_health_checker(health_pid, name.as_str(), pid);
     if let Some(p) = path {
-        registry::unregister(&p);
+        leave_registry(&p);
     }
     registry::clear_box_shm(name.as_str());
     cleanup_scratch(scratch.as_deref());
@@ -7272,38 +7238,6 @@ mod image_defaults_tests {
         );
         assert_eq!(crate::global_env_str("KERN_GATE_FD").as_deref(), Ok("7"));
         crate::unset_global_env("KERN_GATE_FD");
-    }
-
-    /// `KERN_READY_FD` names a pipe: taken once, one byte `1` and closed. Stdin/stdout/stderr,
-    /// a regular file and a closed number are refused, so a stray value never makes kern write
-    /// into a descriptor that is not the readiness pipe.
-    #[test]
-    fn ready_fd_is_taken_only_for_a_pipe_and_signals_once() {
-        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-        let _g = crate::env_guard();
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `pipe2` writes two descriptors into the local array.
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        // SAFETY: just returned by `pipe2`, owned by nothing else.
-        let rd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        crate::set_global_env("KERN_READY_FD", fds[1].to_string());
-        let fd = ready_fd_from_env().expect("a pipe is taken");
-        signal_ready(fd);
-        let mut b = [0u8; 2];
-        // SAFETY: two bytes into a local buffer; the write end is closed, so the read ends.
-        let got = unsafe { libc::read(rd.as_raw_fd(), b.as_mut_ptr().cast(), 2) };
-        assert_eq!((got, b[0]), (1, b'1'), "one byte, then EOF");
-        let file = std::fs::File::open("/proc/self/stat")
-            .unwrap()
-            .into_raw_fd();
-        for refused in ["0", "1", "2", "-1", "x", &file.to_string(), "99999"] {
-            crate::set_global_env("KERN_READY_FD", refused);
-            assert!(ready_fd_from_env().is_none(), "{refused}");
-        }
-        // SAFETY: the file opened above, owned here.
-        drop(unsafe { OwnedFd::from_raw_fd(file) });
-        crate::unset_global_env("KERN_READY_FD");
-        assert!(ready_fd_from_env().is_none());
     }
 
     #[test]
