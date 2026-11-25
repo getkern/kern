@@ -31,6 +31,30 @@ answered with the new verb and the command written for it: `kern run [options] -
 path where the image goes are refused naming `kern limit`, and a `kern run <word>` whose image does
 not exist while `<word>` is a program of this host says `kern limit -- <word> ...` would run it.
 
+**Breaking: A box reaches the internet by default, as a Docker container does.** `kern run alpine wget
+example.com` had no interface but `lo` and no `/etc/resolv.conf`; a box that names no network now
+gets a NAT of its own (`eth0`, the host's resolvers), and so do `docker run` through kern's socket and
+`--network bridge`. `--network none` is the box with loopback only it used to be by default, and
+`network_mode: none` in a compose file says it. The NAT costs one pasta per box, about 11 ms of its
+start (14.7 ms against 4.0 ms with `--network none`). A service the host binds to `127.0.0.1` stays
+out of reach, by the gateway, the host's LAN address or `host-gateway`, as under Docker (measured with
+a canary). The Python and Node sandboxes and the Rust `Sandbox` builder ask for `--network none` and
+are isolated as before.
+
+**Breaking: An OOM kills the process the kernel picks, and the box goes on, as under Docker.** kern wrote
+`memory.oom.group=1` on every box, so an `exec` that ran out of memory took the whole box with it
+(`exited`), where Docker's container stays `running`. That is now `--oom-group`, which the Python and
+Node sandboxes pass, so their `oom` verdict covers every process of a cell as before.
+
+**Breaking: A denied syscall answers `EPERM`, as under Docker, instead of killing the caller.** A box that
+called a refused syscall (`unshare`, `mount`, `bpf`, `ptrace`, a namespace-creating `clone`) died with
+`Bad system call` (exit 159), where Docker's answer is `Operation not permitted` and the program goes
+on: a browser's or bubblewrap's sandbox probe, systemd's `bpf` probe and a debugger now report the
+refusal instead of crashing. The set of refused syscalls is unchanged, and none of them ever runs.
+`--security-opt seccomp-deny=kill` keeps the kill (so does `--security-profile untrusted`), `kern
+exec` and health probes get the box's own verdict, and the Python and Node sandboxes ask for the kill
+on every box, so their `escape_blocked` reads as before.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).
@@ -103,28 +127,6 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 `kern kill -s HUP <box>` sends HUP to the init and leaves the box running, `killall` kills every box
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
-
-**A box reaches the internet by default, as a Docker container does.** `kern run alpine wget
-example.com` had no interface but `lo` and no `/etc/resolv.conf`; a box that names no network now
-gets a NAT of its own (`eth0`, the host's resolvers), and so do `docker run` through kern's socket and
-`--network bridge`. `--network none` is the box with loopback only it used to be by default, and
-`network_mode: none` in a compose file says it. The NAT costs one pasta per box, about 11 ms of its
-start (14.7 ms against 4.0 ms with `--network none`). The Python and Node sandboxes ask for
-`--network none` and are isolated as before.
-
-**An OOM kills the process the kernel picks, and the box goes on, as under Docker.** kern wrote
-`memory.oom.group=1` on every box, so an `exec` that ran out of memory took the whole box with it
-(`exited`), where Docker's container stays `running`. That is now `--oom-group`, which the Python and
-Node sandboxes pass, so their `oom` verdict covers every process of a cell as before.
-
-**A denied syscall answers `EPERM`, as under Docker, instead of killing the caller.** A box that
-called a refused syscall (`unshare`, `mount`, `bpf`, `ptrace`, a namespace-creating `clone`) died with
-`Bad system call` (exit 159), where Docker's answer is `Operation not permitted` and the program goes
-on: a browser's or bubblewrap's sandbox probe, systemd's `bpf` probe and a debugger now report the
-refusal instead of crashing. The set of refused syscalls is unchanged, and none of them ever runs.
-`--security-opt seccomp-deny=kill` keeps the kill (so does `--security-profile untrusted`), `kern
-exec` and health probes get the box's own verdict, and the Python and Node sandboxes ask for the kill
-on every box, so their `escape_blocked` reads as before.
 
 **A compose service's `platform:` is honoured.** `platform: linux/arm64` was a warning and the
 service ran this machine's image; it runs the arm64 image now, through the kernel's qemu-user handler,
