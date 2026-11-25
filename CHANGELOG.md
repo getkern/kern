@@ -161,6 +161,11 @@ when its command starts.
 was not read, so the box had no check and the `docker compose` client refused the stack ("has no
 healthcheck configured"); it is the box's `--health-*` now, durations rounded up to whole seconds.
 
+**`docker.io/library/alpine` is `alpine`, as under Docker.** kern cached a Docker Hub image under the
+name it was given, so `docker pull` through kern's socket (which says `docker.io/library/...`) stored
+a second copy beside the familiar name and a create naming `wordpress:php8.2-apache` answered "No
+such image". The three spellings of Docker Hub's host are one name now.
+
 **Images with a named pipe in a layer pull.** A FIFO in a layer was refused "by policy", which made
 the official `mysql:8.0` unpullable; it is extracted, as Docker extracts it, and vetted as any member.
 

@@ -810,11 +810,33 @@ pub fn split_tag(image: &str) -> Option<(&str, &str)> {
 /// Without it `alpine` and `alpine:latest` are two different keys for one image, which is how the
 /// same 8.7 MB got stored twice, `rmi alpine` left `alpine:latest` behind, and a `save`+`load` round
 /// trip renamed an image so the reference that worked before stopped resolving.
+///
+/// AND ITS FAMILIAR NAME, Docker's: `docker.io/library/alpine` is `alpine`, `docker.io/bitnami/redis`
+/// is `bitnami/redis`, for the three spellings of Docker Hub's host. MEASURED before: the Docker
+/// client pulls through kern's socket as `docker.io/library/wordpress`, kern cached it under that
+/// name beside `wordpress`, the 740 MB image was stored twice, and the create that named it
+/// `wordpress:php8.2-apache` answered "No such image".
 pub fn normalize_ref(image: &str) -> String {
+    let image = familiar_ref(image);
     if image.is_empty() || split_tag(image).is_some() {
         return image.to_string();
     }
     format!("{image}:{DEFAULT_TAG}")
+}
+
+/// `image` without Docker Hub's host, and without `library/` for an official image: the name Docker
+/// prints and keys its images by. Any other registry is left as it is.
+pub fn familiar_ref(image: &str) -> &str {
+    for host in ["docker.io/", "index.docker.io/", "registry-1.docker.io/"] {
+        if let Some(rest) = image.strip_prefix(host) {
+            let rest = rest.strip_prefix("library/").unwrap_or(rest);
+            // `docker.io/library/` with nothing after it is not a name; leave it to fail as it was.
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    image
 }
 
 /// `[registry/]repo[:tag]` → `(registry, repo, reference)`. Bare names get `library/` +
@@ -4790,6 +4812,15 @@ mod tests {
             ("img@sha256:abc123", "img@sha256:abc123"),
             // Nothing to normalize.
             ("", ""),
+            // Docker Hub's three host spellings are the familiar name, as Docker keys them.
+            ("docker.io/library/wordpress:php8.2-apache", "wordpress:php8.2-apache"),
+            ("docker.io/library/alpine", "alpine:latest"),
+            ("index.docker.io/library/alpine:3.20", "alpine:3.20"),
+            ("registry-1.docker.io/bitnami/redis", "bitnami/redis:latest"),
+            ("docker.io/bitnami/redis:7", "bitnami/redis:7"),
+            ("docker.io/library/alpine@sha256:abc123", "alpine@sha256:abc123"),
+            // Another registry keeps its host.
+            ("ghcr.io/library/x:1", "ghcr.io/library/x:1"),
         ] {
             assert_eq!(normalize_ref(input), want, "normalize_ref({input:?})");
             // Normalizing is idempotent: applying it twice must not append a second tag.
