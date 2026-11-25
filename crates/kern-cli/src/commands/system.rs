@@ -157,7 +157,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      -q prints the resolved reference and nothing else, for `ref=$(kern pull -q X)`
     {c}pull{z} <image> --dest <dir> [--platform os/arch]                 Extract a rootfs instead, for `--rootfs`
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
-    {c}tag{z} <src> <dst>                                                Give a cached image a second name
+    {c}tag{z} <src> <dst> [--platform P]                                 Give a cached image a second name
     {c}commit{z} <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
     {c}build{z} -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx|-]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage; `-` or -f -: from stdin)
     {c}build{z} --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that file, and build NOTHING

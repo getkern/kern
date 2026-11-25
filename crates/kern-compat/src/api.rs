@@ -1796,27 +1796,34 @@ fn image_list(bin: &Path, req: &Request) -> Response {
 /// another platform's, as `kern run` picks it.
 fn cached_image(bin: &Path, name: &str) -> Option<Value> {
     let images = kern_images(bin, false);
-    if let Some(hex) = image_id_ref(name) {
-        if let Some(i) = images
-            .iter()
-            .find(|i| image_entry_id(i).is_some_and(|id| id.starts_with(hex)))
-        {
-            return Some(i.clone());
-        }
-    }
+    // THE NAME FIRST, then the id, as Docker resolves them: an image called `bf` is that image, not
+    // the one whose id starts with `bf`.
     let want_latest = if name.contains(':') || name.contains('@') {
         name.to_string()
     } else {
         format!("{name}:latest")
     };
-    images
-        .into_iter()
+    let by_name = images
+        .iter()
         .filter(|i| {
             i.get("image")
                 .and_then(Value::as_str)
                 .is_some_and(|n| n == name || n == want_latest || n.split('@').next() == Some(name))
         })
         .min_by_key(|i| i.get("platform").is_some())
+        .cloned();
+    by_name.or_else(|| image_by_id_prefix(&images, name))
+}
+
+/// The one cached entry whose id `r` names (`sha256:<hex>` or a prefix of 2 or more, as Docker
+/// takes one); `None` for no match and for an ambiguous prefix.
+fn image_by_id_prefix(images: &[Value], r: &str) -> Option<Value> {
+    let hex = image_id_ref(r)?;
+    let mut hits = images
+        .iter()
+        .filter(|i| image_entry_id(i).is_some_and(|id| id.starts_with(hex)));
+    let one = hits.next()?;
+    hits.next().is_none().then(|| one.clone())
 }
 
 /// The id a client sees for a cached image: of its name, and for another platform's entry of the
@@ -1842,7 +1849,7 @@ fn image_entry_platform(i: &Value) -> Option<&str> {
 /// of at least 12 (what `docker images` prints).
 fn image_id_ref(r: &str) -> Option<&str> {
     let hex = r.strip_prefix("sha256:").unwrap_or(r);
-    (12..=64).contains(&hex.len()).then_some(hex).filter(|h| {
+    (2..=64).contains(&hex.len()).then_some(hex).filter(|h| {
         h.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
@@ -1851,13 +1858,18 @@ fn image_id_ref(r: &str) -> Option<&str> {
 /// The create's `Image` when it is an image id: the cached entry's name in its place, and that
 /// entry's platform when the create named none. `None` when it is not an id of a cached image.
 fn image_by_id(bin: &Path, body: &Value) -> Option<(String, Option<String>)> {
-    let hex = body
-        .get("Image")
-        .and_then(Value::as_str)
-        .and_then(image_id_ref)?;
-    let i = kern_images(bin, false)
-        .into_iter()
-        .find(|i| image_entry_id(i).is_some_and(|id| id.starts_with(hex)))?;
+    let r = body.get("Image").and_then(Value::as_str)?;
+    image_id_ref(r)?;
+    let images = kern_images(bin, false);
+    // A cached image of that NAME is the one meant, as in `cached_image`.
+    if images.iter().any(|i| {
+        i.get("image")
+            .and_then(Value::as_str)
+            .is_some_and(|n| n == r || n == format!("{r}:latest"))
+    }) {
+        return None;
+    }
+    let i = image_by_id_prefix(&images, r)?;
     let name = i.get("image").and_then(Value::as_str)?.to_string();
     Some((name, image_entry_platform(&i).map(str::to_string)))
 }
@@ -2622,6 +2634,55 @@ fn image_remove(bin: &Path, name: &str, req: &Request) -> Response {
             ))
         ),
     )
+}
+
+/// `POST /images/{name}/tag?repo=R&tag=T`: `kern tag`, the source by name or id, `latest` for no
+/// tag, and Docker's 201. MEASURED before: `docker tag` through kern's socket answered "not served
+/// by kern's Docker API", which a build-tag-push script meets at its second line.
+fn image_tag(bin: &Path, name: &str, req: &Request) -> Response {
+    let Some(repo) = req.param("repo").filter(|r| !r.is_empty()) else {
+        return error(400, "repo is required");
+    };
+    let tag = req
+        .param("tag")
+        .filter(|t| !t.is_empty())
+        .unwrap_or("latest");
+    // A reference, never a flag: Docker's characters, and nothing that starts with `-`.
+    let ok = |s: &str, extra: &[u8]| {
+        !s.starts_with(['-', '.', '/'])
+            && s.len() <= 255
+            && s.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'.' | b'_' | b'-')
+                    || extra.contains(&b)
+            })
+    };
+    if !ok(repo, b"/:") || !ok(tag, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ") || tag.len() > 128 {
+        return error(400, &format!("invalid reference format: {repo}:{tag}"));
+    }
+    let Some(i) = cached_image(bin, name) else {
+        return error(404, &format!("No such image: {name}"));
+    };
+    // Another platform's entry by that platform: by the tag alone it would be this machine's entry
+    // that gets the new name.
+    let src = i.get("image").and_then(Value::as_str).unwrap_or(name);
+    let dst = format!("{repo}:{tag}");
+    let mut args = vec!["tag"];
+    if let Some(p) = image_entry_platform(&i) {
+        args.extend(["--platform", p]);
+    }
+    args.extend([src, dst.as_str()]);
+    let (code, _, err) = kern(bin, &args);
+    if code != 0 {
+        return error(500, &kern_error(&err));
+    }
+    Response::Full {
+        status: 201,
+        content_type: "text/plain",
+        body: Vec::new(),
+        extra: Vec::new(),
+    }
 }
 
 /// `GET /images/{name}/json`.
@@ -4717,6 +4778,9 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
         ("DELETE", ["images", rest @ ..]) if !rest.is_empty() => {
             image_remove(bin, &rest.join("/"), req)
         }
+        ("POST", ["images", rest @ .., "tag"]) if !rest.is_empty() => {
+            image_tag(bin, &rest.join("/"), req)
+        }
         ("POST", ["containers", id, "exec"]) => {
             let Some(name) = resolve(bin, id) else {
                 return error(404, &format!("No such container: {id}"));
@@ -5536,11 +5600,37 @@ mod tests {
             Some("442210d3f5f95933ad9f")
         );
         assert_eq!(image_id_ref("442210d3f5f9"), Some("442210d3f5f9"));
-        assert_eq!(
-            image_id_ref("442210d3f5f"),
-            None,
-            "shorter than docker images prints"
+        // Docker takes a prefix from two characters (measured: `docker image inspect bf`).
+        assert_eq!(image_id_ref("44"), Some("44"));
+        assert_eq!(image_id_ref("4"), None);
+        let two = [
+            json::parse(r#"{"image":"a:1"}"#).unwrap(),
+            json::parse(r#"{"image":"b:1"}"#).unwrap(),
+        ];
+        let (ia, ib) = (
+            image_entry_id(&two[0]).unwrap(),
+            image_entry_id(&two[1]).unwrap(),
         );
+        let unique = (2..12)
+            .map(|n| &ia[..n])
+            .find(|p| !ib.starts_with(p))
+            .unwrap();
+        assert!(
+            image_by_id_prefix(&two, unique).is_some(),
+            "a unique prefix names one"
+        );
+        let common: String = ia
+            .chars()
+            .zip(ib.chars())
+            .take_while(|(x, y)| x == y)
+            .map(|(x, _)| x)
+            .collect();
+        if common.len() >= 2 {
+            assert!(
+                image_by_id_prefix(&two, &common).is_none(),
+                "an ambiguous one names none"
+            );
+        }
         assert_eq!(image_id_ref("alpine:3.20"), None);
         assert_eq!(
             image_id_ref("ABCDEF012345"),

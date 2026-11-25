@@ -418,6 +418,8 @@ pub enum Command {
     Tag {
         src: String,
         dst: String,
+        /// `--platform <os/arch>`: the source is that platform's entry of the image.
+        platform: Option<kern_oci::Platform>,
     },
     /// `kern commit <box> <image>`: snapshot a running box's filesystem into a reusable local image
     /// (warm sessions: bake an expensive setup once, start the next box warm).
@@ -1512,21 +1514,31 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `tag <src> <dst>`: give a cached image a second name.
         Some("tag") => {
-            reject_unknown_flags("tag", &rest, &[])?;
+            reject_unknown_flags("tag", &rest, &["--platform"])?;
+            let platform = match flag_value(&rest, "--platform") {
+                Some(want) => Some(
+                    kern_oci::Platform::parse(&want)
+                        .map_err(|e| Error::Oci(format!("--platform {want}: {e}")))?,
+                ),
+                None => None,
+            };
+            let value_of_platform = rest.iter().position(|a| *a == "--platform").map(|i| i + 1);
             let args: Vec<&&str> = rest
                 .iter()
+                .enumerate()
                 .skip(1)
-                .filter(|a| !a.starts_with('-'))
+                .filter(|(i, a)| !a.starts_with('-') && Some(*i) != value_of_platform)
+                .map(|(_, a)| a)
                 .collect();
             let src = args
                 .first()
                 .map(|s| s.to_string())
-                .ok_or(Error::Usage("tag <src> <dst>"))?;
+                .ok_or(Error::Usage("tag <src> <dst> [--platform <os/arch>]"))?;
             let dst = args
                 .get(1)
                 .map(|s| s.to_string())
-                .ok_or(Error::Usage("tag <src> <dst>"))?;
-            Command::Tag { src, dst }
+                .ok_or(Error::Usage("tag <src> <dst> [--platform <os/arch>]"))?;
+            Command::Tag { src, dst, platform }
         }
         Some("commit") => {
             reject_unknown_flags("commit", &rest, &[])?;
@@ -7673,7 +7685,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             quiet,
         } => commands::pull(&image, dest.as_deref(), platform.as_deref(), quiet),
         Command::Push { local, remote } => commands::push(&local, remote.as_deref()),
-        Command::Tag { src, dst } => commands::tag(&src, &dst),
+        Command::Tag { src, dst, platform } => {
+            commands::with_image_platform(platform, || commands::tag(&src, &dst))
+        }
         Command::Commit { box_ref, image } => commands::commit(&box_ref, &image),
         Command::Stop { names, all, grace } => match grace {
             None => commands::stop(&names, all),
@@ -11227,6 +11241,21 @@ mod tests {
             ]),
             Err(Error::Usage(_))
         ));
+    }
+
+    /// `tag --platform`: its value is neither the source nor the destination.
+    #[test]
+    fn tag_takes_a_platform_whose_value_is_not_a_name() {
+        let owned: Vec<String> = ["tag", "--platform", "linux/arm64", "a:1", "b:2"]
+            .map(str::to_string)
+            .to_vec();
+        match parse(&owned).unwrap().1 {
+            Command::Tag { src, dst, platform } => {
+                assert_eq!((src.as_str(), dst.as_str()), ("a:1", "b:2"));
+                assert_eq!(platform.map(|p| p.arch), Some("arm64".to_string()));
+            }
+            other => panic!("expected Tag, got {other:?}"),
+        }
     }
 
     #[test]

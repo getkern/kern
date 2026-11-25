@@ -96,6 +96,11 @@ moment `docker run -d` returns (it was "No such container" for about a second). 
 publishes Docker's `rename` (`name` and `oldName`), and the renamed container's `die` comes under its
 new name.
 
+**`docker tag` through kern's socket, and image ids as short as Docker takes them.** `docker tag`
+answered "not served by kern's Docker API"; it is `kern tag`, the source by name or id, another
+platform's entry included (`kern tag --platform <os/arch>`). An image is found by name first and
+then by a unique id prefix of two characters or more, as Docker finds one; it took twelve.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

@@ -18,7 +18,7 @@ COMMANDS:
     pull <image> [-q|--quiet]                                      Fetch an image into the cache (`--image` uses it)
     pull <image> --dest <dir> [--platform os/arch]                 Extract a rootfs instead, for `--rootfs`
     push <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
-    tag <src> <dst>                                                Give a cached image a second name
+    tag <src> <dst> [--platform P]                                 Give a cached image a second name
     commit <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
     build -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx|-]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage; `-` or -f -: from stdin)
     build --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that file, and build NOTHING

@@ -1174,7 +1174,9 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
 pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
     let cache = cache_dir();
     own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
-    let src_safe = sanitize_ref(src);
+    // `--platform`: the source is that platform's entry, by the rule the pull uses; the new name is
+    // a plain one, as `docker tag` of an arm64 image gives a name that is arm64.
+    let src_safe = super::imagecache::cache_entry_for(&cache, src);
     let dst_safe = sanitize_ref(dst);
     if src_safe == dst_safe {
         return Ok(()); // tagging to the same key is a no-op (not an error, like Docker)
