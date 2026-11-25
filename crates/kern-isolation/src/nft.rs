@@ -737,3 +737,478 @@ mod tests {
         );
     }
 }
+
+/// The rules against a stand-in for the old pasta, over IPv4 AND IPv6, in namespaces of the test's
+/// own: a box namespace (`eth0`, where the rules go) and a peer one on the other end of a veth whose
+/// packet socket answers a SYN the way pasta `0.0~git20240220` does. No host network is involved,
+/// which is what lets IPv6 be tried on a host with no IPv6 route.
+#[cfg(test)]
+mod against_a_stand_in {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    /// The port the stand-in refuses (a RST without ACK to every SYN), and the one it never answers.
+    const REFUSING: u16 = 7001;
+    const SILENT: u16 = 7002;
+
+    fn ip_bin() -> Option<&'static str> {
+        ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+    }
+
+    fn ip(args: &str) -> bool {
+        ip_bin().is_some_and(|b| {
+            std::process::Command::new(b)
+                .args(args.split_whitespace())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    }
+
+    fn csum(data: &[u8], init: u32) -> u16 {
+        let mut sum = init;
+        for c in data.chunks(2) {
+            let w = if c.len() == 2 {
+                u16::from_be_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], 0])
+            };
+            sum += u32::from(w);
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    fn pseudo_sum(src: &[u8], dst: &[u8], len: usize) -> u32 {
+        let mut s = 0u32;
+        for c in src.chunks(2).chain(dst.chunks(2)) {
+            s += u32::from(u16::from_be_bytes([c[0], c[1]]));
+        }
+        s + 6 + len as u32
+    }
+
+    /// A RST with no ACK, as that pasta sends it, answering the SYN in `frame`.
+    fn rst_for(frame: &[u8], l3: usize, v6: bool, tcp: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&frame[6..12]); // to the sender
+        out.extend_from_slice(&frame[0..6]);
+        out.extend_from_slice(&frame[12..14]);
+        let (src, dst) = if v6 {
+            (&frame[l3 + 24..l3 + 40], &frame[l3 + 8..l3 + 24])
+        } else {
+            (&frame[l3 + 16..l3 + 20], &frame[l3 + 12..l3 + 16])
+        };
+        let mut t = vec![0u8; 20];
+        t[0..2].copy_from_slice(&frame[tcp + 2..tcp + 4]);
+        t[2..4].copy_from_slice(&frame[tcp..tcp + 2]);
+        t[4..8].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        t[12] = 5 << 4;
+        t[13] = TCP_RST;
+        let c = csum(&t, pseudo_sum(src, dst, 20));
+        t[16..18].copy_from_slice(&c.to_be_bytes());
+        if v6 {
+            let mut h = vec![0x60, 0, 0, 0, 0, 20, 6, 64];
+            h.extend_from_slice(src);
+            h.extend_from_slice(dst);
+            out.extend_from_slice(&h);
+        } else {
+            let mut h = vec![0x45, 0, 0, 40, 0, 0, 0x40, 0, 64, 6, 0, 0];
+            h.extend_from_slice(src);
+            h.extend_from_slice(dst);
+            let c = csum(&h, 0);
+            h[10..12].copy_from_slice(&c.to_be_bytes());
+            out.extend_from_slice(&h);
+        }
+        out.extend_from_slice(&t);
+        out
+    }
+
+    /// The stand-in: count every SYN by (v6, destination port, source port), refuse `REFUSING`,
+    /// ignore `SILENT`, until `stop` reads end of file. The counts go to `out`, one line each.
+    fn stand_in(
+        ifname: &str,
+        mut ready: std::fs::File,
+        up: bool,
+        mut stop: std::fs::File,
+        mut out: std::fs::File,
+    ) {
+        // SAFETY: an AF_PACKET socket bound to one interface; buffers sized from what is written.
+        let sock = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW,
+                i32::from((libc::ETH_P_ALL as u16).to_be()),
+            )
+        };
+        assert!(sock >= 0, "packet socket");
+        let idx = crate::netlink::index_of(ifname).unwrap_or(0);
+        let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+        sll.sll_family = libc::AF_PACKET as u16;
+        sll.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+        sll.sll_ifindex = idx;
+        unsafe {
+            libc::bind(
+                sock,
+                std::ptr::addr_of!(sll).cast(),
+                std::mem::size_of::<libc::sockaddr_ll>() as u32,
+            )
+        };
+        // READY ONCE BOUND, not before: a SYN that came first would go unanswered, and the rules
+        // under test then hold back the retry that would have reached it.
+        let _ = ready.write_all(if up { b"r" } else { b"x" });
+        let mut counts: HashMap<(bool, u16, u16), u32> = HashMap::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: sock,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stop.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
+            if fds[1].revents != 0 {
+                let mut b = [0u8; 1];
+                if stop.read(&mut b).map_or(true, |n| n == 0) {
+                    break;
+                }
+            }
+            if fds[0].revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let mut from: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            let mut flen = std::mem::size_of::<libc::sockaddr_ll>() as u32;
+            let n = unsafe {
+                libc::recvfrom(
+                    sock,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                    std::ptr::addr_of_mut!(from).cast(),
+                    &mut flen,
+                )
+            };
+            if n < 54 || from.sll_pkttype == libc::PACKET_OUTGOING {
+                continue;
+            }
+            let f = &buf[..n as usize];
+            let (v6, tcp) = match u16::from_be_bytes([f[12], f[13]]) {
+                0x0800 if f[23] == 6 => (false, 14 + usize::from(f[14] & 0x0f) * 4),
+                0x86dd if f[20] == 6 => (true, 54),
+                _ => continue,
+            };
+            if f.len() < tcp + 20 || f[tcp + 13] & (TCP_SYN | TCP_ACK) != TCP_SYN {
+                continue;
+            }
+            let sport = u16::from_be_bytes([f[tcp], f[tcp + 1]]);
+            let dport = u16::from_be_bytes([f[tcp + 2], f[tcp + 3]]);
+            *counts.entry((v6, dport, sport)).or_default() += 1;
+            if dport == REFUSING {
+                let r = rst_for(f, 14, v6, tcp);
+                unsafe { libc::send(sock, r.as_ptr().cast(), r.len(), 0) };
+            }
+        }
+        for ((v6, dport, sport), n) in counts {
+            let _ = writeln!(out, "{} {dport} {sport} {n}", u8::from(v6));
+        }
+    }
+
+    /// A non-blocking connect with a deadline: the local port, and the errno it ended with (0 for a
+    /// connection, `ETIMEDOUT` for the deadline), and how long it took.
+    fn connect(addr: &str, port: u16, limit_ms: i32) -> (u16, i32, u128) {
+        let sa: std::net::SocketAddr = format!("{addr}:{port}")
+            .parse()
+            .or_else(|_| format!("[{addr}]:{port}").parse())
+            .expect("address");
+        let sock = socket2_like(&sa);
+        let t = std::time::Instant::now();
+        let (raw, len) = sockaddr(&sa);
+        unsafe { libc::connect(sock, raw.as_ptr().cast(), len) };
+        let mut local: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut ll = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        unsafe { libc::getsockname(sock, std::ptr::addr_of_mut!(local).cast(), &mut ll) };
+        // `sin_port` and `sin6_port` sit at the same offset, right after the family.
+        let lb = unsafe { std::slice::from_raw_parts(std::ptr::addr_of!(local).cast::<u8>(), 4) };
+        let lport = u16::from_be_bytes([lb[2], lb[3]]);
+        let mut p = libc::pollfd {
+            fd: sock,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut p, 1, limit_ms) };
+        let err = if r == 0 {
+            libc::ETIMEDOUT
+        } else {
+            let mut e = 0i32;
+            let mut el = 4u32;
+            unsafe {
+                libc::getsockopt(
+                    sock,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    std::ptr::addr_of_mut!(e).cast(),
+                    &mut el,
+                )
+            };
+            e
+        };
+        unsafe { libc::close(sock) };
+        (lport, err, t.elapsed().as_millis())
+    }
+
+    fn socket2_like(sa: &std::net::SocketAddr) -> i32 {
+        let fam = if sa.is_ipv6() {
+            libc::AF_INET6
+        } else {
+            libc::AF_INET
+        };
+        unsafe { libc::socket(fam, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) }
+    }
+
+    fn sockaddr(sa: &std::net::SocketAddr) -> (Vec<u8>, u32) {
+        match sa {
+            std::net::SocketAddr::V4(a) => {
+                let mut s: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                s.sin_family = libc::AF_INET as u16;
+                s.sin_port = a.port().to_be();
+                s.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
+                let b = unsafe {
+                    std::slice::from_raw_parts(
+                        std::ptr::addr_of!(s).cast::<u8>(),
+                        std::mem::size_of::<libc::sockaddr_in>(),
+                    )
+                };
+                (b.to_vec(), b.len() as u32)
+            }
+            std::net::SocketAddr::V6(a) => {
+                let mut s: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+                s.sin6_family = libc::AF_INET6 as u16;
+                s.sin6_port = a.port().to_be();
+                s.sin6_addr.s6_addr = a.ip().octets();
+                let b = unsafe {
+                    std::slice::from_raw_parts(
+                        std::ptr::addr_of!(s).cast::<u8>(),
+                        std::mem::size_of::<libc::sockaddr_in6>(),
+                    )
+                };
+                (b.to_vec(), b.len() as u32)
+            }
+        }
+    }
+
+    fn pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0i32; 2];
+        unsafe { libc::pipe(fds.as_mut_ptr()) };
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    /// Per family (IPv4, IPv6): the refused port's errno and milliseconds, and how many SYNs to the
+    /// silent port the stand-in saw.
+    type Seen = Vec<(i32, u128, u32)>;
+
+    fn scenario(with_rules: bool) -> Result<Seen, String> {
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+            return Err("skip: no user namespace".into());
+        }
+        let _ = std::fs::write("/proc/self/setgroups", b"deny");
+        if std::fs::write("/proc/self/uid_map", format!("0 {uid} 1")).is_err()
+            || std::fs::write("/proc/self/gid_map", format!("0 {gid} 1")).is_err()
+        {
+            return Err("skip: the namespace's map was refused".into());
+        }
+        if ip_bin().is_none() || !ip("link add eth0 type veth peer name peer0") {
+            return Err("skip: no `ip` or no veth".into());
+        }
+        let (ready_r, mut ready_w) = pipe();
+        let (moved_r, mut moved_w) = pipe();
+        let (stop_r, stop_w) = pipe();
+        let (res_r, res_w) = pipe();
+        let peer = unsafe { libc::fork() };
+        if peer == 0 {
+            drop((ready_r, moved_w, stop_w, res_r));
+            let ok = unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0;
+            let _ = ready_w.write_all(if ok { b"n" } else { b"x" });
+            let mut b = [0u8; 1];
+            let mut moved_r = moved_r;
+            let _ = moved_r.read(&mut b);
+            let _ = std::fs::write("/proc/sys/net/ipv6/conf/peer0/accept_dad", b"0");
+            // SILENT ROUTING for the targets: with forwarding off this kernel answers a packet that
+            // is not its own with ICMP unreachable (MEASURED: ENETUNREACH at once), and a forwarded
+            // one to a blackhole is dropped with no answer. The packet socket below is the only
+            // thing that answers, as pasta is the only thing a box behind it hears from.
+            let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1");
+            let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", b"1");
+            let up = ip("addr add 10.9.0.2/24 dev peer0")
+                && ip("addr add fd00:9::2/64 dev peer0 nodad")
+                && ip("link set peer0 up")
+                && ip("route add blackhole 10.9.1.0/24")
+                && ip("-6 route add blackhole fd00:9:1::/64");
+            stand_in("peer0", ready_w, up, stop_r, res_w);
+            unsafe { libc::_exit(0) };
+        }
+        drop((moved_r, stop_r, res_w));
+        let mut b = [0u8; 1];
+        let mut ready_r = ready_r;
+        let _ = ready_r.read(&mut b);
+        if b[0] != b'n' || !ip(&format!("link set peer0 netns {peer}")) {
+            return Err("the peer namespace could not be made".into());
+        }
+        let _ = moved_w.write_all(b"m");
+        let _ = std::fs::write("/proc/sys/net/ipv6/conf/eth0/accept_dad", b"0");
+        let up = ip("addr add 10.9.0.1/24 dev eth0")
+            && ip("addr add fd00:9::1/64 dev eth0 nodad")
+            && ip("link set eth0 up")
+            && ip("link set lo up")
+            && ip("route add 10.9.1.0/24 via 10.9.0.2")
+            && ip("-6 route add fd00:9:1::/64 via fd00:9::2");
+        let _ = ready_r.read(&mut b);
+        if !up || b[0] != b'r' {
+            return Err("the addresses could not be set".into());
+        }
+        if with_rules {
+            install_here("eth0").map_err(|e| format!("install: {e}"))?;
+        }
+        // Neighbours first, so the first SYN is not held by ARP or neighbour discovery.
+        let _ = connect("10.9.0.2", 9, 300);
+        let _ = connect("fd00:9::2", 9, 300);
+        // Both families at once: they share nothing but the stand-in, which tells them apart.
+        let probes: Vec<_> = ["10.9.1.1", "fd00:9:1::1"]
+            .into_iter()
+            .map(|target| {
+                std::thread::spawn(move || {
+                    let (_, errno, ms) = connect(target, REFUSING, 2500);
+                    let (sport, _, _) = connect(target, SILENT, 2300);
+                    (errno, ms, sport)
+                })
+            })
+            .collect();
+        let mut seen = Vec::new();
+        let mut silent_ports = Vec::new();
+        for p in probes {
+            let (errno, ms, sport) = p.join().map_err(|_| "a probe thread panicked")?;
+            silent_ports.push(sport);
+            seen.push((errno, ms));
+        }
+        drop(stop_w);
+        let mut text = String::new();
+        let mut res_r = res_r;
+        let _ = res_r.read_to_string(&mut text);
+        unsafe { libc::waitpid(peer, std::ptr::null_mut(), 0) };
+        let count = |v6: bool, sport: u16| {
+            text.lines()
+                .filter_map(|l| {
+                    let f: Vec<u32> = l.split(' ').filter_map(|x| x.parse().ok()).collect();
+                    (f.len() == 4
+                        && f[0] == u32::from(v6)
+                        && f[1] == u32::from(SILENT)
+                        && f[2] == u32::from(sport))
+                    .then_some(f[3])
+                })
+                .sum::<u32>()
+        };
+        Ok(vec![
+            (seen[0].0, seen[0].1, count(false, silent_ports[0])),
+            (seen[1].0, seen[1].1, count(true, silent_ports[1])),
+        ])
+    }
+
+    /// Run [`scenario`] in a forked child (a user namespace needs a single-threaded process) and
+    /// read its outcome back as text.
+    fn in_child(with_rules: bool) -> Result<Seen, String> {
+        let (mut r, mut w) = pipe();
+        let c = unsafe { libc::fork() };
+        if c == 0 {
+            drop(r);
+            let line = match scenario(with_rules) {
+                Ok(s) => s
+                    .iter()
+                    .map(|(e, ms, n)| format!("{e} {ms} {n}"))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+                Err(e) => format!("err {e}"),
+            };
+            let _ = w.write_all(line.as_bytes());
+            unsafe { libc::_exit(0) };
+        }
+        drop(w);
+        let mut out = String::new();
+        let _ = r.read_to_string(&mut out);
+        unsafe { libc::waitpid(c, std::ptr::null_mut(), 0) };
+        if let Some(e) = out.strip_prefix("err ") {
+            return Err(e.to_string());
+        }
+        let seen: Seen = out
+            .split(';')
+            .filter_map(|f| {
+                let v: Vec<&str> = f.split(' ').collect();
+                Some((
+                    v.first()?.parse().ok()?,
+                    v.get(1)?.parse().ok()?,
+                    v.get(2)?.parse().ok()?,
+                ))
+            })
+            .collect();
+        if seen.len() == 2 {
+            Ok(seen)
+        } else {
+            Err(format!("the child said {out:?}"))
+        }
+    }
+
+    /// WITHOUT the rules the stand-in reproduces both defects, which is what makes the second half
+    /// mean anything: the refused port runs to the deadline, and the box sends its SYN again (the
+    /// retry the old pasta reset on). WITH them, over IPv4 and IPv6 alike: `ECONNREFUSED` within
+    /// about a second, and one SYN to the silent port in 2.3 s.
+    #[test]
+    fn the_rules_refuse_and_hold_back_over_ipv4_and_ipv6() {
+        // The control and the case run at once, each in namespaces of its own.
+        let with = std::thread::spawn(|| in_child(true));
+        let before = match in_child(false) {
+            Ok(s) => s,
+            Err(e) if e.starts_with("skip") => {
+                eprintln!("{e}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let after = with
+            .join()
+            .map_err(|_| "the thread panicked".to_string())
+            .and_then(|r| r)
+            .expect("with the rules");
+        eprintln!("without: {before:?}\nwith:    {after:?}");
+        let (b, a) = (&before, &after);
+        for (fam, (wo, w)) in ["ipv4", "ipv6"].iter().zip(b.iter().zip(a.iter())) {
+            assert_eq!(
+                wo.0,
+                libc::ETIMEDOUT,
+                "{fam}: the control must hang: {before:?}"
+            );
+            assert!(
+                wo.2 >= 2,
+                "{fam}: the control must retry its SYN: {before:?}"
+            );
+            assert_eq!(w.0, libc::ECONNREFUSED, "{fam}: {after:?}");
+            assert!(w.1 < 1600, "{fam}: refused after {} ms", w.1);
+            assert_eq!(w.2, 1, "{fam}: the retry must be held back: {after:?}");
+        }
+    }
+}
