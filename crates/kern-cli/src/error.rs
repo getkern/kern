@@ -180,9 +180,11 @@ impl Error {
             // under an instruction is how an instruction gets skipped. Multi-line means the message
             // brought its own fix. Same shape as `oci_hint` below, which branches on the message
             // rather than on the variant.
-            Error::Volume(msg) => {
-                (!msg.contains('\n')).then(|| "run `kern volume ls` to see existing volumes".into())
-            }
+            // And only about a volume that is not there or is taken: the refusals of a `--path`, a
+            // driver or an option name their own way through, and a list of volumes is not it.
+            Error::Volume(msg) => (!msg.contains('\n')
+                && (msg.contains("no volume named") || msg.contains("in use")))
+            .then(|| "run `kern volume ls` to see existing volumes".into()),
             // The right hint depends on *why* the pull failed - telling someone whose image name is
             // wrong to "install curl and tar" sends them down the wrong path. Branch on the message.
             // A refusal that already names the box and both ways out has no hint to add; the generic
@@ -244,9 +246,16 @@ impl Error {
                  stay inside the image"
                     .into(),
             ),
-            // `data_dir`'s refusals name the directory and what to do with it; a pointer to the
-            // profiles would send the reader to the wrong part of the file.
-            Error::Config(msg) if msg.starts_with("data_dir:") => None,
+            // The refusals of a key that places kern's data (`data_dir`, `logs_dir`, ...) name the
+            // directory and what to do with it; a pointer to the profiles would send the reader to
+            // the wrong part of the file.
+            Error::Config(msg)
+                if crate::config::DIR_KEYS
+                    .iter()
+                    .any(|(k, _)| msg.starts_with(&format!("{k}:"))) =>
+            {
+                None
+            }
             Error::Config(_) => {
                 Some("profiles live in ~/.config/kern/kern.toml - see docs/CONFIG.md".into())
             }
