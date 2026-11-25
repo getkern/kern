@@ -70,6 +70,8 @@ pub enum Command {
         /// INTERNAL `--copy-in <archive>` (repeatable, written by the Docker API): see
         /// [`commands::BoxRunArgs::copy_in`].
         copy_in: Vec<String>,
+        /// `--security-opt seccomp-deny=kill|eperm` (see [`commands::BoxRunArgs::seccomp_deny_kill`]).
+        seccomp_deny_kill: Option<bool>,
         /// `--platform <os/arch>`: run that platform's image, through the kernel's binfmt handler
         /// when it is not this machine's (`docker run --platform`). `None`: this machine's.
         platform: Option<kern_oci::Platform>,
@@ -4269,6 +4271,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut pull = commands::PullPolicy::default();
     let mut platform: Option<kern_oci::Platform> = None;
     let mut copy_in: Vec<String> = Vec::new();
+    let mut seccomp_deny_kill: Option<bool> = None;
     let mut plan = false;
     let mut detached = false;
     let mut read_only = false;
@@ -5527,6 +5530,21 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         i += 1;
                         continue;
                     }
+                    // kern's own: what a denied syscall gets. `eperm` is Docker's answer and the
+                    // default; `kill` ends the caller with SIGSYS, a verdict a supervisor can read.
+                    if let Some(verdict) = v.strip_prefix("seccomp-deny=") {
+                        seccomp_deny_kill = Some(match verdict {
+                            "kill" => true,
+                            "eperm" => false,
+                            _ => {
+                                return Err(Error::Cli(format!(
+                                    "--security-opt {v:?}: seccomp-deny takes kill or eperm"
+                                )))
+                            }
+                        });
+                        i += 1;
+                        continue;
+                    }
                     let (key, val) = v.split_once('=').unwrap_or((v, ""));
                     return Err(Error::Cli(match key {
                         "apparmor" => format!(
@@ -5691,6 +5709,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             pull,
             platform,
             copy_in,
+            seccomp_deny_kill,
             command,
             entrypoint,
             detached,
@@ -7110,6 +7129,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             pull,
             platform,
             copy_in,
+            seccomp_deny_kill,
             command,
             entrypoint,
             detached,
@@ -7265,6 +7285,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     ports: &ports,
                     secrets: &secrets,
                     copy_in: &copy_in,
+                    seccomp_deny_kill,
                     secret_envs: &secret_envs,
                     secret_mode,
                     ssh_port,

@@ -8893,7 +8893,8 @@ fn a_box_sys_is_read_only_like_docker_sysfs() {
     }
 }
 
-/// `listns` (470) answers ENOSYS in a box and `open_tree_attr` (467) kills it, under the default
+/// `listns` (470) answers ENOSYS in a box and `open_tree_attr` (467) is refused with EPERM (it was
+/// killed before the owner's 22/11 decision for Docker's verdict), under the default
 /// allowlist AND under `KERN_SECCOMP=denylist`. The denylist let both RUN on a 7.0 kernel (measured
 /// 17/11: `listns` reached the kernel, `open_tree_attr` returned), because a syscall newer than the
 /// lists is allowed by a denylist until someone names it. Skips on a host kernel without them, asked
@@ -8911,7 +8912,7 @@ fn the_newest_mount_and_namespace_syscalls_are_denied_in_both_postures() {
     }
     let script = "import ctypes,os; l=ctypes.CDLL(None,use_errno=True); \
                   r=l.syscall(470,0,0,0,0); print('LISTNS', r, ctypes.get_errno(), flush=True); \
-                  l.syscall(467,-100,b'/',0,0,0); print('OPEN_TREE_ATTR-RAN', flush=True)";
+                  r=l.syscall(467,-100,b'/',0,0,0); print('OPEN_TREE_ATTR', r, ctypes.get_errno(), flush=True)";
     for posture in ["", "denylist"] {
         let out = kern()
             .env("KERN_SECCOMP", posture)
@@ -8941,8 +8942,8 @@ fn the_newest_mount_and_namespace_syscalls_are_denied_in_both_postures() {
             "listns is not ENOSYS (posture {posture:?}): {said}"
         );
         assert!(
-            !said.contains("OPEN_TREE_ATTR-RAN") && out.status.code() == Some(159),
-            "open_tree_attr was not killed (posture {posture:?}, exit {:?}): {said}",
+            said.contains(&format!("OPEN_TREE_ATTR -1 {}", libc::EPERM)),
+            "open_tree_attr was not refused with EPERM (posture {posture:?}, exit {:?}): {said}",
             out.status.code()
         );
     }

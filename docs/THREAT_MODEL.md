@@ -49,7 +49,7 @@ network.
 |---|---|
 | Process / mount / UTS / IPC isolation | `unshare` + `pivot_root`, root remounted read-only **last** (compile-enforced by a typestate). A box sees no host process, mount or peer box |
 | Rootless privilege | user namespace; box-root maps to an unprivileged host uid. No host uid 0 unless the caller is real root, where `--privileged` is refused |
-| Dangerous syscalls | **always-on seccomp, allowlist by default**: a syscall outside the set returns `ENOSYS`, so honest software degrades instead of dying, while the mount, namespace, module and ptrace escape vectors hard-kill with `SIGSYS`. Both the classic and the new mount API are denied, so a box cannot remount its root writable or unmask the cgroup; `clone` is filtered on its namespace flags and `clone3` is refused wholesale, so a nested-userns escape is closed either way |
+| Dangerous syscalls | **always-on seccomp, allowlist by default**: a syscall outside the set returns `ENOSYS`, so honest software degrades instead of dying, while the mount, namespace, module and ptrace escape vectors are refused with `EPERM`, Docker's answer (a `SIGSYS` kill with `--security-opt seccomp-deny=kill` and in the SDKs' sandboxes, where the kill is the reported verdict). Both the classic and the new mount API are denied, so a box cannot remount its root writable or unmask the cgroup; `clone` is filtered on its namespace flags and `clone3` is refused wholesale, so a nested-userns escape is closed either way |
 | Capabilities | bounding, effective, permitted and inheritable dropped before exec, **verified by read-back**. A re-added cap is effective only over the box's own user namespace |
 | `/proc` and devices | sensitive `/proc` paths masked; `/dev` is a box-owned tmpfs with a deny-by-default node set; `MS_NODEV` plus userns `SB_I_NODEV` make a fabricated node inert |
 | Fresh-fd hygiene | inherited descriptors shed before exec (CVE-2016-9962 class), so an SDK or CI fd cannot pass into the workload |
@@ -105,8 +105,8 @@ The claims are checked by asking the kernel what is true, not by asking kern to 
 - The tar byte-parser is fuzzed, production code is panic-free, and the boundaries have been exercised
   on x86_64, aarch64, WSL2 and a VPS.
 - Three properties are asserted by a test rather than assumed: the WHOLE mount API, classic and
-  fd-based, hard-kills with `SIGSYS` by arch-correct number, so "safe by construction" never stands in
-  for "killed"; the cap drop, Landlock and the seccomp filter are all in force **before** the workload's
+  fd-based, is refused by arch-correct number (the helper sees `EPERM` and nothing runs), so "safe by
+  construction" never stands in for "refused"; the cap drop, Landlock and the seccomp filter are all in force **before** the workload's
   `execvp`, with a source-level regression failing the build if any fork is introduced before the filter
   install; and the shared overlay lower is isolating, with a marker written in one box invisible to a
   fresh box from the same image.

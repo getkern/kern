@@ -2717,6 +2717,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         crate::global_env("KERN_SECCOMP").as_deref(),
         args.security_profile,
     )?;
+    // A denied syscall answers EPERM, Docker's verdict, unless the box asked for the kill
+    // (`--security-opt seccomp-deny=kill`, implied by `--security-profile untrusted`): set for this
+    // process before anything forks, so PID 1's filter and every helper's agree.
+    kern_isolation::set_seccomp_deny_kills(args.seccomp_deny_kill.unwrap_or(matches!(
+        args.security_profile,
+        Some(SecurityProfile::Untrusted)
+    )));
     let mut cap_drops = args.cap_drop.to_vec();
     let mut read_only = args.read_only;
     // The profile is for code nobody has read, so it also refuses a setuid gain, which a plain box
@@ -3232,6 +3239,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // mapped uid, and reading it needs `CAP_SYS_PTRACE` in the box's user namespace, which the
         // box has dropped. See `registry::set_box_env`.
         registry::set_box_env(&inst.name, inst.pid, &spec.env);
+        if kern_isolation::seccomp_deny_kills() {
+            registry::set_box_seccomp_kills(&inst.name, inst.pid);
+        }
         crate::runstats::record_box(); // count this box start for kern top's box-start rate
         Some((inst, path))
     };
@@ -4883,6 +4893,8 @@ pub fn exec(
         exec_env.push(("HOME".to_string(), home));
     }
     exec_env.extend(env.iter().cloned());
+    // The verdict of the box's denied syscalls, from its record, as its filter and caps are.
+    kern_isolation::set_seccomp_deny_kills(registry::box_seccomp_kills(&inst.name, inst.pid));
     let result = exec_in_box(
         pid1,
         &cmd,
@@ -6305,6 +6317,9 @@ fn run_detached(
     // See the sibling site above: the box's environment is recorded here because `kern exec` cannot
     // read it back from a workload running as a non-root user.
     registry::set_box_env(&inst.name, inst.pid, &spec.env);
+    if kern_isolation::seccomp_deny_kills() {
+        registry::set_box_seccomp_kills(&inst.name, inst.pid);
+    }
     crate::runstats::record_box(); // count this box start for kern top's box-start rate
                                    // `--health-cmd`: a sidecar process that periodically probes the box and records its health for
                                    // `kern ps`. Lives in this supervisor's process group, so it's reaped on stop with everything else.

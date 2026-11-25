@@ -476,6 +476,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         read-only), applied as a base explicit flags override; prints its constituents
     --apparmor <profile>  Enter a pre-loaded AppArmor profile on exec (the
                         `--security-opt apparmor=` form too), layered over seccomp; a missing/unloaded profile fails closed
+    --security-opt V    no-new-privileges[:true|:false]; seccomp-deny=eperm|kill: a denied syscall
+                        answers EPERM, as under Docker (default), or kill ends the caller with SIGSYS
     --plan              Preview the isolation sequence and any device grants, without running
 
 {b}OPTIONS for limit:{z}

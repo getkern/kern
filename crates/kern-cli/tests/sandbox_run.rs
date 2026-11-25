@@ -380,9 +380,12 @@ const SYSCALL_BY_NR_SRC: &str = r#"
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <stdlib.h>
+#include <errno.h>
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
-    syscall(strtol(argv[1], 0, 0), 0, 0, 0, 0, 0, 0);
+    long r = syscall(strtol(argv[1], 0, 0), 0, 0, 0, 0, 0, 0);
+    /* 77: refused with EPERM, the verdict of kern's filter (as of Docker's) for a denied call. */
+    if (r == -1 && errno == EPERM) return 77;
     return 0;
 }
 "#;
@@ -5172,7 +5175,8 @@ fn box_run_hardening_uts_net_seccomp() {
         "the box network namespace must expose ONLY loopback: {net}"
     );
 
-    // SECCOMP: a denied syscall (mount) kills the workload with SIGSYS (signal 31).
+    // SECCOMP: a denied syscall (mount) is refused with EPERM, Docker's verdict: the call never runs
+    // and the workload is told "not permitted" (it used to be killed with SIGSYS, exit 159).
     let killed = kern()
         .args([
             "box",
@@ -5189,12 +5193,13 @@ fn box_run_hardening_uts_net_seccomp() {
         ])
         .output()
         .expect("run kern");
-    // The workload is PID 1 in the box's PID namespace; kern reaps it and reports its death by
-    // SIGSYS (31) as exit code 128+31 = 159.
-    assert_eq!(
-        killed.status.code(),
-        Some(159),
-        "the denied syscall should be killed by SIGSYS (reported as 128+31)"
+    let said = String::from_utf8_lossy(&killed.stderr);
+    assert!(
+        !killed.status.success()
+            && killed.status.code() != Some(159)
+            && (said.contains("not permitted") || said.contains("permission denied")),
+        "the denied mount must fail with EPERM, not run and not SIGSYS: {:?} {said}",
+        killed.status.code()
     );
 
     // PROC MASKING (regression for a real pen-test finding): `/proc/sys` is mounted READ-ONLY, so a
@@ -5389,8 +5394,78 @@ int main(void) {
 /// KILL prologue, so an attempt is `SIGSYS`, not a survivable `ENOSYS` the workload can branch on.
 /// This asserts each by its ARCH-CORRECT number (`libc::SYS_*`, so it holds on x86_64 and aarch64
 /// where the numbers differ), closing the "safe by construction != killed" gap for the whole family.
+/// A DENIED SYSCALL ANSWERS EPERM, AS DOCKER'S, UNLESS THE BOX ASKED FOR THE KILL, and `kern exec`
+/// gets the box's own verdict. MEASURED before (owner's decision, 22/11): `unshare -U true` in a box
+/// died with "Bad system call" (159) where Docker's answered "Operation not permitted" and the script
+/// went on. The SDKs ask for the kill (`seccomp-deny=kill`): it is their `escape_blocked`.
 #[test]
-fn mount_api_family_is_hard_killed() {
+fn a_denied_syscall_is_eperm_unless_the_box_asks_for_the_kill() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(helper) = compile_static_helper(SYSCALL_BY_NR_SRC, "verdict") else {
+        eprintln!("skip: no static C compiler available");
+        return;
+    };
+    let root = build_rootfs(&busybox, "verdict");
+    place_helper(&helper, &root, "syscall1");
+    let rootfs = root.to_str().unwrap().to_string();
+    let nr = libc::SYS_unshare.to_string();
+    let run = |extra: &[&str]| {
+        let mut c = kern();
+        c.args(["box", "verdict", "--rootfs", &rootfs]);
+        c.args(extra);
+        c.args(["--", "/syscall1", &nr]);
+        c.output().expect("run kern")
+    };
+    let eperm = run(&[]);
+    if String::from_utf8_lossy(&eperm.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let killed = run(&["--security-opt", "seccomp-deny=kill"]);
+    let untrusted = run(&["--security-profile", "untrusted"]);
+    // `exec` into a box that asked for the kill is killed too; into a plain one, EPERM.
+    let exec_in = |opts: &[&str], name: &str| {
+        let mut up = kern();
+        up.args(["box", name, "--rootfs", &rootfs, "-d"]);
+        up.args(opts);
+        up.args(["--", "/bin/busybox", "sleep", "30"]);
+        let _ = up.output();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let out = kern()
+            .args(["exec", name, "/syscall1", &nr])
+            .output()
+            .expect("exec");
+        let _ = kern().args(["stop", "-t", "0", name]).output();
+        out.status.code()
+    };
+    let exec_kill = exec_in(&["--security-opt", "seccomp-deny=kill"], "verdict-k");
+    let exec_plain = exec_in(&[], "verdict-p");
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(eperm.status.code(), Some(77), "EPERM by default: {eperm:?}");
+    assert_eq!(
+        killed.status.code(),
+        Some(159),
+        "the kill when asked: {killed:?}"
+    );
+    assert_eq!(
+        untrusted.status.code(),
+        Some(159),
+        "the kill under untrusted: {untrusted:?}"
+    );
+    assert_eq!(exec_kill, Some(159), "exec gets the box's kill");
+    assert_eq!(exec_plain, Some(77), "exec gets the box's EPERM");
+}
+
+#[test]
+fn mount_api_family_is_denied_with_eperm() {
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -5450,8 +5525,8 @@ fn mount_api_family_is_hard_killed() {
             .expect("run kern");
         assert_eq!(
             killed.status.code(),
-            Some(159),
-            "{name} (nr {nr}) must SIGSYS-kill (128+31), not survive: {killed:?}"
+            Some(77),
+            "{name} (nr {nr}) must be refused with EPERM by the filter (helper exit 77): {killed:?}"
         );
     }
 

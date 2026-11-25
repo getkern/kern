@@ -65,6 +65,38 @@ const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
 // 16 bits of the return value.
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
+/// The verdict for every DENIED syscall: `EPERM`, Docker's (`SCMP_ACT_ERRNO`). The syscall never
+/// runs, exactly as under a kill; the caller sees "not permitted" and goes on, so software that
+/// PROBES a capability (Chrome's and bubblewrap's `unshare`, systemd's `bpf`, a debugger's
+/// `ptrace`) reports it or falls back instead of dying. MEASURED before (owner's decision, 22/11):
+/// `unshare -U true` died with "Bad system call" (exit 159) where Docker's answered "Operation not
+/// permitted" and the script went on. Only an ABI confusion (wrong arch, the x32 alias) still kills.
+const SECCOMP_RET_DENY: u32 = SECCOMP_RET_ERRNO | (libc::EPERM as u32 & SECCOMP_RET_DATA);
+
+/// `--security-opt seccomp-deny=kill` (and `--security-profile untrusted`, and every sandbox the SDKs
+/// start): a denied syscall KILLS the caller (`SIGSYS`, exit 159) instead of answering `EPERM`. The
+/// syscall never runs either way; the kill is the VERDICT a caller can read, which is how the
+/// sandbox SDKs report `escape_blocked` for code that tried to leave. Process-wide, set by kern
+/// before it forks a box or an exec, so every filter that process tree installs agrees.
+static DENY_KILLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Choose the verdict of a denied syscall for the filters this process installs from now on.
+pub fn set_deny_kills(kill: bool) {
+    DENY_KILLS.store(kill, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The verdict [`set_deny_kills`] chose: `true` for the kill.
+pub fn deny_kills() -> bool {
+    DENY_KILLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn deny_action() -> u32 {
+    if deny_kills() {
+        SECCOMP_RET_KILL_PROCESS
+    } else {
+        SECCOMP_RET_DENY
+    }
+}
 
 // Offsets into `struct seccomp_data`:
 //   int   nr;                    // 0
@@ -379,8 +411,8 @@ fn emit_kill_prologue(allow_nesting: bool) -> Vec<libc::sock_filter> {
         prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     }
     for nr in denylist(allow_nesting) {
-        prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (kill); else skip
-        prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+        prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (deny); else skip
+        prog.push(stmt(BPF_RET | BPF_K, deny_action()));
     }
     prog
 }
@@ -529,8 +561,8 @@ fn build_filter(allow_nesting: bool) -> Vec<libc::sock_filter> {
             3,
         ));
         prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0)); // A = low 32 bits of flags
-        prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEW_MASK, 0, 1)); // any bit → next (kill)
-        prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+        prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEW_MASK, 0, 1)); // any bit → next (deny)
+        prog.push(stmt(BPF_RET | BPF_K, deny_action()));
     }
     // 4. Default: allow.
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
@@ -654,8 +686,8 @@ fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_fi
             4,
         )); // !=clone → skip 4 → search
         prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0)); // A = low 32 bits of clone flags
-        prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEW_MASK, 0, 1)); // any ns bit → next (kill)
-        prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+        prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEW_MASK, 0, 1)); // any ns bit → next (deny)
+        prog.push(stmt(BPF_RET | BPF_K, deny_action()));
         prog.push(jump(BPF_JMP | BPF_JA, JA_ALLOW, 0, 0)); // clone without a ns bit → allow
     }
     // Collapse the sorted allow numbers into their contiguous RUNS and binary-search the runs, appended
@@ -1352,7 +1384,7 @@ mod tests {
                 // The reference verdict, independent of the BPF layout.
                 let expect = |nr: u32, arg0: u64| -> u32 {
                     if killset.contains(&nr) {
-                        return SECCOMP_RET_KILL_PROCESS;
+                        return super::SECCOMP_RET_DENY;
                     }
                     if allow_nesting && nesting.contains(&nr) {
                         return SECCOMP_RET_ALLOW;
@@ -1363,7 +1395,7 @@ mod tests {
                         if allow_nesting || (arg0 as u32 & CLONE_NEW_MASK) == 0 {
                             return SECCOMP_RET_ALLOW;
                         }
-                        return SECCOMP_RET_KILL_PROCESS;
+                        return super::SECCOMP_RET_DENY;
                     }
                     if nr == socket_nr {
                         // The dedicated socket block governs it (NOT the allow search), regardless of
@@ -1742,7 +1774,11 @@ mod tests {
         );
 
         assert_eq!(prog[n - 2].code, BPF_RET | BPF_K, "n-2 is not a return");
-        assert_eq!(prog[n - 2].k, SECCOMP_RET_KILL_PROCESS, "n-2 does not kill");
+        assert_eq!(
+            prog[n - 2].k,
+            super::SECCOMP_RET_DENY,
+            "n-2 does not deny (EPERM)"
+        );
         assert_eq!(prog[n - 1].code, BPF_RET | BPF_K, "n-1 is not a return");
         assert_eq!(prog[n - 1].k, super::SECCOMP_RET_ALLOW, "n-1 is not ALLOW");
 
@@ -1950,7 +1986,7 @@ mod tests {
                 "SECURITY.md",
                 vec![
                     format!("**{total} escape syscalls**"),
-                    format!("{kill} that hard-kill"),
+                    format!("{kill} that answer `EPERM`"),
                     format!("the {errno} that return"),
                     // SECURITY.md said "**34 syscalls denied**" in one bullet and "9 plus 24 is the
                     // 33" two paragraphs below, having been half-updated when `clone3` joined. Only
@@ -1984,8 +2020,8 @@ mod tests {
                 assert!(
                     text.contains(&needle),
                     "{file} no longer contains {needle:?}. The filter denies {total} syscalls \
-                     ({kill} by SIGSYS, {errno} by ENOSYS); update the prose to match the code, \
-                     not the other way round."
+                     ({kill} by EPERM or the kill, {errno} by ENOSYS); update the prose to match the \
+                     code, not the other way round."
                 );
             }
         }

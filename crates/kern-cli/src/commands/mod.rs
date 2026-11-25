@@ -311,6 +311,9 @@ pub struct BoxRunArgs<'a> {
     /// INTERNAL `--copy-in <archive>` (repeatable): a tar the Docker API kept for a container that
     /// had not started, extracted into the box's root at the directory named in `<archive>.dir`.
     pub copy_in: &'a [String],
+    /// `--security-opt seccomp-deny=kill|eperm`: what a denied syscall gets. `None`: EPERM, Docker's,
+    /// or the kill under `--security-profile untrusted`.
+    pub seccomp_deny_kill: Option<bool>,
     /// `--secret-env <name>`: content from `KERN_SECRET_<name>` rather than from argv.
     pub secret_envs: &'a [String],
     /// `--secret-mode <octal>`: the file mode every `--secret` of this box is created with.

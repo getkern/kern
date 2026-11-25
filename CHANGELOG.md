@@ -104,6 +104,15 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**A denied syscall answers `EPERM`, as under Docker, instead of killing the caller.** A box that
+called a refused syscall (`unshare`, `mount`, `bpf`, `ptrace`, a namespace-creating `clone`) died with
+`Bad system call` (exit 159), where Docker's answer is `Operation not permitted` and the program goes
+on: a browser's or bubblewrap's sandbox probe, systemd's `bpf` probe and a debugger now report the
+refusal instead of crashing. The set of refused syscalls is unchanged, and none of them ever runs.
+`--security-opt seccomp-deny=kill` keeps the kill (so does `--security-profile untrusted`), `kern
+exec` and health probes get the box's own verdict, and the Python and Node sandboxes ask for the kill
+on every box, so their `escape_blocked` reads as before.
+
 **`docker stats`, exec events and terminal resizes through kern's socket.** `docker stats` answered
 501; it reads kern's figures now as Docker's (memory against the box's limit, CPU% from two
 readings, pids, network). `docker events` sends `exec_create`, `exec_start` and `exec_die`, and an

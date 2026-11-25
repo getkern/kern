@@ -350,11 +350,35 @@ pub fn box_env(name: &str, pid: i32) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A box whose denied syscalls KILL (`--security-opt seccomp-deny=kill`, the SDKs' sandboxes): a
+/// marker beside its environment, read by `kern exec` and the health probe so what they run gets the
+/// verdict PID 1 got, whatever the caller's own flags.
+fn seccomp_kill_marker(name: &str, pid: i32) -> Option<PathBuf> {
+    runtime_subdir("seccomp-kill")
+        .ok()
+        .map(|d| d.join(format!("{name}-{pid}")))
+}
+
+/// Record that the box's denied syscalls kill.
+pub fn set_box_seccomp_kills(name: &str, pid: i32) {
+    if let Some(p) = seccomp_kill_marker(name, pid) {
+        let _ = fs::write(p, b"");
+    }
+}
+
+/// Do the box's denied syscalls kill? `false` for one that never said so (`EPERM`, Docker's).
+pub fn box_seccomp_kills(name: &str, pid: i32) -> bool {
+    seccomp_kill_marker(name, pid).is_some_and(|p| p.exists())
+}
+
 /// Drop a box's environment and deadline sidecars. Called wherever the health sidecar is dropped,
 /// so none of them can outlive the box while another does not.
 pub fn clear_box_env(name: &str, pid: i32) {
     if let Ok(d) = env_dir() {
         let _ = fs::remove_file(d.join(format!("{name}-{pid}")));
+    }
+    if let Some(p) = seccomp_kill_marker(name, pid) {
+        let _ = fs::remove_file(p);
     }
     clear_box_deadline(name, pid);
     clear_box_attempt(name, pid);
@@ -705,7 +729,12 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 18] = [
+const AUTHORITATIVE_DIRS: [&str; 19] = [
+    // `seccomp-kill/` marks a box whose denied syscalls KILL; `kern exec` and the health probe read it
+    // to give what they run PID 1's verdict. A box able to remove a peer's marker would turn that
+    // peer's kills into EPERM (the syscall still never runs, but a supervisor reading the kill as
+    // "this code tried to leave" would no longer see it), so it is authoritative.
+    "seccomp-kill",
     "instances",
     "claims",
     "exit",

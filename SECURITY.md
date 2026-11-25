@@ -103,7 +103,8 @@ shared hardware, see [kern or a microVM](#kern-or-a-microvm).
 - **Always-on seccomp, allowlist by default**: the shipped default is moby's own default filter
   minus kern's 37 (deny-by-default, the long tail returning `ENOSYS`); the wider denylist is the
   opt-out via `KERN_SECCOMP=denylist`. Either posture always refuses the **37 escape syscalls**: 25
-  that hard-kill plus the 12 that return `ENOSYS`; a rootless `--privileged` box denies 5 fewer. Do
+  that answer `EPERM` (or kill, see below) plus the 12 that return `ENOSYS`; a rootless `--privileged`
+  box denies 5 fewer. Do
   not take the number from this file, ask the binary: `kern box <name> --image <ref> --show-config`
   prints `seccomp_denied_syscalls` from the live lists.
 
@@ -136,7 +137,12 @@ Verified on this desktop, the string arrives outside.
 
 ### What a denied syscall returns
 The filter has two verdicts for a whole syscall. Real escape vectors (kexec, module load/unload, the mount API, `bpf`,
-`ptrace`, `setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`. Twelve, in eight
+`ptrace`, `setns`/`unshare`/`pivot_root`) answer **`EPERM`**, as Docker's default filter answers them, so
+software that probes one (a browser's or bubblewrap's `unshare`, a debugger's `ptrace`) reports it or
+goes on instead of dying. `--security-opt seccomp-deny=kill` makes them **kill** the caller with
+`SIGSYS` instead, and so do `--security-profile untrusted` and every sandbox the SDKs start: the kill
+is the verdict a supervisor reads as "this code tried to leave" (`escape_blocked`). `kern exec` and a
+health probe get the box's own verdict. Twelve, in eight
 families (io_uring's three, `userfaultfd`, `perf_event_open`, the keyring's three, `syslog`,
 `clone3`, `open_by_handle_at` and `listns`), return **`ENOSYS`** instead: equally denied, and the difference
 is Redis falling back to its epoll path rather than Redis dying.
@@ -157,7 +163,7 @@ inside a box on x86_64, kernel 7.0:
 |---|---|
 | `io_uring_setup` (denied, degrade set) | `-1 ENOSYS`, process survives |
 | syscall number 998 (exists on no kernel) | `-1 ENOSYS`, process survives |
-| `kexec_load`, `bpf` (denied, kill set) | killed by `SIGSYS` |
+| `kexec_load`, `bpf`, `mount`, `ptrace` (denied) | `-1 EPERM`, process survives; killed by `SIGSYS` (exit 159) under `seccomp-deny=kill` |
 | the same calls with no kern filter (control) | a *different* errno, never `ENOSYS` |
 So the errno discloses nothing: a filtered call is byte-identical to one this kernel does not
 implement. What is cheap to enumerate is the **permitted** set, and always was, since a permitted
@@ -166,12 +172,13 @@ syscall runs and returns its own errno.
 ### Read-only and cgroup-mask integrity
 Two independent layers, and neither is the default cap drop - which does **not** remove
 `CAP_SYS_ADMIN` (that cap is kept, held only over the box's own user namespace). First, the always-
-on filter **kills** the mount API - `mount`, `umount2`, `pivot_root`, `setns` and the whole
+on filter **refuses** the mount API - `mount`, `umount2`, `pivot_root`, `setns` and the whole
 reconfiguration family - so a box cannot re-mount its root writable OR `umount` the cgroup masks to
 reach the host hierarchy, whatever caps it holds.
 
 ### Nested boxes (`--privileged`)
-By default a full `kern box` cannot run inside another; it gets `SIGSYS`. `--privileged` relaxes
+By default a full `kern box` cannot run inside another; its namespaces are refused (`EPERM`).
+`--privileged` relaxes
 **exactly five** syscalls, `unshare`, `setns`, `mount`, `umount2` and `pivot_root`, so a nested box
 can create its own namespaces and rootfs.
 

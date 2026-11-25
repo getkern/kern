@@ -364,7 +364,10 @@ pub use real::{iface_set_ipv4, iface_up, mask_of, member_mac, pod_bridge_name, p
 pub use real::{mount_overlay_c, overlay_escape, overlay_lowerdir, OverlayMount, OverlayOpts};
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};
-pub use seccomp::{denied_syscall_count, install_no_vsock_filter, SeccompFilter};
+pub use seccomp::{
+    denied_syscall_count, deny_kills as seccomp_deny_kills, install_no_vsock_filter,
+    set_deny_kills as set_seccomp_deny_kills, SeccompFilter,
+};
 pub use ssh::SshSetup;
 
 /// `MS_BIND` from `<sys/mount.h>` - bind-mount an existing tree at a new location.

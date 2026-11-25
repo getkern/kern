@@ -163,6 +163,9 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
                         .collect()
                 })
                 .unwrap_or_default();
+            // The box's verdict for a denied syscall, as its filter: the probe is killed where the
+            // workload would be, and refused with EPERM where it would be.
+            kern_isolation::set_seccomp_deny_kills(registry::box_seccomp_kills(&cur, pid));
             let ok = run_probe(
                 pid1,
                 &probe,
