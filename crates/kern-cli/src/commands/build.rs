@@ -358,15 +358,25 @@ fn step_event(s: usize, total: usize, what: &str, clock: Clock) -> Option<u64> {
         Some(w) => (w, true),
         None => (what, false),
     };
-    // The live view's row for this image (a standalone `kern build` on a terminal).
+    // The live view's row for this image (a standalone `kern build` on a terminal). A BATCH OF RUNs
+    // IS ONE ROW: its steps are announced back to back and run as one box from the first, so each
+    // rewriting the row left the LAST step on screen while the first was running. The first step
+    // names the span; the others, untimed, leave the row as it is.
     if crate::progress::board_active() {
-        let image = step_clock::image();
-        let last_said = step_clock::said(last, 1);
-        crate::progress::service(
-            &image,
-            "building",
-            &format!("step {s}/{total} {what}{last_said}"),
-        );
+        if let Clock::Timed { together } = clock {
+            let image = step_clock::image();
+            let last_said = step_clock::said(last, 1);
+            let span = if together > 1 {
+                format!(
+                    "step {s}-{}/{total} {what} (with the next {})",
+                    s + together - 1,
+                    together - 1
+                )
+            } else {
+                format!("step {s}/{total} {what}")
+            };
+            crate::progress::service(&image, "building", &format!("{span}{last_said}"));
+        }
     }
     kern_common::progress_event(
         "build_step",
