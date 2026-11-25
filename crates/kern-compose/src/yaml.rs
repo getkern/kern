@@ -5018,7 +5018,14 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             },
             // `tmpfs:` MAY ALREADY HAVE BEEN SET by its own key, and a long-form `type: tmpfs`
             // volume appends to it rather than replacing it: a file is allowed to write both.
-            "volumes" => b.volumes = volumes_value(node, &mut b.tmpfs_from_volumes, name),
+            "volumes" => {
+                b.volumes = volumes_value(
+                    node,
+                    &mut b.tmpfs_from_volumes,
+                    &mut b.binds_must_exist,
+                    name,
+                )?
+            }
             "devices" => {
                 let raw = devices_value(node, name)?;
                 b.devices = normalise_devices(&raw, name, &mut b.tun, &mut b.device);
@@ -7580,17 +7587,23 @@ pub fn normalise_devices(
 /// short form); a LONG-form entry (`{type:, source:, target:, read_only:}`, which `build_tree` folds to
 /// an inline `{…}` scalar) is reconstructed into `source:target[:ro]`. Passing the raw `{…}` to `-v`
 /// was a bug - the box rejected it and the whole service failed to start.
-fn volumes_value(node: &Node, tmpfs: &mut Vec<String>, service: &str) -> Vec<String> {
-    list_value(node)
-        .into_iter()
-        .filter_map(|item| {
-            if item.trim_start().starts_with('{') {
-                reconstruct_volume_item(&item, tmpfs, service)
-            } else {
-                Some(anonymous_volume(&item, service))
+fn volumes_value(
+    node: &Node,
+    tmpfs: &mut Vec<String>,
+    must_exist: &mut Vec<String>,
+    service: &str,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for item in list_value(node) {
+        if item.trim_start().starts_with('{') {
+            if let Some(v) = reconstruct_volume_item(&item, tmpfs, must_exist, service)? {
+                out.push(v);
             }
-        })
-        .collect()
+        } else {
+            out.push(anonymous_volume(&item, service));
+        }
+    }
+    Ok(out)
 }
 
 /// `~` and `~/...` at the start of a bind source are the caller's home directory, as compose-go
@@ -7660,8 +7673,68 @@ fn anonymous_volume(item: &str, service: &str) -> String {
 /// `S:T[:ro]`. An anonymous volume (no `source`) or an unsupported shape is dropped with a warning
 /// rather than forwarded as a malformed `-v`. `type: tmpfs` has no `source`; we don't map it here
 /// (kern has `--tmpfs`), so it's warned-and-skipped.
-fn reconstruct_volume_item(item: &str, tmpfs: &mut Vec<String>, service: &str) -> Option<String> {
+fn reconstruct_volume_item(
+    item: &str,
+    tmpfs: &mut Vec<String>,
+    must_exist: &mut Vec<String>,
+    service: &str,
+) -> Result<Option<String>, String> {
     let inner = item.trim().trim_start_matches('{').trim_end_matches('}');
+    // `bind:` and `volume:` sub-options, in their block form (`bind: {k: v}` after the item fold) or
+    // flattened (`bind.k: v`). READ, where they were all ignored: MEASURED (Grok's round 17, case
+    // y08) `bind: {create_host_path: false}` on a missing source made kern create it, where Docker
+    // refuses the service.
+    let (mut no_create, mut propagation, mut subpath, mut nocopy) =
+        (false, String::new(), String::new(), false);
+    for field in split_top_commas(inner) {
+        let Some((k, v)) = field.split_once(':') else {
+            continue;
+        };
+        let mut sub = |key: &str, val: &str| match key {
+            "create_host_path" => no_create = scalar_str(val) == "false",
+            "propagation" => propagation = scalar_str(val),
+            "subpath" => subpath = scalar_str(val),
+            "nocopy" => nocopy = scalar_str(val) == "true",
+            _ => {}
+        };
+        match k.trim() {
+            "bind" | "volume" => {
+                let body = v.trim().trim_start_matches('{').trim_end_matches('}');
+                for f in split_top_commas(body) {
+                    if let Some((sk, sv)) = f.split_once(':') {
+                        sub(sk.trim(), sv);
+                    }
+                }
+            }
+            other => {
+                if let Some(key) = other
+                    .strip_prefix("bind.")
+                    .or_else(|| other.strip_prefix("volume."))
+                {
+                    sub(key, v);
+                }
+            }
+        }
+    }
+    if !subpath.is_empty() {
+        return Err(format!(
+            "service '{service}': a volume's `subpath: {subpath}` is not something kern mounts; \
+             mounting the whole volume instead would show the service files it did not ask for. \
+             Mount a volume of its own, or a bind of that directory"
+        ));
+    }
+    if !propagation.is_empty() && !matches!(propagation.as_str(), "rprivate" | "private") {
+        return Err(format!(
+            "service '{service}': bind `propagation: {propagation}` is not something kern does \
+             (a box's mounts are private, nothing propagates in or out); drop the key"
+        ));
+    }
+    if nocopy {
+        warn(&format!(
+            "service '{service}': `volume: {{nocopy: true}}` is not read; an empty volume is filled \
+             from the image as usual"
+        ));
+    }
     let (mut source, mut target, mut read_only, mut vtype) =
         (String::new(), String::new(), false, String::new());
     // `tmpfs: {size: …, mode: …}` folds to `tmpfs.size` / `tmpfs.mode` here, because the whole long
@@ -7723,7 +7796,7 @@ fn reconstruct_volume_item(item: &str, tmpfs: &mut Vec<String>, service: &str) -
             spec.push_str(&opts.join(","));
         }
         tmpfs.push(spec);
-        return None;
+        return Ok(None);
     }
     // THE LONG FORM OF AN ANONYMOUS VOLUME, which the short form has handled since it was measured
     // breaking a real project. `{type: volume, target: /usr/src/app/node_modules}` with no source is
@@ -7737,11 +7810,11 @@ fn reconstruct_volume_item(item: &str, tmpfs: &mut Vec<String>, service: &str) -
     // must land on one volume, or a file that switches between them silently gets two.
     if source.is_empty() && !target.is_empty() && (vtype.is_empty() || vtype == "volume") {
         let synthesised = anonymous_volume(&target, service);
-        return Some(if read_only {
+        return Ok(Some(if read_only {
             format!("{synthesised}:ro")
         } else {
             synthesised
-        });
+        }));
     }
     if target.is_empty() || source.is_empty() {
         warn(&format!(
@@ -7752,13 +7825,16 @@ fn reconstruct_volume_item(item: &str, tmpfs: &mut Vec<String>, service: &str) -
                 "anonymous/unsupported"
             }
         ));
-        return None;
+        return Ok(None);
     }
-    Some(if read_only {
+    if no_create && vtype == "bind" {
+        must_exist.push(target.clone());
+    }
+    Ok(Some(if read_only {
         format!("{source}:{target}:ro")
     } else {
         format!("{source}:{target}")
-    })
+    }))
 }
 
 /// `depends_on`: short list → start-order; long-form map with `condition:` → healthy/completed buckets.
@@ -10017,6 +10093,30 @@ mod tests {
         // is a refusal.
         let dflt = "services:\n  db:\n    image: alpine\n    environment:\n      - A=${KERN_T_UNSET:-fallback}\n";
         assert!(parse(dflt).is_ok(), "a defaulted variable is not required");
+    }
+
+    /// The long form's `bind:`/`volume:` sub-options are read: `create_host_path: false` marks the
+    /// target for the existence check, a `subpath` and a propagation kern does not do are refused
+    /// by name, and `rprivate` (what a box has) passes.
+    #[test]
+    fn long_form_bind_and_volume_options_are_read_not_ignored() {
+        let svc = |opt: &str| {
+            format!("services:\n  s:\n    image: alpine\n    volumes:\n      - type: bind\n        source: /srv/x\n        target: /d\n        {opt}\n")
+        };
+        let boxes = parse(&svc("bind:\n          create_host_path: false")).unwrap();
+        assert_eq!(boxes[0].binds_must_exist, ["/d"]);
+        assert!(
+            parse(&svc("bind:\n          create_host_path: true")).unwrap()[0]
+                .binds_must_exist
+                .is_empty()
+        );
+        assert!(parse(&svc("bind:\n          propagation: rshared")).is_err());
+        assert!(parse(&svc("bind:\n          propagation: rprivate")).is_ok());
+        let sub = "services:\n  s:\n    image: alpine\n    volumes:\n      - type: volume\n        source: v\n        target: /d\n        volume:\n          subpath: a\nvolumes:\n  v: {}\n";
+        assert!(
+            parse(sub).is_err(),
+            "a subpath is refused, not mounted as the whole volume"
+        );
     }
 
     /// A volume the file names (`name:`, not external) is mounted by that name and is the project's
@@ -14714,8 +14814,10 @@ mod home_expansion_tests {
         let long = reconstruct_volume_item(
             "{type: bind, source: ~/cache, target: /c}",
             &mut Vec::new(),
+            &mut Vec::new(),
             "s",
-        );
+        )
+        .expect("a plain long form");
         assert!(
             long.as_deref()
                 .is_some_and(|v| v.starts_with(&format!("{home}/cache:"))),

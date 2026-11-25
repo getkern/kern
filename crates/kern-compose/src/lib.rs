@@ -471,6 +471,9 @@ pub struct ComposeBox {
     /// by that name, without the project's prefix, and still the project's own for `down -v`, as
     /// Docker treats them. `volumes` already carries the name.
     pub named_volumes: Vec<String>,
+    /// Targets of the long-form binds that say `bind: {create_host_path: false}`: their source must
+    /// already exist, and the compose driver refuses the service when it does not, as Docker does.
+    pub binds_must_exist: Vec<String>,
     /// Volumes the top-level block puts at a directory (`driver_opts: {type: none, o: bind, device:
     /// <dir>}`, Docker's local driver), as `(volume key, directory)`. The compose driver makes each
     /// one a kern volume at that directory (`kern volume create --path`) before the box starts; the
@@ -1690,6 +1693,7 @@ impl ComposeBox {
             volumes,
             external_volumes,
             named_volumes,
+            binds_must_exist,
             volume_paths,
             env,
             env_file,
@@ -5034,6 +5038,11 @@ mod contract_tests {
                 "the compose driver makes each one a kern volume at its directory before the box \
                  starts (`kern volume create --path`); the mount itself is an ordinary named entry in \
                  `volumes`",
+            ),
+            (
+                "binds_must_exist",
+                "the compose driver refuses the service when such a bind's source does not exist \
+                 (`create_host_path: false`), after relative sources are resolved",
             ),
             (
                 "named_volumes",

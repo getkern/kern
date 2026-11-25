@@ -1203,6 +1203,28 @@ pub(crate) fn resolve_relative_binds(
             *s = format!("{}:{nm}", abs.to_string_lossy());
         }
     }
+    // A BIND THAT SAYS `create_host_path: false` needs its source to exist, as Docker refuses the
+    // service otherwise ("bind source path does not exist"); kern creates a missing bind source
+    // for every other bind, as Docker's short form does. Checked here, where relative sources have
+    // just become the paths the box will mount.
+    for b in boxes.iter() {
+        for target in &b.binds_must_exist {
+            let src = b.volumes.iter().find_map(|v| {
+                let (src, rest) = v.split_once(':')?;
+                let dst = rest.split(':').next()?;
+                (std::path::Path::new(dst) == std::path::Path::new(target)).then_some(src)
+            });
+            if let Some(src) = src {
+                if std::fs::symlink_metadata(src).is_err() {
+                    return Err(Error::Compose(format!(
+                        "service '{}': bind source {src} does not exist, and the file says \
+                         `create_host_path: false`",
+                        b.name
+                    )));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
