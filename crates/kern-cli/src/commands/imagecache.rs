@@ -250,7 +250,8 @@ pub(crate) fn resolve_image_command(
 /// either, because a digest-pinned ref is already satisfied.
 ///
 /// So the version decides: an entry stamped with anything older has its sidecar REFRESHED once, by
-/// [`refresh_image_config`], which re-reads the config blob and leaves the rootfs alone.
+/// [`refresh_image_config`], which re-reads the config blob and leaves the rootfs alone. `3`: the
+/// image's `VOLUME` paths (`volume` lines), which a box now mounts anonymous volumes at.
 ///
 /// ⛔ NOT A CACHE MISS. The first version of this treated an old stamp as an incomplete entry, which
 /// sent it down the repair path - and that path clears the image dir first. An image whose layers
@@ -258,7 +259,7 @@ pub(crate) fn resolve_image_command(
 /// user that pulled it: `remove_dir_all` returns EPERM, and the entry was then unusable until
 /// `--pull always`. Measured by a later pass on a 66-image, 22 GB cache. The rootfs was never
 /// the stale part.
-pub(crate) const IMAGE_CFG_FMT: u32 = 2;
+pub(crate) const IMAGE_CFG_FMT: u32 = 3;
 
 pub(crate) fn write_image_config(
     path: &std::path::Path,
@@ -292,6 +293,9 @@ pub(crate) fn write_image_config(
     }
     if let Some(u) = &c.user {
         line("user", u);
+    }
+    for v in &c.volumes {
+        line("volume", v);
     }
     for (port, udp) in &c.exposed_ports {
         line(
@@ -404,6 +408,14 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
             "env" => c.env.push(v.to_string()),
             "label" => c.labels.push(v.to_string()),
             "workdir" => c.workdir = Some(v.to_string()),
+            // Re-checked on read: the sidecar is a file in the caller's cache, not the registry's
+            // word, and the box mounts a volume at each path.
+            "volume"
+                if kern_oci::volume_path_is_valid(v)
+                    && c.volumes.len() < kern_oci::MAX_IMAGE_VOLUMES =>
+            {
+                c.volumes.push(v.to_string());
+            }
             "user" => c.user = Some(v.to_string()),
             "expose" => {
                 if let Some((num, proto)) = v.split_once('/') {
@@ -1820,11 +1832,12 @@ pub(crate) fn record_setuid_kept(cache: &std::path::Path, safe: &str) {
 /// What [`record_setuid_kept`] writes. `v2`: an entry marked by the first binaries that kept the bits
 /// could still have lost them afterwards, because `kern save` and `kern push` then cleared every
 /// setuid bit IN the cache entry of a pulled image (MEASURED: `/usr/bin/su` of python:3.12-slim). The
-/// export no longer touches the tree, so only this mark vouches for the bits.
-const SETUID_MARK: &[u8] = b"kept v2\n";
+/// export no longer touches the tree, so only this mark vouches for the bits. `v3`: the image's file
+/// capabilities are kept too (`kern_oci` extracts `security.capability`), which a `v2` entry lost.
+const SETUID_MARK: &[u8] = b"kept v3\n";
 
 /// What marks an entry whose re-extraction failed (a loaded image no registry has): asked once.
-const SETUID_GIVEN_UP: &[u8] = b"not repairable v2\n";
+const SETUID_GIVEN_UP: &[u8] = b"not repairable v3\n";
 
 /// Whether an entry was extracted with the image's setuid/setgid bits ([`record_setuid_kept`]).
 fn setuid_kept(cache: &std::path::Path, safe: &str) -> bool {
@@ -1841,6 +1854,77 @@ const USUALLY_SETUID: [&str; 6] = [
     "usr/bin/newgrp",
     "bin/mount",
 ];
+
+/// Programs an image gives a privilege when it ships them: setuid or a file capability, depending on
+/// the distribution (Alpine's are `cap_setuid=ep`/`cap_setgid=ep`, Debian's setuid). One present with
+/// NEITHER, in an entry without the current mark, is an entry an older kern stripped of its caps.
+const USUALLY_PRIVILEGED: [&str; 2] = ["usr/bin/newuidmap", "usr/bin/newgidmap"];
+
+/// What an older kern stripped from a cached image: setuid bits or file capabilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stripped {
+    Setuid(&'static str),
+    Capability(&'static str),
+}
+
+impl Stripped {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Setuid(p) | Self::Capability(p) => p,
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Self::Setuid(_) => "setuid bits",
+            Self::Capability(_) => "file capabilities",
+        }
+    }
+}
+
+/// Does the file at `path` carry a `security.capability` attribute (not following a symlink)?
+fn has_file_capability(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(p) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a NUL-terminated path and a zero-length query (the size only).
+    unsafe {
+        libc::lgetxattr(
+            p.as_ptr(),
+            c"security.capability".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        ) > 0
+    }
+}
+
+/// What an older kern stripped from a cached image ([`Stripped`]), or `None`. Asked only of an entry
+/// without the current mark, so a current one costs a single read.
+fn stripped_privileges(cache: &std::path::Path, safe: &str) -> Option<Stripped> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(r) = stripped_setuid(cache, safe) {
+        return Some(Stripped::Setuid(r));
+    }
+    if built_here(cache, safe) {
+        return None;
+    }
+    let mark = std::fs::read(cache.join(format!("{safe}.setuid"))).unwrap_or_default();
+    if mark == SETUID_MARK || mark == SETUID_GIVEN_UP {
+        return None;
+    }
+    let dir = cache.join(safe);
+    USUALLY_PRIVILEGED
+        .iter()
+        .copied()
+        .find(|rel| {
+            let p = dir.join(rel);
+            std::fs::symlink_metadata(&p).is_ok_and(|m| {
+                m.is_file() && m.permissions().mode() & 0o6000 == 0 && !has_file_capability(&p)
+            })
+        })
+        .map(Stripped::Capability)
+}
 
 /// A program in a cached image that an older kern left without its setuid bit, or `None`. Asked only
 /// of an entry without the current mark, so a current one costs a single read.
@@ -1974,17 +2058,19 @@ pub(crate) fn pull_to_cache(
     // `--pull never` there is no registry to ask, so the entry is used as it is and the line says how
     // to repair it.
     if policy != PullPolicy::Always && cache_entry_complete(&cache, &safe) {
-        if let Some(rel) = stripped_setuid(&cache, &safe) {
+        if let Some(gone) = stripped_privileges(&cache, &safe) {
+            let (rel, what) = (gone.path(), gone.what());
             if policy == PullPolicy::Never {
                 eprintln!(
-                    "kern: note: image '{image}' was cached by an older kern, which cleared setuid \
-                     bits (/{rel} has none), so `sudo` and `su` in it cannot raise a user; \
-                     `--pull never` leaves it so, and one start without it re-extracts the image"
+                    "kern: note: image '{image}' was cached by an older kern, which cleared {what} \
+                     (/{rel} has none), so a program in it that raises a user or a capability \
+                     cannot; `--pull never` leaves it so, and one start without it re-extracts the \
+                     image"
                 );
             } else {
                 kern_common::progress!(
                     "→ re-extracting image '{image}': it was cached by an older kern, which cleared \
-                     setuid bits (/{rel} has none)"
+                     {what} (/{rel} has none)"
                 );
                 // BEST EFFORT: a loaded image may exist on no registry. Then the entry is used as it
                 // is, and marked so that later starts do not ask the network again.
@@ -1993,7 +2079,7 @@ pub(crate) fn pull_to_cache(
                     Err(e) => {
                         eprintln!(
                             "kern: note: image '{image}' could not be re-extracted ({e}); it runs as \
-                             cached, and its `sudo` cannot raise a user until it is pulled again"
+                             cached, without its {what}, until it is pulled again"
                         );
                         let _ =
                             std::fs::write(cache.join(format!("{safe}.setuid")), SETUID_GIVEN_UP);
@@ -2821,6 +2907,34 @@ mod built_here_tests {
             assert_eq!(stripped_setuid(&dir, "img"), None, "{marker}");
             std::fs::remove_file(dir.join(marker)).expect("unmark");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An entry an older kern extracted without file capabilities: `newuidmap` with neither setuid nor
+    /// `security.capability` is re-extracted once; setuid (Debian's) is not missing anything; the
+    /// current mark asks nothing.
+    #[test]
+    fn an_entry_whose_newuidmap_lost_its_capability_is_re_extracted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kern-fcap-{}", std::process::id()));
+        let nu = dir.join("img/usr/bin/newuidmap");
+        std::fs::create_dir_all(nu.parent().expect("parent")).expect("dirs");
+        std::fs::write(&nu, b"x").expect("newuidmap");
+        std::fs::set_permissions(&nu, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        std::fs::write(dir.join("img.setuid"), b"kept v2\n").expect("v2 mark");
+        assert_eq!(
+            stripped_privileges(&dir, "img"),
+            Some(Stripped::Capability("usr/bin/newuidmap"))
+        );
+        std::fs::set_permissions(&nu, std::fs::Permissions::from_mode(0o4755)).expect("setuid");
+        assert_eq!(
+            stripped_privileges(&dir, "img"),
+            None,
+            "setuid needs no capability"
+        );
+        std::fs::set_permissions(&nu, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        record_setuid_kept(&dir, "img");
+        assert_eq!(stripped_privileges(&dir, "img"), None, "the current mark");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

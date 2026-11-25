@@ -20775,3 +20775,154 @@ fn inspect_format_answers_memory_and_restart_count() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&xdg);
 }
+
+/// ⛔ AN IMAGE'S FILE CAPABILITY SURVIVES `load`, `build` AND `save`, as docker keeps it. The fixture
+/// is an archive in `docker save` form whose one file carries `cap_setuid=ep` (given in a user
+/// namespace and archived by GNU tar with `--xattrs`, as an image carries one). It is loaded, built
+/// upon (`FROM` it with a `COPY`, so the save copies the base through the merged view, where a chown
+/// after the attribute used to remove it), and saved: the saved layer holds the capability as v2.
+/// No network.
+#[test]
+fn a_file_capability_survives_load_build_and_save() {
+    let base = std::env::temp_dir().join(format!("kern-it-fcap-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("root")).unwrap();
+    fs::create_dir_all(base.join("arch/l1")).unwrap();
+    fs::create_dir_all(base.join("ctx")).unwrap();
+    fs::write(base.join("root/nu"), b"#!/bin/sh\n").unwrap();
+    let script = format!(
+        "python3 -c \"import os; os.setxattr('{root}/nu', 'security.capability', \
+         bytes.fromhex('0100000280000000000000000000000000000000'))\" && \
+         tar --xattrs --xattrs-include=security.capability --format=posix --owner=0 --group=0 \
+         --numeric-owner -C {root} -cf {arch}/l1/layer.tar nu",
+        root = base.join("root").display(),
+        arch = base.join("arch").display()
+    );
+    let made = Command::new("unshare")
+        .args(["-r", "sh", "-c", &script])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !made {
+        let _ = fs::remove_dir_all(&base);
+        eprintln!("SKIP: no user namespace, python3 or GNU tar with xattrs for the fixture");
+        return;
+    }
+    let sha = |p: &std::path::Path| -> String {
+        let out = Command::new("sha256sum").arg(p).output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "amd64",
+    };
+    let diff = sha(&base.join("arch/l1/layer.tar"));
+    fs::write(
+        base.join("arch/cfg.json"),
+        format!(
+            r#"{{"architecture":"{arch}","os":"linux","config":{{}},"rootfs":{{"type":"layers","diff_ids":["sha256:{diff}"]}}}}"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        base.join("arch/manifest.json"),
+        r#"[{"Config":"cfg.json","RepoTags":["kern-it-fcapbase:1"],"Layers":["l1/layer.tar"]}]"#,
+    )
+    .unwrap();
+    let packed = Command::new("tar")
+        .args(["-C"])
+        .arg(base.join("arch"))
+        .arg("-cf")
+        .arg(base.join("in.tar"))
+        .args(["manifest.json", "cfg.json", "l1"])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(packed, "tar of the fixture archive");
+    let k = KernIn {
+        cache: base.join("cache"),
+        data: base.join("data"),
+    };
+    let input = base.join("in.tar");
+    let (loaded, said) = k.run(&["load", "-i", input.to_str().unwrap()], &[]);
+    assert!(loaded, "load: {said}");
+    fs::write(base.join("ctx/x"), b"x").unwrap();
+    fs::write(
+        base.join("ctx/Dockerfile"),
+        "FROM kern-it-fcapbase:1\nCOPY x /x\n",
+    )
+    .unwrap();
+    let ctx = base.join("ctx");
+    let (built, said) = k.run(
+        &[
+            "build",
+            "-q",
+            "-t",
+            "kern-it-fcapbuilt:1",
+            ctx.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(built, "build: {said}");
+    let out = base.join("out.tar");
+    let (saved, said) = k.run(
+        &["save", "-o", out.to_str().unwrap(), "kern-it-fcapbuilt:1"],
+        &[],
+    );
+    assert!(saved, "save: {said}");
+    fs::create_dir_all(base.join("outx")).unwrap();
+    let opened = Command::new("tar")
+        .arg("-xf")
+        .arg(&out)
+        .arg("-C")
+        .arg(base.join("outx"))
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(opened, "untar the saved archive");
+    let key = b"SCHILY.xattr.security.capability=";
+    let v2 = [
+        1u8, 0, 0, 2, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let mut found = Vec::new();
+    for e in walk(&base.join("outx")) {
+        if e.file_name().and_then(|n| n.to_str()) != Some("layer.tar") {
+            continue;
+        }
+        let bytes = fs::read(&e).unwrap_or_default();
+        for (i, w) in bytes.windows(key.len()).enumerate() {
+            if w == key {
+                found.push(
+                    bytes
+                        .get(i + key.len()..i + key.len() + 20)
+                        .map(<[u8]>::to_vec),
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&base);
+    assert_eq!(
+        found,
+        vec![Some(v2.to_vec())],
+        "the saved image must carry the one file capability, as v2"
+    );
+}
+
+/// Every file under `dir`, recursively (no symlink followed).
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(p),
+                Ok(t) if t.is_file() => out.push(p),
+                _ => {}
+            }
+        }
+    }
+    out
+}

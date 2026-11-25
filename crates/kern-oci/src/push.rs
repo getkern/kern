@@ -259,9 +259,8 @@ fn pack_layer(
     // SECURITY (privilege-escalation via ownership normalization): the layer is tarred root-owned
     // (Docker layers are root-owned), but forcing owner 0 on a NON-root-owned `-rwsr-xr-x` binary would
     // turn it into **setuid-ROOT** in the pushed image - an escalation the original never had. So the
-    // shared packer strips setuid/setgid BEFORE tarring (kern treats in-image setuid as inert anyway -
-    // the box root mount is MS_NOSUID and pull uses `--no-same-owner`; file-capabilities are closed the
-    // same way, the build copier never propagates `security.capability`). It also handles the tar-flavour
+    // shared packer keeps a setuid/setgid bit only where the box's root owned the file, and carries a
+    // file capability as a v2 one (see `normalize_for_export`). It also handles the tar-flavour
     // split: GNU `--owner=0 --group=0`, or BusyBox `--numeric-owner` (which is already 0:0 for a
     // root-run build) - the fix for `save`/`push` erroring on Alpine/WSL's BusyBox tar.
     crate::archive::tar_rootfs_root_owned(rootfs, &tar_path)?;
@@ -356,6 +355,16 @@ pub(crate) fn build_config_json(cfg: &crate::ImageConfig, diff_id: &str) -> Stri
             })
             .collect();
         config_fields.push(format!("\"ExposedPorts\":{{{}}}", ports.join(",")));
+    }
+    // `VOLUME`, so a saved or pushed image declares what it was pulled or built declaring.
+    let volumes: Vec<String> = cfg
+        .volumes
+        .iter()
+        .filter(|v| crate::pull::volume_path_is_valid(v))
+        .map(|v| format!("{}:{{}}", json_str(v)))
+        .collect();
+    if !volumes.is_empty() {
+        config_fields.push(format!("\"Volumes\":{{{}}}", volumes.join(",")));
     }
     if let Some(sig) = &cfg.stop_signal {
         config_fields.push(format!("\"StopSignal\":{}", json_str(sig)));
@@ -707,6 +716,7 @@ mod tests {
         let cfg = crate::ImageConfig {
             cmd: vec!["nginx".into()],
             exposed_ports: vec![(8080, false), (53, true)],
+            volumes: vec!["/var/lib/postgresql/data".into(), "/cache".into()],
             stop_signal: Some("SIGQUIT".into()),
             labels: vec!["org.opencontainers.image.version=1.2".into(), "bare".into()],
             healthcheck: Some(crate::ImageHealthcheck {
@@ -730,6 +740,10 @@ mod tests {
         let j = build_config_json(&cfg, "sha256:dd");
         let back = crate::pull::parse_image_config(&j);
         assert_eq!(back.exposed_ports, cfg.exposed_ports, "{j}");
+        assert_eq!(
+            back.volumes, cfg.volumes,
+            "a saved image declares its VOLUMEs: {j}"
+        );
         assert_eq!(back.stop_signal, cfg.stop_signal);
         assert_eq!(
             back.labels,

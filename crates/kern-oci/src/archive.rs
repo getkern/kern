@@ -155,9 +155,13 @@ pub(crate) fn tar_rootfs_root_owned(rootfs: &Path, out: &Path) -> Result<(), Oci
     let mut file = std::fs::File::create(out)
         .map_err(|e| OciError::Extract(format!("create {}: {e}", out.display())))?;
     let filtered = match child.stdout.take() {
-        Some(mut stdout) => {
-            crate::pull::normalize_for_export(&mut stdout, &mut file, root_uid, root_gid)
-        }
+        Some(mut stdout) => crate::pull::normalize_for_export(
+            &mut stdout,
+            &mut file,
+            root_uid,
+            root_gid,
+            Some(rootfs),
+        ),
         None => Err(OciError::Tool("tar", "no stdout".into())),
     };
     let done = child
@@ -315,11 +319,18 @@ fn extract_into(
             } else {
                 "-xf"
             };
+            // `load` fills kern's cache: an image's file capabilities stay, as pull keeps them.
+            let caps: &[&str] = if crate::pull::tar_takes_xattrs() {
+                &["--xattrs", "--xattrs-include=security.capability"]
+            } else {
+                &[]
+            };
             Command::new("tar")
                 .args([flag])
                 .arg(layer)
                 .args(["-C", &staging_s, "--same-permissions"])
                 .args(owner_flag(keep_owner))
+                .args(caps)
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
@@ -397,6 +408,7 @@ fn parse_image_config(json: &str) -> ImageConfig {
         // A `docker save`d image keeps its history in the same config, so it loads with it.
         history: crate::pull::history_after(json),
         architecture: str_field(json, "architecture").filter(|s| !s.is_empty()),
+        volumes: crate::pull::volumes_after(cfg),
     }
 }
 

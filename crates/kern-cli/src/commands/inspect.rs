@@ -2748,6 +2748,12 @@ fn record_stop_exit(b: &registry::Instance, code: i32) {
     if b.auto_remove {
         let log_key = format!("{}-{}", b.name, b.pid);
         registry::set_box_exit_removed(b.pid, b.starttime, code, Some(&log_key));
+        // Its supervisor was killed and removes nothing: the box's anonymous volumes go here.
+        if b.volume_names()
+            .any(|v| crate::volume::is_anon_of(v, &b.name))
+        {
+            crate::volume::remove_anon_of(&b.name);
+        }
     } else {
         // A stop's code is its signal's, never the OOM killer's.
         registry::set_box_exit(b.pid, b.starttime, code, b, false);
@@ -3920,6 +3926,9 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
         // THE NAME ALONE ON STDOUT for every box this removed, as `docker rm` prints it: a
         // restarting box stopped here has no exit record left to clear.
         if !kept && (stopped || !records.is_empty()) {
+            // Its anonymous volumes (an image's VOLUME) go with it, as `docker rm -v` removes them:
+            // kept, they would be found again by the next box of this name.
+            crate::volume::remove_anon_of(name);
             println!("{name}");
             continue;
         }
@@ -3927,6 +3936,7 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
             Ok(()) => {
                 // Every run of a kept box left a log: none of them outlives the box.
                 crate::commands::boxlog::remove_logs_of(name);
+                crate::volume::remove_anon_of(name);
                 println!("{name}")
             }
             // `-f` on a name that is not there: said, and not a failure, as docker answers it.

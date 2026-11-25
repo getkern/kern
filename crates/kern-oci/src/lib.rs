@@ -14,8 +14,9 @@ pub use archive::{load, save, save_many, Loaded, SaveItem};
 pub use pull::{
     dir_mode, fetch_image_config, normalize_ref, pull, remote_config_digest,
     remote_config_digest_for, remote_digests_for, remote_record_for, salvage_layer_blobs,
-    set_dir_mode, split_tag, valid_reference, verify_credentials, HealthTest, HistoryEntry,
-    ImageConfig, ImageHealthcheck, OciError, Platform, RemoteDigests, SetuidBits, DEFAULT_TAG,
+    set_dir_mode, split_tag, valid_reference, verify_credentials, volume_path_is_valid, HealthTest,
+    HistoryEntry, ImageConfig, ImageHealthcheck, OciError, Platform, RemoteDigests, SetuidBits,
+    DEFAULT_TAG, MAX_IMAGE_VOLUMES,
 };
 pub use push::{push, push_by_digest, push_index, PushedManifest};
 pub use search::{search, SearchResult};

@@ -2599,6 +2599,7 @@ mod net_resource_tests {
             workdir: Some("/srv".into()),
             user: Some("999:999".into()),
             exposed_ports: vec![(5432, false), (1194, true)],
+            volumes: vec!["/var/lib/postgresql/data".into(), "/backups".into()],
             stop_signal: Some("SIGQUIT".into()),
             labels: vec!["maintainer=a <b@c>".into(), "team=infra".into()],
             healthcheck: Some(kern_oci::ImageHealthcheck {
@@ -3035,6 +3036,7 @@ mod net_resource_tests {
             workdir: Some("/app".into()),
             user: Some("1000:1000".into()),
             exposed_ports: vec![(80, false), (53, true)],
+            volumes: vec!["/data".into()],
             stop_signal: Some("SIGQUIT".into()),
             // A label carrying a `=` in its VALUE, which is the shape that breaks a reader splitting
             // on the last separator instead of the first.

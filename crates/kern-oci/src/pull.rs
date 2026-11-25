@@ -128,6 +128,65 @@ pub struct ImageConfig {
     /// build from its base, stamped by a `--platform` build: what a push writes and what a build for
     /// another platform checks before it reuses an image.
     pub architecture: Option<String>,
+    /// `config.Volumes` - the paths the image declares as volumes (`VOLUME`). A box gets an anonymous
+    /// volume at each one no mount of its own covers, as a docker container does. Only paths
+    /// [`volume_path_is_valid`] accepts, normalised, at most [`MAX_IMAGE_VOLUMES`].
+    pub volumes: Vec<String>,
+}
+
+/// How many `VOLUME` paths an image may declare: each is a directory and a mount at every start, and
+/// the config comes off an untrusted registry.
+pub const MAX_IMAGE_VOLUMES: usize = 32;
+
+/// Is `p` a path a box may get a volume at: absolute, not `/` itself, no `..` component, and none of
+/// the bytes that would change its meaning in a `-v` spec, a JSON string or a line of kern's cache
+/// (`:`, `"`, `\`, a control character), at most 1024 bytes.
+pub fn volume_path_is_valid(p: &str) -> bool {
+    p.starts_with('/')
+        && p.len() <= 1024
+        && !p.trim_end_matches('/').is_empty()
+        && !p.split('/').any(|c| c == "..")
+        && !p
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || matches!(b, b':' | b'"' | b'\\'))
+}
+
+/// The keys of the config's `Volumes` object, valid ones only ([`volume_path_is_valid`]), trailing
+/// slashes dropped, each once, at most [`MAX_IMAGE_VOLUMES`].
+pub(crate) fn volumes_after(cfg: &str) -> Vec<String> {
+    let Some(obj) = object_after(cfg, "Volumes") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    // Keys only: a string at depth 1 followed by `:`. The values are `{}` and carry nothing.
+    let bytes = obj.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() && out.len() < MAX_IMAGE_VOLUMES {
+        match bytes.get(i) {
+            Some(b'{') => depth += 1,
+            Some(b'}') => depth = depth.saturating_sub(1),
+            Some(b'"') => {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && bytes.get(j) != Some(&b'"') {
+                    j += if bytes.get(j) == Some(&b'\\') { 2 } else { 1 };
+                }
+                let key = obj.get(start..j.min(bytes.len())).unwrap_or_default();
+                let after = obj.get(j + 1..).unwrap_or_default().trim_start();
+                if depth == 1 && after.starts_with(':') && volume_path_is_valid(key) {
+                    let norm = key.trim_end_matches('/').to_string();
+                    if !out.contains(&norm) {
+                        out.push(norm);
+                    }
+                }
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
 }
 
 /// An image's own `HEALTHCHECK`, as the OCI config spells it.
@@ -658,6 +717,7 @@ pub(crate) fn parse_image_config(blob: &str) -> ImageConfig {
         repo_digest: None,
         history: history_after(blob),
         architecture: first_str(blob, "architecture").and_then(nonempty),
+        volumes: volumes_after(cfg),
     }
 }
 
@@ -2464,10 +2524,20 @@ fn process_layer(
         // subordinate range mapped, dropping the flag is what lets an image that gives a directory to
         // a non-root user hand it to that same user inside the box; without one there is no id to
         // give it to, and the flag keeps the extraction from failing on every chown.
+        // FILE CAPABILITIES, WITH THE SETUID BITS AND FOR THE SAME REASON (see `SetuidBits`): an
+        // image's `newuidmap` is `cap_setuid=ep` on Alpine, not setuid, and rootless BuildKit stops
+        // at "newuidmap: Could not set caps" without it. Written by this namespace's root, the kernel
+        // stores it as a v3 capability whose root id is the caller's uid: honoured in a box, whose
+        // root is that uid, and by nothing on the host. MEASURED: such a copy of `cat` runs on the
+        // host with CapEff 0. `--dest` takes neither.
+        let caps = setuid == SetuidBits::Keep && tar_takes_xattrs();
         let run_tar = |keep: bool| -> Result<bool, OciError> {
             let mut args = vec!["-xf", &filtered_s, "-C", &staging_s, "--same-permissions"];
             if !keep {
                 args.push("--no-same-owner");
+            }
+            if caps {
+                args.extend(["--xattrs", "--xattrs-include=security.capability"]);
             }
             Command::new("tar")
                 .args(&args)
@@ -3189,11 +3259,20 @@ fn rechecksum(header: &mut [u8; TAR_BLOCK]) {
 /// another owner kept as it was would come out setuid-ROOT, a privilege the image never had. Only
 /// those lose the bit. A PAX record carrying `uid`/`gid` would override the fields rewritten here, so
 /// one is refused rather than exported with an owner this pass did not set.
+///
+/// FILE CAPABILITIES, from `caps_root` (the tree being archived): a regular file carrying
+/// `security.capability` there is preceded by a PAX record with it, the form docker's layers carry,
+/// and nothing else changes. Not `tar --xattrs`, which turns the whole archive to the POSIX format
+/// with an `atime` and a `ctime` on EVERY member (MEASURED, GNU tar 1.35), so the same image would
+/// export to another digest each time it was read. The value goes out as a v2 capability, which is
+/// what the image means: a v3 one whose root is the box's (`root_uid`) is rewritten, one of another
+/// root is not the image's and is dropped.
 pub(crate) fn normalize_for_export(
     r: &mut impl std::io::Read,
     w: &mut impl std::io::Write,
     root_uid: u64,
     root_gid: u64,
+    caps_root: Option<&Path>,
 ) -> Result<(), OciError> {
     let bad = |m: &str| OciError::Extract(m.to_string());
     let wr = |w: &mut dyn std::io::Write, b: &[u8]| -> Result<(), OciError> {
@@ -3201,6 +3280,8 @@ pub(crate) fn normalize_for_export(
             .map_err(|e| OciError::Extract(format!("write exported layer: {e}")))
     };
     let mut header = [0u8; TAR_BLOCK];
+    // The GNU long name (`L`) of the member that follows it, which its own header holds truncated.
+    let mut long_name: Option<Vec<u8>> = None;
     loop {
         let n = read_block(r, &mut header).map_err(|e| OciError::Tool("tar", e.to_string()))?;
         if n == 0 {
@@ -3237,10 +3318,25 @@ pub(crate) fn normalize_for_export(
                         ));
                     }
                 }
+                if typeflag == b'L' {
+                    let name = raw.get(..size as usize).unwrap_or_default();
+                    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                    long_name = name.get(..end).map(<[u8]>::to_vec);
+                }
                 wr(w, &header)?;
                 wr(w, &raw)?;
             }
             _ => {
+                let name = long_name
+                    .take()
+                    .unwrap_or_else(|| tar_field(&header[0..100]).into_bytes());
+                if let (Some(root), true) = (caps_root, matches!(typeflag, b'0' | 0 | b'7')) {
+                    if let Some(cap) = member_capability(root, &name, root_uid) {
+                        let (h, data) = pax_capability_record(&cap);
+                        wr(w, &h)?;
+                        wr(w, &data)?;
+                    }
+                }
                 if header[100] & 0x80 == 0 && matches!(typeflag, b'0' | 0 | b'7') {
                     let mode = tar_num(&header[100..108]).unwrap_or(0);
                     let uid = tar_num(&header[108..116]);
@@ -3270,6 +3366,92 @@ pub(crate) fn normalize_for_export(
             }
         }
     }
+}
+
+/// The `security.capability` of member `name` under `root`, as an image carries it (v2), or `None`:
+/// none there, or a v3 one whose root is not the box's (`root_uid`), which is not the image's. A
+/// name that climbs out of `root` is answered `None` (the vetted stream has none; this does not rely
+/// on it).
+fn member_capability(root: &Path, name: &[u8], root_uid: u64) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let rel = std::path::Path::new(std::ffi::OsStr::from_bytes(name));
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let path = std::ffi::CString::new(root.join(rel).as_os_str().as_bytes()).ok()?;
+    let mut buf = [0u8; 64];
+    // SAFETY: a NUL-terminated path and a buffer of the length passed.
+    let n = unsafe {
+        libc::lgetxattr(
+            path.as_ptr(),
+            c"security.capability".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let v = buf.get(..usize::try_from(n).ok()?)?;
+    capability_for_export(v, root_uid)
+}
+
+/// A `security.capability` value as an image layer carries it: v2 kept, a v3 one of the box's root
+/// rewritten as v2 (its root id dropped), anything else `None`.
+fn capability_for_export(v: &[u8], root_uid: u64) -> Option<Vec<u8>> {
+    const REVISION_MASK: u32 = 0xFF00_0000;
+    const REVISION_2: u32 = 0x0200_0000;
+    const REVISION_3: u32 = 0x0300_0000;
+    let magic = u32::from_le_bytes(v.get(..4)?.try_into().ok()?);
+    match (magic & REVISION_MASK, v.len()) {
+        (REVISION_2, 20) => Some(v.to_vec()),
+        (REVISION_3, 24) => {
+            let rootid = u32::from_le_bytes(v.get(20..24)?.try_into().ok()?);
+            if u64::from(rootid) != root_uid {
+                return None;
+            }
+            let mut out = v.get(..20)?.to_vec();
+            out.get_mut(..4)?
+                .copy_from_slice(&((magic & !REVISION_MASK) | REVISION_2).to_le_bytes());
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// A PAX extended header (`x`) carrying `SCHILY.xattr.security.capability=<cap>`, and its data padded
+/// to whole blocks. Root-owned, mtime 0: the same bytes for the same capability, every time.
+fn pax_capability_record(cap: &[u8]) -> ([u8; TAR_BLOCK], Vec<u8>) {
+    const KEY: &[u8] = b"SCHILY.xattr.security.capability";
+    // `<len> <key>=<value>\n`, where `<len>` counts its own digits.
+    let body = 1 + KEY.len() + 1 + cap.len() + 1;
+    let mut len = body + 1;
+    while len != body + len.to_string().len() {
+        len = body + len.to_string().len();
+    }
+    let mut data = Vec::with_capacity(len.div_ceil(TAR_BLOCK) * TAR_BLOCK);
+    data.extend_from_slice(len.to_string().as_bytes());
+    data.push(b' ');
+    data.extend_from_slice(KEY);
+    data.push(b'=');
+    data.extend_from_slice(cap);
+    data.push(b'\n');
+    let size = data.len();
+    data.resize(size.div_ceil(TAR_BLOCK) * TAR_BLOCK, 0);
+    let mut h = [0u8; TAR_BLOCK];
+    let name = b"./PaxHeaders/capability";
+    h[..name.len()].copy_from_slice(name);
+    h[100..107].copy_from_slice(b"0000644");
+    h[108..115].copy_from_slice(b"0000000");
+    h[116..123].copy_from_slice(b"0000000");
+    h[124..135].copy_from_slice(format!("{size:011o}").as_bytes());
+    h[136..147].copy_from_slice(b"00000000000");
+    h[156] = b'x';
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    rechecksum(&mut h);
+    (h, data)
 }
 
 /// Clear the setuid/setgid bits (`0o6000`) from a regular-file tar header IN PLACE, recomputing the
@@ -3979,10 +4161,67 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
             remove_no_follow(&target)?;
             if std::fs::rename(&src, &target).is_err() {
                 std::fs::copy(&src, &target).map_err(|e| OciError::Extract(e.to_string()))?;
+                // A copy drops the file capability the extraction kept (see `run_tar`).
+                copy_file_capability(&src, &target);
             }
         }
     }
     Ok(())
+}
+
+/// Does this host's `tar` take `--xattrs` (GNU tar does; BusyBox's does not)? Asked once.
+pub(crate) fn tar_takes_xattrs() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        Command::new("tar")
+            .args([
+                "--xattrs",
+                "--xattrs-include=security.capability",
+                "--version",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
+/// Copy `security.capability` from `src` to `dst`, best-effort, without following a symlink at
+/// either end.
+fn copy_file_capability(src: &Path, dst: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let (Ok(s), Ok(d)) = (
+        std::ffi::CString::new(src.as_os_str().as_bytes()),
+        std::ffi::CString::new(dst.as_os_str().as_bytes()),
+    ) else {
+        return;
+    };
+    let name = c"security.capability";
+    let mut buf = [0u8; 64];
+    // SAFETY: both paths are NUL-terminated, and the buffer's length is the one passed.
+    let n = unsafe {
+        libc::lgetxattr(
+            s.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let Ok(n) = usize::try_from(n) else {
+        return;
+    };
+    let Some(value) = buf.get(..n) else {
+        return;
+    };
+    unsafe {
+        libc::lsetxattr(
+            d.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
 }
 
 /// An open DIRECTORY descriptor, used to read and change a directory's mode by OBJECT rather than by
@@ -6467,6 +6706,26 @@ mod tests {
         );
     }
 
+    /// `Volumes` keys become the image's volume paths: normalised (no trailing `/`), each once, and a
+    /// path that is not absolute, climbs with `..`, is `/` itself, or carries a byte that would change
+    /// its meaning in a `-v` spec (`:`) is dropped. The config comes off an untrusted registry.
+    #[test]
+    fn image_volumes_are_absolute_normalised_and_safe() {
+        let c = parse_image_config(
+            r#"{"config":{"Volumes":{"/var/lib/docker":{},"/data/":{},"/data":{},"rel":{},"/a/../etc":{},"/":{},"/x:y":{},"/ok/sub":{"nested":"/no"}},"Cmd":["x"]}}"#,
+        );
+        assert_eq!(c.volumes, vec!["/var/lib/docker", "/data", "/ok/sub"]);
+        assert!(parse_image_config(r#"{"config":{"Cmd":["x"]}}"#)
+            .volumes
+            .is_empty());
+        let many: Vec<String> = (0..40).map(|i| format!("\"/v{i}\":{{}}")).collect();
+        let c = parse_image_config(&format!(
+            r#"{{"config":{{"Volumes":{{{}}}}}}}"#,
+            many.join(",")
+        ));
+        assert_eq!(c.volumes.len(), MAX_IMAGE_VOLUMES);
+    }
+
     #[test]
     fn exposed_ports_parses_proto_dedups_and_skips_garbage() {
         // The pod port-collision warning reads this. tcp/udp both, insertion order, deduplicated.
@@ -6937,6 +7196,96 @@ mod verified_memory_tests {
         )
     }
 
+    /// ⛔ AN IMAGE'S FILE CAPABILITY IS KEPT IN THE CACHE AND DROPPED FROM A `--dest` TREE, as its
+    /// setuid bits are. The fixture is made the way an image carries one: a file given `cap_setuid=ep`
+    /// in a user namespace, archived by GNU tar with `--xattrs` (a `SCHILY.xattr.security.capability`
+    /// record). Through the whole layer path (verify, filter, vet, extract, merge) the cache's copy
+    /// holds the attribute and the `--dest` copy does not.
+    #[test]
+    fn a_layer_keeps_its_file_capability_in_the_cache_and_not_in_a_dest_tree() {
+        let dir = std::env::temp_dir().join(format!("kern-ut-fcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("dir");
+        std::fs::write(dir.join("src/nu"), b"#!/bin/sh\n").expect("write");
+        // v2 `cap_setuid=ep`: magic 0x02000001 (revision 2, effective), permitted bit 7.
+        let script = format!(
+            "python3 -c \"import os; os.setxattr('{src}/nu', 'security.capability', \
+             bytes.fromhex('0100000280000000000000000000000000000000'))\" && \
+             tar --xattrs --xattrs-include=security.capability --format=posix --owner=0 \
+             --group=0 --numeric-owner -C {src} -cf {dir}/layer.tar nu",
+            src = dir.join("src").display(),
+            dir = dir.display()
+        );
+        let made = Command::new("unshare")
+            .args(["-r", "sh", "-c", &script])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made || !tar_takes_xattrs() {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!(
+                "SKIP: no user namespace, python3 or GNU tar with xattrs to build the fixture"
+            );
+            return;
+        }
+        let tar = std::fs::read(dir.join("layer.tar")).expect("read");
+        let digest = digest_of(&tar);
+        let has_cap = |p: &std::path::Path| {
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).expect("path");
+            unsafe {
+                libc::lgetxattr(
+                    c.as_ptr(),
+                    c"security.capability".as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                ) > 0
+            }
+        };
+        let run = |setuid: SetuidBits, name: &str| {
+            let blob = dir.join(format!("{name}.blob"));
+            std::fs::write(&blob, &tar).expect("blob");
+            let dest = dir.join(name);
+            std::fs::create_dir_all(&dest).expect("dest");
+            process_layer(&blob, &digest, &dest, 1, 1, setuid).map(|()| has_cap(&dest.join("nu")))
+        };
+        // IN A SINGLE-THREADED CHILD: the test harness runs threads, and `unpack_as_root` then
+        // extracts without a namespace (it must not fork a threaded process), where no capability
+        // can be written. A pull runs single-threaded and maps one.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let one = |v: Result<bool, OciError>| match v {
+                Ok(true) => b'y',
+                Ok(false) => b'n',
+                Err(_) => b'e',
+            };
+            let got = [
+                one(run(SetuidBits::Keep, "cache")),
+                one(run(SetuidBits::Strip, "dest")),
+            ];
+            unsafe {
+                libc::write(fds[1], got.as_ptr().cast(), got.len());
+                libc::_exit(0)
+            };
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut got = [0u8; 2];
+        let n = unsafe { libc::read(fds[0], got.as_mut_ptr().cast(), got.len()) };
+        unsafe {
+            libc::close(fds[0]);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(n, 2, "the child said nothing");
+        assert_eq!(got[0], b'y', "the cache lost the file capability: {got:?}");
+        assert_eq!(
+            got[1], b'n',
+            "a --dest tree kept the file capability: {got:?}"
+        );
+    }
+
     /// ⛔ THE MEMORY NEVER VOUCHES FOR A CHANGED FILE. A blob proven once is not hashed again while it
     /// is the same file; overwritten in place (another size) or replaced by a rename (another inode),
     /// it is hashed again and the old digest refused.
@@ -7037,6 +7386,93 @@ mod setuid_bits_tests {
 mod export_tests {
     use super::*;
 
+    /// A capability goes out as an image carries it: v2 as it is, v3 of the box's root rewritten as v2,
+    /// v3 of another root dropped (it is not the image's), anything malformed dropped.
+    #[test]
+    fn a_capability_is_exported_as_v2_and_only_the_boxs() {
+        let v2: Vec<u8> = [1u8, 0, 0, 2, 0x80, 0, 0, 0]
+            .into_iter()
+            .chain([0u8; 12])
+            .collect();
+        let v3 = |root: u32| -> Vec<u8> {
+            let mut v = v2.clone();
+            v[3] = 3;
+            v.extend_from_slice(&root.to_le_bytes());
+            v
+        };
+        assert_eq!(capability_for_export(&v2, 1000), Some(v2.clone()));
+        assert_eq!(capability_for_export(&v3(1000), 1000), Some(v2.clone()));
+        assert_eq!(capability_for_export(&v3(1001), 1000), None);
+        assert_eq!(capability_for_export(&v2[..19], 1000), None);
+        assert_eq!(capability_for_export(&[], 1000), None);
+        // The record is a PAX `x` member whose length prefix counts itself.
+        let (h, data) = pax_capability_record(&v2);
+        assert_eq!(h[156], b'x');
+        let size = tar_num(&h[124..136]).unwrap_or(0) as usize;
+        let rec = &data[..size];
+        let len: usize =
+            std::str::from_utf8(&rec[..rec.iter().position(|&b| b == b' ').unwrap_or(0)])
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0);
+        assert_eq!(len, size, "the length prefix must count the whole record");
+        assert_eq!(data.len() % TAR_BLOCK, 0);
+    }
+
+    /// ⛔ EXPORT CARRIES A FILE CAPABILITY, AND ONLY WHERE THERE IS ONE. A tree with one file given
+    /// `cap_setuid=ep` (in a user namespace, as the cache holds it: v3 of the caller) and one without:
+    /// one record, v2, before the first; the export of the same tree twice is the same bytes (what
+    /// `tar --xattrs` would not give, see `normalize_for_export`).
+    #[test]
+    fn export_carries_a_file_capability_as_v2_and_stays_byte_stable() {
+        let dir = std::env::temp_dir().join(format!("kern-ut-export-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("t")).expect("dir");
+        std::fs::write(dir.join("t/nu"), b"x").expect("nu");
+        std::fs::write(dir.join("t/plain"), b"y").expect("plain");
+        let script = format!(
+            "import os; os.setxattr('{}', 'security.capability', \
+             bytes.fromhex('0100000280000000000000000000000000000000'))",
+            dir.join("t/nu").display()
+        );
+        let made = Command::new("unshare")
+            .args(["-r", "python3", "-c", &script])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("SKIP: no user namespace or python3 to give the fixture a capability");
+            return;
+        }
+        let export = |out: &str| {
+            crate::archive::tar_rootfs_root_owned(&dir.join("t"), &dir.join(out)).expect("export");
+            std::fs::read(dir.join(out)).expect("read")
+        };
+        let a = export("a.tar");
+        let b = export("b.tar");
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = b"SCHILY.xattr.security.capability=";
+        let at: Vec<usize> = a
+            .windows(key.len())
+            .enumerate()
+            .filter(|(_, w)| *w == key)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            at.len(),
+            1,
+            "one capability record, for the one file that has one"
+        );
+        let value = &a[at[0] + key.len()..at[0] + key.len() + 21];
+        assert_eq!(
+            value,
+            &[1u8, 0, 0, 2, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b'\n'][..],
+            "a v2 capability, cap_setuid effective"
+        );
+        assert_eq!(a, b, "the same tree must export to the same bytes");
+    }
+
     /// ⛔ EXPORT KEEPS A ROOT-OWNED SETUID BIT AND FORGES NONE. Every member comes out 0:0, so a
     /// setuid file of another owner would become setuid-root: that one loses the bit, as does a setgid
     /// file of another group, while root's own `sudo` keeps it, as docker's save and push keep it.
@@ -7073,7 +7509,7 @@ mod export_tests {
         assert!(made, "GNU tar is needed to build the fixture");
         let input = std::fs::read(dir.join("in.tar")).expect("read");
         let mut out = Vec::new();
-        normalize_for_export(&mut &input[..], &mut out, 1000, 1000).expect("export");
+        normalize_for_export(&mut &input[..], &mut out, 1000, 1000, None).expect("export");
         let _ = std::fs::remove_dir_all(&dir);
         let mut seen = Vec::new();
         let mut off = 0;

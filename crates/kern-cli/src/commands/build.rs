@@ -1803,6 +1803,17 @@ fn build_run(
                 );
                 i += 1;
             }
+            Instr::Volume(p) => {
+                apply_declaration(&mut config, &instrs[i]);
+                announce(
+                    step,
+                    format!(
+                        "VOLUME {p} (declared by the image - a box gets an anonymous volume there \
+                         unless -v mounts one)"
+                    ),
+                );
+                i += 1;
+            }
             // CONFIG-ONLY, like EXPOSE above: a label changes what the image DECLARES and touches no
             // file, so it costs no box and no layer. It used to be dropped at the parser, which is
             // why `images --filter label=` could answer for a pulled image and not for a built one.
@@ -2281,6 +2292,17 @@ fn build_layered_cached(
                 );
                 i += 1;
             }
+            Instr::Volume(p) => {
+                apply_declaration(&mut config, &instrs[i]);
+                announce(
+                    step,
+                    format!(
+                        "VOLUME {p} (declared by the image - a box gets an anonymous volume there \
+                         unless -v mounts one)"
+                    ),
+                );
+                i += 1;
+            }
             // CONFIG-ONLY, like EXPOSE above: a label changes what the image DECLARES and touches no
             // file, so it costs no box and no layer. It used to be dropped at the parser, which is
             // why `images --filter label=` could answer for a pulled image and not for a built one.
@@ -2470,6 +2492,7 @@ pub fn build_check(args: BuildArgs) -> Result<(), Error> {
                 ("ENTRYPOINT".to_string(), truncate(&a.join(" "), 68))
             }
             crate::dockerfile::Instr::Expose(p) => ("EXPOSE".to_string(), p.clone()),
+            crate::dockerfile::Instr::Volume(p) => ("VOLUME".to_string(), p.clone()),
             crate::dockerfile::Instr::Label(k, _) => ("LABEL".to_string(), k.clone()),
             crate::dockerfile::Instr::StopSignal(s) => ("STOPSIGNAL".to_string(), s.clone()),
             crate::dockerfile::Instr::Healthcheck { test, .. } => {

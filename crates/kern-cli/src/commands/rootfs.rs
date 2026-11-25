@@ -1047,13 +1047,9 @@ pub(crate) unsafe fn copy_one_file(
             }
         }
     }
-    // Carry `user.*` xattrs (application metadata, harmless) - best-effort, BEFORE owner/mtime. We do
-    // NOT carry `security.capability`: file-capabilities are a privilege channel exactly like setuid, and
-    // the source image is UNTRUSTED (a hostile `COPY --from`/push base could ship `/bin/sh` with
-    // `cap_setuid+ep` → escalation in the copied/published image, and file-caps bypass the box's
-    // MS_NOSUID unlike setuid). kern's model grants no file-caps at runtime, so dropping them removes an
-    // injection vector without losing anything usable - the same call kern makes for setuid (stripped at
-    // push). `system.*`/`trusted.*` are skipped too (need privilege, not ours to propagate).
+    // Carry `user.*` xattrs - best-effort, BEFORE owner/mtime; the file capability goes after the
+    // owner (`copy_capability`). `system.*`/`trusted.*` are skipped (need privilege, not ours to
+    // propagate).
     copy_xattrs(rfd, dfd);
     // Preserve owner, then the MODE AGAIN, then mtime, best-effort. The mode given at create time is
     // not enough: the chown CLEARS setuid and setgid, so it went in first and the bits came off.
@@ -1062,6 +1058,7 @@ pub(crate) unsafe fn copy_one_file(
     // path (`own_like_source_dir`) already did chown, then chmod.
     libc::fchown(dfd, st.st_uid, st.st_gid);
     libc::fchmod(dfd, st.st_mode & 0o7777);
+    super::copy_capability(rfd, dfd);
     let times = [
         libc::timespec {
             tv_sec: st.st_atime,
@@ -1555,9 +1552,10 @@ pub(crate) fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<
     // `user.overlay.opaque` becomes a live marker in the layer this copies into, hiding the lower
     // layer's version of it. The attributes are kept deliberately (application metadata, the same
     // choice the merged-view copier makes), and the shape is the author's own context hiding files
-    // from their own image, not a boundary crossing; `security.capability` IS stripped, because that
-    // one is a privilege channel. Stated here because the markers are read on every host since kern
-    // began asking for `userxattr`, where before they were ignored on a kernel that did not imply it.
+    // from their own image, not a boundary crossing; `security.capability` goes with them where the
+    // copy runs as a namespace's root, as the merged-view copier carries it (see `copy_xattrs`). Stated
+    // here because the markers are read on every host since kern began asking for `userxattr`, where
+    // before they were ignored on a kernel that did not imply it.
     let run = || {
         std::process::Command::new("cp")
             .arg("-a")

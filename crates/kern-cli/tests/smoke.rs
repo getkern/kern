@@ -2283,6 +2283,104 @@ fn a_privileged_box_nests_a_cgroup_and_its_cap_still_holds() {
     );
 }
 
+/// An image's `VOLUME` gets an anonymous volume, as under Docker: a directory of kern's volumes,
+/// seeded from the image, mounted at the path; gone with a `--rm` box and with `rm` of a kept one;
+/// and not made where `-v` already mounts something at the path. Built here (`FROM alpine`, a
+/// `VOLUME` and a file under it), with the volumes in a data dir of this test's own.
+#[test]
+fn an_image_volume_gets_an_anonymous_volume_that_goes_with_the_box() {
+    let base = std::env::temp_dir().join(format!("kern-it-anonvol-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("ctx")).expect("ctx");
+    std::fs::write(
+        base.join("ctx/Dockerfile"),
+        "FROM alpine\nRUN mkdir -p /data && echo seeded > /data/f\nVOLUME /data\n",
+    )
+    .expect("dockerfile");
+    let data = base.join("data");
+    let k = |args: &[&str]| {
+        kern()
+            .env("XDG_DATA_HOME", &data)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    let anon = || -> Vec<String> {
+        std::fs::read_dir(data.join("kern/volumes"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.starts_with("kern-anon-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let tag = format!("kern-it-anonvol:{}", std::process::id());
+    let ctx = base.join("ctx");
+    let built = k(&["build", "-q", "-t", &tag, ctx.to_str().expect("utf-8")]);
+    if !built.status.success() {
+        let _ = std::fs::remove_dir_all(&base);
+        eprintln!(
+            "skip: could not build the fixture image: {:?}",
+            out_err(&built)
+        );
+        return;
+    }
+    let probe = "cat /data/f; grep ' /data ' /proc/self/mountinfo | cut -d' ' -f4";
+    let rm_run = k(&["run", "--rm", &tag, "sh", "-c", probe]);
+    let after_rm = anon();
+    let named = k(&[
+        "run",
+        "--rm",
+        "-v",
+        "kern-it-named:/data",
+        &tag,
+        "sh",
+        "-c",
+        probe,
+    ]);
+    let after_named = anon();
+    let kept_name = format!("kav{}", std::process::id());
+    let started = k(&["run", "-d", "-q", "--name", &kept_name, &tag, "sleep", "30"]);
+    let while_kept = anon();
+    let removed = k(&["rm", "-f", &kept_name]);
+    let after_kept = anon();
+    let _ = k(&["rmi", &tag]);
+    let _ = k(&["volume", "rm", "kern-it-named"]);
+    let _ = std::fs::remove_dir_all(&base);
+
+    let (out, err) = out_err(&rm_run);
+    assert!(
+        out.contains("seeded") && out.contains("/kern-anon-"),
+        "the volume must be seeded from the image and mounted from kern's volumes: {out} {err}"
+    );
+    assert!(
+        after_rm.is_empty(),
+        "a --rm box's anonymous volume outlived it: {after_rm:?}"
+    );
+    let (out, _) = out_err(&named);
+    assert!(
+        out.contains("/kern-it-named/") && !out.contains("kern-anon-"),
+        "-v at the path replaces the anonymous volume: {out}"
+    );
+    assert!(
+        after_named.is_empty(),
+        "an anonymous volume was made under a -v: {after_named:?}"
+    );
+    assert!(started.status.success(), "{:?}", out_err(&started));
+    assert!(
+        while_kept
+            .iter()
+            .any(|n| n.starts_with(&format!("kern-anon-{kept_name}-"))),
+        "a kept box's anonymous volume: {while_kept:?}"
+    );
+    assert!(removed.status.success(), "{:?}", out_err(&removed));
+    assert!(
+        after_kept.is_empty(),
+        "rm left the box's anonymous volume: {after_kept:?}"
+    );
+}
+
 /// A stack whose FIRST service is refused must not leave its pod behind.
 ///
 /// MEASURED before the guard existed, on 0.9.32-37-g02ecedf: `compose up` printed

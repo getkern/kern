@@ -1412,6 +1412,8 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         history: committed_history(&inst.image, box_ref),
         // The box ran on this machine, so its filesystem is this machine's architecture.
         architecture: Some(kern_oci::Platform::host().as_oci_arch().to_string()),
+        // OCI metadata like the rest: a snapshot recovers no `VOLUME`.
+        volumes: Vec::new(),
     };
     write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg)
         .map_err(|e| Error::Oci(format!("commit image config: {e}")))?;

@@ -735,12 +735,25 @@ fn say_what_the_egress_filter_cannot_close(args: &BoxRunArgs) {
 /// through per-file whiteouts and through opaque directories that carry no `.wh.` file at all. A
 /// single-layer image cannot hold a cross-layer opaque and is copied directly, which is the same
 /// split the push path makes.
-fn seed_empty_named_volumes(lower: &[String], volumes: &[Volume]) {
+///
+/// AN EMPTY IMAGE DIRECTORY NEEDS NO COPY, only its owner and mode, and those the BOX sets: the
+/// targets returned go to `SandboxSpec::own_volume_targets`. The commonest volume is exactly that (a
+/// database's data directory, docker-in-docker's `/var/lib/docker`, an image's `VOLUME`), and the
+/// namespace below cost it two helper processes: MEASURED, an anonymous volume at redis's `/data`
+/// started 2.0 ms slower than a bind there. Only a target with something to copy takes the namespace.
+fn seed_empty_named_volumes(lower: &[String], volumes: &[Volume]) -> Vec<String> {
     // NOTHING TO SEED: the common case, and it must cost nothing. Checked before the fork, because a
     // fork per box start would be a real cost on the hot path for a job that is almost always empty.
     let seedable: Vec<&Volume> = volumes.iter().filter(|v| is_seedable(v)).collect();
     if seedable.is_empty() {
-        return;
+        return Vec::new();
+    }
+    let (own, seedable): (Vec<&Volume>, Vec<&Volume>) = seedable
+        .into_iter()
+        .partition(|v| image_dir_is_empty(lower, &v.target));
+    let own: Vec<String> = own.iter().map(|v| v.target.clone()).collect();
+    if seedable.is_empty() {
+        return own;
     }
     // INSIDE THE MAPPED NAMESPACE, so the copy can carry the image's OWNERSHIP onto the volume and
     // the volume's own root can be given the image directory's owner and mode.
@@ -762,6 +775,26 @@ fn seed_empty_named_volumes(lower: &[String], volumes: &[Volume]) {
         // No namespace to map: the volume stays empty, which is where it started and what every kern
         // volume did before this existed.
     }
+    own
+}
+
+/// Does the image hold NOTHING at `target` but, at most, empty directories: in no layer a file, a
+/// link or a directory with an entry? Conservative on purpose: a whiteout, an opaque directory's
+/// marker or anything else is an entry, and sends the volume to the copying seed, which reads the
+/// kernel's merged view. Only a plain "nothing to copy" takes the box-side owner.
+fn image_dir_is_empty(lower: &[String], target: &str) -> bool {
+    let rel = target.trim_matches('/');
+    if rel.is_empty() || lower.is_empty() {
+        return false;
+    }
+    lower.iter().all(|layer| {
+        let p = std::path::Path::new(layer).join(rel);
+        match std::fs::symlink_metadata(&p) {
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(m) if m.is_dir() => std::fs::read_dir(&p).is_ok_and(|mut d| d.next().is_none()),
+            Ok(_) => false,
+        }
+    })
 }
 
 /// May this mount be seeded from the image? Three conditions, each excluding a different mistake.
@@ -2270,7 +2303,45 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             }),
         );
     }
-    seed_empty_named_volumes(&lower, &volumes);
+    // AN IMAGE'S `VOLUME` GETS AN ANONYMOUS VOLUME, as a docker container gets one: a directory of
+    // kern's volumes, seeded from the image like a named one (below), bind-mounted at the path, so
+    // what the workload writes there is outside the box's layer. MEASURED before: docker:dind's
+    // dockerd found `/var/lib/docker` on the box's overlay, where overlay2 cannot run, and fell back
+    // to `vfs`; postgres, mysql and redis wrote their data into the layer. Not where a mount of the
+    // box's own (`-v`, `--tmpfs`) already is, as docker skips it. Named after the box and the path
+    // (`volume::anon_name`), recorded with the box's named volumes, removed with the box.
+    let mut anon_specs: Vec<String> = Vec::new();
+    if !image_config.volumes.is_empty() {
+        let norm = |t: &str| t.trim_end_matches('/').to_string();
+        let mut covered: Vec<String> = volumes.iter().map(|v| norm(&v.target)).collect();
+        covered.extend(
+            quota_specs
+                .iter()
+                .chain(net_specs.iter())
+                .filter_map(|s| crate::volume::spec_target(s))
+                .map(norm),
+        );
+        covered.extend(
+            args.tmpfs
+                .iter()
+                .filter_map(|t| t.split(':').next())
+                .map(norm),
+        );
+        for dest in &image_config.volumes {
+            if covered.iter().any(|c| c == dest) {
+                continue;
+            }
+            let name = crate::volume::anon_name(args.name, dest);
+            let source = crate::volume::resolve_named(&name)?;
+            volumes.push(Volume {
+                source,
+                target: dest.clone(),
+                read_only: false,
+            });
+            anon_specs.push(format!("{name}:{dest}"));
+        }
+    }
+    let own_volume_targets = seed_empty_named_volumes(&lower, &volumes);
     // Resolve the effective command from the image config (docker semantics: Entrypoint + the user's
     // command, else the image's Cmd; a shell if nothing is set). `--ssh` with no command keeps the
     // box alive instead. Explicit `-- CMD` always wins over the image's Cmd.
@@ -2932,6 +3003,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             .unwrap_or_default(),
         idmap_binds,
         socket_binds,
+        own_volume_targets,
         no_new_privs,
         vdisks,
         secrets,
@@ -3012,7 +3084,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // Each box records the named volumes it mounts (below, in the registry) BEFORE it mounts them, so
     // `kern volume rm` sees an in-use volume and refuses - race-free without holding an fd open on the
     // volume dir (which would disturb the sandbox's mount setup).
-    let mounted_vols = mounted_named_volumes(args.volumes);
+    // The anonymous volumes too, so `kern volume rm` leaves them alone while the box runs.
+    let mounted_vols = mounted_named_volumes(&[args.volumes, anon_specs.as_slice()].concat());
     if standalone_persistent && !systemd_supervises {
         // Fell through the systemd branch above because no `systemd --user` manager is reachable. The
         // box still runs and restarts on any exit (in-process, via `restart_always` above); it just does
@@ -3579,6 +3652,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     &pod_label,
                     std::slice::from_ref(&args.name.to_string()),
                 );
+                // And its anonymous volumes, as `docker run --rm` removes a container's. Only when
+                // it had some: the removal lists kern's volumes, which is a directory read on the
+                // exit path of every `--rm` box (MEASURED: +22 getdents64 for an image with none).
+                if !anon_specs.is_empty() {
+                    crate::volume::remove_anon_of(args.name);
+                }
             }
             // A kept box remembers how its last run ended, which is what `kern ps -a` shows for it.
             // Best effort: a code that could not be recorded costs a column, not the box.
@@ -6136,6 +6215,14 @@ fn supervise_box(
             final_code,
             ran_once.then_some(log_key.as_str()),
         );
+        // Its anonymous volumes go with it, as `docker run --rm` removes a container's: only when
+        // its record names one, so a box without pays no directory read on its way out.
+        if inst
+            .volume_names()
+            .any(|v| crate::volume::is_anon_of(v, &inst.name))
+        {
+            crate::volume::remove_anon_of(&inst.name);
+        }
     } else {
         registry::set_box_exit(
             std::process::id() as i32,

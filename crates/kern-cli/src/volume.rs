@@ -151,6 +151,96 @@ pub fn resolve_named(name: &str) -> Result<String, Error> {
     Ok(real.to_string_lossy().into_owned())
 }
 
+// ─────────────────────────── anonymous volumes (an image's VOLUME) ───────────────────────────
+
+/// What every anonymous volume's name starts with.
+const ANON_PREFIX: &str = "kern-anon-";
+
+/// The anonymous volume box `box_name` gets at `dest`, an image's `VOLUME`, as a docker container
+/// gets one: `kern-anon-<box>-<16 hex of dest>`. The SAME name at every start of that box, so a box
+/// restarted, or recreated by `compose up` under its name, finds its data as a docker container's
+/// anonymous volume survives both; a new box of another name gets a fresh one. The hash is FNV-1a
+/// over the path: a name, not a secret.
+pub(crate) fn anon_name(box_name: &str, dest: &str) -> String {
+    format!(
+        "{ANON_PREFIX}{}-{:016x}",
+        anon_box_part(box_name),
+        fnv1a(dest)
+    )
+}
+
+/// The box's part of an anonymous volume's name: the name itself, or `h<16 hex>` of it when it is
+/// long enough to take the whole name past a volume name's limit.
+fn anon_box_part(box_name: &str) -> String {
+    if box_name.len() <= 120 {
+        box_name.to_string()
+    } else {
+        format!("h{:016x}", fnv1a(box_name))
+    }
+}
+
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// The mount point of a `-v` spec: the second field of `src:dst[:opts]`, or, for a network URL
+/// (`nfs://host/path:/dst[:ro]`), the field before an optional `ro`/`rw`.
+pub(crate) fn spec_target(spec: &str) -> Option<&str> {
+    if is_network(spec) {
+        let s = spec
+            .strip_suffix(":ro")
+            .or_else(|| spec.strip_suffix(":rw"))
+            .unwrap_or(spec);
+        return s.rsplit_once(':').map(|(_, d)| d);
+    }
+    spec.split(':').nth(1)
+}
+
+/// Is `volume` one of box `box_name`'s anonymous volumes ([`anon_name`])? Exactly `<prefix><box>-`
+/// then 16 hex digits, so box `a` never claims box `a-b`'s.
+pub(crate) fn is_anon_of(volume: &str, box_name: &str) -> bool {
+    let part = anon_box_part(box_name);
+    volume
+        .strip_prefix(ANON_PREFIX)
+        .and_then(|r| r.strip_prefix(part.as_str()))
+        .and_then(|r| r.strip_prefix('-'))
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Remove box `box_name`'s anonymous volumes, as `docker rm -v` and `--rm` remove a container's:
+/// when the box goes, so does what only it could reach. Called by whoever ends the box, so the box
+/// itself may still be listed (a `--rm` box's supervisor removes its own as it exits): a volume
+/// ANOTHER running box mounts is left, as `kern volume rm` leaves it. Best-effort; the names removed
+/// are returned.
+pub(crate) fn remove_anon_of(box_name: &str) -> Vec<String> {
+    let dir = volumes_dir();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mine: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| is_anon_of(n, box_name))
+        .collect();
+    if mine.is_empty() {
+        return Vec::new();
+    }
+    let in_use: std::collections::HashSet<String> = crate::registry::list()
+        .iter()
+        .filter(|b| b.name != box_name)
+        .flat_map(|b| b.volume_names().map(str::to_string))
+        .collect();
+    mine.into_iter()
+        .filter(|n| !in_use.contains(n))
+        .filter(|n| crate::commands::remove_tree_mapped(&dir.join(n)).is_ok())
+        .collect()
+}
+
 // ─────────────────────────── network volumes (nfs/smb/sshfs) ───────────────────────────
 
 /// A network filesystem scheme.
@@ -1228,6 +1318,46 @@ pub fn rename_if_absent(old: &str, new: &str) -> Result<bool, Error> {
 
 #[cfg(test)]
 mod tests {
+    use super::{anon_name, is_anon_of, spec_target};
+
+    /// An anonymous volume's name is the box's and the path's, the same at every start; box `a`
+    /// never claims box `a-b`'s; a box name too long for the limit is hashed, and still recognised.
+    #[test]
+    fn an_anonymous_volume_is_named_by_its_box_and_path_and_claimed_by_that_box_only() {
+        let a = anon_name("a", "/data");
+        assert_eq!(a, anon_name("a", "/data"), "the same name at every start");
+        assert_ne!(a, anon_name("a", "/var/lib/docker"));
+        assert!(is_anon_of(&a, "a"));
+        assert!(
+            !is_anon_of(&anon_name("a-b", "/data"), "a"),
+            "box a must not claim a-b's"
+        );
+        assert!(!is_anon_of(&a, "a-b"));
+        assert!(
+            !is_anon_of("kern-anon-a-xyz", "a"),
+            "16 hex digits, nothing else"
+        );
+        assert!(!is_anon_of("data", "a"));
+        let long = "x".repeat(150);
+        let l = anon_name(&long, "/data");
+        assert!(kern_common::valid_resource_name(&l), "{l}");
+        assert!(is_anon_of(&l, &long));
+        assert!(kern_common::valid_resource_name(&a));
+    }
+
+    /// The mount point of a `-v` spec, for a host path, a name and a network URL.
+    #[test]
+    fn a_specs_mount_point_is_read_for_every_kind_of_source() {
+        assert_eq!(spec_target("/srv:/data:ro"), Some("/data"));
+        assert_eq!(
+            spec_target("pg:/var/lib/postgresql/data"),
+            Some("/var/lib/postgresql/data")
+        );
+        assert_eq!(spec_target("nfs://host/export:/mnt:ro"), Some("/mnt"));
+        assert_eq!(spec_target("sshfs://u@h/p:/mnt"), Some("/mnt"));
+        assert_eq!(spec_target("lonely"), None);
+    }
+
     /// THE INVERSE OF `resolve_named` MUST AGREE WITH IT, and nothing else may claim to be a volume.
     ///
     /// The seeding path holds a RESOLVED `-v` source - `<volumes_dir>/<name>/data` - and has to

@@ -152,14 +152,20 @@ pub enum Instr {
     Cmd(Vec<String>),
     Entrypoint(Vec<String>),
     Expose(String),
+    /// `VOLUME`, one path per instruction (`VOLUME /a /b` and `VOLUME ["/a","/b"]` give two): the image
+    /// declares it, and a box gets an anonymous volume there unless a mount of its own covers it.
+    Volume(String),
     /// An instruction kern PARSES AND DOES NOT ACT ON, carried so it leaves a trace.
     ///
-    /// `VOLUME` was dropped in the parser with a comment and no output: the build said nothing, the
-    /// image said nothing, and a reader had to know kern's source to learn that the line had no
+    /// `VOLUME` was once dropped in the parser with a comment and no output: the build said nothing,
+    /// the image said nothing, and a reader had to know kern's source to learn that the line had no
     /// effect. A dropped instruction is a difference between what the file says and what the image
     /// is, and this codebase's rule about differences is that they are NAMED. Carrying it as an
     /// instruction means one list describes the whole file, so `build --check` reports from the
-    /// parser's own output rather than from a second scanner that could disagree with it.
+    /// parser's own output rather than from a second scanner that could disagree with it. NO
+    /// instruction is dropped today (`VOLUME` is declared since 23/11); the variant is how the next
+    /// one would be reported, which is why it stays.
+    #[allow(dead_code)]
     Dropped {
         keyword: String,
         /// One line, present tense, saying what happens instead. Shown by `build --check` and by a
@@ -942,11 +948,22 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
             // a run-time concern), so there is no filesystem effect to reproduce - but the line is
             // recorded rather than vanishing, because "kern did nothing with this" is a fact the
             // reader of a build is entitled to.
-            "VOLUME" => out.push(Instr::Dropped {
-                keyword: "VOLUME".to_string(),
-                why: "a declaration with no build-time effect; mount it at run with -v, or as a \
-                      compose `volumes:` entry",
-            }),
+            // DECLARED IN THE IMAGE, as docker declares it: no build-time effect, and at run a box
+            // gets an anonymous volume at each path no mount of its own covers. Both of Docker's
+            // forms: a JSON array, or paths separated by spaces.
+            "VOLUME" => {
+                let text = subst(rest, &vars);
+                let paths = if text.trim_start().starts_with('[') {
+                    parse_exec_array(text.trim()).ok_or_else(|| {
+                        format!("Dockerfile line {lineno}: VOLUME's JSON form must be an array of strings")
+                    })?
+                } else {
+                    split_ws(&text)
+                };
+                for p in paths {
+                    out.push(Instr::Volume(p));
+                }
+            }
             // `SHELL ["/bin/bash","-c"]` swaps the shell that wraps subsequent shell-form
             // RUN/CMD/ENTRYPOINT. Must be a JSON exec array (Docker's rule); anything else is an error.
             "SHELL" => {
@@ -2301,13 +2318,10 @@ mod tests {
     /// last two that lost a contract the file states: a Dockerfile healthcheck vanished, and a peer
     /// with `depends_on: condition: service_healthy` on that service could never be satisfied.
     ///
-    /// For `VOLUME` the FILESYSTEM answer is still nothing, and that part has not changed: it
-    /// declares a runtime mount point, and Docker's own build does nothing with it either. What
-    /// changed is that it is no longer INVISIBLE. It emitted no instruction at all, so the build
-    /// printed nothing, the image recorded nothing, and only kern's source said the line had no
-    /// effect. It now carries an [`Instr::Dropped`], which is what lets a build announce it and
-    /// `build --check` report it - from the parser's own list, rather than from a second scan of the
-    /// file that could disagree with what the builder will actually execute.
+    /// For `VOLUME` the FILESYSTEM answer is still nothing: it declares a runtime mount point, and
+    /// Docker's own build does nothing with it either. It was once invisible (no instruction), then a
+    /// trace ([`Instr::Dropped`]); since 23/11 it is DECLARED in the image, as Docker declares it, and
+    /// a box gets an anonymous volume there.
     ///
     /// This test was RED when that changed, which is what it is for: the instruction stream is a
     /// contract, and a deliberate change to it has to be written down rather than absorbed.
@@ -2318,16 +2332,11 @@ mod tests {
         assert_eq!(got[0], from("alpine"));
         // A TRACE, NOT AN EFFECT: the instruction exists so a reader can be told, and carries a
         // sentence saying what happens instead. Nothing downstream acts on it.
-        match &got[1] {
-            Instr::Dropped { keyword, why } => {
-                assert_eq!(keyword, "VOLUME");
-                assert!(
-                    why.contains("-v") || why.contains("volumes:"),
-                    "the note must say where a volume IS mounted: {why}"
-                );
-            }
-            other => panic!("VOLUME must leave a trace, got {other:?}"),
-        }
+        assert_eq!(
+            got[1],
+            Instr::Volume("/data".to_string()),
+            "VOLUME is declared"
+        );
         assert_eq!(
             got[2],
             Instr::Healthcheck {

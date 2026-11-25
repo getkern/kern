@@ -289,6 +289,11 @@ pub struct SandboxSpec {
     /// Box targets where a bind may be a SOCKET: a build step's SSH agent proxies. Everywhere else a
     /// socket source is refused (see [`setup_volumes`]).
     pub socket_binds: Vec<String>,
+    /// Box targets whose (empty, directory) volume source takes the OWNER AND MODE the box's own root
+    /// filesystem has at the target, set by the box before the bind (see [`setup_volumes`]). How an
+    /// empty named or anonymous volume gets the image directory's ownership, as Docker gives it,
+    /// without a user namespace of its own: the box's root already maps the image's ids.
+    pub own_volume_targets: Vec<String>,
     /// vDisk profiles to mount at `/vdisk/<name>` in the box (from `vdisk:` profiles).
     pub vdisks: Vec<VdiskMount>,
     /// Secrets to expose as `/run/secrets/<name>` (mode 0400), from `--secret`. The bytes were read
@@ -2006,7 +2011,12 @@ fn child_setup_and_exec(
     // both, and `python /tmp/job.py` failed with ENOENT where Docker ran it.
     let (outer, inner) = split_tmpfs_around_volumes(&spec.tmpfs, &spec.volumes);
     setup_tmpfs(&spec.root, &outer)?;
-    setup_volumes(&spec.root, &spec.volumes, &spec.socket_binds)?;
+    setup_volumes(
+        &spec.root,
+        &spec.volumes,
+        &spec.socket_binds,
+        &spec.own_volume_targets,
+    )?;
     setup_vdisk(&spec.root, &spec.vdisks)?;
     setup_tmpfs(&spec.root, &inner)?;
     // `--ssh` needs a box-owned tmpfs over ALL of `/run` (so `/run/sshd` is namespace-root-owned for
@@ -2913,6 +2923,35 @@ fn expand_cpu_list(s: &str) -> Vec<usize> {
 /// check (in the parent) and the bind (here, post-fork) - the CVE-2021-30465 symlink-exchange race.
 /// Resolving it ourselves with `O_NOFOLLOW` and mounting from the pinned fd makes a swap FAIL the walk,
 /// never redirect it: the bind is either the checked inode or an error. Symmetric with the target side.
+/// Give the volume source `src_fd` (an `O_PATH` descriptor of an empty directory) the owner and
+/// mode of `tgt_fd`, the directory the box's root filesystem has where it will be mounted.
+fn take_target_owner(src_fd: libc::c_int, tgt_fd: libc::c_int) {
+    // SAFETY: two descriptors this function only reads metadata of, or changes the owner and mode
+    // of; `st` is a plain struct the kernel fills.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(tgt_fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return;
+    }
+    let empty = c"";
+    if unsafe {
+        libc::fchownat(
+            src_fd,
+            empty.as_ptr(),
+            st.st_uid,
+            st.st_gid,
+            libc::AT_EMPTY_PATH,
+        )
+    } != 0
+    {
+        return;
+    }
+    // The mode AFTER the owner, whose change clears setgid; through the descriptor's own path, since
+    // an `O_PATH` descriptor takes no `fchmod`.
+    if let Ok(p) = cstr(&format!("/proc/self/fd/{src_fd}")) {
+        unsafe { libc::chmod(p.as_ptr(), st.st_mode & 0o7777) };
+    }
+}
+
 fn open_source_nofollow(src: &str) -> Result<libc::c_int, Error> {
     // ONE SYSCALL FOR THE DIRECTORIES WHERE THE KERNEL HAS IT. `openat2` with `RESOLVE_NO_SYMLINKS`
     // refuses a link anywhere on the path, which is what the walk below does one `openat` per
@@ -3437,7 +3476,12 @@ fn recv_indexed_fd(sock: libc::c_int) -> Option<(u32, libc::c_int)> {
     Some((u32::from_ne_bytes(data), fd))
 }
 
-fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Result<(), Error> {
+fn setup_volumes(
+    root: &str,
+    vols: &[Volume],
+    socket_targets: &[String],
+    own_targets: &[String],
+) -> Result<(), Error> {
     if vols.is_empty() {
         return Ok(());
     }
@@ -3548,6 +3592,13 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
                 break;
             }
         };
+        // THE IMAGE DIRECTORY'S OWNER AND MODE onto an empty volume (`own_volume_targets`): read
+        // from the target as the box's root filesystem has it, set by this process, root of the
+        // box's mapped namespace. Before the bind, so the workload never sees the volume otherwise.
+        // Best-effort, as the seeding it replaces: a volume left as it was is what kern did before.
+        if is_dir && own_targets.iter().any(|t| t == &v.target) {
+            take_target_owner(src_fd, tgt_fd);
+        }
         // Both ends addressed by their pinned fd (a decimal fd can never contain a NUL, so these
         // cannot fail - returned as an error, not asserted, since box mount-setup has no message path).
         let src = cstr(&format!("/proc/self/fd/{src_fd}"))?;

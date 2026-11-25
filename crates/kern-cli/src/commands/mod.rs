@@ -1429,6 +1429,8 @@ struct BuildSpec<'a> {
     idmap_binds: Vec<(String, String)>,
     /// Box targets where a SOCKET may be bound: a build step's SSH agents, nothing else.
     socket_binds: Vec<String>,
+    /// See `kern_isolation::SandboxSpec::own_volume_targets`.
+    own_volume_targets: Vec<String>,
     /// `--security-opt no-new-privileges`.
     no_new_privs: bool,
     vdisks: Vec<kern_isolation::VdiskMount>,
@@ -1802,6 +1804,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         ldconfig_dirs: b.ldconfig_dirs,
         idmap_binds: b.idmap_binds,
         socket_binds: b.socket_binds,
+        own_volume_targets: b.own_volume_targets,
         no_new_privs: b.no_new_privs,
         vdisks: b.vdisks,
         secrets: b.secrets,
@@ -4519,12 +4522,10 @@ fn ensure_repo_tag(image: &str) -> String {
     }
 }
 
-/// Copy the `user.*` extended attributes from `src_fd` to `dst_fd`, best-effort. Carries ONLY `user.*`
-/// (application metadata, no privilege). Deliberately NOT `security.capability`: file-capabilities are a
-/// privilege channel like setuid, and the source image is untrusted - blindly propagating an attacker's
-/// `cap_setuid+ep` would inject an escalation into the copied/pushed image (worse than setuid: caps
-/// bypass MS_NOSUID). `system.*`/`trusted.*` need privilege we don't have. Failures are ignored (xattrs
-/// are best-effort like `cp --preserve=all`; a filesystem without xattr support must not fail the copy).
+/// Copy the `user.*` extended attributes from `src_fd` to `dst_fd`, best-effort (application
+/// metadata). The file capability is [`copy_capability`]'s, after the owner is set, because a chown
+/// removes it. `system.*`/`trusted.*` need privilege we don't have. Failures are ignored (xattrs are
+/// best-effort like `cp --preserve=all`; a filesystem without xattr support must not fail the copy).
 unsafe fn copy_xattrs(src_fd: libc::c_int, dst_fd: libc::c_int) {
     // List the source's xattr names into a buffer. `flistxattr(_, NULL, 0)` returns the needed size.
     let need = libc::flistxattr(src_fd, std::ptr::null_mut(), 0);
@@ -4542,9 +4543,8 @@ unsafe fn copy_xattrs(src_fd: libc::c_int, dst_fd: libc::c_int) {
         .split(|&b| b == 0)
         .filter(|n| !n.is_empty())
     {
-        // Carry ONLY `user.*`. NOT `security.capability` (privilege channel - an untrusted image's caps
-        // would be injected into the output; kern uses no runtime file-caps), NOT `system.*`/`trusted.*`
-        // (need privilege, not ours to move).
+        // ONLY `user.*`: NOT `system.*`/`trusted.*` (need privilege, not ours to move), and the file
+        // capability is set later (`copy_capability`).
         if !name.starts_with(b"user.") {
             continue;
         }
@@ -4568,6 +4568,27 @@ unsafe fn copy_xattrs(src_fd: libc::c_int, dst_fd: libc::c_int) {
             0,
         );
     }
+}
+
+/// Copy `security.capability` from `src_fd` to `dst_fd`, best-effort, AFTER the owner is set: the
+/// kernel removes a file's capability on `chown` (as it clears setuid), so set before it, it was gone.
+/// MEASURED: a built image's `newuidmap` kept `cap_setuid=ep` in its layer and lost it in the merged
+/// copy `kern save` exports. A file capability travels as the setuid bit does, which kern keeps as
+/// docker keeps it (see `kern_oci::SetuidBits`); it is no wider: the kernel bounds it by the box's
+/// capability set, and `no-new-privileges` disables both. Written in a user namespace it becomes a v3
+/// capability of that namespace's root, inert on the host. No allocation (a stack buffer: a
+/// capability is 20 or 24 bytes).
+pub(crate) unsafe fn copy_capability(src_fd: libc::c_int, dst_fd: libc::c_int) {
+    let name = c"security.capability";
+    let mut val = [0u8; 64];
+    let n = libc::fgetxattr(src_fd, name.as_ptr(), val.as_mut_ptr().cast(), val.len());
+    let Ok(n) = usize::try_from(n) else {
+        return;
+    };
+    let Some(v) = val.get(..n) else {
+        return;
+    };
+    libc::fsetxattr(dst_fd, name.as_ptr(), v.as_ptr().cast(), v.len(), 0);
 }
 
 /// `write(open(path), val)` - async-signal-safe (no allocation). `true` on full write.
@@ -5597,6 +5618,17 @@ fn apply_declaration(config: &mut kern_oci::ImageConfig, ins: &crate::dockerfile
         // DOCKER'S GRAMMAR: `<port>` or `<port>/<proto>`, one `Instr` per token, so `EXPOSE 80 443`
         // arrives here twice. A port that does not parse is DROPPED rather than guessed at: the
         // parser accepts the line as text and this is the one place that knows what a port is.
+        // `VOLUME`: declared, as docker declares it. A path a box cannot get a volume at (relative,
+        // `..`, a `:`) is dropped here, the one place that decides what the image declares.
+        Instr::Volume(p) => {
+            let p = p.trim_end_matches('/');
+            if kern_oci::volume_path_is_valid(p)
+                && !config.volumes.iter().any(|v| v == p)
+                && config.volumes.len() < kern_oci::MAX_IMAGE_VOLUMES
+            {
+                config.volumes.push(p.to_string());
+            }
+        }
         Instr::Expose(spec) => {
             let (num, proto) = match spec.split_once('/') {
                 Some((n, p)) => (n, p),
@@ -9500,6 +9532,15 @@ pub(crate) fn tear_down_stack_keeping(
     }
     let outcome = stop_stack(boxes, selected, pod, grace);
     let names = outcome.asked;
+    // `down` takes the services' anonymous volumes (an image's VOLUME) too: the next `up` makes its
+    // boxes under the same names, and must find fresh ones, as docker's new containers get fresh
+    // anonymous volumes. A recreate (`up` on a changed service) does not come here and keeps them,
+    // as docker carries them over.
+    if reap {
+        for n in &names {
+            crate::volume::remove_anon_of(n);
+        }
+    }
     // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
     // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
     // `compose ps -a` is empty after a `down` (matching Docker), while `compose stop` (which does
@@ -10996,6 +11037,10 @@ fn run_terminal_verb(
                 .map(|b| b.name.clone())
                 .collect();
             let removed = registry::clear_waitexit_pod(pod, &names);
+            // And their anonymous volumes, as `down` takes them: the next `up` must find fresh ones.
+            for n in &names {
+                crate::volume::remove_anon_of(n);
+            }
             println!("compose rm: {removed} service record(s) removed");
             return Ok(true);
         }
