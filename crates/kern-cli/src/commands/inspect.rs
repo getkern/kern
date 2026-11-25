@@ -1683,6 +1683,18 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
             // exited WELL, and `kern ps -a` is a table rather than a value a script can test.
             "State.ExitCode" => Some(exited.as_ref().map_or(0, |e| e.code).to_string()),
             "Name" => Some(format!("/{name}")),
+            // The memory cap the box runs under, in bytes, 0 for none, as Docker prints it. Only
+            // while it runs: the exit record does not keep it, so an exited box is refused below
+            // rather than answered 0, which would read as "it had no cap".
+            "HostConfig.Memory" => b.as_ref().map(|i| i.memory_max.unwrap_or(0).to_string()),
+            // How many times it was restarted, as Docker counts it.
+            "RestartCount" => Some(match (&b, &exited) {
+                (Some(i), _) => registry::box_attempt(&i.name, i.pid)
+                    .map_or(0, registry::Attempt::restarts)
+                    .to_string(),
+                (None, Some(e)) => e.restarts.to_string(),
+                (None, None) => "0".to_string(),
+            }),
             "Config.Image" | "Image" => b.as_ref().map(|i| i.rootfs.clone()),
             // Every label as a JSON object, which is the shape `{{json .Config.Labels}}` asks for
             // and the only shape a caller can feed to a parser. A box past its exit has none: the

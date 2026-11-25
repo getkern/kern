@@ -104,6 +104,12 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**The `--health-*` times and `--timeout` take Docker's durations.** `--health-interval 30s`, the form
+`docker run` requires, was a usage error; `30s`, `1m30s` and `2h` work now beside a plain number of
+seconds, and a duration that is not a whole number of seconds (`500ms`) is refused rather than
+rounded. `kern inspect -f` answers `{{.HostConfig.Memory}}` (the cap, 0 for none) and
+`{{.RestartCount}}`.
+
 **`docker run --restart` through kern's Docker API is honoured, and the restart count is reported.**
 The API did not read `HostConfig.RestartPolicy`, so `--restart on-failure:2` ran once and stayed down.
 It is `kern box --restart` now (`on-failure:N`, `always`, `unless-stopped`), refused with

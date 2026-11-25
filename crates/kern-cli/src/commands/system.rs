@@ -363,7 +363,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --health-cmd <cmd>  Shell command probed in the box; sets ps HEALTH (exit 0 = healthy)
     --health-cmd-argv A The same check with NO shell: one argv element per flag, repeated
                         (the exec form). Use it when the image has no /bin/sh
-    --health-interval N Seconds between health checks (default 30)
+    --health-interval N Seconds between health checks (default 30). Every --health-* time and
+                        the auto-stop timeout take seconds (10) or a duration as Docker writes it (30s, 1m30s)
     --health-retries N  Consecutive failures before a box is unhealthy (default 3)
     --health-start-period N  Grace period where failures keep it starting (default 0)
     --health-start-interval N  Probe this often INSIDE the start period (default: the interval)

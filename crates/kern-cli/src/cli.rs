@@ -3573,6 +3573,20 @@ fn parse_signal(s: &str) -> Result<i32, Error> {
     })
 }
 
+/// A whole number of seconds, written as kern writes it (`30`) or as Docker does (`30s`, `1m30s`,
+/// `2h`, Go's duration syntax). MEASURED before: `--health-interval 30s`, the form `docker run`
+/// requires (it refuses a bare `30`), was a usage error here. A duration that is not a whole number
+/// of seconds (`500ms`) is refused rather than rounded: kern counts in seconds, and a value changed
+/// in silence is one accepted and not honoured.
+fn secs_or_duration(v: &str) -> Option<u64> {
+    let v = v.trim();
+    if let Ok(n) = v.parse::<u64>() {
+        return Some(n);
+    }
+    let ns = crate::dockerfile::parse_go_duration_ns(v)?;
+    (ns % 1_000_000_000 == 0).then_some(ns / 1_000_000_000)
+}
+
 /// `kill [-s|--signal SIGNAL] <name>... | kill --all`. See the `kill` arm of [`parse`].
 fn parse_kill(rest: &[&str]) -> Result<Command, Error> {
     const USAGE: &str = "kill [-s|--signal SIGNAL] <name>... | kill --all";
@@ -4833,11 +4847,15 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     i += 1;
                     match rest
                         .get(i)
-                        .and_then(|v| v.parse::<u64>().ok())
+                        .and_then(|v| secs_or_duration(v))
                         .filter(|s| *s > 0)
                     {
                         Some(s) => health_interval = s,
-                        None => return Err(Error::Usage("--health-interval <seconds> (e.g. 10)")),
+                        None => {
+                            return Err(Error::Usage(
+                                "--health-interval <seconds or duration> (e.g. 10, 30s, 1m30s)",
+                            ))
+                        }
                     }
                 }
                 // `--health-retries <n>`: consecutive failures before "unhealthy" (default 3).
@@ -4858,29 +4876,37 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // reported `starting` for five minutes.
                 "--health-start-interval" => {
                     i += 1;
-                    match rest.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    match rest.get(i).and_then(|v| secs_or_duration(v)) {
                         Some(s) => health_start_interval = s,
                         None => {
-                            return Err(Error::Usage("--health-start-interval <seconds> (e.g. 5)"))
+                            return Err(Error::Usage(
+                                "--health-start-interval <seconds or duration> (e.g. 5, 5s)",
+                            ))
                         }
                     }
                 }
                 // `--health-start-period <sec>`: grace period where failures keep "starting".
                 "--health-start-period" => {
                     i += 1;
-                    match rest.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    match rest.get(i).and_then(|v| secs_or_duration(v)) {
                         Some(s) => health_start_period = s,
                         None => {
-                            return Err(Error::Usage("--health-start-period <seconds> (e.g. 5)"))
+                            return Err(Error::Usage(
+                                "--health-start-period <seconds or duration> (e.g. 5, 1m)",
+                            ))
                         }
                     }
                 }
                 // `--health-timeout <sec>`: kill a single check that exceeds this (0 = no timeout).
                 "--health-timeout" => {
                     i += 1;
-                    match rest.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    match rest.get(i).and_then(|v| secs_or_duration(v)) {
                         Some(s) => health_timeout = s,
-                        None => return Err(Error::Usage("--health-timeout <seconds> (e.g. 5)")),
+                        None => {
+                            return Err(Error::Usage(
+                                "--health-timeout <seconds or duration> (e.g. 5, 5s)",
+                            ))
+                        }
                     }
                 }
                 // `--health-action <restart|stop|none>`: action when the box turns unhealthy.
@@ -4904,9 +4930,13 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // `--timeout <sec>`: auto-stop the box after N seconds.
                 "--timeout" => {
                     i += 1;
-                    match rest.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    match rest.get(i).and_then(|v| secs_or_duration(v)) {
                         Some(s) => timeout = s,
-                        None => return Err(Error::Usage("--timeout <seconds> (e.g. 60)")),
+                        None => {
+                            return Err(Error::Usage(
+                                "--timeout <seconds or duration> (e.g. 60, 90s, 2h)",
+                            ))
+                        }
                     }
                 }
                 // `--nice <n>`: scheduling niceness (-20..19).
@@ -10965,6 +10995,62 @@ mod tests {
                 grace: None,
             }
         );
+    }
+
+    /// The `--health-*` times and `--timeout` take kern's seconds or Docker's durations; a duration
+    /// that is not a whole number of seconds is refused, not rounded.
+    #[test]
+    fn duration_flags_take_seconds_or_dockers_durations() {
+        for (v, want) in [
+            ("30", Some(30)),
+            ("30s", Some(30)),
+            ("1m30s", Some(90)),
+            ("2h", Some(7200)),
+            ("0", Some(0)),
+            ("0s", Some(0)),
+            ("1000ms", Some(1)),
+            ("500ms", None),
+            ("1.5s", None),
+            ("x", None),
+            ("-5", None),
+            ("", None),
+        ] {
+            assert_eq!(secs_or_duration(v), want, "{v:?}");
+        }
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert!(p(&[
+            "run",
+            "--health-cmd",
+            "true",
+            "--health-interval",
+            "30s",
+            "--health-timeout",
+            "5s",
+            "--health-start-period",
+            "1m",
+            "--timeout",
+            "90s",
+            "alpine:3.21"
+        ])
+        .is_ok());
+        assert!(p(&[
+            "run",
+            "--health-cmd",
+            "true",
+            "--health-interval",
+            "500ms",
+            "alpine:3.21"
+        ])
+        .is_err());
+        assert!(p(&[
+            "run",
+            "--health-cmd",
+            "true",
+            "--health-interval",
+            "0s",
+            "alpine:3.21"
+        ])
+        .is_err());
     }
 
     /// `kill` IS DOCKER'S: the box killed at once (a stop with no grace), or with `-s` a signal

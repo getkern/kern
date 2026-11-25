@@ -20161,3 +20161,72 @@ fn a_restarted_box_reports_its_restart_count() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&xdg);
 }
+
+/// `inspect -f` answers Docker's `{{.HostConfig.Memory}}` with the cap the box runs under (0 for
+/// none) and `{{.RestartCount}}`; it refused both, and a script reading them stopped.
+#[test]
+fn inspect_format_answers_memory_and_restart_count() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "inspmem");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-inspmem-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let k = || {
+        let mut c = kern();
+        c.env("XDG_RUNTIME_DIR", &xdg);
+        c
+    };
+    let out = k()
+        .args([
+            "box",
+            "inspmem",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--memory",
+            "64m",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("box");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let f = k()
+        .args([
+            "inspect",
+            "-f",
+            "{{.HostConfig.Memory}} {{.RestartCount}}",
+            "inspmem",
+        ])
+        .output()
+        .expect("inspect");
+    assert_eq!(
+        String::from_utf8_lossy(&f.stdout).trim(),
+        "67108864 0",
+        "{}",
+        String::from_utf8_lossy(&f.stderr)
+    );
+    let _ = k().args(["stop", "-t", "0", "inspmem"]).output();
+    let _ = k().args(["rm", "inspmem"]).output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
