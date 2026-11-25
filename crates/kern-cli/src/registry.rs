@@ -522,22 +522,47 @@ pub fn shm_dir_of(name: &str) -> io::Result<PathBuf> {
     Ok(runtime_subdir("shm")?.join(valid.as_str()))
 }
 
-/// Remove the shared `/dev/shm` directory of the box `name`, if it has one: called wherever the box's
-/// other sidecars go, so its shared memory ends with it, and when a box of that name starts WITHOUT
-/// `--ipc shareable`, so a directory a dead box left cannot make it look shareable (a live box holds
-/// its name alone, so any directory found then is stale). LOOKED UP, NEVER CREATED: every box start
-/// and end passes here, and most boxes have no `shm/` at all. The path is the validated name under
-/// kern's own `shm/` directory and nothing else.
-pub fn clear_box_shm(name: &str) {
+/// Remove the box `name`'s own directories: its shared `/dev/shm` (`shm/`, a box started `--ipc
+/// shareable`) and its `/etc` files (`etc/`). Called wherever the box's other sidecars go, so they
+/// end with it, and when a box of that name starts, so a directory a dead box left cannot make it
+/// look shareable or hand it stale files (a live box holds its name alone, so any directory found
+/// then is stale). LOOKED UP, NEVER CREATED. The path is the validated name under kern's own
+/// directory of that kind and nothing else.
+pub fn clear_box_dirs(name: &str) {
     let Ok(valid) = kern_common::BoxName::parse(name) else {
         return;
     };
-    for base in runtime_subdir_candidates("shm") {
-        let dir = base.join(valid.as_str());
-        if dir.is_dir() && dir.starts_with(&base) && dir != base {
-            let _ = fs::remove_dir_all(&dir);
+    for kind in ["shm", "etc"] {
+        for base in runtime_subdir_candidates(kind) {
+            let dir = base.join(valid.as_str());
+            if dir.is_dir() && dir.starts_with(&base) && dir != base {
+                let _ = fs::remove_dir_all(&dir);
+            }
         }
     }
+}
+
+/// The host directory holding the box `name`'s `/etc/hosts`, `/etc/hostname` (and `resolv.conf`),
+/// bound over the image's (see `SandboxSpec::etc_dir`), made EMPTY and `0700`: a dead box of this
+/// name may have left one. `None` when it cannot be made, and the box then writes them into its
+/// root as before.
+/// Where the box `name`'s `/etc` files are ([`fresh_etc_dir`] made it), for `kern commit`. Not made.
+pub fn etc_dir_of(name: &str) -> io::Result<PathBuf> {
+    let valid = kern_common::BoxName::parse(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "not a box name"))?;
+    Ok(runtime_subdir("etc")?.join(valid.as_str()))
+}
+
+pub fn fresh_etc_dir(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let valid = kern_common::BoxName::parse(name).ok()?;
+    let base = runtime_subdir("etc").ok()?;
+    let dir = base.join(valid.as_str());
+    if dir.starts_with(&base) && dir != base && dir.is_dir() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
+    Some(dir)
 }
 
 /// Record a box's latest health (`healthy`/`unhealthy`/`starting`); written by the health-checker.
@@ -728,7 +753,9 @@ const AUTHORITATIVE_DIRS: [&str; 18] = [
 /// code), but the effect leaves the box - a published artefact - so it is documented, not silent.
 /// `shm` holds the POSIX shared memory of a box started `--ipc shareable`, bound at its `/dev/shm`
 /// and at the `/dev/shm` of every box that joins it (`--ipc container:<box>`): a box's own bytes.
-const BOX_DATA_DIRS: [&str; 3] = ["logs", "scratch", "shm"];
+/// `etc` holds each box's `/etc/hosts`, `/etc/hostname` (and `resolv.conf` with `--dns`), bound over
+/// the image's: a box's own bytes too.
+const BOX_DATA_DIRS: [&str; 4] = ["logs", "scratch", "shm", "etc"];
 
 /// The classification CHOKEPOINT: every function that builds a `<runtime>/kern/<name>` path calls this,
 /// so a registry-root child cannot be created without being in a class. A new unclassified `name` would
@@ -2272,7 +2299,7 @@ fn load_live(path: &Path) -> Option<Instance> {
             unregister(path);
             clear_box_env(&inst.name, inst.pid);
             clear_health(&inst.name, inst.pid);
-            clear_box_shm(&inst.name);
+            clear_box_dirs(&inst.name);
             None
         }
     }

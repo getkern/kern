@@ -2835,6 +2835,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         pod_holder,
         ipc_from,
         shm_dir,
+        // AFTER `share_ipc`, which clears this box name's directories: made here, empty.
+        etc_dir: registry::fresh_etc_dir(name.as_str()).map(|d| d.to_string_lossy().into_owned()),
         // `--ssh` and a non-root `--user` imply the uid/gid *range* mapping: sshd's privsep needs a
         // working `setgroups` (a single-uid map forbids it via `/proc/self/setgroups=deny`), and a
         // non-zero target uid must be mapped in. With the range (via `newgidmap`/`newuidmap`) both
@@ -3372,7 +3374,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     if let Some((_, Some(_))) = &reg_state {
         registry::clear_box_env(name.as_str(), launcher_pid);
     }
-    registry::clear_box_shm(name.as_str());
+    registry::clear_box_dirs(name.as_str());
     pt.mark("parent:teardown");
     // CLOSE THE PROFILE, naming what the marks above do NOT cover. Every phase here is a delta
     // between two marks, so the sum describes only the span from the first mark onwards: the
@@ -4412,7 +4414,7 @@ fn share_ipc(
         .ipc
         .is_some_and(|m| m.eq_ignore_ascii_case("shareable"))
     {
-        registry::clear_box_shm(name.as_str());
+        registry::clear_box_dirs(name.as_str());
     }
     let Some(mode) = args.ipc else {
         return Ok((None, None));
@@ -4423,7 +4425,7 @@ fn share_ipc(
         })?;
         // A directory left by a box of this name that is gone (a live box holds its name alone) is
         // stale: the new box starts with an empty store, as a new container does.
-        registry::clear_box_shm(name.as_str());
+        registry::clear_box_dirs(name.as_str());
         std::fs::create_dir_all(&dir)
             .map_err(|e| Error::Sandbox(format!("--ipc shareable: {}: {e}", dir.display())))?;
         use std::os::unix::fs::PermissionsExt;
@@ -6326,7 +6328,7 @@ fn run_detached(
     if let Some(p) = path {
         leave_registry(&p);
     }
-    registry::clear_box_shm(name.as_str());
+    registry::clear_box_dirs(name.as_str());
     cleanup_scratch(scratch.as_deref());
     unsafe { libc::_exit(0) };
 }

@@ -1382,6 +1382,8 @@ struct BuildSpec<'a> {
     ipc_from: Option<i32>,
     /// The host directory bound at `/dev/shm` (`--ipc shareable`, or the one joined).
     shm_dir: Option<String>,
+    /// The box's own `/etc` files' directory (`kern_isolation::SandboxSpec::etc_dir`).
+    etc_dir: Option<String>,
     uid_range: UidRange,
     bind_rootfs: bool,
     /// `--privileged`: relax seccomp for a nested `kern box` (rootless-only).
@@ -1713,6 +1715,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         pod_holder: b.pod_holder,
         ipc_from: b.ipc_from,
         shm_dir: b.shm_dir,
+        etc_dir: b.etc_dir,
         uid_range: b.uid_range,
         memory_max: b.memory,
         // `--shm-size` when given, else the cap that is ACTUALLY in force: `--memory` when the operator

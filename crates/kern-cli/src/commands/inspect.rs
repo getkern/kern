@@ -2760,7 +2760,7 @@ pub fn stop_with_grace(
             // The environment sidecar has the same lifetime as the health one: cleared together so a
             // runtime dir cannot accumulate one and not the other.
             registry::clear_box_env(&b.name, b.pid);
-            registry::clear_box_shm(&b.name);
+            registry::clear_box_dirs(&b.name);
             cleanup_box_scratch(&b.rootfs);
             if reaped {
                 println!(
@@ -2896,7 +2896,7 @@ pub fn stop_with_grace(
         // The environment sidecar has the same lifetime as the health one: cleared together so a
         // runtime dir cannot accumulate one and not the other.
         registry::clear_box_env(&b.name, b.pid); // a SIGKILL skips the supervisor's own cleanup
-        registry::clear_box_shm(&b.name);
+        registry::clear_box_dirs(&b.name);
         cleanup_box_scratch(&b.rootfs);
         if outcome.confirmed() {
             // Eagerly rmdir the box's now-empty cgroup dir (captured above) - the SIGKILL skipped the

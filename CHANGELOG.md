@@ -84,6 +84,15 @@ The image's steps are kept too, as metadata under the one layer kern writes, whi
 buildah still take as the base of a build. A rebuild answered entirely from the cache keeps its
 steps' times, so the same image saves and pushes under the same digest.
 
+**A box's `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are its own files, bound over the
+image's.** kern wrote them into the box's root: a box started `--keep` (every container of kern's
+Docker API is one) paid a copy of `/etc` onto disk at its first start, and `kern commit` carried the
+box's own name into the image's `/etc/hosts`. They are written in the box's directory under
+`$XDG_RUNTIME_DIR/kern/etc/` and bound over, as a container runtime binds them; an image without
+them gets an empty file to bind over. A committed image keeps the image's own files, or none where
+it had none. Measured, release builds, a new `--keep` box started and removed: 10.5 ms against 15.7,
+interval [-5.40, -4.91] ms; a box without `--keep` unchanged.
+
 **What a box writes while it stops is in its log.** `kern stop` signals the supervisor's process group,
 and the log pump of a detached box was in it: it died on the SIGTERM while the workload's handler was
 still writing, so a `trap ... TERM` that printed its last lines and exited 0 left none of them in

@@ -182,6 +182,15 @@ pub struct SandboxSpec {
     /// it with `--ipc container:<box>` binds the same one. Docker keeps a container's shm on the host
     /// for the same reason: a mount cannot be bound from another mount namespace.
     pub shm_dir: Option<String>,
+    /// The box's own directory for the `/etc` files a container runtime owns (`hosts`, `hostname`,
+    /// and `resolv.conf` when `--dns` asks for one), on the host's tmpfs (`$XDG_RUNTIME_DIR`): they
+    /// are written there and BOUND over the image's, as Docker binds its container's files, instead of
+    /// written into the box root. `None` writes them into the root, as before.
+    ///
+    /// MEASURED: written into the root of a `--keep` box, whose writable layer is on disk, the first
+    /// write into `/etc` copied it up and cost 5.1-5.6 ms of every start (`setup_etc_identity`, with
+    /// `KERN_TIMING`); and `kern commit` carried the box's own name into the image's `/etc/hosts`.
+    pub etc_dir: Option<String>,
     /// `--pod-bridge <ip>/<prefix>`: join the pod through its BRIDGE instead of sharing its network
     /// namespace, taking this address on it.
     ///
@@ -1957,15 +1966,30 @@ fn child_setup_and_exec(
     // A pod member in the SHARED namespace has the pod's hosts file bound over its own, and its
     // entry there is written by the CLI; writing it here would race the other members on one file.
     let shared_hosts = spec.pod_holder.is_some() && spec.pod_bridges.is_empty();
+    let self_ip = box_own_ip(spec).unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+    // Bound from the box's own directory where the image has the file; written into the root for a
+    // file it does not have (the debian family ships no `/etc/hosts`), as before.
+    let bound = spec
+        .etc_dir
+        .as_deref()
+        .map(|dir| bind_etc_identity(&spec.root, dir, &spec.hostname, self_ip, shared_hosts))
+        .unwrap_or_default();
     setup_etc_identity(
         &spec.root,
         &spec.hostname,
-        box_own_ip(spec).unwrap_or(std::net::Ipv4Addr::LOCALHOST),
-        shared_hosts,
+        self_ip,
+        shared_hosts || bound.hosts,
+        bound.hostname,
     );
     setup_extra_hosts(&spec.root, &spec.extra_hosts);
     // AFTER the hosts files, because the two are independent and this one only fires when asked.
-    setup_resolv_conf(&spec.root, &spec.dns, &spec.dns_search, &spec.dns_options);
+    setup_resolv_conf(
+        &spec.root,
+        spec.etc_dir.as_deref(),
+        &spec.dns,
+        &spec.dns_search,
+        &spec.dns_options,
+    );
     // The store is opened while host paths still resolve; after the pivot it is reached only through
     // this descriptor.
     let ld_store = ld_key.and_then(|k| LdStore::open(spec.ldcache_dir.as_deref()?, k));
@@ -5174,7 +5198,13 @@ fn hosts_text_names(text: &[u8], host: &[u8]) -> bool {
 ///
 /// Best-effort in every branch: no failure here fails the box, and `setup_extra_hosts` appends
 /// `--add-host` entries after this, so they land under the seeds instead of into an empty file.
-fn setup_etc_identity(root: &str, hostname: &str, self_ip: std::net::Ipv4Addr, shared_hosts: bool) {
+fn setup_etc_identity(
+    root: &str,
+    hostname: &str,
+    self_ip: std::net::Ipv4Addr,
+    shared_hosts: bool,
+    skip_hostname: bool,
+) {
     /// The two lines every runtime seeds, byte-identical to what the pod's shared file carries so a
     /// standalone box and a pod member cannot disagree about `localhost`.
     ///
@@ -5327,7 +5357,7 @@ fn setup_etc_identity(root: &str, hostname: &str, self_ip: std::net::Ipv4Addr, s
     }
 
     // --- /etc/hostname: always the box's own name ------------------------------------------------
-    if name_ok {
+    if name_ok && !skip_hostname {
         if let Ok(f) = cstr("hostname") {
             let fd = unsafe {
                 libc::openat(
@@ -5360,6 +5390,222 @@ fn setup_etc_identity(root: &str, hostname: &str, self_ip: std::net::Ipv4Addr, s
         }
     }
     unsafe { libc::close(dir_fd) };
+}
+
+/// Which of `/etc/hosts` and `/etc/hostname` [`bind_etc_identity`] gave the box.
+#[derive(Default, Clone, Copy)]
+struct EtcBound {
+    hosts: bool,
+    hostname: bool,
+}
+
+/// The box's `/etc/hosts` and `/etc/hostname`, written into its own directory `dir` (see
+/// `SandboxSpec::etc_dir`) and bound over the image's, as Docker binds its container's files, so
+/// nothing is written into the box root: the same text [`setup_etc_identity`] would append and
+/// write, computed from the image's own `/etc/hosts`, which is read and not modified. A file the
+/// image does not have, or that is not a regular file there, is not bound, and the caller writes it
+/// into the root as before. `hosts` is left alone in a pod's shared namespace (the pod's file is
+/// already bound there). Best-effort like the rest: a failure here only means the old way.
+fn bind_etc_identity(
+    root: &str,
+    dir: &str,
+    hostname: &str,
+    self_ip: std::net::Ipv4Addr,
+    shared_hosts: bool,
+) -> EtcBound {
+    const LOCALHOST_SEED: &[u8] = b"127.0.0.1\tlocalhost\n::1\tip6-localhost ip6-loopback\n";
+    const LOCALHOST: &[u8] = b"localhost";
+    let mut out = EtcBound::default();
+    let h = hostname.trim();
+    let name_ok = !h.is_empty() && !h.chars().any(|c| c.is_whitespace() || c.is_control());
+    let Ok(rc) = cstr(root) else {
+        return out;
+    };
+    // SAFETY: a path string this owns; the fd is checked and closed below.
+    let root_fd = unsafe {
+        libc::open(
+            rc.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return out;
+    }
+    let etc = open_etc_dir(root_fd);
+    // SAFETY: closing the fd opened above.
+    unsafe { libc::close(root_fd) };
+    if etc < 0 {
+        return out;
+    }
+    if !shared_hosts {
+        if let Some((target, had)) = etc_target(etc, "hosts") {
+            let mut text = read_through(target, 1 << 20);
+            let resolves_localhost = text
+                .windows(LOCALHOST.len())
+                .any(|w| w.eq_ignore_ascii_case(LOCALHOST));
+            let names_host = name_ok && hosts_text_names(&text, h.as_bytes());
+            if !resolves_localhost {
+                text.extend_from_slice(LOCALHOST_SEED);
+            }
+            if name_ok && !names_host {
+                text.extend_from_slice(format!("{self_ip}\t{h}\n").as_bytes());
+            }
+            out.hosts = bind_etc_file(dir, "hosts", &text, target, had);
+            // SAFETY: closing the target fd `etc_target` opened.
+            unsafe { libc::close(target) };
+        }
+    }
+    if name_ok {
+        if let Some((target, had)) = etc_target(etc, "hostname") {
+            let text = format!("{h}\n");
+            out.hostname = bind_etc_file(dir, "hostname", text.as_bytes(), target, had);
+            // SAFETY: closing the target fd `etc_target` opened.
+            unsafe { libc::close(target) };
+        }
+    }
+    // SAFETY: closing the `etc` fd opened above.
+    unsafe { libc::close(etc) };
+    out
+}
+
+/// The box root's `etc`, as an `O_PATH` directory fd, never through a symlink; `-1` when absent.
+fn open_etc_dir(root_fd: libc::c_int) -> libc::c_int {
+    let Ok(etc) = cstr("etc") else {
+        return -1;
+    };
+    // SAFETY: openat on a directory fd this caller owns, with a literal name.
+    unsafe {
+        libc::openat(
+            root_fd,
+            etc.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    }
+}
+
+/// `name` in the directory `dir_fd` as an `O_PATH` fd, when it is a regular file there (not a
+/// symlink, not missing): a bind target that cannot lead out of the box root and is never created.
+fn existing_regular(dir_fd: libc::c_int, name: &str) -> Option<libc::c_int> {
+    let c = cstr(name).ok()?;
+    // SAFETY: openat on a directory fd the caller owns, with a literal name.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            c.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a zeroed stat buffer for fstat on the fd just opened.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        // SAFETY: closing the fd just opened.
+        unsafe { libc::close(fd) };
+        return None;
+    }
+    Some(fd)
+}
+
+/// The bind target for `name` in the box root's `etc` (`dir_fd`): the image's file when it is a
+/// regular file there, `(fd, true)`; else, when the name is free, an empty file made to mount over,
+/// `(fd, false)`, as Docker's container has one for each of these whatever its image shipped (the
+/// debian family ships no `/etc/hosts`). `None` for a name taken by anything else (a symlink, a
+/// directory): the caller then keeps the old way, which refuses to follow it.
+fn etc_target(dir_fd: libc::c_int, name: &str) -> Option<(libc::c_int, bool)> {
+    if let Some(fd) = existing_regular(dir_fd, name) {
+        return Some((fd, true));
+    }
+    let c = cstr(name).ok()?;
+    // SAFETY: openat on a directory fd the caller owns, with a literal name; O_EXCL makes it only
+    // ever a new file, never one that appeared in between.
+    let made = unsafe {
+        libc::openat(
+            dir_fd,
+            c.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if made < 0 {
+        return None;
+    }
+    // SAFETY: closing the fd just made.
+    unsafe { libc::close(made) };
+    existing_regular(dir_fd, name).map(|fd| (fd, false))
+}
+
+/// Up to `cap` bytes of the file behind the `O_PATH` fd `fd`, read through `/proc/self/fd`
+/// (reading does not copy anything up); empty when it cannot be read.
+fn read_through(fd: libc::c_int, cap: usize) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    if let Ok(f) = std::fs::File::open(format!("/proc/self/fd/{fd}")) {
+        let _ = f.take(cap as u64).read_to_end(&mut out);
+    }
+    out
+}
+
+/// Write `content` to `dir/name` and bind it over the `O_PATH` target `target`. `true` once bound.
+/// The image's own file (`image_had` it) is kept beside it as `dir/<name>.image`: a mount point is
+/// skipped by `kern commit`, which puts this back, so a committed image carries the image's file and
+/// not the box's, and no file where the image had none, as `docker commit` does.
+fn bind_etc_file(
+    dir: &str,
+    name: &str,
+    content: &[u8],
+    target: libc::c_int,
+    image_had: bool,
+) -> bool {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let write = |path: &std::path::Path, bytes: &[u8]| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .and_then(|mut f| {
+                f.write_all(bytes)?;
+                // The mode is the file's whatever the umask was: a box reads it as its own root's.
+                use std::os::unix::fs::PermissionsExt as _;
+                f.set_permissions(std::fs::Permissions::from_mode(0o644))
+            })
+    };
+    let path = std::path::Path::new(dir).join(name);
+    if image_had {
+        let original = read_through(target, 1 << 20);
+        if write(
+            &std::path::Path::new(dir).join(format!("{name}.image")),
+            &original,
+        )
+        .is_err()
+        {
+            return false;
+        }
+    }
+    if write(&path, content).is_err() {
+        return false;
+    }
+    let (Ok(src), Ok(dst)) = (
+        cstr(&path.to_string_lossy()),
+        cstr(&format!("/proc/self/fd/{target}")),
+    ) else {
+        return false;
+    };
+    // SAFETY: two C strings this owns; a plain bind with no data argument.
+    unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            ptr::null(),
+            libc::MS_BIND,
+            ptr::null(),
+        ) == 0
+    }
 }
 
 fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
@@ -5436,7 +5682,13 @@ fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
 ///
 /// Best-effort in every branch, like its two neighbours: DNS that could not be written must not stop
 /// a box that may not need to resolve anything.
-fn setup_resolv_conf(root: &str, dns: &[String], search: &[String], options: &[String]) {
+fn setup_resolv_conf(
+    root: &str,
+    etc_dir: Option<&str>,
+    dns: &[String],
+    search: &[String],
+    options: &[String],
+) {
     if dns.is_empty() && search.is_empty() && options.is_empty() {
         return;
     }
@@ -5483,6 +5735,24 @@ fn setup_resolv_conf(root: &str, dns: &[String], search: &[String], options: &[S
     };
     if root_fd < 0 {
         return;
+    }
+    // Bound from the box's own directory when the image has the file (see `SandboxSpec::etc_dir`).
+    if let Some(dir) = etc_dir {
+        let etc = open_etc_dir(root_fd);
+        if etc >= 0 {
+            let done = etc_target(etc, "resolv.conf")
+                .map(|(t, had)| {
+                    let ok = bind_etc_file(dir, "resolv.conf", body.as_bytes(), t, had);
+                    unsafe { libc::close(t) };
+                    ok
+                })
+                .unwrap_or(false);
+            unsafe { libc::close(etc) };
+            if done {
+                unsafe { libc::close(root_fd) };
+                return;
+            }
+        }
     }
     let path_fd = open_in_root(root_fd, "etc/resolv.conf", false);
     unsafe { libc::close(root_fd) };
@@ -11578,7 +11848,7 @@ mod add_host_tests {
         let _ = std::fs::write(tmp.join("etc/hostname"), "debuerreotype\n");
         let root = tmp.to_string_lossy().into_owned();
 
-        setup_etc_identity(&root, "boxname", BOX_ADDR, false);
+        setup_etc_identity(&root, "boxname", BOX_ADDR, false, false);
 
         let hosts = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
         assert!(
@@ -11621,7 +11891,7 @@ mod add_host_tests {
         let root = tmp.to_string_lossy().into_owned();
         let bridge = std::net::Ipv4Addr::new(10, 89, 0, 3);
 
-        setup_etc_identity(&root, "boxname", bridge, false);
+        setup_etc_identity(&root, "boxname", bridge, false, false);
         let once = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
         assert_eq!(
             once,
@@ -11629,7 +11899,7 @@ mod add_host_tests {
             "the image's lines are kept and only the box's own name is added, at its address"
         );
         // A second setup over the same file (a restart on a kept rootfs) adds nothing.
-        setup_etc_identity(&root, "boxname", bridge, false);
+        setup_etc_identity(&root, "boxname", bridge, false, false);
         let twice = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
         assert_eq!(
             twice, once,
@@ -11639,7 +11909,7 @@ mod add_host_tests {
         // THE POD'S SHARED FILE is never written here: the CLI owns its entries, and every member
         // writing its own would race the others on one file.
         let _ = std::fs::write(tmp.join("etc/hosts"), shipped);
-        setup_etc_identity(&root, "boxname", BOX_ADDR, true);
+        setup_etc_identity(&root, "boxname", BOX_ADDR, true, false);
         let shared = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
         assert_eq!(shared, shipped, "a shared pod hosts file is left alone");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -11677,7 +11947,7 @@ mod add_host_tests {
         let comments = "# written by the build\n# do not edit\n";
         let _ = std::fs::write(tmp.join("etc/hosts"), comments);
 
-        setup_etc_identity(&tmp.to_string_lossy(), "boxname", BOX_ADDR, false);
+        setup_etc_identity(&tmp.to_string_lossy(), "boxname", BOX_ADDR, false, false);
 
         let out = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
         assert!(
@@ -11706,7 +11976,7 @@ mod add_host_tests {
 
         // 1. `/etc` itself is a symlink out of the root: the descent must refuse it.
         if std::os::unix::fs::symlink(&out, tmp.join("etc")).is_ok() {
-            setup_etc_identity(&tmp.to_string_lossy(), "boxname", BOX_ADDR, false);
+            setup_etc_identity(&tmp.to_string_lossy(), "boxname", BOX_ADDR, false, false);
             assert!(
                 !out.join("hosts").exists() && !out.join("hostname").exists(),
                 "a symlinked /etc must not be followed out of the box root"
@@ -11719,7 +11989,7 @@ mod add_host_tests {
             return;
         };
         if std::os::unix::fs::symlink(out.join("pwned"), tmp.join("etc/hosts")).is_ok() {
-            setup_etc_identity(&tmp.to_string_lossy(), "boxname", BOX_ADDR, false);
+            setup_etc_identity(&tmp.to_string_lossy(), "boxname", BOX_ADDR, false, false);
             assert!(
                 !out.join("pwned").exists(),
                 "a symlinked /etc/hosts must not be followed out of the box root"

@@ -1265,6 +1265,37 @@ fn committed_history(box_image: &str, box_ref: &str) -> Vec<kern_oci::HistoryEnt
     h
 }
 
+/// The image's own `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` into a commit's tree `out`.
+/// A box has its own bound over them (`registry::fresh_etc_dir`), so the copy skipped them as mount
+/// points; the image's were kept beside them as `<name>.image`. Only into a real `etc` directory
+/// of `out` (never through a symlink the image shipped), only where the copy left no file, and
+/// never following one: `out` is kern's own cache, and nothing here may write outside it.
+fn restore_image_etc_files(out: &std::path::Path, name: &str) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Ok(dir) = registry::etc_dir_of(name) else {
+        return;
+    };
+    let etc = out.join("etc");
+    if !std::fs::symlink_metadata(&etc).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    for f in ["hosts", "hostname", "resolv.conf"] {
+        let Ok(original) = std::fs::read(dir.join(format!("{f}.image"))) else {
+            continue;
+        };
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(etc.join(f))
+        else {
+            continue;
+        };
+        let _ = std::io::Write::write_all(&mut file, &original);
+    }
+}
+
 pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     let inst = registry::find_ref(box_ref).ok_or_else(|| {
         Error::Sandbox(format!("no running box '{box_ref}'; `kern ps` lists them"))
@@ -1305,6 +1336,7 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     let _freeze = FreezeGuard::freeze(inst.cgroup_pid());
     copy_rootfs_snapshot(std::os::fd::AsFd::as_fd(&root), &out, &skip)?;
     drop(_freeze); // thaw before the (non-filesystem) config/marker writes below
+    restore_image_etc_files(&out, &inst.name);
 
     // A minimal runtime config: default the command to a shell so `kern box --image <image>` works with
     // no args, while `--image <image> -- <cmd>` still overrides it. (The base image's entrypoint/env are

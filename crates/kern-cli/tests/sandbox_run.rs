@@ -3791,6 +3791,112 @@ fn stop_skips_a_grace_the_kernel_would_make_pointless() {
     let _ = fs::remove_dir_all(&xdg);
 }
 
+/// A BOX'S `/etc` IDENTITY IS BOUND, NOT WRITTEN INTO ITS ROOT. Inside the box `/etc/hosts` and
+/// `/etc/hostname` name the box; a commit of it carries the image's own files, as `docker commit`
+/// does. MEASURED before: written into the root, the files cost a `--keep` box 5.1-5.6 ms of disk
+/// copy-up at its first start, and the committed image's `/etc/hosts` named the committed box.
+#[test]
+fn a_boxs_etc_identity_is_bound_and_a_commit_keeps_the_images_files() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "etcbind");
+    let _ = fs::create_dir_all(root.join("etc"));
+    fs::write(root.join("etc/hosts"), "127.0.0.1\tlocalhost\n").unwrap();
+    fs::write(root.join("etc/hostname"), "builder\n").unwrap();
+    let rootfs = root.to_str().unwrap();
+    let base = std::env::temp_dir().join(format!("kern-it-etcbind-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    for d in ["run", "cache"] {
+        let _ = fs::create_dir_all(base.join(d));
+    }
+    let env = |c: &mut std::process::Command| {
+        c.env("XDG_RUNTIME_DIR", base.join("run"))
+            .env("XDG_CACHE_HOME", base.join("cache"));
+    };
+    let mut start = kern();
+    env(&mut start);
+    let out = start
+        .args([
+            "box",
+            "etcbox",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&base);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut ex = kern();
+    env(&mut ex);
+    let inside = ex
+        .args([
+            "exec",
+            "etcbox",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "cat /etc/hostname /etc/hosts",
+        ])
+        .output()
+        .expect("exec");
+    let inside = String::from_utf8_lossy(&inside.stdout).to_string();
+    assert!(
+        inside.starts_with("etcbox\n") && inside.contains("\tetcbox"),
+        "{inside}"
+    );
+    let mut cm = kern();
+    env(&mut cm);
+    let c = cm
+        .args(["commit", "etcbox", "etcimg:1"])
+        .output()
+        .expect("commit");
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let mut st = kern();
+    env(&mut st);
+    let _ = st.args(["stop", "-t", "0", "etcbox"]).output();
+    let images = base.join("cache/kern/images");
+    let img = fs::read_dir(&images)
+        .expect("the image cache")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("etcimg_1-"))
+        })
+        .expect("the committed image's tree");
+    assert_eq!(
+        fs::read_to_string(img.join("etc/hosts")).unwrap_or_default(),
+        "127.0.0.1\tlocalhost\n"
+    );
+    assert_eq!(
+        fs::read_to_string(img.join("etc/hostname")).unwrap_or_default(),
+        "builder\n"
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// WHAT A WORKLOAD WRITES WHILE IT STOPS IS IN ITS LOG. `kern stop` signals the supervisor's
 /// process group, and the log pump was in it: it died on the SIGTERM while the workload's handler was
 /// still writing. MEASURED (0.56.0 too): a `trap ... TERM` that printed and exited 0 had none of it
@@ -4735,7 +4841,7 @@ fn run_applies_vcpu_profile_from_kern_toml() {
         let out = kern()
             .env("XDG_CONFIG_HOME", &cfgdir)
             .args([
-                "run",
+                "limit",
                 "vcpu:pinned",
                 "--",
                 "grep",
@@ -4765,7 +4871,7 @@ fn run_applies_vcpu_profile_from_kern_toml() {
     // being recognized as any kind of "reserved" profile.
     let refused = kern()
         .env("XDG_CONFIG_HOME", &cfgdir)
-        .args(["run", "vgpu:x", "--", "true"])
+        .args(["limit", "vgpu:x", "--", "true"])
         .output()
         .expect("run kern");
     assert!(!refused.status.success());
@@ -11150,7 +11256,7 @@ fn run_landlock_rw_confines_writes_or_refuses_to_run() {
 
     // The control FIRST, so a host that cannot write the "denied" dir at all is caught before the
     // confined run is interpreted.
-    let ctrl = kern_out(&["run", "--", "/bin/sh", "-c", script.as_str()]);
+    let ctrl = kern_out(&["limit", "--", "/bin/sh", "-c", script.as_str()]);
     let ctrl_out = String::from_utf8_lossy(&ctrl.stdout).to_string();
     if !ctrl_out.contains("RAN") || !ctrl_out.contains("OUT-WROTE") {
         let _ = fs::remove_dir_all(&dir);
@@ -11160,7 +11266,7 @@ fn run_landlock_rw_confines_writes_or_refuses_to_run() {
     let _ = fs::remove_file(outside.join("f"));
 
     let out = kern_out(&[
-        "run",
+        "limit",
         "--landlock-rw",
         inside_s.as_str(),
         "--",
@@ -11225,7 +11331,7 @@ fn run_landlock_rw_does_not_grant_the_hosts_tmp() {
     );
     let dir_s = dir.to_str().unwrap_or_default().to_string();
     let out = kern_out(&[
-        "run",
+        "limit",
         "--landlock-rw",
         dir_s.as_str(),
         "--",
@@ -11270,7 +11376,14 @@ fn run_landlock_rw_refuses_a_path_that_cannot_be_granted() {
         (link.clone(), "is a symlink"),
     ] {
         let p = path.to_str().unwrap_or_default().to_string();
-        let out = kern_out(&["run", "--landlock-rw", p.as_str(), "--", "/bin/echo", "RAN"]);
+        let out = kern_out(&[
+            "limit",
+            "--landlock-rw",
+            p.as_str(),
+            "--",
+            "/bin/echo",
+            "RAN",
+        ]);
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         assert!(
@@ -11304,7 +11417,7 @@ fn run_landlock_commitment_aborts_when_the_flag_did_not_survive_the_reexec() {
 
     // Requested before the re-exec, absent after it: the impossible state. Must refuse.
     let lost = std::process::Command::new(bin)
-        .args(["run", "--", "/bin/echo", marker])
+        .args(["limit", "--", "/bin/echo", marker])
         .env("KERN_SCOPE", "1")
         .env("KERN_LANDLOCK_REQUIRED", "1")
         .output();
@@ -11334,18 +11447,18 @@ fn run_landlock_commitment_aborts_when_the_flag_did_not_survive_the_reexec() {
     for (label, args, envs) in [
         (
             "in a scope, nothing requested",
-            vec!["run", "--", "/bin/echo", marker],
+            vec!["limit", "--", "/bin/echo", marker],
             vec![("KERN_SCOPE", "1")],
         ),
         (
             "stray variable, no scope",
-            vec!["run", "--", "/bin/echo", marker],
+            vec!["limit", "--", "/bin/echo", marker],
             vec![("KERN_LANDLOCK_REQUIRED", "1")],
         ),
         (
             "requested and carried",
             vec![
-                "run",
+                "limit",
                 "--landlock-rw",
                 dir_s.as_str(),
                 "--",
@@ -11385,9 +11498,9 @@ fn run_landlock_commitment_aborts_when_the_flag_did_not_survive_the_reexec() {
 #[test]
 fn run_landlock_rw_rejects_an_empty_or_missing_value() {
     for args in [
-        vec!["run", "--landlock-rw", "", "--", "/bin/echo", "RAN"],
-        vec!["run", "--landlock-rw", "   ", "--", "/bin/echo", "RAN"],
-        vec!["run", "--landlock-rw"],
+        vec!["limit", "--landlock-rw", "", "--", "/bin/echo", "RAN"],
+        vec!["limit", "--landlock-rw", "   ", "--", "/bin/echo", "RAN"],
+        vec!["limit", "--landlock-rw"],
     ] {
         let out = kern_out(&args);
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -12476,7 +12589,7 @@ fn a_kern_run_is_capped_by_a_leaf_it_removes_afterwards() {
     // kern's claim, and a value the kernel exposes to the capped process is the cap.
     let out = kern()
         .args([
-            "run",
+            "limit",
             "--memory",
             "64m",
             "--",
@@ -12536,7 +12649,7 @@ fn a_live_kern_run_is_not_reported_as_a_box_by_ps() {
         return;
     };
     let mut child = kern()
-        .args(["run", "--", "sleep", "5"])
+        .args(["limit", "--", "sleep", "5"])
         .spawn()
         .expect("spawn kern run");
     let pid = child.id();
@@ -12610,7 +12723,7 @@ fn a_kern_run_killed_by_its_own_cap_reports_the_oom() {
     // this is the second of two independent stops rather than the only one.
     let out = kern()
         .args([
-            "run",
+            "limit",
             "--memory",
             "16m",
             "--",
@@ -12660,7 +12773,7 @@ fn a_kern_run_killed_by_its_own_cap_reports_the_oom() {
 #[test]
 fn a_kern_run_reports_its_commands_exit_code_and_relays_a_signal() {
     let out = kern()
-        .args(["run", "--", "sh", "-c", "exit 42"])
+        .args(["limit", "--", "sh", "-c", "exit 42"])
         .output()
         .expect("run kern");
     assert_eq!(
@@ -12671,7 +12784,7 @@ fn a_kern_run_reports_its_commands_exit_code_and_relays_a_signal() {
         String::from_utf8_lossy(&out.stderr)
     );
     let mut child = kern()
-        .args(["run", "--", "sleep", "30"])
+        .args(["limit", "--", "sleep", "30"])
         .spawn()
         .expect("spawn kern run");
     // WAIT FOR THE HANDLER, NOT FOR THE FORK. Both are needed and only the second was checked: the
@@ -12734,7 +12847,7 @@ fn a_kern_run_does_not_inherit_its_parents_direct_path_decision() {
         return;
     }
     let out = kern()
-        .args(["run", "--", "cat", "/proc/self/cgroup"])
+        .args(["limit", "--", "cat", "/proc/self/cgroup"])
         .env("KERN_NO_SCOPE", "1")
         .env("KERN_DIRECT_CAPS", "1") // the poison: a decision this invocation never made
         .env("KERN_ALLOW_UNCAPPED", "1") // KERN_NO_SCOPE is deliberate here; silence its warning
@@ -12829,7 +12942,7 @@ fn a_kern_run_sweeps_a_leaf_left_by_a_kern_run_that_was_killed() {
     // reach.
     let mut gone = false;
     for _ in 0..10 {
-        let _ = kern().args(["run", "--", "/bin/true"]).output();
+        let _ = kern().args(["limit", "--", "/bin/true"]).output();
         if !orphan.exists() {
             gone = true;
             break;
@@ -12874,7 +12987,7 @@ fn a_kern_run_sweeps_a_leaf_left_by_a_kern_run_that_was_killed() {
 fn a_default_capped_kern_run_is_silent_and_the_cap_is_really_there() {
     let out = kern()
         .args([
-            "run",
+            "limit",
             "--",
             "sh",
             "-c",
@@ -12918,7 +13031,7 @@ fn a_default_capped_kern_run_is_silent_and_the_cap_is_really_there() {
 fn the_uncapped_notice_names_the_cause_it_can_name_and_not_the_other_one() {
     // WITH the opt-out: the variable is the cause, so the message must name it.
     let opted_out = kern()
-        .args(["run", "--", "/bin/true"])
+        .args(["limit", "--", "/bin/true"])
         .env("KERN_NO_SCOPE", "1")
         .env_remove("KERN_QUIET")
         .env_remove("KERN_ALLOW_UNCAPPED")
@@ -12940,7 +13053,7 @@ fn the_uncapped_notice_names_the_cause_it_can_name_and_not_the_other_one() {
     let nomgr = std::env::temp_dir().join(format!("kern-nomgr-{}", std::process::id()));
     let _ = fs::create_dir_all(&nomgr);
     let out = kern()
-        .args(["run", "--", "/bin/true"])
+        .args(["limit", "--", "/bin/true"])
         .env("XDG_RUNTIME_DIR", &nomgr)
         .env("DBUS_SESSION_BUS_ADDRESS", "")
         .env_remove("KERN_NO_SCOPE")
