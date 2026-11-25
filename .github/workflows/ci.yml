@@ -25,11 +25,11 @@ jobs:
     name: build + test (x86)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
@@ -184,13 +184,13 @@ jobs:
     name: workflow syntax
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # The workflows are the one thing here with no local check at all: `yaml.safe_load` parses
       # `runs-on: ubunutu-latest` and a `${{ matrix.pyhton }}` typo without complaint, so a broken
       # job is found by pushing it, which is the worst moment. actionlint knows the runner labels
       # and type-checks the expression contexts; both were confirmed to fail on exactly those two
       # mistakes before this step was added.
-      - uses: rhysd/actionlint@main
+      - uses: rhysd/actionlint@011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7 # main
         with:
           args: -color
 
@@ -211,8 +211,8 @@ jobs:
           - python: "3.12"
             extras: "[langchain]"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
       - name: install
@@ -253,11 +253,11 @@ jobs:
     # compiles clippy-clean and its non-privileged tests pass on real aarch64 too, every push.
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: clippy
         run: cargo clippy --all-targets --all-features
       - name: test
@@ -283,12 +283,12 @@ jobs:
       matrix:
         node: ["22", "24"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: what this runner allows
         # Same knob the webstack job turns: a GitHub runner ships AppArmor's unprivileged-userns
         # restriction on, and kern refuses to pretend it can build a sandbox without one.
@@ -363,9 +363,9 @@ jobs:
     # can: the pod network, the health dependency, the port publisher and compose's own teardown.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: what this runner allows, before and after
         run: |
           sysctl kernel.apparmor_restrict_unprivileged_userns || true
@@ -511,9 +511,9 @@ jobs:
     # read is worse than no job, and worse still on the push path where it would sit red.
     if: github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: let this runner open an unprivileged user namespace
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -546,9 +546,9 @@ jobs:
     # not. The second half is the one that would have caught the original defect.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: build the binary under test
         run: cargo build --release --bin kern
       - name: with the controller delegated, the cap must bite
@@ -622,7 +622,7 @@ jobs:
     # cancelled the job twice; nothing this job checks depends on the CPU.
     runs-on: macos-15-intel
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: the installer's Darwin branch drives Lima as it should, without a VM
         # SINCE 2026-11-17 THE INSTALLER INSTALLS ON A MAC instead of refusing: Lima, a VM named
         # `kern` without containerd, kern inside it, and a `kern` shim on the Mac. This runner cannot
@@ -684,7 +684,7 @@ jobs:
           grep -qF 'CALL [start] [--tty=false] [kern]' "$log" || { echo 'the shim did not start a stopped VM' >&2; exit 1; }
           grep -qF 'CALL [shell] [kern] [/usr/local/bin/kern] [ps]' "$log" || {
             echo 'outside HOME the shim must run without --workdir' >&2; exit 1; }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: the Python SDK names the VM, not a download that does not exist
@@ -764,12 +764,12 @@ jobs:
     name: cargo-audit + cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       # Install recent prebuilt binaries so tool versions match local dev: the
       # pinned cargo-deny-action@v1 shipped an old cargo-deny that rejected newer
       # deny.toml keys / SPDX ids (e.g. Unicode-3.0).
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: cargo-deny,cargo-audit
       - name: cargo-deny

@@ -27,7 +27,7 @@ jobs:
   script:
     runs-on: macos-15-intel
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: syntax
         run: sh -n install.sh
       - name: shellcheck
@@ -40,7 +40,7 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: QEMU (an Intel runner has no `vz` guest to offer)
         run: brew install qemu
       - name: install (the Darwin branch of install.sh)

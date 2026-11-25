@@ -97,6 +97,16 @@ API lists and inspects an ended container from kern's record, after a restart to
 container found by its label, its exit code and image). `kern ps --json` also gives a running box's
 `image`, and `docker ps` shows each container's image (it showed `<no image>` for all of them).
 
+**The release's SBOM lists what each published file contains, and it is signed.** `kern.spdx.json`
+is built from what each build compiled (the graph cargo resolved, checked against the units the build
+compiled) rather than from a scan of the source tree, which listed the workflow's actions and crates
+the binary never links and declared 3 licenses. Each asset is an entry with its SHA256: the Linux
+binaries and `kern.exe` with their crates (version, license, `purl`, download SHA256), the standard
+library and the statically linked C runtime, and the WSL rootfs with its Alpine packages. It carries
+a `.sha256` and is signed with the other assets (see SECURITY.md). Every action the workflows run is
+pinned to a commit, and the release jobs read the repository only, except the one that writes the
+draft.
+
 **`--restart on-failure:N` works on `kern box` and `kern run`, as in Docker.** It is `on-failure`
 with `--restart-max N`, which is what compose's `restart: on-failure:N` already was; before, the
 command line refused it as an unexpected argument.

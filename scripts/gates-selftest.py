@@ -48,6 +48,7 @@ NOT_A_GATE = {
     "ab-measure": "a measuring instrument, not a gate: it answers a question rather than refusing",
     "gates-selftest": "this script, which runs the others by construction",
     "seccomp-audit": "not a gate: it needs a live workload and an audit log to read",
+    "sbom": "the release's SBOM generator, not a gate: `sbom-check` is the gate that runs it",
     "injection-declared": "reports rather than refuses: it always exits 0 by design, so a case that turned it red would be asserting the opposite of its contract",
 }
 
@@ -273,6 +274,15 @@ CASES: list[Case] = [
     # parse TOML, deliberately), but a case that proves only that would be a case whose label lies.
     ("test-env-lock", "rustflags disarming the lint in a cargo config", ".cargo/config.toml",
      replace_once('rustflags = [\n', 'rustflags = [\n    "-A", "clippy::disallowed_methods",\n')),
+    # --- sbom-check: the license of what is LINKED into kern, read from Cargo, kern's own included.
+    # This is the case that found the blind spot: kern's license was a constant in the generator, so
+    # a relicensed workspace still came out "Apache-2.0" and passed.
+    ("sbom-check", "the workspace relicensed under a copyleft license", "Cargo.toml",
+     replace_once('license = "Apache-2.0"', 'license = "GPL-3.0-only"')),
+    # --- actions-pinned: a pin turned back into a movable tag, in the workflow that builds releases
+    ("actions-pinned", "an action back on a movable tag in the release workflow",
+     ".github/workflows/release.yml",
+     sub_once(r"uses: actions/checkout@[0-9a-f]{40} # v5", "uses: actions/checkout@v5")),
 ]
 
 

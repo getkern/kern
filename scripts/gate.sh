@@ -97,7 +97,7 @@ step "cargo test (kern-win)" \
 echo "docs"
 for g in docker-vocabulary dockerfiles flat-continuation gen-seccomp-allowlist injection-declared \
          md-links measured-figures no-ai-slop registry-classified retired-claims stale-numbers \
-         progress-is-tty-gated \
+         progress-is-tty-gated sbom-check actions-pinned \
          gates-selftest; do
     step "$g" python3 "scripts/$g.py"
 done

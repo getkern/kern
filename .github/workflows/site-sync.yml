@@ -26,7 +26,7 @@ jobs:
     name: the site serves the installer this repo audits
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # TAGS, not just the tip: `site-version-current.py` compares the page against the newest
           # tag, and the default shallow checkout fetches none, so `git describe` would fail on a

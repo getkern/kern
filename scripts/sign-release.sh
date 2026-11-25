@@ -7,7 +7,8 @@
 #
 # The release workflow leaves a new release as a DRAFT, so nothing is public before it is signed.
 # This script finds the draft (or a published release, to re-sign one), and for each asset - the two
-# Linux tarballs, the Windows shim and the WSL rootfs - downloads it, checks it against the release's
+# Linux tarballs, the Windows shim, the WSL rootfs and the SBOM (`kern.spdx.json`, target `sbom`, so
+# its signature can never be taken for a binary's) - downloads it, checks it against the release's
 # own .sha256, signs it with the trusted comment `kern self-update`, install.sh and install.ps1 read
 # (`kern-release v1 version=X.Y.Z target=T file=F`), verifies the signature with the public keys, and
 # uploads `<file>.minisig` (replacing an older one of the same name). When every file is signed, a
@@ -99,7 +100,8 @@ for pair in \
   "kern-x86_64-unknown-linux-musl.tar.gz x86_64-unknown-linux-musl" \
   "kern-aarch64-unknown-linux-musl.tar.gz aarch64-unknown-linux-musl" \
   "kern-windows-x86_64.exe x86_64-pc-windows-gnu" \
-  "kern-wsl-rootfs.tar.gz x86_64-wsl-rootfs"; do
+  "kern-wsl-rootfs.tar.gz x86_64-wsl-rootfs" \
+  "kern.spdx.json sbom"; do
   file="${pair%% *}"
   target="${pair#* }"
   echo "== $file"

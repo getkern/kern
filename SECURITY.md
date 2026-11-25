@@ -471,5 +471,25 @@ That wrapper serves the test image from your own loopback, so nothing here needs
 or a network. Exit status is 0 only if every asserted property held; a host that cannot answer a
 question reports `SKIP` with the reason and never counts it as a pass.
 
+## What a release contains
+Every release carries `kern.spdx.json` (SPDX 2.3), signed with minisign like the binaries, with
+`target=sbom` in the signed comment. It lists each published file with its SHA256 and what is in it:
+
+- each binary's Rust crates as its build compiled them: the graph cargo resolved for that target,
+  checked during the build against the units it compiled, every crate with its version, license,
+  `purl` and the SHA256 `Cargo.lock` records for its download; crates used only to build (build
+  scripts, proc-macros) are listed apart, as build dependencies;
+- the Rust standard library, at the toolchain commit named, and the C runtime linked statically:
+  musl in the Linux binaries, the MinGW-w64 runtime in `kern.exe`;
+- the Alpine packages of the WSL rootfs, each with the license Alpine declares.
+
+A crate linked into kern under a license outside the list in `scripts/sbom.py` fails
+`scripts/sbom-check.py`, which runs on every change. To check the file, with either release key:
+
+```sh
+minisign -Vm kern.spdx.json -P RWSuYG/qtD8AV5p5IzIqfRuCwh5eJlT7ed5+7lVKrgILE1qvIpPGv+Ej
+minisign -Vm kern.spdx.json -P RWRLQt2lFPXXsC0g2+1SPfSmOdjpxJ/f+t5DU+xPOaRNjElnisOR0Uo3
+```
+
 ## What's supported
 The code on `main` is what's supported; security fixes land there.

@@ -11,8 +11,11 @@ on:
         description: "Tag whose draft release to (re)build (e.g. v0.52.0); a published release is refused"
         required: true
 
+# READ BY DEFAULT. Only `publish` writes, and it is the job that puts the draft together; every other
+# job hands its files on as artifacts. A build step that is compromised gets a token that can read the
+# repository and nothing else.
 permissions:
-  contents: write # create/upload release assets
+  contents: read
 
 jobs:
   # THE EVIDENCE GATE RUNS BEFORE ANYTHING IS BUILT, AND IT REFUSES THE TAG.
@@ -35,7 +38,7 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
       - name: pentest freshness
@@ -72,7 +75,7 @@ jobs:
       # THE TAG, NOT THE DEFAULT BRANCH. On a dispatch `github.ref` is `main`, so a bare checkout
       # would build whatever `main` happens to be and stamp the tag's version onto it: an asset that
       # claims to be v0.9.31 and is not. `fetch-depth: 0` because the version comes from the tag.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
           fetch-depth: 0
@@ -80,12 +83,12 @@ jobs:
       # (no `#![feature]`), so `cargo build --release` on stable still produces a working binary - this
       # only makes the released one ~22% smaller. Pinned for a reproducible build; bump deliberately and
       # re-validate (a throwaway tag push, see below) when you move it.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: nightly-2026-08-09
           targets: ${{ matrix.target }}
           components: rust-src
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install musl tooling
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Stamp the release version from the tag
@@ -129,10 +132,24 @@ jobs:
           # packaging/README.md before assuming a new file ships.
           tar -C dist -czf "${name}.tar.gz" kern
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+      # WHAT THIS BINARY LINKS, read from this build: the resolver's graph, checked against the
+      # units cargo compiled for the target (a crate in one and not the other stops the release),
+      # the toolchain, the musl it links and the binary's sha256. The `sbom` job assembles these.
+      - name: What the binary links (for the SBOM)
+        run: >
+          python3 scripts/sbom.py collect --package getkern --target ${{ matrix.target }}
+          --toolchain nightly-2026-08-09 --build-std --target-dir target --binary dist/kern
+          --out sbom-input-${{ matrix.target }}.json
+      - name: Hand the SBOM input to the sbom job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-input-${{ matrix.target }}
+          path: sbom-input-${{ matrix.target }}.json
+          if-no-files-found: error
       # TO THE PUBLISH JOB, NOT TO THE RELEASE: every asset reaches the release in one step, as a
       # DRAFT, so nothing is public before the owner has signed it (`scripts/sign-release.sh`).
       - name: Hand the tarball to the publish job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -142,33 +159,52 @@ jobs:
 
   sbom:
     name: SBOM (SPDX)
-    # Gated too: an SBOM attached to a release whose evidence is stale asserts a provenance the
-    # suites have not vouched for.
-    needs: evidence
-    # Same reasoning as `build`: a dispatch that repairs a release must be able to attach the SBOM
-    # the original run never produced.
+    # WHAT EACH PUBLISHED FILE CONTAINS, built from what the builds compiled (`scripts/sbom.py`).
+    # It used to be Syft over the checkout: MEASURED on v0.56.0, 68 entries listing the workflow's
+    # actions and crates the binary never links, nothing for the WSL rootfs's Alpine packages, the
+    # rebuilt standard library or the static musl, 3 licenses, and no signature. Now every asset is
+    # an entry with its sha256 and what it contains, the file is deterministic for a tag, and it
+    # carries a .sha256 so `sign-release.sh` signs it with the rest.
+    #
+    # After `build` and `windows` because it needs their files: the assets' bytes and what each
+    # build reported. `evidence` gates it through them.
+    needs: [build, windows]
     if: >-
       !cancelled()
-      && (needs.evidence.result == 'success' || needs.evidence.result == 'skipped')
+      && needs.build.result == 'success'
+      && needs.windows.result == 'success'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # anchore/sbom-action attaches the SBOM to the tag's release
-    # The dependency tree is identical across targets (one Cargo.lock), so the SBOM is generated
-    # once for the whole project rather than per matrix target. On a tag push the action attaches
-    # kern.spdx.json to the release itself (upload-release-assets defaults to true).
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
-      - name: Generate SPDX SBOM (Syft) for the publish job
-        uses: anchore/sbom-action@v0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: .
-          format: spdx-json
-          artifact-name: kern.spdx.json
-          # The publish job attaches it with the rest: the action finds a release by tag, which does
-          # not see a draft.
-          upload-release-assets: false
+          pattern: release-*
+          path: assets
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: sbom-input-*
+          path: sbom-inputs
+          merge-multiple: true
+      - name: Assemble kern.spdx.json
+        # The tag commit's time is the document's, so the same tag gives the same bytes.
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" python3 scripts/sbom.py assemble \
+            --tag "$TAG" --assets assets --inputs sbom-inputs --out kern.spdx.json
+          sha256sum -c kern.spdx.json.sha256
+      - name: Hand the SBOM to the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kern.spdx.json
+          path: |
+            kern.spdx.json
+            kern.spdx.json.sha256
+          if-no-files-found: error
 
   windows:
     # GATED THROUGH `build`, whose x86_64 tarball it needs: the kern inside the WSL rootfs IS that
@@ -180,20 +216,18 @@ jobs:
     if: ${{ !cancelled() && needs.build.result == 'success' }}
     name: windows shim + WSL rootfs
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # attach the Windows assets to the release
     steps:
       # THE TAG, for the reason the build job states: on a dispatch a bare checkout builds `main` and
       # then stamps the tag's version onto it. The assets on v0.9.31 were produced that way before
       # this line existed.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install cross tooling (mingw)
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - name: The release tag to attach to
@@ -208,7 +242,7 @@ jobs:
         # build into windows/kern-win/target; pin it to the repo-root target dir the Package step reads.
         run: cargo build --release --target x86_64-pc-windows-gnu --manifest-path windows/kern-win/Cargo.toml --target-dir target
       - name: The released x86_64 tarball (its kern goes into the WSL rootfs)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-x86_64-unknown-linux-musl
           path: linux
@@ -238,6 +272,24 @@ jobs:
           echo "released kern  $want"
           echo "rootfs kern    $got"
           [ "$want" = "$got" ] || { echo "::error::the WSL rootfs carries a kern that is not the released one"; exit 1; }
+      # What kern.exe links (read from this build, as for the Linux binaries) and what the rootfs
+      # carries (its apk database), for the `sbom` job.
+      - name: What kern.exe links and the rootfs carries (for the SBOM)
+        run: |
+          set -eu
+          python3 scripts/sbom.py collect --package kern-win \
+            --manifest-path windows/kern-win/Cargo.toml --target x86_64-pc-windows-gnu \
+            --target-dir target --binary target/x86_64-pc-windows-gnu/release/kern.exe \
+            --out sbom-input-x86_64-pc-windows-gnu.json
+          python3 scripts/sbom.py rootfs --tar kern-wsl-rootfs.tar.gz --out sbom-input-wsl-rootfs.json
+      - name: Hand the SBOM inputs to the sbom job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-input-windows
+          path: |
+            sbom-input-x86_64-pc-windows-gnu.json
+            sbom-input-wsl-rootfs.json
+          if-no-files-found: error
       - name: Package + checksums (exact names install.ps1 expects)
         run: |
           set -eu
@@ -245,7 +297,7 @@ jobs:
           sha256sum kern-windows-x86_64.exe > kern-windows-x86_64.exe.sha256
           sha256sum kern-wsl-rootfs.tar.gz  > kern-wsl-rootfs.tar.gz.sha256
       - name: Hand the Windows assets to the publish job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-windows
           path: |
@@ -272,12 +324,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           path: assets
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: kern.spdx.json
           path: assets
