@@ -495,8 +495,8 @@ pub fn info() -> Result<(), Error> {
         // fixed, and "default" on this row would describe a place nothing uses.
         let unread = crate::config::unread_data_place().is_some();
         let why = if unread {
-            "kern.toml does not parse and sets where data goes: boxes and volumes refuse until it is \
-             fixed, `kern validate`"
+            "kern.toml cannot be read and may set where data goes: boxes and volumes refuse until \
+             it is fixed, `kern validate`"
         } else if set_by("data_dir") {
             "[kern] data_dir"
         } else if root {

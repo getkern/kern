@@ -1241,7 +1241,7 @@ fn list_json() -> Result<(), Error> {
         // anything other than a single path component. So the listing states which entries the other
         // verbs will refuse instead of presenting them as ordinary.
         format!(
-            "{{\"name\":{},\"size\":{},\"quota\":{},\"usable\":{}}}",
+            "{{\"name\":{},\"size\":{},\"quota\":{},\"usable\":{},\"path\":{}}}",
             kern_common::json_str(&v.raw),
             // `entries()` measures, so `None` is unreachable here. `null` rather than `0` if it
             // ever becomes reachable: a consumer must not read "not measured" as "empty".
@@ -1249,6 +1249,12 @@ fn list_json() -> Result<(), Error> {
             v.quota
                 .map_or_else(|| "null".to_string(), |q| q.to_string()),
             kern_common::valid_resource_name(&v.raw),
+            // WHERE ITS DATA IS when that is not under kern's volumes (`--path`, `--opt device=`),
+            // as the table says it with `at <dir>`; `null` for one kern keeps itself.
+            v.device.as_ref().map_or_else(
+                || "null".to_string(),
+                |d| kern_common::json_str(&d.to_string_lossy())
+            ),
         )
     });
     println!("{out}");

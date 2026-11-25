@@ -272,6 +272,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}uninstall{z} [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     {c}examples{z}                                                       Print an example kern.toml (alias: example)
     {c}volume{z} <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes (alias: vol)
+                                                                     `create <n> --path DIR` (or --opt device=DIR) keeps one's data
+                                                                     in DIR; `ls` and `inspect` say where (`path` in --json)
     {c}login{z} [registry] [--username U] [--password-stdin|--password P] / {c}logout{z} [registry]  Registry credentials (private pulls)
                                                                      The credentials are CHECKED against the registry before they are
                                                                      stored, so a bad one fails here and not at the next push
@@ -296,9 +298,13 @@ fn help_text(p: &crate::ui::Palette) -> String {
     -d, --detach        Run in the background (track with `kern ps`)
     --read-only         Read-only root (default is a writable overlay)
     -v, --volume S:D[:ro]   Mount into the box (repeatable). S = a host path, a named volume
-                        (auto-created; see `kern volume`), or nfs://|smb://|sshfs:// URL
-    --volumes-from BOX[:ro|:rw]  Every mount of another box, running or kept (repeatable); :ro
-                        makes them all read-only
+                        (auto-created; see `kern volume`), or nfs://|smb://|sshfs:// URL. kern's
+                        own state and image cache (and a directory holding one) are refused, so
+                        are two of the box's mounts on one path; a file mounted on /etc/hosts,
+                        /etc/hostname or /etc/resolv.conf is left as it is
+    --volumes-from BOX[:ro|:rw]  Every mount of another box, running, kept, or ended detached
+                        within the hour (repeatable); :ro makes them all read-only, and the box's
+                        own -v, --mount or --tmpfs on the same path wins
     --mount type=…,src=…,dst=…  The same mount, written with named fields (repeatable).
                         type=bind|volume|tmpfs, src=|source=, dst=|destination=|target=,
                         ro|readonly, tmpfs-size=<sz>. A type= that disagrees with its src is

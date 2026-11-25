@@ -2315,8 +2315,13 @@ fn volume_detail(v: &crate::volume::VolInfo) -> String {
         || "∞ (unlimited - grows until the disk is full)".to_string(),
         human_bytes,
     );
+    // WHERE THE DATA IS, for one made with `--path` (or compose's `driver_opts` bind): the table of
+    // `kern volume ls` says `at <dir>`, and this pane is where top answers the same question.
+    let at = v.device.as_ref().map_or_else(String::new, |d| {
+        format!("\n  data at     {}", crate::ui::scrub(&d.to_string_lossy()))
+    });
     format!(
-        "volume '{}'\n\n  data used   {}\n  quota       {}\n  mount with  -v {}:/path[:ro]",
+        "volume '{}'\n\n  data used   {}\n  quota       {}{at}\n  mount with  -v {}:/path[:ro]",
         v.name,
         // `-` until the sizer has measured this volume (a volume made a moment ago): an unmeasured
         // volume and an empty one are different facts, so never `0`.
@@ -2653,6 +2658,11 @@ fn frame_json(s: &Snapshot, tabs: &[usize], ts_ms: u64) -> String {
             put_opt(o, v.size);
             o.push_str(",\"quota_bytes\":");
             put_opt(o, v.quota);
+            o.push_str(",\"path\":");
+            match &v.device {
+                Some(d) => put_str(o, &d.to_string_lossy()),
+                None => o.push_str("null"),
+            }
             o.push('}');
         });
     }
