@@ -2080,3 +2080,54 @@ def test_an_empty_image_variable_is_unset():
     for blank in ("", "  "):
         assert _server(KERN_MCP_IMAGE=blank)._image == M._DEFAULT_MCP_IMAGE
     assert _server(KERN_MCP_IMAGE="node:20-slim")._image == "node:20-slim"
+
+
+def test_a_request_cancelled_before_it_runs_is_neither_run_nor_answered(monkeypatch):
+    """MCP: a receiver SHOULD stop processing a cancelled request and not answer it. Measured
+    before: a call cancelled while queued behind another ran anyway and was answered."""
+    server = M._Server()
+    server.cancel(7)
+    assert _drive(server, _req("ping", mid=7), monkeypatch) == []
+    # The cancellation is used up: a later request reusing the id is answered.
+    assert len(_drive(server, _req("ping", mid=7), monkeypatch)) == 1
+
+
+def test_the_answer_of_a_request_cancelled_while_it_ran_is_not_sent(monkeypatch):
+    server = M._Server()
+    buf = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buf)
+    server.cancel("a")
+    server.cancel("c")
+    server._result("a", {"content": []})  # its one reply, a result: not sent
+    server._error("c", -32603, "late")  # its one reply, an error: not sent
+    server._result("b", {})
+    lines = [json.loads(ln) for ln in buf.getvalue().split("\n") if ln.strip()]
+    assert [ln["id"] for ln in lines] == ["b"], lines
+
+
+def test_main_honours_a_cancellation_read_before_its_request(monkeypatch):
+    """The stdin reader records a cancellation as it reads it, in order, so a request cancelled
+    before the loop reaches it does not run."""
+    stdin = (
+        json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 5}})
+        + "\n"
+        + json.dumps(_req("ping", mid=5))
+        + "\n"
+        + json.dumps(_req("ping", mid=6))
+        + "\n"
+    )
+    replies = _lines(_run_main(stdin, monkeypatch))
+    assert [r["id"] for r in replies] == [6], replies
+
+
+def test_a_cancelled_queued_call_does_not_run(monkeypatch):
+    """Not answering is half of it: the call must not RUN, a cell queued behind another is work
+    the client has already said it does not want."""
+    server = M._Server()
+    ran = []
+    # On the instance, not through monkeypatch: `_drive` undoes the monkeypatch after each message.
+    server._tool_call = lambda mid, params: ran.append(mid)
+    server.cancel(3)
+    _drive(server, _req("tools/call", mid=3, name="run_code", arguments={"code": "print(1)"}), monkeypatch)
+    _drive(server, _req("tools/call", mid=4, name="run_code", arguments={"code": "print(1)"}), monkeypatch)
+    assert ran == [4], ran

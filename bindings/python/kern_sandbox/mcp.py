@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import sys
 import threading
@@ -410,6 +411,12 @@ class _Server:
         # Empty is UNSET, as every other KERN_MCP_* knob reads it: `KERN_MCP_IMAGE=` in a client
         # config answered every call with an error about an empty image reference.
         self._image = os.environ.get("KERN_MCP_IMAGE", "").strip() or _DEFAULT_MCP_IMAGE
+        # The ids a client CANCELLED (`notifications/cancelled`) that have not been answered yet. MCP:
+        # the receiver SHOULD stop processing a cancelled request and not send a response. MEASURED
+        # before: a request cancelled while it was still queued behind another ran anyway and was
+        # answered. Written by the stdin reader thread and read by the request loop, so a lock.
+        self._cancelled: set = set()
+        self._cancel_lock = threading.Lock()
 
     # -- lifecycle ---------------------------------------------------------------------------------
     def _session(self) -> Sandbox:
@@ -585,18 +592,45 @@ class _Server:
             self._sbx = None
 
     # -- JSON-RPC plumbing (newline-delimited over stdio) ------------------------------------------
+    # ONE WRITER AT A TIME: the stdin reader thread answers a frame it cannot parse while the request
+    # loop answers requests, and two writes interleaved would put half a message on a line.
+    _send_lock = threading.Lock()
+
     @staticmethod
     def _send(msg: dict) -> None:
         # ensure_ascii=False keeps non-ASCII as real UTF-8 (1-4 bytes) instead of \uXXXX escapes (6-12
         # bytes): without it a reply "bounded" in code points could be up to 12x larger in wire bytes.
         # main() forces stdout to UTF-8 with errors="replace" so this can never raise UnicodeEncodeError.
-        sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        line = json.dumps(msg, ensure_ascii=False) + "\n"
+        with _Server._send_lock:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+    def cancel(self, request_id: object) -> None:
+        """Record a client's `notifications/cancelled` for `request_id` (any thread)."""
+        if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
+            with self._cancel_lock:
+                self._cancelled.add(request_id)
+
+    def _take_cancelled(self, mid: object) -> bool:
+        """Whether `mid` was cancelled, forgetting it: its one reply is the one not sent."""
+        if not isinstance(mid, (str, int)) or isinstance(mid, bool):
+            return False
+        with self._cancel_lock:
+            if mid in self._cancelled:
+                self._cancelled.discard(mid)
+                return True
+        return False
 
     def _result(self, mid: object, result: dict) -> None:
+        # Cancelled while it ran: the work is done and its answer is not sent, as MCP asks.
+        if self._take_cancelled(mid):
+            return
         self._send({"jsonrpc": "2.0", "id": mid, "result": result})
 
     def _error(self, mid: object, code: int, message: str) -> None:
+        if self._take_cancelled(mid):
+            return
         self._send({"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}})
 
     # -- dispatch ----------------------------------------------------------------------------------
@@ -604,8 +638,16 @@ class _Server:
         method = msg.get("method")
         mid = msg.get("id")
         is_request = mid is not None
-        if method in ("notifications/initialized", "initialized", "notifications/cancelled"):
+        if method == "notifications/cancelled":
+            params = msg.get("params")
+            if isinstance(params, dict):
+                self.cancel(params.get("requestId"))
+            return  # a notification: no response
+        if method in ("notifications/initialized", "initialized"):
             return  # notifications: no response
+        # CANCELLED BEFORE IT STARTED (queued behind a running call): nothing runs, nothing answers.
+        if is_request and self._take_cancelled(mid):
+            return
         if not is_request:
             # JSON-RPC 2.0 section 4.1: a Notification carries no `id`, and the server MUST NOT reply to
             # one. Every branch below answers, so the guard belongs HERE rather than inside each: without
@@ -960,69 +1002,91 @@ def main() -> None:
             stream.reconfigure(encoding="utf-8", **kw)
         except (AttributeError, ValueError):
             pass
+    # THE READER IS ITS OWN THREAD so a `notifications/cancelled` is seen while a call runs: read in
+    # line with the calls, it waited behind the very request it cancelled. It reads and parses, and
+    # answers what cannot be parsed, exactly as before; a cancellation is recorded at once, and every
+    # other message goes to the request loop in order. `None` in the queue ends the loop.
+    inbox: "queue.Queue" = queue.Queue()
+
+    def _read() -> None:
+        try:
+            while True:
+                # readline(_MAX_FRAME) returns AT MOST _MAX_FRAME chars, so a client flooding a gigabyte
+                # with no newline is read in bounded chunks instead of buffering into host RAM.
+                line = sys.stdin.readline(_MAX_FRAME)
+                if line == "":  # EOF
+                    break
+                if len(line) >= _MAX_FRAME and not line.endswith("\n"):
+                    # Oversize frame with no newline: drain the REST of this line so the next read starts at a
+                    # fresh message boundary (resync), rather than parsing the tail of a giant frame.
+                    #
+                    # 🔴 AND ANSWER IT, because dropping it in silence leaves the client waiting FOREVER on
+                    # an id that will never come back. MEASURED: a 10 MB `code` argument through `run_code`
+                    # left the server alive and correct and the caller hung, with no error, no timeout and
+                    # no way to tell a dropped frame from a slow one. The `id` is at the START of a
+                    # JSON-RPC frame, which is inside the bytes already read, so the one thing the client
+                    # needs is recoverable even though the frame is not parseable. If it is not there, the
+                    # silence is unavoidable and is the only case left.
+                    mid = _prefix_id(line)
+                    while True:
+                        chunk = sys.stdin.readline(_MAX_FRAME)
+                        if chunk == "" or chunk.endswith("\n"):
+                            break
+                    if mid is not None:
+                        server._error(
+                            mid,
+                            -32600,
+                            f"request frame exceeds this server's {_MAX_FRAME} character limit and was "
+                            f"dropped; nothing ran. Send less in one call: for a large `code`, write it "
+                            f"to the workspace with write_file and run it from there",
+                        )
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line, parse_constant=_not_json)
+                except (ValueError, RecursionError) as e:
+                    # JSONDecodeError (a ValueError) is the ordinary malformed frame. RecursionError is the
+                    # hostile one: `[`*100000 is SYNTACTICALLY valid, so the decoder recurses past the
+                    # interpreter's limit and raises something that is NOT a JSONDecodeError. Caught only as
+                    # JSONDecodeError, it escaped the loop and killed the connection - one frame, no reply to
+                    # anything after it.
+                    #
+                    # 🔴 AND EVERY ID ON THE LINE IS ANSWERED, for the reason the oversize frame above is:
+                    # a dropped frame leaves its client waiting forever. MEASURED before this: two `ping`s
+                    # on one line, a frame cut short, and a line that is not JSON each got NO reply, and
+                    # the server answered the next well-formed line normally, so nothing marked the loss.
+                    # Nothing on the line runs - it is not one message, so which part was meant cannot be
+                    # known - and each id gets -32700. With no id there is no reply: MCP's error schema
+                    # requires the request's id, so JSON-RPC's `"id": null` form is not available here.
+                    why = _clip(str(e), _MAX_NAME)
+                    for mid in _unparsed_ids(line):
+                        server._error(
+                            mid,
+                            -32700,
+                            f"this line is not ONE JSON-RPC message ({why}), so nothing on it ran. The "
+                            f"stdio transport carries exactly one message per line, each ending in a "
+                            f"newline",
+                        )
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("method") == "notifications/cancelled":
+                    server.handle(msg)
+                    continue
+                inbox.put(msg)
+        except (KeyboardInterrupt, BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            inbox.put(None)
+
+    threading.Thread(target=_read, name="kern-mcp-stdin", daemon=True).start()
     try:
         while True:
-            # readline(_MAX_FRAME) returns AT MOST _MAX_FRAME chars, so a client flooding a gigabyte
-            # with no newline is read in bounded chunks instead of buffering into host RAM.
-            line = sys.stdin.readline(_MAX_FRAME)
-            if line == "":  # EOF
+            msg = inbox.get()
+            if msg is None:  # EOF, or the reader could not go on
                 break
-            if len(line) >= _MAX_FRAME and not line.endswith("\n"):
-                # Oversize frame with no newline: drain the REST of this line so the next read starts at a
-                # fresh message boundary (resync), rather than parsing the tail of a giant frame.
-                #
-                # 🔴 AND ANSWER IT, because dropping it in silence leaves the client waiting FOREVER on
-                # an id that will never come back. MEASURED: a 10 MB `code` argument through `run_code`
-                # left the server alive and correct and the caller hung, with no error, no timeout and
-                # no way to tell a dropped frame from a slow one. The `id` is at the START of a
-                # JSON-RPC frame, which is inside the bytes already read, so the one thing the client
-                # needs is recoverable even though the frame is not parseable. If it is not there, the
-                # silence is unavoidable and is the only case left.
-                mid = _prefix_id(line)
-                while True:
-                    chunk = sys.stdin.readline(_MAX_FRAME)
-                    if chunk == "" or chunk.endswith("\n"):
-                        break
-                if mid is not None:
-                    server._error(
-                        mid,
-                        -32600,
-                        f"request frame exceeds this server's {_MAX_FRAME} character limit and was "
-                        f"dropped; nothing ran. Send less in one call: for a large `code`, write it "
-                        f"to the workspace with write_file and run it from there",
-                    )
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line, parse_constant=_not_json)
-            except (ValueError, RecursionError) as e:
-                # JSONDecodeError (a ValueError) is the ordinary malformed frame. RecursionError is the
-                # hostile one: `[`*100000 is SYNTACTICALLY valid, so the decoder recurses past the
-                # interpreter's limit and raises something that is NOT a JSONDecodeError. Caught only as
-                # JSONDecodeError, it escaped the loop and killed the connection - one frame, no reply to
-                # anything after it.
-                #
-                # 🔴 AND EVERY ID ON THE LINE IS ANSWERED, for the reason the oversize frame above is:
-                # a dropped frame leaves its client waiting forever. MEASURED before this: two `ping`s
-                # on one line, a frame cut short, and a line that is not JSON each got NO reply, and
-                # the server answered the next well-formed line normally, so nothing marked the loss.
-                # Nothing on the line runs - it is not one message, so which part was meant cannot be
-                # known - and each id gets -32700. With no id there is no reply: MCP's error schema
-                # requires the request's id, so JSON-RPC's `"id": null` form is not available here.
-                why = _clip(str(e), _MAX_NAME)
-                for mid in _unparsed_ids(line):
-                    server._error(
-                        mid,
-                        -32700,
-                        f"this line is not ONE JSON-RPC message ({why}), so nothing on it ran. The "
-                        f"stdio transport carries exactly one message per line, each ending in a "
-                        f"newline",
-                    )
-                continue
-            if not isinstance(msg, dict):
-                continue
             try:
                 server.handle(msg)
             except (KeyboardInterrupt, BrokenPipeError):
