@@ -2722,6 +2722,25 @@ fn log_head<W: std::io::Write>(
                  (a foreground box, which is what an SDK call and a plain `kern box` both are). Only \
                  `kern box -d` detaches the output into a log this verb can read"
             )
+        } else if let Some(code) = registry::list_exited()
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.code)
+        {
+            // AN ENDED BOX WHOSE LOG IS GONE: the reason is the retention, and the reader asked about
+            // a box `kern ps -a` still lists, so a pointer to `kern ps` sends them in a circle.
+            let keep = crate::config::load_cached(None)
+                .ok()
+                .and_then(|c| c.kern.log_keep_ended_s);
+            let now = keep.map_or_else(
+                || "7 days, the default".to_string(),
+                |s| format!("{s} s, `[kern] log_keep_ended`"),
+            );
+            format!(
+                "box '{name}' ended (exit {code}) and its log is gone: ended boxes' logs are removed \
+                 by the retention (now {now}), by `kern prune`, or at once with `--rm`. `kern config \
+                 set log_keep_ended 30d` keeps them longer; `--keep` keeps a box's until it is removed"
+            )
         } else {
             format!("no logs for box '{name}'")
         }));
