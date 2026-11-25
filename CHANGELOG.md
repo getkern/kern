@@ -71,6 +71,29 @@ uid (100998 for a box's 999), which you cannot `chown` or remove; `kern unshare 
 `kern unshare -- chown -R 0:0 ./data` can. Without a subordinate id range it still runs, as uid 0 of
 your own id only, and says so first. See [docs/RUNTIME-PARITY.md](docs/RUNTIME-PARITY.md) section 38.
 
+**`kern bench` says how much of a number is noise.** Besides min/median/avg/max it prints p10/p90, the
+floor (what spawning `/bin/true` costs on that machine), an A/A interval (the same start in two
+interleaved series), the load average before and after, and saves each run as JSON;
+`--compare docker|podman` runs the same image there, paired run by run, reported as the median of the
+per-pair differences with a 95% interval. `--json` prints one object. See [BENCHMARKS.md](BENCHMARKS.md).
+
+**Busybox `wget` reaches an allowlisted HTTPS host through `--egress-allow`.** It sends the whole
+`https://` URL to the proxy instead of a `CONNECT`; the proxy now makes that HTTPS request itself, over
+the vetted and pinned leg `--egress-secret` uses, where it used to dial port 80 and fail.
+
+- `kern doctor` typed in Windows: the row checked from Windows is one of the table's rows, counted in
+  the tally, where it was printed after it.
+- `install.ps1` resolves the latest version once, with a timeout, and downloads every file from that
+  release; a release published during an install no longer makes the signature check refuse it.
+- The `--egress-allow` note is printed to a terminal only, not into every SDK cell's stderr.
+- The `.localhost` router says it listens instead of being polled every 10 ms: a cold `kern box -d -p`
+  takes about 3 ms less.
+- `kern sandbox show` ends a block with its last line, not a blank one.
+- `kern build`'s live view shows a batch of RUNs as one row named from its first step.
+- A `COPY --from` path missing from a single-layer stage is named, with the stage, as it already was for
+  a multi-layer one.
+
+
 ## kern sandbox 0.3.0 - 2026-11-20
 
 **It carries the kern v0.56.0 binary**, and both bindings gain what v0.56.0 lists under "kern sandbox":
