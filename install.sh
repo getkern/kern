@@ -130,15 +130,18 @@ kern_macos() {
       /usr/local/bin/kern doctor --apparmor-profile | sudo tee /etc/apparmor.d/kern >/dev/null &&
         sudo apparmor_parser -r /etc/apparmor.d/kern
     fi' || err "installing the AppArmor profile inside the VM failed."
-  # THE UID RANGE HELPERS: Lima's Ubuntu image gives the user an /etc/subuid range but ships no
-  # newuidmap, so every box ran with a single-uid map and an image that chowns to a service user
-  # failed at start. MEASURED on the Mac: nginx `chown(.., 101) failed (22: Invalid argument)`, redis
-  # `chown: .: Invalid argument`; with `uidmap` installed both start.
+  # WHAT LIMA'S UBUNTU IMAGE LACKS AND A BOX NEEDS, all measured on the Mac:
+  # - uidmap: the image gives the user an /etc/subuid range but no newuidmap, so every box ran with a
+  #   single-uid map and nginx/redis failed at start (`chown ... Invalid argument`);
+  # - passt (pasta): without it a compose service has no outbound network at all, which read as a
+  #   "rete front" failure and was blamed on kern before `kern doctor` named the missing pasta;
+  # - zstd: images with zstd-compressed layers cannot be pulled without it.
   # shellcheck disable=SC2016
   limactl shell "$vm" sh -c '
-    command -v newuidmap >/dev/null 2>&1 || ! command -v apt-get >/dev/null 2>&1 ||
-      sudo apt-get install -y -q uidmap >/dev/null 2>&1' ||
-    err "installing uidmap inside the VM failed (kern still runs, with a single-uid map)."
+    { command -v newuidmap && command -v pasta && command -v zstd; } >/dev/null 2>&1 ||
+      ! command -v apt-get >/dev/null 2>&1 ||
+      sudo apt-get install -y -q uidmap passt zstd >/dev/null 2>&1' ||
+    err "installing uidmap, passt and zstd inside the VM failed (kern still runs; \`kern doctor\` names what is missing)."
 
   # The `kern` command on the Mac.
   shimdir="$HOME/.local/bin"

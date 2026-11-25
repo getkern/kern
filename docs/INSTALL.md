@@ -176,7 +176,8 @@ On a Mac it installs Lima (with Homebrew if you have it, else the latest Lima re
 against its SHA256SUMS, in `~/.kern/lima`), creates a VM named `kern` from Ubuntu 24.04 LTS minimal
 (about 200 MB to download, once, checked against Ubuntu's SHA256SUMS) with no Docker and no containerd
 in it and your home mounted writable, installs kern inside it with this same script, kern's AppArmor
-profile and `uidmap` (so images that switch to a service user, such as nginx and redis, start), and
+profile, `uidmap` (so images that switch to a service user, such as nginx and redis, start), `passt`
+(outbound network for compose services) and `zstd` (zstd-compressed image layers), and
 puts `kern` in `~/.local/bin` on the Mac. Measured on an Apple Silicon Mac: about two and a half
 minutes from nothing to a box running.
 That `kern` starts the VM when it is stopped and runs kern in it; under your home the current

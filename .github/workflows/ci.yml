@@ -665,9 +665,10 @@ jobs:
           # shellcheck disable=SC2016
           grep -qF '[sh] [-c] [curl -fsSL "$1" | sudo env KERN_VERSION="$2" KERN_INSTALL_FROM_MAC=1 sh]' "$log" || {
             echo 'kern is not installed inside the VM through install.sh' >&2; exit 1; }
-          # The uid range helpers: without them nginx and redis fail to start in the VM (measured).
-          grep -qF 'sudo apt-get install -y -q uidmap' "$log" || {
-            echo 'install.sh does not put uidmap in the VM' >&2; exit 1; }
+          # What Lima's Ubuntu lacks (measured): uidmap or nginx and redis fail to start, passt or a
+          # compose service has no outbound network, zstd or zstd layers cannot be pulled.
+          grep -qF 'sudo apt-get install -y -q uidmap passt zstd' "$log" || {
+            echo 'install.sh does not put uidmap, passt and zstd in the VM' >&2; exit 1; }
           grep -qF 'apparmor_restrict_unprivileged_userns' "$log" || {
             echo 'the VM no longer gets the AppArmor step' >&2; exit 1; }
           [ -x "$home/.local/bin/kern" ] || { echo 'no kern shim on the Mac' >&2; exit 1; }
