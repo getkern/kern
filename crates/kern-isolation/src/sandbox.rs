@@ -1376,7 +1376,8 @@ mod tests {
         }
         assert!(a.iter().any(|x| x == "--oom-group"), "{a:?}");
         assert!(
-            a.windows(2).any(|w| w[0] == "--memory-swap-max" && w[1] == "0"),
+            a.windows(2)
+                .any(|w| w[0] == "--memory-swap-max" && w[1] == "0"),
             "a sandbox's memory cap is its whole budget: {a:?}"
         );
         // Quiet + rootfs + command separator present.
