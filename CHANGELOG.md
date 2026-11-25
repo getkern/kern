@@ -162,6 +162,10 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
   directory is checked first, on the disk itself: yours, private, and keeping file modes and symlinks
   (a FAT or exFAT card is refused with what failed). Not while a box runs; what stays at the old
   place is said with the `mv` that moves it.
+- **A box starts as fast where kern's runtime directory is on a disk.** Ending a box synced its
+  scratch layer's filesystem, a journal commit on ext4: a default box took 14 ms there against 3 ms
+  on tmpfs. The scratch layer, thrown away with the box, no longer asks for that sync; a kept box's
+  layer still does.
 - **A box on the default network starts without waiting for its NAT.** A box that names no network
   now enters a network namespace kern prepared ahead, with pasta already up; it serves that box alone
   and goes with it. Measured, `kern run --rm alpine true`: 14.7 ms to 4.3-5.0 ms here (when boxes
