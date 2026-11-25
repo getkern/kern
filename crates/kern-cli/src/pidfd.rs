@@ -26,6 +26,18 @@ impl PidFd {
         self.0.as_raw_fd()
     }
 
+    /// The raw descriptor of an optional pidfd, `-1` for none: the shape of the `signal_box` and
+    /// wait helpers, which fall back to the pid when there is no pidfd.
+    pub(crate) fn raw_of(p: &Option<Self>) -> RawFd {
+        p.as_ref().map_or(-1, Self::raw)
+    }
+
+    /// Send `sig` to the process this pins, never to a pid reused since. `true` when delivered.
+    pub(crate) fn send_signal(&self, sig: i32) -> bool {
+        // SAFETY: `pidfd_send_signal(fd, sig, NULL, 0)` takes a descriptor this owns and integers.
+        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.raw(), sig, 0, 0) == 0 }
+    }
+
     /// Block until the process exits or `ms` milliseconds pass. `true` only when it was seen to
     /// exit; an error answers `false`.
     pub(crate) fn wait_exit(&self, ms: i32) -> bool {

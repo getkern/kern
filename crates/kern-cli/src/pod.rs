@@ -1647,7 +1647,7 @@ fn output_within(
     // handed to an unrelated process, and `recv_timeout` expires microseconds later and signals it.
     // Nothing serialises those two, so the window is real rather than theoretical. `-1` on kernels
     // older than 5.3, where the fallback below accepts that window rather than doing nothing.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+    let pin = crate::pidfd::PidFd::open(pid);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
@@ -1679,9 +1679,9 @@ fn output_within(
             // through the pidfd and targets the fd rather than the number, so whether a pidfd
             // pins the number is no longer load-bearing here either.
             unsafe {
-                if pidfd >= 0 {
+                if let Some(p) = &pin {
                     // Exact, and immune to reuse: the fd names the process, not the number.
-                    libc::syscall(libc::SYS_pidfd_send_signal, pidfd, libc::SIGKILL, 0, 0);
+                    p.send_signal(libc::SIGKILL);
                 } else {
                     // No pidfd (kernel < 5.3): the number is unpinned and could in principle
                     // have been reused. That is the ordinary risk of signalling by pid, which is
@@ -1698,9 +1698,7 @@ fn output_within(
             ))
         }
     };
-    if pidfd >= 0 {
-        unsafe { libc::close(pidfd) };
-    }
+    drop(pin);
     result
 }
 

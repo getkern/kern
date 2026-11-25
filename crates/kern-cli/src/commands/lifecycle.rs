@@ -210,11 +210,10 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
                 // Falls back to `kill` on kernels < 5.3.
                 HealthAction::Restart => {
                     if let Some(pid1) = pid1 {
-                        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
-                        unsafe { signal_box(pidfd, pid1, libc::SIGKILL) };
-                        if pidfd >= 0 {
-                            unsafe { libc::close(pidfd) };
-                        }
+                        let pin = crate::pidfd::PidFd::open(pid1);
+                        unsafe {
+                            signal_box(crate::pidfd::PidFd::raw_of(&pin), pid1, libc::SIGKILL)
+                        };
                     }
                 }
                 // Stop: tear the whole box down (a detached stopper that has escaped this checker's
@@ -345,7 +344,8 @@ pub(crate) fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
     // exact process for its whole life, so the delayed signals below can never land on a reused pid
     // (if the box exits during the sleep, the signal just fails with ESRCH). Fall back to plain
     // `kill(pid1)` only on a kernel too old for pidfd (< 5.3) - the target boards are 5.15+.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
+    let pin = crate::pidfd::PidFd::open(pid1);
+    let pidfd = crate::pidfd::PidFd::raw_of(&pin);
     unsafe {
         // WAIT FOR THE BOX TO EXIT, with `secs` as a CAP - do not sleep `secs` out. A pidfd becomes
         // readable the instant the process it pins terminates, so the common case (the box finishes
@@ -373,8 +373,11 @@ pub(crate) fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
         }
         signal_box(pidfd, pid1, libc::SIGTERM);
         // Same again for the grace period: a box that dies on the SIGTERM must not hold us here for
-        // the full 2 s, and one that ignores it gets exactly the 2 s it used to get.
-        wait_for_box_exit(pidfd, 2000);
+        // the full 2 s, and one that ignores it gets exactly the 2 s it used to get. One whose init
+        // cannot hear it gets none (see `init_hears_no_alloc`), as `kern stop` gives it none.
+        if init_hears_no_alloc(pid1, libc::SIGTERM) {
+            wait_for_box_exit(pidfd, 2000);
+        }
         signal_box(pidfd, pid1, libc::SIGKILL);
         libc::_exit(0);
     }
@@ -580,17 +583,90 @@ fn signal_in_mask(pid1: i32, sig: i32, field: &str) -> bool {
     if pid1 <= 0 || !(1..=64).contains(&sig) {
         return true;
     }
-    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid1}/status")) else {
+    let Ok(status) = std::fs::read(format!("/proc/{pid1}/status")) else {
         return true;
     };
-    let Some(mask) = status
-        .lines()
-        .find_map(|l| l.strip_prefix(field))
-        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
-    else {
+    let Some(mask) = mask_in_status(&status, field.as_bytes()) else {
         return true;
     };
     mask & (1u64 << (sig - 1)) != 0
+}
+
+/// The hex mask of the `field` line (`SigCgt:`, `SigIgn:`) of a `/proc/<pid>/status`. ONE reading
+/// of the file's lines, for [`signal_in_mask`] and the allocation-free [`init_hears_no_alloc`].
+fn mask_in_status(status: &[u8], field: &[u8]) -> Option<u64> {
+    let line = status
+        .split(|b| *b == b'\n')
+        .find(|l| l.starts_with(field))?;
+    let mut mask: u64 = 0;
+    let mut digits = 0;
+    for b in line[field.len()..]
+        .iter()
+        .filter(|b| !b.is_ascii_whitespace())
+    {
+        let d = (*b as char).to_digit(16)?;
+        mask = mask.checked_mul(16)?.checked_add(u64::from(d))?;
+        digits += 1;
+    }
+    (digits > 0).then_some(mask)
+}
+
+/// Whether `sig` can reach the box's init (`pid1` catches or ignores it), read from
+/// `/proc/<pid1>/status` with NO allocation: for the post-fork timeout watchdog, which must not
+/// touch the allocator. `true` when it cannot be read, which keeps the grace.
+///
+/// An init with the default disposition never hears it: the kernel discards it for a PID-namespace
+/// init, so waiting for it to act is a guaranteed delay. MEASURED: `kern box --timeout N -- sleep
+/// 30` ended after N + 2 s, the watchdog's 2 s grace spent on an init that could not hear the
+/// SIGTERM, while one that catches it ended at N s.
+unsafe fn init_hears_no_alloc(pid1: i32, sig: i32) -> bool {
+    if pid1 <= 0 || !(1..=64).contains(&sig) {
+        return true;
+    }
+    // "/proc/<pid>/status\0" on the stack.
+    let mut path = [0u8; 32];
+    path[..6].copy_from_slice(b"/proc/");
+    let mut digits = [0u8; 10];
+    let (mut n, mut len) = (pid1.unsigned_abs(), 0);
+    loop {
+        digits[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 || len == digits.len() {
+            break;
+        }
+    }
+    let mut at = 6;
+    for d in digits[..len].iter().rev() {
+        path[at] = *d;
+        at += 1;
+    }
+    path[at..at + 8].copy_from_slice(b"/status\0");
+    let fd = libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC);
+    if fd < 0 {
+        return true;
+    }
+    let mut buf = [0u8; 8192];
+    let mut got = 0usize;
+    while got < buf.len() {
+        let r = libc::read(fd, buf[got..].as_mut_ptr().cast(), buf.len() - got);
+        if r < 0 && *libc::__errno_location() == libc::EINTR {
+            continue;
+        }
+        if r <= 0 {
+            break;
+        }
+        got += r as usize;
+    }
+    libc::close(fd);
+    let status = &buf[..got];
+    match (
+        mask_in_status(status, b"SigCgt:"),
+        mask_in_status(status, b"SigIgn:"),
+    ) {
+        (Some(caught), Some(ignored)) => (caught | ignored) & (1u64 << (sig - 1)) != 0,
+        _ => true,
+    }
 }
 
 /// The `/proc/<pid>/stat` line, or `None` if the process is gone (or was never a pid).
@@ -913,7 +989,8 @@ pub(crate) fn kill_box_graceful(
     // `init_catches_signal` reports "cannot catch it" for a workload that caught it and exited 7.
     let already = zombie_exit_code(pid1);
     let pidfd = if pid1 > 0 {
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
+        let pin = crate::pidfd::PidFd::open(pid1);
+        let fd = crate::pidfd::PidFd::raw_of(&pin);
         // Skip the graceful phase entirely when the init provably cannot receive the signal: see
         // `init_catches_signal`. This is the difference between `kern stop` returning in 2 ms and in
         // 9 s for the most ordinary box there is. Already dead is the same case: nothing to wait for.
@@ -937,16 +1014,9 @@ pub(crate) fn kill_box_graceful(
                     unsafe { libc::kill(-pid, stop_signal) };
                 }
             }
-            if fd >= 0 {
-                let mut pfd = libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
+            if let Some(p) = &pin {
                 // Exited within the grace: nothing left to kill, and we say so without the SIGKILL.
-                let ms = grace_ms.min(i32::MAX as u64) as i32;
-                if crate::eintr::poll(std::slice::from_mut(&mut pfd), ms) > 0 {
-                    unsafe { libc::close(fd) };
+                if p.wait_exit(grace_ms.min(i32::MAX as u64) as i32) {
                     // Read the status HERE, first thing, while the reaper is still held: once it is
                     // released and reaps, the box's real exit code is gone for good.
                     return Teardown::Gone(zombie_exit_code(pid1));
@@ -954,7 +1024,7 @@ pub(crate) fn kill_box_graceful(
             }
         }
         unsafe { signal_box(fd, pid1, libc::SIGKILL) };
-        fd
+        pin
     } else {
         // No pidfd: the group is the only handle. The same rule applies - a caller that already
         // signalled must not make the workload handle it a second time - but the wait still has to
@@ -965,14 +1035,14 @@ pub(crate) fn kill_box_graceful(
             }
             std::thread::sleep(std::time::Duration::from_millis(grace_ms.min(60_000)));
         }
-        -1
+        None
     };
     // Never let a corrupt/degenerate `pid <= 1` turn the group sweep into `kill(-1)` (SIGKILL every
     // process the user owns) or `kill(0)` (our own group): it's only meaningful for a real supervisor.
     if pid > 1 {
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
-    if pidfd >= 0 {
+    if let Some(p) = &pidfd {
         // Wait (bounded) for the init to actually exit - POLLIN fires on termination, so the bound
         // costs nothing on the ordinary path and is only reached by a process stuck in the kernel.
         // DOCKER'S WAITS, NOT ONE SECOND: a SIGKILL cannot be refused, only delayed by an exit that
@@ -980,22 +1050,16 @@ pub(crate) fn kill_box_graceful(
         // with 1 s, `kern stop -t 1` on `sh -c yes` with a 300m log said "did not exit in time" 3 of
         // 3, and with 5 s 6 of 28 under load; each time the box was gone a moment later. Not
         // reproduced on this desktop (3 of 3 confirmed in about 1050 ms). See `KILL_CONFIRM_MS`.
-        let mut pfd = libc::pollfd {
-            fd: pidfd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let mut ready = crate::eintr::poll(std::slice::from_mut(&mut pfd), KILL_CONFIRM_MS);
-        if ready <= 0 {
+        let mut ready = p.wait_exit(KILL_CONFIRM_MS);
+        if !ready {
             // The second kill, as Docker's: to the init and to the group again, then a short wait.
-            unsafe { signal_box(pidfd, pid1, libc::SIGKILL) };
+            unsafe { signal_box(p.raw(), pid1, libc::SIGKILL) };
             if pid > 1 {
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
-            ready = crate::eintr::poll(std::slice::from_mut(&mut pfd), KILL_RECONFIRM_MS);
+            ready = p.wait_exit(KILL_RECONFIRM_MS);
         }
-        unsafe { libc::close(pidfd) };
-        if ready > 0 {
+        if ready {
             // Read it again now that it is definitely dead: our SIGKILL leaves a status of 137, and
             // an init that had already exited on its own leaves the code it chose. `already` wins -
             // it was read before we signalled, so it cannot be our own SIGKILL overwriting a real
@@ -1137,7 +1201,7 @@ pub(crate) fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> Optio
         watchdog_start: registry::proc_starttime(me),
     };
     let _ = registry::set_box_deadline(&name, sup_pid, owned);
-    let mut pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, sup_pid, 0) as i32 };
+    let mut pin = crate::pidfd::PidFd::open(sup_pid);
     let expired = loop {
         // The file is the deadline; this process's own copy covers a file that cannot be read. A
         // file naming ANOTHER watchdog means this one was replaced: it leaves, the other enforces.
@@ -1153,19 +1217,17 @@ pub(crate) fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> Optio
         if now >= owned.at_unix_ms {
             break true;
         }
-        match unsafe { wait_exit_or_wake(pidfd, owned.at_unix_ms - now, &wait_mask) } {
+        let fd = crate::pidfd::PidFd::raw_of(&pin);
+        match unsafe { wait_exit_or_wake(fd, owned.at_unix_ms - now, &wait_mask) } {
             Waited::Exited => break false, // nothing left to stop
             Waited::Unwaitable => {
                 // An fd that cannot be waited on: wait on the clock and the wake alone.
-                unsafe { libc::close(pidfd) };
-                pidfd = -1;
+                pin = None;
             }
             Waited::Expired | Waited::Woken => {}
         }
     };
-    if pidfd >= 0 {
-        unsafe { libc::close(pidfd) };
-    }
+    drop(pin);
     // The mask back as it was, so nothing `stop` starts inherits a blocked SIGUSR1.
     unsafe { libc::sigprocmask(libc::SIG_SETMASK, &original, std::ptr::null_mut()) };
     // Exact (name,pid)-PAIR probe: a by-name `find` would test the pid against whichever same-name
@@ -1643,4 +1705,32 @@ pub(crate) fn current_health(name: &str) -> String {
     registry::find(name)
         .map(|i| registry::health_of(name, i.pid))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod signal_mask_tests {
+    use super::{init_hears_no_alloc, mask_in_status, signal_in_mask};
+
+    /// The `SigCgt:`/`SigIgn:` masks, read once for both readers; and the allocation-free reader
+    /// answers as the ordinary one does, signal by signal, on a live process (this one).
+    #[test]
+    fn the_signal_masks_read_alike_with_and_without_allocation() {
+        let status = b"Name:\tsh\nSigIgn:\t0000000000000004\nSigCgt:\t0000000000004002\n";
+        assert_eq!(mask_in_status(status, b"SigIgn:"), Some(4));
+        assert_eq!(mask_in_status(status, b"SigCgt:"), Some(0x4002));
+        assert_eq!(mask_in_status(status, b"SigBlk:"), None);
+        assert_eq!(mask_in_status(b"SigCgt:\tzz\n", b"SigCgt:"), None);
+        let me = std::process::id() as i32;
+        for sig in 1..=64 {
+            let either = signal_in_mask(me, sig, "SigCgt:") || signal_in_mask(me, sig, "SigIgn:");
+            // SAFETY: reads a /proc file through libc into a stack buffer.
+            assert_eq!(
+                unsafe { init_hears_no_alloc(me, sig) },
+                either,
+                "signal {sig}"
+            );
+        }
+        // Unreadable: the grace is kept.
+        assert!(unsafe { init_hears_no_alloc(i32::MAX, 15) });
+    }
 }

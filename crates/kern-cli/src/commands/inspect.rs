@@ -2719,11 +2719,8 @@ pub fn stop_with_grace(
             // the init we registered. Between an init exiting and its supervisor unregistering, that
             // pid can already belong to someone else, and `stop` would send them SIGTERM.
             if let Some(pid1) = b.live_pid1() {
-                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid1, 0) as i32 };
-                unsafe { signal_box(fd, pid1, sig) };
-                if fd >= 0 {
-                    unsafe { libc::close(fd) };
-                }
+                let pin = crate::pidfd::PidFd::open(pid1);
+                unsafe { signal_box(crate::pidfd::PidFd::raw_of(&pin), pid1, sig) };
             }
             // The group carries the signal to the box's OTHER processes, not just its init: they
             // inherit the supervisor's process group, so a shell blocked in `sleep` wakes now

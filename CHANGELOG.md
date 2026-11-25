@@ -84,6 +84,12 @@ The image's steps are kept too, as metadata under the one layer kern writes, whi
 buildah still take as the base of a build. A rebuild answered entirely from the cache keeps its
 steps' times, so the same image saves and pushes under the same digest.
 
+**`--timeout N` ends a box at N seconds when its init cannot hear SIGTERM.** At the deadline kern sent
+SIGTERM and waited 2 s before the SIGKILL, also for an init with the default disposition, which the
+kernel never delivers it to: `kern box --timeout 1 -- sleep 30` ended after 3 s. It ends after 1 s
+now, as `kern stop` already did; an init that catches SIGTERM still ends on its own, and one that
+ignores it still gets the 2 s.
+
 **A box started from an ssh login or a WSL shell starts 2.1 ms sooner.** From a session outside the
 user's systemd subtree a box needs a scope of its own, and kern asked for it through `systemd-run`,
 then started again inside it. It now asks systemd itself, over D-Bus (the manager's private socket,
