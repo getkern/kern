@@ -1033,12 +1033,70 @@ pub fn clear_exited_named(name: &str) -> usize {
 /// NON-consuming: several `kern wait` on the same box all read the same code (matching Docker); the
 /// sidecar is reaped by `prune`/`gc` once the pid is dead, not on read.
 pub fn box_exit(pid: i32, starttime: u64) -> Option<i32> {
-    waitexit_dir()
-        .ok()
-        .and_then(|d| fs::read_to_string(d.join(format!("{pid}-{starttime}"))).ok())
-        // Line 1 is the code (the record grew extra lines for `ps -a`); a bare-code sidecar is line 1
-        // alone, so both formats read here.
-        .and_then(|s| s.lines().next().and_then(|l| l.trim().parse().ok()))
+    let d = waitexit_dir().ok()?;
+    // A `--rm` box's record is the hidden one ([`set_box_exit_removed`]); a box has one or the other.
+    [
+        format!("{pid}-{starttime}"),
+        format!("{pid}-{starttime}{REMOVED_SUFFIX}"),
+    ]
+    .iter()
+    .find_map(|k| fs::read_to_string(d.join(k)).ok())
+    // Line 1 is the code (the record grew extra lines for `ps -a`); a bare-code sidecar is line 1
+    // alone, so both formats read here.
+    .and_then(|s| s.lines().next().and_then(|l| l.trim().parse().ok()))
+}
+
+/// The suffix of a `--rm` box's exit record. [`waitexit_split`] refuses it (`"<st>.rm"` is not a
+/// number), so `ps -a`, `kern rm` and every sweep that lists records never see it; only `kern wait`
+/// reads it, through [`box_exit`].
+const REMOVED_SUFFIX: &str = ".rm";
+
+/// How long a `--rm` box's hidden record outlives the box: enough for a `kern wait` that was already
+/// waiting to read it after the box left the registry (it polls every 100 ms), and short enough that
+/// a box nobody waited for leaves nothing behind for long.
+const REMOVED_RECORD_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The exit code of a `--rm` box, for a `kern wait` (or `docker wait`) ALREADY WAITING on it.
+///
+/// `--rm` keeps no record a later reader can find, as Docker keeps no container: after the box has
+/// gone, `kern wait` answers that there is no such box, and `ps -a` never lists it. But a wait that
+/// started while the box ran is owed its code, and Docker gives it: MEASURED through kern's socket,
+/// `docker run -d --rm alpine sh -c 'sleep 1; exit 7'` then `docker wait` answered -1, where Docker
+/// answers 7. So the record is written HIDDEN (see [`REMOVED_SUFFIX`]) and expires after
+/// [`REMOVED_RECORD_TTL`]; each write sweeps the expired ones, so the directory never accumulates.
+pub fn set_box_exit_removed(pid: i32, starttime: u64, code: i32) {
+    let Ok(d) = waitexit_dir() else {
+        return;
+    };
+    let _ = fs::write(
+        d.join(format!("{pid}-{starttime}{REMOVED_SUFFIX}")),
+        code.to_string(),
+    );
+    sweep_removed_records(&d, REMOVED_RECORD_TTL);
+}
+
+/// Remove the hidden `--rm` records older than `ttl`. Best effort: a record that cannot be read or
+/// removed waits for the next sweep.
+fn sweep_removed_records(dir: &Path, ttl: std::time::Duration) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        if !name.to_str().is_some_and(|n| n.ends_with(REMOVED_SUFFIX)) {
+            continue;
+        }
+        let expired = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= ttl);
+        if expired {
+            let _ = fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Reap the `waitexit` sidecars of a stack's boxes on `compose down`: those whose recorded pod == `pod`
@@ -5533,5 +5591,64 @@ mod log_keep_ended_tests {
         assert_eq!(n, 0);
         assert!(logs.join("late-7.log").exists());
         let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod removed_record_tests {
+    use super::*;
+
+    /// The hidden record is invisible to every reader that lists records and visible to `kern wait`,
+    /// and the sweep takes only the expired hidden ones.
+    #[test]
+    fn a_removed_box_record_is_read_by_wait_only_and_expires() {
+        assert_eq!(
+            waitexit_split(std::ffi::OsStr::new("123-456")),
+            Some((123, 456))
+        );
+        assert_eq!(
+            waitexit_split(std::ffi::OsStr::new(&format!("123-456{REMOVED_SUFFIX}"))),
+            None,
+            "a lister must not parse the hidden record as a box that exited"
+        );
+
+        let _g = crate::env_guard();
+        let base = std::env::temp_dir().join(format!("kern-rmrec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        assert!(fs::create_dir_all(base.join("kern")).is_ok());
+        struct Restore(Option<std::ffi::OsString>, PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+                    None => crate::unset_global_env("XDG_RUNTIME_DIR"),
+                }
+                let _ = fs::remove_dir_all(&self.1);
+            }
+        }
+        let _restore = Restore(crate::global_env("XDG_RUNTIME_DIR"), base.clone());
+        crate::set_global_env("XDG_RUNTIME_DIR", &base);
+
+        // A pid that is not alive, so `list_exited` would show a normal record of it.
+        let (pid, st) = (i32::MAX - 7, 42u64);
+        set_box_exit_removed(pid, st, 7);
+        assert_eq!(box_exit(pid, st), Some(7), "a waiter reads the code");
+        assert!(
+            !list_exited().iter().any(|e| e.code == 7),
+            "`ps -a` must not list a --rm box"
+        );
+
+        // A normal record beside it, and a sweep with no grace: only the hidden one goes.
+        set_box_exit(pid - 1, st, 3, "kept", "", "true");
+        let Ok(dir) = waitexit_dir() else {
+            panic!("waitexit dir");
+        };
+        sweep_removed_records(&dir, std::time::Duration::ZERO);
+        assert_eq!(box_exit(pid, st), None, "the expired hidden record is gone");
+        assert_eq!(
+            box_exit(pid - 1, st),
+            Some(3),
+            "a normal record is never swept"
+        );
     }
 }

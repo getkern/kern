@@ -6005,12 +6005,15 @@ fn supervise_box(
     // keyed `<name>-<pid>` (our own pid = the registered pid). Written LAST here, and this whole call
     // returns BEFORE the caller unregisters the instance file, so a `wait` that sees the box leave
     // `list()` finds the code. If compose is also waiting, record it under its stack+run-scoped key too.
-    // `--rm` LEAVES NOTHING, which is the one thing Docker's flag asks for that kern did not
-    // already do. `kern wait` then has nothing to read for this box, exactly as `docker wait` has
-    // nothing to read for a container that removed itself. The compose exit key below is NOT
+    // `--rm` LEAVES NOTHING A LATER READER CAN FIND, which is what Docker's flag asks for: no `ps -a`
+    // line, and a `kern wait` that starts after the box has gone finds no box. A wait ALREADY
+    // waiting still gets the code, from a hidden record that expires (see
+    // `registry::set_box_exit_removed`), as `docker wait` does. The compose exit key below is NOT
     // suppressed: it is a different record, scoped to a stack and read by `compose up`, and a
     // one-off's `--rm` must not make a stack lose a service's status.
-    if !rm {
+    if rm {
+        registry::set_box_exit_removed(std::process::id() as i32, inst.starttime, final_code);
+    } else {
         registry::set_box_exit(
             std::process::id() as i32,
             inst.starttime,
