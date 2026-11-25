@@ -159,7 +159,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}commit{z} <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
-    {c}build{z} -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
+    {c}build{z} -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx|-]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage; `-` or -f -: from stdin)
     {c}build{z} --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that file, and build NOTHING
                                                                      --progress auto|tty|plain|json|quiet (also on compose, before the verb or after up/build/pull):
                                                                      plain = the step lines, json = one event per line on stdout, quiet = none;

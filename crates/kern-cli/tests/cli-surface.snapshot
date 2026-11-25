@@ -20,7 +20,7 @@ COMMANDS:
     push <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     tag <src> <dst>                                                Give a cached image a second name
     commit <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
-    build -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
+    build -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx|-]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage; `-` or -f -: from stdin)
     build --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that file, and build NOTHING
     images [<repo>] [--json] [--digests] [--filter K=V] [--format T]  List pulled (cached) images (<repo> = --filter reference=<repo>)
     image ls|inspect|rm|pull|push|tag|save|load|build             The same verbs grouped under `image` (one parser each, not a second)

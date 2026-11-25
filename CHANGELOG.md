@@ -104,6 +104,10 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**`kern build -` reads stdin, as `docker build -` does.** A Dockerfile on stdin builds with an empty
+context, a tar (plain or gzip) on stdin is the context, and `-f -` takes the Dockerfile from stdin for
+a context on disk; both at once is refused. It answered "unknown build flag '-'".
+
 **The `--health-*` times and `--timeout` take Docker's durations.** `--health-interval 30s`, the form
 `docker run` requires, was a usage error; `30s`, `1m30s` and `2h` work now beside a plain number of
 seconds, and a duration that is not a whole number of seconds (`500ms`) is refused rather than

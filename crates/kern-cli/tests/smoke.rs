@@ -9561,3 +9561,80 @@ fn kern_unshare_removes_what_a_box_user_wrote_and_passes_the_exit_code() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `kern build -` and `-f -` READ STDIN, as `docker build` does: a Dockerfile (empty context), a tar
+/// that is the context, or with `-f -` the Dockerfile for a context on disk; both at once refused.
+/// MEASURED before: `kern build -t x -` answered "unknown build flag '-'". Offline: `FROM scratch`.
+#[test]
+fn build_reads_the_dockerfile_or_the_context_from_stdin() {
+    use std::io::Write as _;
+    let dir = std::env::temp_dir().join(format!("kern-smoke-stdin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("ctx")).expect("dir");
+    std::fs::write(dir.join("ctx/f"), "x").expect("write");
+    std::fs::write(dir.join("ctx/Dockerfile"), "FROM scratch\nCOPY f /f\n").expect("write");
+    let build = |args: &[&str], stdin: &[u8]| {
+        let mut child = kern()
+            .current_dir(&dir)
+            .env("XDG_CACHE_HOME", dir.join("cache"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run kern");
+        let _ = child.stdin.take().expect("stdin").write_all(stdin);
+        let out = child.wait_with_output().expect("wait");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let (ok, said) = build(
+        &["build", "-t", "kern-smoke-stdin:1", "-"],
+        b"FROM scratch\nLABEL from=stdin\n",
+    );
+    if said.contains("user namespaces") {
+        eprintln!("skip: no user namespaces to build in: {said}");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    assert!(
+        ok && said.contains("built 'kern-smoke-stdin:1'"),
+        "Dockerfile on stdin:\n{said}"
+    );
+    let (ok, said) = build(
+        &["build", "-t", "kern-smoke-stdin:2", "-f", "-", "ctx"],
+        b"FROM scratch\nCOPY f /g\n",
+    );
+    assert!(
+        ok && said.contains("built 'kern-smoke-stdin:2'"),
+        "-f - with a context:\n{said}"
+    );
+    let tar = std::process::Command::new("tar")
+        .args(["-czf", "-", "-C"])
+        .arg(dir.join("ctx"))
+        .arg(".")
+        .output()
+        .expect("tar");
+    let (ok, said) = build(&["build", "-t", "kern-smoke-stdin:3", "-"], &tar.stdout);
+    assert!(
+        ok && said.contains("built 'kern-smoke-stdin:3'"),
+        "a tar.gz context on stdin:\n{said}"
+    );
+    let (ok, said) = build(&["build", "-t", "kern-smoke-stdin:4", "-f", "-", "-"], b"x");
+    assert!(
+        !ok && said.contains("both come from stdin"),
+        "both from stdin:\n{said}"
+    );
+    let left = std::fs::read_dir(dir.join("cache/kern/build-stdin"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0, "the stdin copies must be removed after the build");
+    let _ = std::fs::remove_dir_all(&dir);
+}

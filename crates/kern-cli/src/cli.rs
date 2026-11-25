@@ -6897,7 +6897,7 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
             "--no-cache" => no_cache = true,
             // NAMED, because "unknown build flag" sent a reader to re-read their whole command line
             // to find which word kern meant.
-            s if s.starts_with('-') => {
+            s if s.starts_with('-') && s != "-" => {
                 return Err(Error::Build(format!(
                     "unknown build flag '{s}' - `kern build` takes -t/--tag, -f/--file, --build-arg, --target, --platform, --secret, --ssh, --no-cache, -q/--quiet, --check"
                 )))
@@ -6927,6 +6927,114 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
         no_cache,
         platforms,
     })
+}
+
+/// A build whose Dockerfile or context comes from stdin, as `docker build` takes them:
+/// - `kern build -t x -`: stdin is the Dockerfile, with an empty context; or a tar (plain or gzip,
+///   told by its first bytes) that IS the context, its Dockerfile inside;
+/// - `kern build -t x -f - <dir>`: stdin is the Dockerfile, the context is `<dir>`.
+///
+/// Both at once is refused, as Docker refuses it. MEASURED before: `kern build -t x -` answered
+/// "unknown build flag '-'", the form scripts and the docs of most projects use for a one-off image.
+///
+/// Stdin is copied to a private directory under kern's CACHE, on disk and not in the runtime
+/// directory, which is RAM: a context can be large. Streamed, never held in memory whole. The
+/// directory goes when this is dropped, whatever the build did.
+struct StdinBuild {
+    dir: std::path::PathBuf,
+    context: String,
+    file: Option<String>,
+}
+
+impl StdinBuild {
+    fn from(context: &str, file: Option<&str>) -> Result<Option<StdinBuild>, Error> {
+        let (ctx_stdin, file_stdin) = (context == "-", file == Some("-"));
+        if !ctx_stdin && !file_stdin {
+            return Ok(None);
+        }
+        if ctx_stdin && file_stdin {
+            return Err(Error::Build(
+                "the context and the Dockerfile cannot both come from stdin (`-` and `-f -`)"
+                    .into(),
+            ));
+        }
+        let root = crate::kern_xdg_root("XDG_CACHE_HOME", ".cache")
+            .ok_or_else(|| Error::Build("no cache directory for a build from stdin".into()))?
+            .join("build-stdin");
+        std::fs::create_dir_all(&root)
+            .map_err(|e| Error::Build(format!("build from stdin: {}: {e}", root.display())))?;
+        let dir = root.join(format!("{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| Error::Build(format!("build from stdin: {}: {e}", dir.display())))?;
+        }
+        let mut guard = StdinBuild {
+            dir: dir.clone(),
+            context: String::new(),
+            file: None,
+        };
+        let input = dir.join("stdin");
+        {
+            let mut out = std::fs::File::create(&input)
+                .map_err(|e| Error::Build(format!("build from stdin: {e}")))?;
+            std::io::copy(&mut std::io::stdin().lock(), &mut out)
+                .map_err(|e| Error::Build(format!("build from stdin: reading stdin: {e}")))?;
+        }
+        if file_stdin {
+            let df = dir.join("Dockerfile");
+            std::fs::rename(&input, &df)
+                .map_err(|e| Error::Build(format!("build from stdin: {e}")))?;
+            guard.context = context.to_string();
+            guard.file = Some(df.to_string_lossy().into_owned());
+            return Ok(Some(guard));
+        }
+        let ctx = dir.join("context");
+        std::fs::create_dir(&ctx).map_err(|e| Error::Build(format!("build from stdin: {e}")))?;
+        let head = {
+            use std::io::Read as _;
+            let mut h = [0u8; 512];
+            let n = std::fs::File::open(&input)
+                .and_then(|mut f| f.read(&mut h))
+                .unwrap_or(0);
+            h[..n].to_vec()
+        };
+        let gzip = head.starts_with(&[0x1f, 0x8b]);
+        let tar = head.len() >= 262 && &head[257..262] == b"ustar";
+        if gzip || tar {
+            // A context archive: unpacked by the system `tar`, which kern already needs for images,
+            // without the archive's owners (`--no-same-owner`) and refusing members that climb out.
+            let st = std::process::Command::new("tar")
+                .arg(if gzip { "-xzf" } else { "-xf" })
+                .arg(&input)
+                .args(["--no-same-owner", "--no-same-permissions", "-C"])
+                .arg(&ctx)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .map_err(|e| Error::Build(format!("build from stdin: tar: {e}")))?;
+            if !st.success() {
+                return Err(Error::Build(
+                    "build from stdin: the archive on stdin could not be unpacked as a context"
+                        .into(),
+                ));
+            }
+            let _ = std::fs::remove_file(&input);
+        } else {
+            std::fs::rename(&input, ctx.join("Dockerfile"))
+                .map_err(|e| Error::Build(format!("build from stdin: {e}")))?;
+        }
+        guard.context = ctx.to_string_lossy().into_owned();
+        Ok(Some(guard))
+    }
+}
+
+impl Drop for StdinBuild {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// Parse and run.
@@ -7217,6 +7325,13 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             no_cache,
             platforms,
         } => {
+            // `-` as the context or the `-f`: stdin, as `docker build` reads it. The guard keeps the
+            // directory it was written to until the build is done, and removes it after.
+            let stdin_dir = StdinBuild::from(&context, file.as_deref())?;
+            let (context, file) = match &stdin_dir {
+                Some(sb) => (sb.context.clone(), sb.file.clone().or(file)),
+                None => (context, file),
+            };
             let a = commands::BuildArgs {
                 tag: tag.as_deref(),
                 extra_tags: &extra_tags,
