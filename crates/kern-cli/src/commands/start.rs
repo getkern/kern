@@ -1595,6 +1595,38 @@ fn decode_mount_record(
 /// A `--mount` as `BoxRunArgs` carries it: source, target, read-only.
 type Mount = (String, String, bool);
 
+/// A mount the box names itself wins over one `--volumes-from` copies to the same place, as in
+/// Docker: an explicit `-v`, `--mount` or `--tmpfs` on that destination, and the copy is left out.
+/// MEASURED before (Grok's round 15, cases a7 and a8): the copy was mounted last and won, so
+/// `--volumes-from src:ro -v w:/data` gave a read-only `/data` where Docker gives `w`.
+fn drop_shadowed(
+    from_v: &mut Vec<String>,
+    from_m: &mut Vec<Mount>,
+    volumes: &[String],
+    mounts: &[Mount],
+    tmpfs: &[String],
+) {
+    let same = |a: &str, b: &str| {
+        std::path::Path::new(a)
+            .components()
+            .eq(std::path::Path::new(b).components())
+    };
+    let dst_of_v = |spec: &str| spec.split(':').nth(1).unwrap_or_default().to_string();
+    let own: Vec<String> = volumes
+        .iter()
+        .map(|v| dst_of_v(v))
+        .chain(mounts.iter().map(|m| m.1.clone()))
+        .chain(
+            tmpfs
+                .iter()
+                .map(|t| t.split(':').next().unwrap_or_default().to_string()),
+        )
+        .filter(|d| !d.is_empty())
+        .collect();
+    from_v.retain(|v| !own.iter().any(|d| same(d, &dst_of_v(v))));
+    from_m.retain(|m| !own.iter().any(|d| same(d, &m.1)));
+}
+
 fn resolve_volumes_from(entries: &[String]) -> Result<(Vec<String>, Vec<Mount>), Error> {
     let mut volumes = Vec::new();
     let mut mounts = Vec::new();
@@ -1637,7 +1669,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let args = if args.volumes_from.is_empty() {
         args
     } else {
-        let (v, m) = resolve_volumes_from(args.volumes_from)?;
+        let (mut v, mut m) = resolve_volumes_from(args.volumes_from)?;
+        drop_shadowed(&mut v, &mut m, args.volumes, args.mounts, args.tmpfs);
         from_v = [args.volumes, v.as_slice()].concat();
         from_m = [args.mounts, m.as_slice()].concat();
         BoxRunArgs {
@@ -7005,7 +7038,25 @@ mod user_etc_files_tests {
 
 #[cfg(test)]
 mod volumes_from_tests {
-    use super::{decode_mount_record, mount_record_of};
+    use super::{decode_mount_record, drop_shadowed, mount_record_of};
+
+    #[test]
+    fn the_boxs_own_mount_wins_over_a_copied_one() {
+        let mut v = vec!["src:/data:ro".to_string(), "logs:/logs".to_string()];
+        let mut m = vec![
+            ("/a".to_string(), "/t/".to_string(), false),
+            ("/b".to_string(), "/b".to_string(), true),
+        ];
+        drop_shadowed(
+            &mut v,
+            &mut m,
+            &["w:/data".to_string()],
+            &[],
+            &["/t:size=1m".to_string()],
+        );
+        assert_eq!(v, ["logs:/logs"]);
+        assert_eq!(m, [("/b".to_string(), "/b".to_string(), true)]);
+    }
 
     fn decoded(record: &str, ro: bool) -> (Vec<String>, Vec<(String, String, bool)>) {
         let (mut v, mut m) = (Vec::new(), Vec::new());
