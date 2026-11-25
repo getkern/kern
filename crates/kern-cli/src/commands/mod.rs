@@ -2855,6 +2855,22 @@ fn unit_text_renamed(text: &str, old: &str, new: &str) -> Option<String> {
     Some(out)
 }
 
+/// How a handover unit ([`unit_text_handover`]) describes itself, followed by the unit it starts.
+const HANDOVER_DESCRIPTION: &str = "kern: hand a renamed box over to ";
+
+/// Whether the unit file `text` is a handover, and to which unit.
+fn handover_target(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("Description="))
+        .and_then(|d| d.strip_prefix(HANDOVER_DESCRIPTION))
+}
+
+/// Whether a handover to `name`'s unit is waiting to run: the box is between two runs, about to be
+/// started under that name (`managed_unit_runs` answers `restarting` for it).
+fn handover_pending_to(name: &str) -> bool {
+    !handovers_to(name).is_empty()
+}
+
 /// The unit that takes over from a running box's unit when the box is renamed: systemd runs it
 /// in place of the old one at the box's next exit (the policy restarts it, a crash included), and
 /// it removes itself and starts the box's unit under the new name. Not a kern box's unit (no
@@ -2862,14 +2878,16 @@ fn unit_text_renamed(text: &str, old: &str, new: &str) -> Option<String> {
 /// user manager's `PATH` is not the caller's. PURE.
 fn unit_text_handover(old_path: &str, new_unit: &str, systemctl: &str) -> String {
     let sh = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    // `; exit 0`, NOT `exec`: the new unit may be gone by then (a `kern rm` of the renamed box),
+    // and a failed start made this unit `failed`, a ghost in `systemctl --user --failed`.
     let script = format!(
-        "rm -f -- {path}; {sc} --user daemon-reload; exec {sc} --user --no-block start {unit}",
+        "rm -f -- {path}; {sc} --user daemon-reload; {sc} --user --no-block start {unit}; exit 0",
         path = sh(old_path),
         sc = sh(systemctl),
         unit = sh(new_unit),
     );
     format!(
-        "[Unit]\nDescription=kern: hand a renamed box over to {new_unit}\nStartLimitIntervalSec=0\n\n\
+        "[Unit]\nDescription={HANDOVER_DESCRIPTION}{new_unit}\nStartLimitIntervalSec=0\n\n\
          [Service]\nType=simple\nExecStart=/bin/sh -c {}\nRestart=always\nRestartSec=1\n\
          KillMode=mixed\nTimeoutStopSec=10\n",
         systemd_quote(&script)
@@ -2917,18 +2935,40 @@ pub(crate) fn rename_managed_unit(
     let Some(new_path) = managed_unit_path(new) else {
         return Ok(None);
     };
-    if new_path.exists() {
-        return Err(Error::AlreadyRunning(format!(
-            "a unit for a box named '{new}' exists already ({})",
-            new_path.display()
-        )));
-    }
     let text = std::fs::read_to_string(&old_path)
         .map_err(|e| Error::Sandbox(format!("rename: cannot read {}: {e}", old_path.display())))?;
     let Some(renamed) = unit_text_renamed(&text, old, new) else {
         return Ok(None);
     };
     let (old_unit, new_unit) = (unit_file_name(old), unit_file_name(new));
+    // A HANDOVER ALREADY AT THE NEW NAME is what a rename BACK finds: the box was renamed away from
+    // `new` while it ran, and the file of `new`'s unit became the handover. MEASURED before: the
+    // rename back answered "name already in use". While that unit is ACTIVE it is still the one the
+    // box's process runs under, so the rename back gives it its unit again in place (its next exit
+    // restarts the box as `new`) and the unit made for `old`, enabled and never started, goes. An
+    // inactive one is stale: removed, and the rename goes on as any other.
+    if let Ok(existing) = std::fs::read_to_string(&new_path) {
+        if handover_target(&existing) == Some(old_unit.as_str()) {
+            if live && unit_active_state(&new_unit).as_deref() == Some("active") {
+                std::fs::write(&new_path, &renamed).map_err(|e| {
+                    Error::Sandbox(format!("rename: cannot write {}: {e}", new_path.display()))
+                })?;
+                systemctl_user(&["disable", &old_unit]);
+                let _ = std::fs::remove_file(&old_path);
+                systemctl_user(&["daemon-reload"]);
+                systemctl_user(&["enable", &new_unit]);
+                return Ok(Some(renamed));
+            }
+            systemctl_user(&["reset-failed", &new_unit]);
+            let _ = std::fs::remove_file(&new_path);
+            systemctl_user(&["daemon-reload"]);
+        } else {
+            return Err(Error::AlreadyRunning(format!(
+                "a unit for a box named '{new}' exists already ({})",
+                new_path.display()
+            )));
+        }
+    }
     if live {
         std::fs::write(&new_path, &renamed).map_err(|e| {
             Error::Sandbox(format!("rename: cannot write {}: {e}", new_path.display()))
@@ -3079,7 +3119,13 @@ pub(crate) fn managed_unit_runs(name: &str) -> Option<UnitRuns> {
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    Some(parse_unit_runs(&String::from_utf8_lossy(&out.stdout)))
+    let mut runs = parse_unit_runs(&String::from_utf8_lossy(&out.stdout));
+    // An enabled unit that is not running yet, with a handover to it waiting: the box was renamed
+    // while it ran and is between that run and its first under the new name (Docker: restarting).
+    if !runs.restarting && handover_pending_to(name) {
+        runs.restarting = true;
+    }
+    Some(runs)
 }
 
 /// Did a freshly started unit come up? `active`, or `activating`, which is also where a
@@ -6305,13 +6351,54 @@ fn stop_managed_unit(name: &str) -> bool {
         return false;
     }
     let unit = unit_file_name(name);
+    // A HANDOVER STILL AIMED AT THIS NAME goes first (a box renamed to it while it ran): left, it
+    // would start the unit removed below at the old run's exit. MEASURED: `kern rm -f` of a box
+    // renamed while running left `kern-<name>.service` in `systemctl --user --failed`, started by
+    // the handover a moment after the removal and failed with the box's exit code.
+    for handover in handovers_to(name) {
+        let Some(h) = handover
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        systemctl_user(&["disable", "--now", &h]);
+        let _ = std::fs::remove_file(&handover);
+        systemctl_user(&["reset-failed", &h]);
+    }
     systemctl_user(&["disable", "--now", &unit]);
     // Clear any lingering `failed` state so the removed unit doesn't leave a ghost in `systemctl
     // --user status`; then delete the unit file and reload so systemd forgets it entirely.
     systemctl_user(&["reset-failed", &unit]);
     let _ = std::fs::remove_file(&path);
     systemctl_user(&["daemon-reload"]);
+    // AND ONCE MORE AFTER THE RELOAD: a run that ended between the stop and the removal leaves the
+    // unit `failed`, which the reset above came too early for; a `not-found` unit resets as well.
+    systemctl_user(&["reset-failed", &unit]);
     true
+}
+
+/// The handover unit files ([`unit_text_handover`]) that start `name`'s unit.
+fn handovers_to(name: &str) -> Vec<std::path::PathBuf> {
+    let Ok(dir) = user_systemd_dir() else {
+        return Vec::new();
+    };
+    let target = unit_file_name(name);
+    std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|f| f.starts_with("kern-") && f.ends_with(".service"))
+                        && std::fs::read_to_string(e.path())
+                            .is_ok_and(|t| handover_target(&t) == Some(target.as_str()))
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// How long `compose up` waits for a `depends_healthy` / `depends_completed` condition before it

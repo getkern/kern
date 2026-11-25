@@ -619,6 +619,9 @@ pub fn image_rm_with(refs: &[String], force: bool) -> Result<(), Error> {
             "rmi [-f] <image>... - name at least one image (see `kern images`)",
         ));
     }
+    for r in refs {
+        super::imagecache::refuse_pin_name(r, "rmi")?;
+    }
     if !force {
         for r in refs {
             if let Some(name) = box_using_image(r) {
@@ -732,6 +735,7 @@ pub fn pull(
     quiet: bool,
 ) -> Result<(), Error> {
     crate::progress::quiet_flag(quiet);
+    super::imagecache::refuse_pin_name(image, "pull")?;
     // `--platform` INTO THE CACHE goes to that platform's own entry (see `pull_to_cache`), never
     // under the host's: a foreign-arch rootfs stored under a host-arch key was cache poisoning, which
     // is why this used to be refused. A `--platform linux/arm64` build then finds it there.
@@ -1154,6 +1158,14 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
             return Err(e);
         }
     };
+    // AN ARCHIVE NAMING A PIN IS REFUSED WHOLE, before any of its images lands: its names are the
+    // archive's, and one of them would replace a kept box's image.
+    for t in loaded.iter().flat_map(|img| img.repo_tags.iter()) {
+        if let Err(e) = super::imagecache::refuse_pin_name(t, "load") {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(e);
+        }
+    }
     for img in &loaded {
         let Some(primary) = img.repo_tags.first() else {
             eprintln!("kern: loaded an untagged image (skipped - no name to reference it by)");
@@ -1196,6 +1208,7 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
 /// image's own bytes). Both names are `sanitize_ref`'d, so a `dst` like `../../etc` can't escape the cache
 /// (it maps to a safe key) - the same collision-free key rule as every other cache path.
 pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
+    super::imagecache::refuse_pin_name(dst, "tag")?;
     let cache = cache_dir();
     own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
     // `--platform`: the source is that platform's entry, by the rule the pull uses; the new name is
@@ -1346,6 +1359,7 @@ fn restore_image_etc_files(out: &std::path::Path, name: &str) {
 }
 
 pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
+    super::imagecache::refuse_pin_name(image, "commit")?;
     let inst = registry::find_ref(box_ref).ok_or_else(|| {
         Error::Sandbox(format!("no running box '{box_ref}'; `kern ps` lists them"))
     })?;

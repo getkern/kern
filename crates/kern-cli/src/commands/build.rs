@@ -523,6 +523,13 @@ pub(crate) mod step_clock {
 }
 
 pub fn build(args: BuildArgs) -> Result<(), Error> {
+    for t in args
+        .tag
+        .into_iter()
+        .chain(args.extra_tags.iter().map(String::as_str))
+    {
+        super::imagecache::refuse_pin_name(t, "build -t")?;
+    }
     let tag = args.tag.unwrap_or_default().to_string();
     let started = std::time::Instant::now();
     step_clock::begin(&tag);

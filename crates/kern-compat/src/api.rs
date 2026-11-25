@@ -5306,6 +5306,74 @@ fn not_translated(what: &str) -> Response {
     )
 }
 
+/// The `kern update` flags of a `POST /containers/{id}/update` body: `Memory` (bytes), the CPU limit
+/// (`NanoCpus`, or `CpuQuota` over `CpuPeriod`) and `PidsLimit`, the caps kern changes on a box.
+/// Any other field SET to something (a restart policy, a CPU share, a cpuset, a block-IO weight, a
+/// swap figure) is refused BY NAME: answering 200 and changing nothing is the "runs and lies" kern
+/// refuses everywhere. Zero, `-1` and empty values are not requests. MEASURED before: `docker update
+/// --memory 64m` answered 501 while `kern update` existed. PURE.
+fn update_args(body: &Value) -> Result<Vec<String>, String> {
+    let num = |k: &str| body.get(k).and_then(Value::as_i64).unwrap_or(0);
+    let mut flags = Vec::new();
+    if num("Memory") > 0 {
+        flags.extend(["--memory".to_string(), num("Memory").to_string()]);
+    }
+    let cpus = match (num("NanoCpus"), num("CpuQuota"), num("CpuPeriod")) {
+        (n, _, _) if n > 0 => Some(n as f64 / 1e9),
+        (_, q, p) if q > 0 && p > 0 => Some(q as f64 / p as f64),
+        _ => None,
+    };
+    if let Some(c) = cpus {
+        flags.extend(["--cpus".to_string(), format!("{c}")]);
+    }
+    if num("PidsLimit") > 0 {
+        flags.extend(["--pids-limit".to_string(), num("PidsLimit").to_string()]);
+    }
+    let policy_set = body
+        .get("RestartPolicy")
+        .and_then(|p| p.get("Name"))
+        .and_then(Value::as_str)
+        .is_some_and(|n| !n.is_empty());
+    if policy_set {
+        return Err(
+            "RestartPolicy: kern's update changes caps, not a restart policy; `docker rm -f` and \
+             run the container again with the policy"
+                .to_string(),
+        );
+    }
+    for key in [
+        "CpuShares",
+        "CpusetCpus",
+        "CpusetMems",
+        "BlkioWeight",
+        "MemoryReservation",
+        "KernelMemory",
+        "CpuRealtimePeriod",
+        "CpuRealtimeRuntime",
+    ] {
+        let set = body.get(key).is_some_and(|v| {
+            v.as_i64().is_some_and(|n| n > 0) || v.as_str().is_some_and(|s| !s.is_empty())
+        });
+        if set {
+            return Err(format!(
+                "{key}: not a cap kern's update changes; it changes Memory, the CPU limit \
+                 (NanoCpus, CpuQuota/CpuPeriod) and PidsLimit"
+            ));
+        }
+    }
+    // `MemorySwap` the client sends beside `--memory` (equal to it, or -1) is not a request; a
+    // figure beyond the memory asks for swap, which kern's update does not set.
+    let swap = num("MemorySwap");
+    if swap > 0 && swap != num("Memory") {
+        return Err(
+            "MemorySwap: kern's update does not change swap; it changes Memory, the CPU limit and \
+             PidsLimit"
+                .to_string(),
+        );
+    }
+    Ok(flags)
+}
+
 /// One request.
 pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
     let segs: Vec<String> = req
@@ -5531,6 +5599,30 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             };
             wait(bin, name)
         }
+        // `docker update`: kern's own `update`, live on a running box and into a kept box's record.
+        ("POST", ["containers", id, "update"]) => match resolve(bin, id) {
+            None => error(404, &format!("No such container: {id}")),
+            Some(name) => {
+                let body = json::parse(&String::from_utf8_lossy(&req.body)).unwrap_or(Value::Null);
+                match update_args(&body) {
+                    Err(why) => error(400, &why),
+                    Ok(flags) if flags.is_empty() => {
+                        json_response(200, "{\"Warnings\":[]}".to_string())
+                    }
+                    Ok(flags) => {
+                        let mut args: Vec<&str> = vec!["update"];
+                        args.extend(flags.iter().map(String::as_str));
+                        args.push(&name);
+                        let (code, _, err) = kern(bin, &args);
+                        if code == 0 {
+                            json_response(200, "{\"Warnings\":[]}".to_string())
+                        } else {
+                            error(500, &kern_error(&err))
+                        }
+                    }
+                }
+            }
+        },
         ("POST", ["containers", id, verb @ ("pause" | "unpause")]) => match resolve(bin, id) {
             None => error(404, &format!("No such container: {id}")),
             Some(name) => {
@@ -6752,6 +6844,36 @@ mod tests {
     /// `--pids-limit 32` through the socket let 100 forks through.
     /// An image id as a client hands one back is recognised, and another platform's entry of a
     /// tag has an id of its own; a create given an id runs the entry's name.
+    /// `docker update` asks kern for the caps it changes, and a field it does not change is refused
+    /// by name rather than answered 200 with nothing done.
+    #[test]
+    fn an_update_body_becomes_kern_update_flags_or_a_named_refusal() {
+        let b = |t: &str| json::parse(t).unwrap();
+        let full = r#"{"Memory":67108864,"MemorySwap":-1,"NanoCpus":1500000000,"PidsLimit":64,"RestartPolicy":{"Name":""},"CpuShares":0}"#;
+        assert_eq!(
+            update_args(&b(full)),
+            Ok([
+                "--memory",
+                "67108864",
+                "--cpus",
+                "1.5",
+                "--pids-limit",
+                "64"
+            ]
+            .map(String::from)
+            .to_vec())
+        );
+        assert_eq!(
+            update_args(&b(r#"{"CpuQuota":50000,"CpuPeriod":100000}"#)),
+            Ok(["--cpus", "0.5"].map(String::from).to_vec())
+        );
+        assert_eq!(update_args(&b("{}")), Ok(Vec::new()));
+        assert!(update_args(&b(r#"{"RestartPolicy":{"Name":"always"}}"#))
+            .is_err_and(|e| e.starts_with("RestartPolicy")));
+        assert!(update_args(&b(r#"{"CpuShares":512}"#)).is_err_and(|e| e.starts_with("CpuShares")));
+        assert!(update_args(&b(r#"{"Memory":1000,"MemorySwap":5000}"#)).is_err());
+    }
+
     /// A container's image id is the id the image list gives the same image, for the name it was
     /// run by (a bare name being `:latest`), and this machine's entry before another platform's:
     /// what a client compares `inspect -f '{{.Image}}'` with. An image no longer cached keeps an

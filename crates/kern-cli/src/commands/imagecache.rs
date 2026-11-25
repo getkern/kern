@@ -2741,6 +2741,22 @@ pub(crate) fn is_pin_ref(reference: &str) -> bool {
     reference.starts_with(PIN_REPO)
 }
 
+/// Refuse `reference` as a name an image is GIVEN or TAKEN from (`tag`, `build -t`, `pull`, `load`,
+/// `commit`, `rmi`), when it is in kern's own `kern-pin/` space. MEASURED before: `docker tag
+/// nginx:alpine kern-pin/<id>` through kern's socket answered 0 and replaced the pin of a kept box
+/// created from alpine, which then ran nginx. Checked where the verb begins, before it writes
+/// anything: a pull or a build writes the entry's files before its sentinel.
+pub(crate) fn refuse_pin_name(reference: &str, verb: &str) -> Result<(), Error> {
+    if is_pin_ref(&kern_oci::normalize_ref(reference)) {
+        return Err(Error::Oci(format!(
+            "{verb} '{reference}': names under `{PIN_REPO}` are kern's own, the image a kept box \
+             was created from; an image cannot be given or take one (`kern rm` of the box releases \
+             it)"
+        )));
+    }
+    Ok(())
+}
+
 /// The id a pin stands for, from its NAME (`kern-pin/<hex>[:tag]` gives `sha256:<hex>`), `None`
 /// for any other reference. NOT the pin's own content: a built image's pin has its base line
 /// rewritten to the base's pin, so its bytes, and an id hashed from them, differ from the image it
@@ -3305,6 +3321,17 @@ mod built_here_tests {
 mod pin_tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    /// No verb may give an image a `kern-pin/` name or take one away, in any spelling of it.
+    #[test]
+    fn a_pin_name_is_refused_to_every_verb() {
+        for r in ["kern-pin/0f8a", "kern-pin/0f8a:latest", "kern-pin/abc:v1"] {
+            assert!(refuse_pin_name(r, "tag").is_err(), "{r}");
+        }
+        for r in ["alpine:3.21", "kern-pins/x", "me/kern-pin", "kern-pin"] {
+            assert!(refuse_pin_name(r, "tag").is_ok(), "{r}");
+        }
+    }
 
     /// A pin stands for the id in its NAME, whatever its own bytes hash to; nothing else is a pin.
     #[test]

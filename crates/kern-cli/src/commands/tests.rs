@@ -9433,6 +9433,19 @@ fn the_handover_unit_is_not_a_box_and_quotes_its_paths() {
         "a quote in the path is closed: {text}"
     );
     assert!(text.contains("start 'kern-b.service'"), "{text}");
+    assert!(
+        text.contains("; exit 0"),
+        "a target already gone must not leave it failed: {text}"
+    );
+    assert_eq!(
+        super::handover_target(&text),
+        Some("kern-b.service"),
+        "it says where it hands over"
+    );
+    assert_eq!(
+        super::handover_target("[Unit]\nDescription=kern box b\n"),
+        None
+    );
 }
 
 /// The policy a kept box's record asks for, in each spelling, and `no` for a record without one.

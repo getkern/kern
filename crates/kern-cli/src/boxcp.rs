@@ -278,18 +278,34 @@ impl LayerBox {
             ]);
         }
         args.extend(["--".into(), "/kern-idle".into()]);
-        let mut cmd = std::process::Command::new(&me);
-        cmd.args(&args)
-            .env_remove("KERN_MANAGED")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        if !meta.cwd.is_empty() && std::path::Path::new(&meta.cwd).is_dir() {
-            cmd.current_dir(&meta.cwd);
-        }
-        let out = cmd
-            .output()
-            .map_err(|e| Error::Sandbox(format!("kept box '{owner}': cannot run kern: {e}")))?;
+        // ONE BOX ON A LAYER AT A TIME, so a second copy WAITS ITS TURN rather than failing: the
+        // layer lock is what keeps two overlays off one upper directory, and each copy holds it for
+        // about 15 ms. MEASURED before: five `kern cp` of one stopped box at once, four answered
+        // "in use by another box", where `docker cp` does all five. Bounded, so a layer held by a
+        // run that is not ending still gets an answer.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut pause_ms = 10u64;
+        let out = loop {
+            let mut cmd = std::process::Command::new(&me);
+            cmd.args(&args)
+                .env_remove("KERN_MANAGED")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped());
+            if !meta.cwd.is_empty() && std::path::Path::new(&meta.cwd).is_dir() {
+                cmd.current_dir(&meta.cwd);
+            }
+            let out = cmd
+                .output()
+                .map_err(|e| Error::Sandbox(format!("kept box '{owner}': cannot run kern: {e}")))?;
+            let busy = !out.status.success()
+                && String::from_utf8_lossy(&out.stderr).contains("is in use by another box");
+            if !busy || std::time::Instant::now() >= deadline {
+                break out;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+            pause_ms = (pause_ms * 2).min(200);
+        };
         // From here the box may exist: the guard removes it on every way out, the errors included.
         let lb = LayerBox { name };
         if !out.status.success() {
@@ -313,14 +329,29 @@ impl LayerBox {
 
     /// `<owner>-cp<pid>`, a valid box name that no user box shares; a short fallback when the
     /// owner's name is near the limit.
+    /// A name no box holds now: a user box called `<owner>-cp<pid>` is passed over, not stopped.
     fn name_for(owner: &str) -> String {
         let pid = std::process::id();
-        let full = format!("{owner}-cp{pid}");
-        if kern_common::BoxName::parse(&full).is_ok() {
-            full
+        let taken = |n: &str| {
+            crate::registry::find(n).is_some()
+                || crate::keepbox::dir_of(n).is_some_and(|d| d.exists())
+        };
+        let base = format!("{owner}-cp{pid}");
+        let base = if kern_common::BoxName::parse(&base).is_ok() {
+            base
         } else {
             format!("kern-cp{pid}")
-        }
+        };
+        (0u32..64)
+            .map(|i| {
+                if i == 0 {
+                    base.clone()
+                } else {
+                    format!("{base}-{i}")
+                }
+            })
+            .find(|n| !taken(n) && kern_common::BoxName::parse(n).is_ok())
+            .unwrap_or(base)
     }
 }
 
