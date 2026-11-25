@@ -132,6 +132,24 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 --format json` prints Docker's line per box (it printed the word `json`), and `--format` says
 `restarting` / `Restarting (1) ...` for a box between two runs.
 
+**Fixes from the last mixed test round.**
+- **`docker tag` cannot replace a kept box's image.** `docker tag` or `kern tag` onto a
+  `kern-pin/` name answered 0 and replaced the image a kept box was created from, so the box then
+  ran the other image. `tag`, `build -t`, `pull`, `load`, `commit` and `rmi` now refuse that name
+  space, before anything is written.
+- **Parallel `cp` of a stopped box.** Five `kern cp` of one stopped box at once now all succeed:
+  each waits its turn for the box's layer. Four of the five used to answer "in use". The box kern
+  starts for a copy also avoids a name a user box already holds.
+- **Renaming a running box back.** A `--restart` box renamed while it ran can be renamed back
+  before its next run; this used to answer "name already in use". Between the rename and that run
+  it lists as restarting.
+- **No failed units left behind.** `kern rm -f` of a box renamed while it ran no longer leaves a
+  failed unit in `systemctl --user --failed`.
+- **`docker update`** changes memory, the CPU limit and the pid limit through kern's socket. It
+  answered 501 while `kern update` existed. A field kern does not change is refused by name.
+- **`kern-mcp` honours `notifications/cancelled`.** A call cancelled while it waits behind another
+  is not run and not answered; a running one finishes, but its answer is not sent.
+
 **`kern cp` and `docker cp` reach a kept box that is not running, and a kept box keeps its image.**
 A box that is stopped, never started, or between two runs of its `--restart` policy was refused as
 "not running", where `docker cp` copies into and out of a stopped container. kern now starts a box

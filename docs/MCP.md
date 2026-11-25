@@ -154,6 +154,13 @@ And the lever that needs nothing: **the per-call deadline bounds the write by ra
 ~810 MB/s, `KERN_MCP_TIMEOUT=10` bounds a runaway cell to about 8 GB. It is blunt, since it also kills
 slow legitimate work, but on a default `/tmp` inside the root filesystem it is the only bound available.
 
+## Calls run one at a time, and a cancelled one does not run
+
+The server answers `tools/call` requests in the order they arrive, one at a time. A
+`notifications/cancelled` is read as soon as it arrives, while another call runs: a cancelled call
+still waiting its turn is not run and gets no answer, and one that was already running finishes but
+its answer is not sent, as MCP asks of a receiver.
+
 ## The server is stdio, so it travels
 
 MCP holds one stdio pipe open for the life of the session, and nothing in the protocol cares what
