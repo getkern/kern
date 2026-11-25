@@ -4803,9 +4803,22 @@ fn truncate(s: &str, max: usize) -> String {
 /// The current contents of a box's newest log, for the `kern top` log overlay (`Enter`). `None` if the
 /// box has produced no log yet; errors are swallowed (the TUI shows an empty pane rather than blowing
 /// up mid-frame).
-pub(crate) fn box_log_tail(name: &str) -> Option<String> {
+/// The last `max` bytes of a box's newest log, from the first whole line in them.
+pub(crate) fn box_log_tail(name: &str, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
     let path = newest_log(name).ok().flatten()?;
-    std::fs::read_to_string(path).ok()
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let from = len.saturating_sub(max);
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::with_capacity(usize::try_from(len - from).unwrap_or(0));
+    f.take(max).read_to_end(&mut buf).ok()?;
+    let start = if from > 0 {
+        buf.iter().position(|&b| b == b'\n').map_or(buf.len(), |i| i + 1)
+    } else {
+        0
+    };
+    Some(String::from_utf8_lossy(&buf[start..]).into_owned())
 }
 
 /// Uptime as `Xh YYm` / `Xm YYs` / `Xs` (matches the `kern top` style).

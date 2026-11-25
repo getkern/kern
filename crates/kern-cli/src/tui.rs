@@ -61,8 +61,13 @@ const TAB_LOGS: usize = 7;
 /// What the TUI is doing right now: plain navigation, or a modal layered over it.
 enum Mode {
     Nav,
-    /// A read-only text pane (box logs, profile/volume detail). Any key closes it.
+    /// A read-only text pane (profile/volume detail, an error). Any key closes it.
     Overlay(String),
+    /// A box's output, followed live: re-read on every refresh. The lifecycle keys of the Boxes tab
+    /// still act on THIS box (`s` asks first, `p`/`u` act), Esc/Enter go back, `q` quits. As a plain
+    /// `Overlay` it was a snapshot taken when Enter was pressed, so it looked frozen, and any key
+    /// closed it: `s` pressed to stop the box only closed the pane, and the `y` after it did nothing.
+    BoxLog { name: String, text: String },
     /// A multi-field text form (volume create, profile new/edit).
     Form(Form),
     /// The "new profile" kind picker (Profiles tab `n`): choose vcpu / vgpio / vdisk / disk.
@@ -691,6 +696,9 @@ pub fn run() -> Result<(), crate::error::Error> {
                 first_wait = false;
                 last_refresh = Instant::now();
                 snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_box, &mut box_hist, tab); // timeout → periodic refresh (CPU% window)
+                if let Mode::BoxLog { name, text } = &mut mode {
+                    *text = box_log_text(name);
+                }
                 continue;
             }
             // A MEASUREMENT LANDED: the sizes reach the frame drawn next, without a key, and the
@@ -748,6 +756,14 @@ pub fn run() -> Result<(), crate::error::Error> {
                     break;
                 }
             }
+            // The live log of one box: its lifecycle keys act on it, the rest go back.
+            Mode::BoxLog { name, text } => match box_log_key(key, name, text, &snap.rows) {
+                None => break,
+                Some((next, changed)) => {
+                    mode = next;
+                    dirty = changed;
+                }
+            },
             // Confirm a destructive action: `y` performs it, anything else cancels.
             Mode::Confirm { action, .. } => {
                 if matches!(key.first(), Some(b'y' | b'Y')) {
@@ -1016,9 +1032,10 @@ fn nav_boxes(k: u8, sel: usize, rows: &[Row], mode: &mut Mode) -> bool {
         b'p' => quiet_io(|| crate::commands::pause(std::slice::from_ref(&name), false, true)),
         b'u' => quiet_io(|| crate::commands::pause(std::slice::from_ref(&name), false, false)),
         b'\r' | b'\n' => {
-            *mode = Mode::Overlay(
-                crate::commands::box_log_tail(&name).unwrap_or_else(|| "(no output yet)".into()),
-            );
+            *mode = Mode::BoxLog {
+                text: box_log_text(&name),
+                name,
+            };
             return false;
         }
         _ => return false,
@@ -1028,6 +1045,46 @@ fn nav_boxes(k: u8, sel: usize, rows: &[Row], mode: &mut Mode) -> bool {
     }
     true
 }
+
+/// A key on a box's live log. `None` = quit top. Otherwise the next mode and whether box state
+/// changed. `s` asks before stopping (as on the list), `p`/`u` act and keep the log on screen,
+/// Esc, Enter and any other key go back to the list.
+fn box_log_key(key: &[u8], name: String, text: String, rows: &[Row]) -> Option<(Mode, bool)> {
+    if is_quit(key) && key != [0x1b] {
+        return None;
+    }
+    let k = match key {
+        [k @ (b's' | b'p' | b'u')] => *k,
+        _ => return Some((Mode::Nav, false)),
+    };
+    let Some(i) = rows.iter().position(|r| r.name == name) else {
+        return Some((
+            Mode::Overlay(format!(
+                "{name}\nthe box is no longer running: nothing to stop or pause"
+            )),
+            false,
+        ));
+    };
+    let mut mode = Mode::Nav;
+    let changed = nav_boxes(k, i, rows, &mut mode);
+    // `p`/`u` leave `mode` untouched: the log stays. `s` set its confirmation, an error its overlay.
+    if matches!(mode, Mode::Nav) {
+        mode = Mode::BoxLog { name, text };
+    }
+    Some((mode, changed))
+}
+
+/// What the live log pane shows for a box: a title naming it, then the END of its newest log.
+/// Only the last `LOG_PANE_BYTES` are read, because this runs on every refresh and a long-lived
+/// box's log grows without bound; the first, partial line of that window is dropped.
+fn box_log_text(name: &str) -> String {
+    let title = format!("logs: {name}");
+    let body = crate::commands::box_log_tail(name, LOG_PANE_BYTES).unwrap_or_default();
+    format!("{title}\n{body}")
+}
+
+/// How much of a box's log the live pane reads per refresh: far more than a screen holds.
+const LOG_PANE_BYTES: u64 = 64 * 1024;
 
 /// Profiles-tab action keys: new / edit / delete a `kern.toml` profile.
 fn nav_profiles(
@@ -3802,6 +3859,12 @@ fn render(
             s.push_str(&text_pane(p, text, body_rows, width));
             format!("{d}[{z}any key{d}] back{z}")
         }
+        Mode::BoxLog { text, .. } => {
+            s.push_str(&text_pane(p, text, body_rows, width));
+            format!(
+                "{d}[{z}s{d}]top  [{z}p{d}]ause  [{z}u{d}]npause   [{z}Esc{d}/{z}⏎{d}] back   [{z}q{d}] quit   (live){z}"
+            )
+        }
         Mode::Form(form) => {
             s.push_str(&form_pane(p, form, width, body_rows));
             format!("{d}[{z}Tab{d}/{z}↑↓{d}] field   [{z}⏎{d}] save   [{z}Esc{d}] cancel{z}")
@@ -3906,7 +3969,7 @@ fn help_text() -> String {
      BOXES tab - act on the selected box\n\
        s  stop (asks first)   S  stop ALL (asks first)\n\
        p  pause               u  unpause\n\
-       Enter          view its logs (a box's own output)\n\
+       Enter          its logs, live; s p u still act on the box there, Esc back\n\
      \n\
      IMAGES tab\n\
        d  delete      D  delete ALL cached images       p  prune orphaned layers\n\
@@ -6694,6 +6757,38 @@ mod tests {
             Mode::Nav => panic!("`s` acted immediately instead of asking"),
             _ => panic!("`s` must open a confirmation, and opened something else"),
         }
+    }
+
+    /// `s` ON A BOX'S LOG STOPS THAT BOX (after asking), and it only closed the pane.
+    ///
+    /// Reported from the field: the log pane was an `Overlay` where any key went back, so `s`
+    /// pressed to stop the box closed the log, the `y` after it landed on the list and did nothing,
+    /// and the box kept running. Esc goes back, `q` still quits.
+    #[test]
+    fn s_on_a_box_log_asks_to_stop_that_box_and_esc_goes_back() {
+        let rows = [row("alpha", false), row("beta", false)];
+        let open = |k: &[u8]| box_log_key(k, "beta".into(), "logs: beta".into(), &rows);
+        match open(b"s") {
+            Some((Mode::Confirm { action, .. }, false)) => assert!(
+                matches!(action, Pending::StopBox(ref n) if n == "beta"),
+                "the stop must target the box whose log is open"
+            ),
+            _ => panic!("`s` on the log must open the stop confirmation for that box"),
+        }
+        assert!(
+            matches!(open(b"\x1b"), Some((Mode::Nav, false))),
+            "Esc goes back to the list"
+        );
+        assert!(
+            matches!(open(b"\r"), Some((Mode::Nav, false))),
+            "Enter goes back to the list"
+        );
+        assert!(open(b"q").is_none(), "q quits top, as everywhere");
+        let gone = box_log_key(b"s", "gone".into(), String::new(), &rows);
+        assert!(
+            matches!(gone, Some((Mode::Overlay(ref t), false)) if t.contains("no longer running")),
+            "a box that exited says so instead of doing nothing"
+        );
     }
 
     /// THE HELP AND THE FOOTER MAY NOT PROMISE A KEY THE CODE DOES NOT HONOUR.
