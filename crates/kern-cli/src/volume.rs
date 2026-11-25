@@ -932,6 +932,42 @@ pub(crate) fn ensure_at_path(name: &str, dir: &str) -> Result<(), Error> {
     }
 }
 
+/// Which box uses a named volume: a running one (from the registry, which records a box's volumes
+/// before it mounts them), else a KEPT one, stopped, whose recorded command line mounts it. The
+/// answer is the rest of "volume 'v' is in use by ...", saying what frees it.
+///
+/// THE KEPT ONES TOO, as Docker refuses `volume rm` for a stopped container ("volume is in use").
+/// MEASURED (Grok's round 17, case e10): a kept box's volume was removed, and its next `kern start`
+/// would have mounted an empty new volume of that name where its data had been.
+fn volume_user_finder() -> impl Fn(&str) -> Option<String> {
+    let running = crate::registry::list();
+    let kept: Vec<(String, Vec<String>)> = crate::keepbox::list_matching(|_| true)
+        .into_iter()
+        .filter_map(|k| {
+            let dir = crate::keepbox::dir_of(&k.name)?;
+            let (argv, _) = crate::keepbox::read(&dir)?;
+            Some((k.name, crate::keepbox::volume_names_of(&argv)))
+        })
+        .collect();
+    move |name: &str| {
+        running
+            .iter()
+            .find(|b| b.volume_names().any(|v| v == name))
+            .map(|b| format!("box '{}' - stop it first", b.name))
+            .or_else(|| {
+                kept.iter()
+                    .find(|(b, vols)| {
+                        vols.iter().any(|v| v == name) && !running.iter().any(|r| &r.name == b)
+                    })
+                    .map(|(b, _)| {
+                        format!(
+                            "box '{b}', kept and stopped - `kern rm {b}` first, or keep the volume"
+                        )
+                    })
+            })
+    }
+}
+
 /// Rename and/or re-quota an existing volume. `new_name == orig` keeps the name; `size = None` clears
 /// the quota, `Some(0)` is rejected upstream (a 0-byte quota is meaningless). Shared by the TUI's
 /// Storage-tab edit and `kern volume edit`. A rename refuses an in-use volume (its bind mount would
@@ -945,13 +981,9 @@ pub fn edit(orig: &str, new_name: &str, size: Option<u64>) -> Result<(), Error> 
         return Err(Error::Volume(format!("no volume named '{orig}'")));
     }
     if new_name != orig {
-        if let Some(b) = crate::registry::list()
-            .iter()
-            .find(|b| b.volume_names().any(|v| v == orig))
-        {
+        if let Some(why) = volume_user_finder()(orig) {
             return Err(Error::AlreadyRunning(format!(
-                "volume '{orig}' is in use by box '{}' - stop it first",
-                b.name
+                "volume '{orig}' is in use by {why}"
             )));
         }
         if dir.join(new_name).join("data").is_dir() {
@@ -1323,13 +1355,7 @@ fn remove(names: &[String]) -> Result<(), Error> {
     // Snapshot the running boxes once. Each box records the named volumes it mounts in the registry
     // BEFORE mounting them, so this in-use scan is race-free. Refusing an in-use volume is Docker's
     // behaviour - deleting it would pull the box's bind mount out from under it.
-    let running = crate::registry::list();
-    let user_of = |name: &str| {
-        running
-            .iter()
-            .find(|b| b.volume_names().any(|v| v == name))
-            .map(|b| b.name.clone())
-    };
+    let user_of = volume_user_finder();
     let dir = volumes_dir();
     // Process every requested name independently (like `docker volume rm a b c`): remove what we can,
     // collect the rest, and exit non-zero if any failed - never stop at the first problem. Removed
@@ -1342,11 +1368,9 @@ fn remove(names: &[String]) -> Result<(), Error> {
             fails.push(e.to_string()); // reuse validate's exact wording (parity with create/inspect)
         } else if !dir.join(name).join("data").is_dir() {
             fails.push(format!("no volume named '{name}'"));
-        } else if let Some(box_name) = user_of(name) {
+        } else if let Some(why) = user_of(name) {
             any_in_use = true;
-            fails.push(format!(
-                "volume '{name}' is in use by box '{box_name}' - stop it first"
-            ));
+            fails.push(format!("volume '{name}' is in use by {why}"));
         // `remove_tree_mapped`, not `remove_dir_all`: a volume SEEDED FROM AN IMAGE carries the
         // image's ownership on its root and its contents (that is what lets a service running as a
         // non-root user write there), and an unprivileged caller cannot unlink inside a directory a

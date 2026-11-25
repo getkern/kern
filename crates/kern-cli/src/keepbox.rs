@@ -546,6 +546,41 @@ pub fn labels_of(argv: &[std::ffi::OsString]) -> Vec<String> {
     out
 }
 
+/// The NAMED volumes a recorded `kern box` argv mounts: the source of each `-v`/`--volume` that is a
+/// volume name, and the `src=` of each `--mount type=volume,...`. Paths are not volumes and are left
+/// out, as is anything after the `--` (the workload's own arguments).
+pub fn volume_names_of(argv: &[std::ffi::OsString]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = argv.iter().take_while(|a| a.as_os_str() != "--");
+    let named = |s: &str| matches!(crate::volume::classify(s), crate::volume::SourceKind::Named);
+    while let Some(a) = it.next() {
+        let Some(flag) = a.to_str() else { continue };
+        let value = match flag {
+            "-v" | "--volume" | "--mount" => it.next().and_then(|v| v.to_str()).map(str::to_string),
+            _ => flag
+                .strip_prefix("--volume=")
+                .or_else(|| flag.strip_prefix("--mount="))
+                .map(str::to_string),
+        };
+        let Some(value) = value else { continue };
+        let src = if flag.starts_with("--mount") {
+            value
+                .split(',')
+                .find_map(|f| f.strip_prefix("src=").or_else(|| f.strip_prefix("source=")))
+                .filter(|_| value.split(',').any(|f| f == "type=volume"))
+                .map(str::to_string)
+        } else {
+            value.split(':').next().map(str::to_string)
+        };
+        if let Some(src) = src.filter(|s| named(s)) {
+            if !out.contains(&src) {
+                out.push(src);
+            }
+        }
+    }
+    out
+}
+
 /// The workload part of a recorded `kern box` argv: what follows the first bare `--`, joined with
 /// spaces. Empty when the command line named none, which means the image's own entrypoint ran.
 pub fn workload_of(argv: &[std::ffi::OsString]) -> String {
@@ -1012,5 +1047,34 @@ mod tests {
             OsString::from("daemon off;"),
         ];
         assert_eq!(workload_of(&with_cmd), "nginx -g daemon off;");
+    }
+}
+
+#[cfg(test)]
+mod volume_names_tests {
+    use super::volume_names_of;
+
+    #[test]
+    fn a_recorded_command_line_names_its_volumes_and_not_its_paths() {
+        let argv: Vec<std::ffi::OsString> = [
+            "box",
+            "-v",
+            "data:/d",
+            "-v",
+            "/srv/x:/x",
+            "--volume=logs:/l:ro",
+            "--mount",
+            "type=volume,src=cache,dst=/c",
+            "--mount",
+            "type=bind,src=/h,dst=/h",
+            "alpine",
+            "--",
+            "-v",
+            "notme:/n",
+        ]
+        .iter()
+        .map(Into::into)
+        .collect();
+        assert_eq!(volume_names_of(&argv), ["data", "logs", "cache"]);
     }
 }
