@@ -6133,10 +6133,16 @@ fn tun_keeps_net_admin_and_privileged_keeps_sys_admin_on_a_real_box() {
         1,
         "--privileged must KEEP SYS_ADMIN (bit 21): {privd:#x}"
     );
+    // `--privileged` keeps EVERY capability in the box's user namespace, as Docker's does: a runtime
+    // in the box sets up its bridge and NAT with NET_ADMIN (bit 12).
+    let last: u32 = fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(40);
     assert_eq!(
-        (privd >> 12) & 1,
-        0,
-        "--privileged must NOT keep NET_ADMIN (bit 12): {privd:#x}"
+        privd,
+        (1u64 << (last + 1)) - 1,
+        "--privileged must keep every capability: {privd:#x}"
     );
     // SECURITY-CRITICAL end-to-end: `--security-profile untrusted` (which is `--cap-drop ALL`) plus
     // `--tun` must leave the bounding set with EXACTLY one cap, NET_ADMIN - not a hole that widens the

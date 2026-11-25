@@ -7939,9 +7939,11 @@ pub(crate) fn apply_privileged_grant(
     let names: Vec<&str> = asked.iter().map(String::as_str).collect();
     Some(format!(
         "service(s) {} run with `privileged: true` as you granted: every capability their own user \
-         namespace can hold, and the relaxed seccomp a nested runtime needs. NOT granted, because a \
-         rootless runtime must not: `/proc` and `/sys` stay masked, so `core_pattern` and its \
-         neighbours are unreachable. Docker's `privileged` unmasks them and is not rootless",
+         namespace can hold, the relaxed seccomp, a cgroup tree below the box's caps and a sysfs \
+         a nested runtime needs. NOT granted, because a rootless runtime cannot grant it: the \
+         host's devices, and a write to the host's kernel settings (`/proc/sys`, `sysrq-trigger`, \
+         the sysfs knobs), which only the host's root makes. Docker's `privileged` is both, and \
+         is not rootless",
         crate::compose::name_list(&names)
     ))
 }
@@ -11197,12 +11199,12 @@ fn top_row(service: &str, pid: i32, cmd: &str) -> Option<[String; 10]> {
 
 fn box_processes(pid1: i32) -> Option<Vec<(i32, String)>> {
     let dir = kern_isolation::box_cgroup_dir(pid1)?;
-    let procs = std::fs::read_to_string(dir.join("cgroup.procs")).ok()?;
+    if !dir.join("cgroup.procs").exists() {
+        return None;
+    }
+    // The whole tree: a `--privileged` box runs in a nested leaf, and its runtime makes cgroups below.
     let mut out = Vec::new();
-    for line in procs.lines() {
-        let Ok(pid) = line.trim().parse::<i32>() else {
-            continue;
-        };
+    for pid in kern_isolation::box_tree_pids(&dir) {
         let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
             .ok()
             .map(|b| {

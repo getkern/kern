@@ -389,10 +389,20 @@ fn errno_syscalls() -> Vec<libc::c_long> {
 /// The deny-but-degrade entries that answer `ENOSYS` and not `EPERM`: the ones a libc probes and
 /// falls back from ONLY on `ENOSYS` (`clone3`, glibc's `pthread_create`/`posix_spawn`), and one too
 /// new for any caller to probe (`listns`). Docker answers these the same.
-fn enosys_only() -> Vec<libc::c_long> {
+///
+/// AND THE KEYRING, FOR A BOX THAT NESTS A RUNTIME (`allow_nesting`). runc joins a fresh session
+/// keyring for every container it starts and tolerates `ENOSYS` alone (a kernel built without keys),
+/// so `EPERM` there stopped docker-in-docker at its first `run`. The keyring stays DENIED: it is not
+/// separated by user namespace for a key the operator already holds, since a key's owner check
+/// compares the kernel uid and the box's root IS the operator's uid, so permitting `keyctl` would let
+/// a box read the operator's keys by serial number. `ENOSYS` is the one refusal runc steps over.
+fn enosys_only(allow_nesting: bool) -> Vec<libc::c_long> {
     let mut v = vec![libc::SYS_clone3];
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     v.push(470);
+    if allow_nesting {
+        v.extend([libc::SYS_add_key, libc::SYS_request_key, libc::SYS_keyctl]);
+    }
     v
 }
 
@@ -401,8 +411,8 @@ fn enosys_only() -> Vec<libc::c_long> {
 /// kill, whatever `seccomp-deny` says: software probes these at start (libuv, Node's, probes io_uring;
 /// Redis 8's modules too) and falls back on either errno. MEASURED before: `io_uring_setup` and
 /// `userfaultfd` answered `ENOSYS` in a box, `EPERM` under Docker.
-fn eperm_like_docker() -> Vec<libc::c_long> {
-    let keep = enosys_only();
+fn eperm_like_docker(allow_nesting: bool) -> Vec<libc::c_long> {
+    let keep = enosys_only(allow_nesting);
     errno_syscalls()
         .into_iter()
         .filter(|n| !keep.contains(n))
@@ -569,7 +579,7 @@ fn build_filter(allow_nesting: bool) -> Vec<libc::sock_filter> {
     // never runs (isolation identical to a kill); the caller merely sees "not implemented" and takes
     // its fallback path, so probing software (Redis 8's io_uring, profilers, …) keeps working.
     let errno_ret = SECCOMP_RET_ERRNO | (libc::ENOSYS as u32 & SECCOMP_RET_DATA);
-    let enosys = enosys_only();
+    let enosys = enosys_only(allow_nesting);
     for nr in errno_syscalls() {
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (errno); else skip
         prog.push(stmt(
@@ -780,7 +790,7 @@ fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_fi
     // allows pays nothing for them. In `audit` they log and run, as every refusal does there, so the
     // two variants still differ in their actions alone.
     let eperm_action = if audit { SECCOMP_RET_LOG } else { RET_EPERM };
-    for nr in eperm_like_docker() {
+    for nr in eperm_like_docker(allow_nesting) {
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next; else skip
         prog.push(stmt(BPF_RET | BPF_K, eperm_action));
     }
@@ -1349,7 +1359,10 @@ mod tests {
     /// only; the denylist already had one check per number and keeps its count. Permitting `ptrace`
     /// outside the kill verdict (23/11) takes its two instructions out of the shared kill prologue: the
     /// denylist is 103 (89 nesting); the allowlist adds the same two back as an explicit allow and
-    /// keeps 215 and 210. These are the counts under the default `EPERM` verdict, which tests run in.
+    /// keeps 215 and 210. The keyring answering `ENOSYS` in a nesting box (23/11, so runc in it can
+    /// start a container) takes its three numbers out of the `EPERM` checks there: the allowlist with
+    /// nesting is 204 (they reach its `ENOSYS` default), the denylist keeps 89 (one check each, its
+    /// errno changed). These are the counts under the default `EPERM` verdict, which tests run in.
     /// ON THE KERNEL, not only on the BPF interpreter: in a forked child the filter is installed
     /// and `ptrace` called. Under the `EPERM` verdict (a box) `PTRACE_TRACEME` succeeds and
     /// `process_vm_readv` is refused with `EPERM`, as Docker's profile answers both; under the kill
@@ -1447,7 +1460,7 @@ mod tests {
                 // to x86_64. aarch64 still gets the fit check above.
                 #[cfg(target_arch = "x86_64")]
                 {
-                    let allow_expected = if nesting { 210 } else { 215 };
+                    let allow_expected = if nesting { 204 } else { 215 };
                     assert_eq!(
                         len, allow_expected,
                         "x86_64 allowlist instruction count changed (nesting={nesting}): {len} vs \
@@ -1576,7 +1589,10 @@ mod tests {
                     }
                     // A refused probe Docker answers EPERM (io_uring, userfaultfd, ...): EPERM here,
                     // never a kill; logged and run under audit.
-                    if super::eperm_like_docker().iter().any(|&n| n as u32 == nr) {
+                    if super::eperm_like_docker(allow_nesting)
+                        .iter()
+                        .any(|&n| n as u32 == nr)
+                    {
                         return if audit {
                             SECCOMP_RET_LOG
                         } else {

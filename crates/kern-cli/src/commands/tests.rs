@@ -8004,10 +8004,9 @@ fn a_file_cannot_grant_itself_privileged_and_the_grant_clears_the_field() {
     let note = apply_privileged_grant(&mut boxes, true).expect("owed");
     assert!(boxes[0].privileged);
     assert!(
-        note.contains("/proc"),
-        "the unmask kern does not do must be named: {note}"
+        note.contains("/proc/sys") && note.contains("devices"),
+        "what a rootless grant cannot give must be named: {note}"
     );
-    assert!(note.contains("masked"), "{note}");
 
     // THE CONTROL: a service that never asked is untouched either way, and a stack where nobody
     // asked is owed no sentence at all.

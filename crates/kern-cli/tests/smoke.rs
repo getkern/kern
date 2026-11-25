@@ -2181,6 +2181,108 @@ fn a_box_on_two_networks_of_a_stack_reaches_each_and_only_its_peers() {
     );
 }
 
+/// `--privileged` is a box a container runtime can run in, and its caps still hold. The runtime's own
+/// setup is the attack: move into a child cgroup, enable the controllers, make a cgroup whose
+/// `memory.max` is `max`, and allocate past the box's cap there. THE CONTROL is that every step is
+/// taken (the mount is writable and the box sees its cap at its root), so the kill that follows is
+/// the cap above the box's tree and not a step that failed. Also what the runtime needs: a sysfs of
+/// its own and every capability in the box's user namespace.
+///
+/// TWO WALLS hold it, and this asserts the property, not one of them: the cap on the box's cgroup,
+/// above the box's tree, and its copy on the nested leaf, which a host mounting cgroup2 with
+/// `nsdelegate` does not let the box write. MEASURED: lifting the first alone stays green here;
+/// lifting both turns the control red.
+#[test]
+fn a_privileged_box_nests_a_cgroup_and_its_cap_still_holds() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skip: --privileged is rootless-only");
+        return;
+    }
+    let nest = "mkdir /sys/fs/cgroup/init /sys/fs/cgroup/free && \
+        echo $$ > /sys/fs/cgroup/init/cgroup.procs && \
+        echo '+memory +pids' > /sys/fs/cgroup/cgroup.subtree_control && \
+        echo max > /sys/fs/cgroup/free/memory.max && \
+        echo $$ > /sys/fs/cgroup/free/cgroup.procs";
+    let probe = format!(
+        "m=$(cat /sys/fs/cgroup/memory.max); if {nest}; then w=nested; else w=refused; fi; \
+         echo \"$m $w $(cat /proc/self/cgroup) $(cat /sys/fs/cgroup/free/memory.max) \
+         $(stat -f -c %T /sys) $(grep CapEff /proc/self/status | cut -f2)\""
+    );
+    let o = kern()
+        .args([
+            "run",
+            "--rm",
+            "--privileged",
+            "--memory",
+            "64m",
+            "alpine",
+            "sh",
+            "-c",
+            &probe,
+        ])
+        .output()
+        .expect("run kern");
+    let (out, err) = out_err(&o);
+    if err.contains("user namespaces") || err.contains("cgroup") && out.trim().is_empty() {
+        eprintln!("skip: this host cannot run a capped box ({err})");
+        return;
+    }
+    // WHETHER THIS HOST CAPS AT ALL is read from a PLAIN box: the box under test reading `max` is
+    // the defect this test exists for, and must not be what turns it into a skip.
+    let plain = kern()
+        .args([
+            "run",
+            "--rm",
+            "--memory",
+            "64m",
+            "alpine",
+            "cat",
+            "/sys/fs/cgroup/memory.max",
+        ])
+        .output()
+        .expect("run kern");
+    if out_err(&plain).0.trim() != "67108864" {
+        eprintln!(
+            "skip: a plain box is not capped here, nothing to hold ({:?})",
+            out_err(&plain)
+        );
+        return;
+    }
+    let f: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(
+        f.get(..5),
+        Some(&["67108864", "nested", "0::/free", "max", "sysfs"][..]),
+        "the CONTROL: the box reads its cap, nests a cgroup at max, and has a sysfs: {out} {err}"
+    );
+    assert!(
+        f.get(5)
+            .is_some_and(|c| c.trim_start_matches('0').starts_with("1ff")),
+        "every capability in the box's user namespace: {out}"
+    );
+    let alloc = format!("{nest} && exec dd if=/dev/zero of=/dev/null bs=200M count=1 2>/dev/null");
+    let o = kern()
+        .args([
+            "run",
+            "--rm",
+            "--privileged",
+            "--memory",
+            "64m",
+            "alpine",
+            "sh",
+            "-c",
+            &alloc,
+        ])
+        .output()
+        .expect("run kern");
+    // `dd` reads 200 MiB into one buffer of its own, so it is the process the cap kills.
+    assert_eq!(
+        o.status.code(),
+        Some(137),
+        "200 MiB under a 64 MiB cap, from a cgroup the box made at max: {:?}",
+        out_err(&o)
+    );
+}
+
 /// A stack whose FIRST service is refused must not leave its pod behind.
 ///
 /// MEASURED before the guard existed, on 0.9.32-37-g02ecedf: `compose up` printed
@@ -9249,15 +9351,18 @@ fn a_box_sys_is_read_only_like_docker_sysfs() {
             "--",
             "sh",
             "-c",
-            "touch /sys/x && echo SYS=rw; echo END",
+            "grep ' /sys ' /proc/self/mountinfo | grep -q ' rw,.* - sysfs ' && echo SYS=rw; echo END",
         ])
         .output()
         .expect("run kern box --privileged");
     let said = String::from_utf8_lossy(&privileged.stdout);
     if said.contains("END") {
+        // A sysfs of the box's own, mounted read-write as Docker's `--privileged` mounts it: a
+        // runtime in the box mounts one for each container it makes, which the kernel permits only
+        // where one is fully visible.
         assert!(
             said.contains("SYS=rw"),
-            "--privileged /sys is not writable: {said}"
+            "--privileged /sys is not a read-write sysfs: {said}"
         );
     } else {
         eprintln!(

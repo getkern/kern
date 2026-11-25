@@ -1327,6 +1327,30 @@ fn mask_nvidia_enumeration(what: &GpuEnumeration) -> Result<(), Error> {
 /// Best-effort throughout: a kernel without cgroup namespaces, a host that refuses the `cgroup2` mount,
 /// or a `--privileged` nested box where `mount_too_revealing` bites, simply leaves the box without a
 /// cgroup view (kern's prior behaviour) - it never fails the box.
+/// Does this process have a controlling terminal? `open("/dev/tty")` answers `ENXIO` when it has none.
+/// Any other answer counts as having one, the direction that keeps `/dev/tty` out of a box.
+fn has_controlling_tty() -> bool {
+    let Ok(p) = cstr("/dev/tty") else {
+        return true;
+    };
+    let f = unsafe {
+        libc::open(
+            p.as_ptr(),
+            libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if f >= 0 {
+        unsafe { libc::close(f) };
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ENXIO)
+}
+
+/// Set before the fork when the box's workload runs in a nested leaf it may write (`--privileged`, see
+/// `CgroupGuard::nest_workload`): the child then mounts its cgroup view read-write. Its root is that
+/// leaf, below the caps, so nothing it writes there lifts them.
+static CGROUP_WRITABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn mount_cgroup() {
     // Create the mountpoint on the (still-writable) box root WITHOUT mounting a full sysfs, so `/sys`
     // otherwise stays empty and the host sysfs is never revealed. Neutralize a hostile image symlink at
@@ -1348,8 +1372,11 @@ fn mount_cgroup() {
                 ty.as_ptr(),
                 tgt.as_ptr(),
                 ty.as_ptr(),
-                (libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC)
-                    as libc::c_ulong,
+                (if CGROUP_WRITABLE.load(std::sync::atomic::Ordering::Relaxed) {
+                    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC
+                } else {
+                    libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC
+                }) as libc::c_ulong,
                 ptr::null(),
             );
         }
@@ -1916,6 +1943,8 @@ fn child_setup_and_exec(
         shm_size_for(spec.shm_max, spec.memory_max),
         spec.pty_sock,
         spec.shm_dir.as_deref(),
+        spec.privileged
+            && (spec.tty_slave.is_some() || spec.pty_sock.is_some() || !has_controlling_tty()),
     )?;
     // The host slave is now dead weight in this process: the workload is about to get the box's
     // one. Closing it here rather than leaking it into the exec keeps the box from holding an fd on
@@ -1937,10 +1966,23 @@ fn child_setup_and_exec(
     // directories `/sys`, `/sys/devices` and `/sys/fs/cgroup` no longer land in the overlay upper.
     // REQUIRED only when sysfs paths are granted (they need somewhere box-owned to be bound); without
     // a grant a host that refuses the mount keeps the previous layout, so the box still starts.
-    let sys_mount = make_box_tmpfs(&spec.root, "sys");
-    let sys_is_box_tmpfs = sys_mount.is_ok();
-    if !spec.vgpio_sysfs.is_empty() || !spec.gpu_sysfs.is_empty() {
-        sys_mount?;
+    //
+    // A `--privileged` BOX GETS A SYSFS OF ITS OWN, as Docker and Podman mount one for a privileged
+    // container, because a runtime in the box needs one: the kernel lets a user namespace mount a
+    // fresh sysfs only where one is already fully visible in its mount namespace
+    // (`mount_too_revealing`), so runc in a box with a tmpfs `/sys` could start no container. MEASURED
+    // with docker:dind: "error mounting sysfs to rootfs at /sys: operation not permitted". The mount
+    // is the sysfs of the box's network namespace, which the kernel permits only when the box's user
+    // namespace owns that namespace; its files are the host's kernel's, written only by the host's
+    // root, except the box's own network devices. Not with sysfs grants, which need the tmpfs.
+    let grants = !spec.vgpio_sysfs.is_empty() || !spec.gpu_sysfs.is_empty();
+    let own_sysfs = spec.privileged && !grants && mount_box_sysfs(&spec.root);
+    let sys_mount = (!own_sysfs).then(|| make_box_tmpfs(&spec.root, "sys"));
+    let sys_is_box_tmpfs = matches!(sys_mount, Some(Ok(())));
+    if grants {
+        if let Some(r) = sys_mount {
+            r?;
+        }
     }
     setup_vgpio(
         &spec.root,
@@ -4074,6 +4116,7 @@ fn mount_or_leave_nothing(path: &str, fstype: &str) -> bool {
 ///
 /// See [`crate::ptybox`] for why a box-owned slave is the difference between `tty(1)` working and
 /// printing "not a tty" on every musl image.
+#[allow(clippy::too_many_arguments)] // each is a distinct property of the box's `/dev`
 fn setup_dev(
     root: &str,
     tun: bool,
@@ -4082,6 +4125,7 @@ fn setup_dev(
     shm_size: Option<u64>,
     pty_sock: Option<i32>,
     shm_dir: Option<&str>,
+    tty_device: bool,
 ) -> Result<Option<i32>, Error> {
     let mut box_slave: Option<i32> = None;
     let dev_path = format!("{root}/dev");
@@ -4139,8 +4183,40 @@ fn setup_dev(
     //
     // Best-effort like the binds below: on a host where the `mkdir` fails, the box keeps exactly the
     // behaviour it had before this line.
-    if let Ok(t) = cstr(&format!("{root}/dev/tty")) {
-        unsafe { libc::mkdir(t.as_ptr(), 0o000) };
+    //
+    // THE DEVICE, FOR A `--privileged` BOX WHOSE TERMINAL IS ITS OWN OR NONE (`tty_device`): one with
+    // `-t`, whose controlling terminal is the box's own pty, or one with no controlling terminal at
+    // all (detached, or started through kern's Docker API), where opening it answers `ENXIO` as under
+    // Docker. `/dev/tty` names the OPENER's controlling terminal, so in neither case does it reach the
+    // operator's, and a runtime in the box (runc binds `/dev/tty` into every container it makes)
+    // finds the node it expects. A foreground box without `-t` keeps the directory.
+    let tty = format!("{root}/dev/tty");
+    if let Ok(t) = cstr(&tty) {
+        let bound = tty_device && {
+            let f = unsafe {
+                libc::open(
+                    t.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0o666,
+                )
+            };
+            if f >= 0 {
+                unsafe { libc::close(f) };
+            }
+            cstr("/dev/tty").is_ok_and(|s| unsafe {
+                libc::mount(
+                    s.as_ptr(),
+                    t.as_ptr(),
+                    ptr::null(),
+                    libc::MS_BIND as libc::c_ulong,
+                    ptr::null(),
+                ) == 0
+            })
+        };
+        if !bound {
+            unsafe { libc::unlink(t.as_ptr()) };
+            unsafe { libc::mkdir(t.as_ptr(), 0o000) };
+        }
     }
     // Bind each node best-effort: a host that lacks one (or refuses the bind) just leaves that
     // node absent rather than failing the whole box. The tmpfs above is the load-bearing step.
@@ -4549,6 +4625,26 @@ fn unlink_if_symlink(path: &str) {
 /// `setup_dev`'s `/dev` handling). Used for `/sys` when a vGPIO profile needs sysfs peripherals, and
 /// for the wide `/run` tmpfs the `--ssh` path needs. `NOSUID|NODEV`: a box tmpfs never hosts a setuid
 /// binary or a device node (parity with the vdisk/secrets mounts).
+/// Mount a fresh sysfs at the box's `/sys` (`--privileged`, see the call). False when the kernel
+/// refuses it, and the box takes the tmpfs.
+fn mount_box_sysfs(root: &str) -> bool {
+    let path = format!("{root}/sys");
+    let (Ok(p), Ok(ty)) = (cstr(&path), cstr("sysfs")) else {
+        return false;
+    };
+    unlink_if_symlink(&path);
+    unsafe { libc::mkdir(p.as_ptr(), 0o755) };
+    unsafe {
+        libc::mount(
+            ty.as_ptr(),
+            p.as_ptr(),
+            ty.as_ptr(),
+            (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
+            ptr::null(),
+        ) == 0
+    }
+}
+
 fn make_box_tmpfs(root: &str, leaf: &str) -> Result<(), Error> {
     let path = format!("{root}/{leaf}");
     let p = cstr(&path)?;
@@ -7555,7 +7651,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     // Held for RAII: its Drop removes the box's cgroup dirs after waitpid (see CgroupGuard). Named
     // rather than `_`-prefixed because the forked child below reads it to join the capped cgroup: the
     // supervisor is no longer in that cgroup, so the workload is not placed there by inheritance.
-    let cg = cg;
+    let mut cg = cg;
     pt_spawn.mark("parent:limits+cgroup");
 
     let euid = unsafe { libc::geteuid() };
@@ -7761,6 +7857,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     // real root's idmapped binds) is released here, before the fork, so no box inherits it.
     discard_early_userns();
     let allow_nesting = spec.privileged && box_root_is_unprivileged();
+    // A box that may nest a runtime gets a cgroup tree it can write, one level below its caps (see
+    // `CgroupGuard::nest_workload`). Read by the child through `CGROUP_WRITABLE` when it mounts its
+    // cgroup view: the forked child is a copy of this address space.
+    let nested = allow_nesting
+        && cg
+            .as_mut()
+            .filter(|g| g.supervisor_is_outside())
+            .is_some_and(crate::cgroup::CgroupGuard::nest_workload);
+    CGROUP_WRITABLE.store(nested, std::sync::atomic::Ordering::Relaxed);
 
     // THE WORKLOAD'S CGROUP IS DECIDED BEFORE THE FORK, because that is the only place it can be used
     // to avoid a migration: `clone3(CLONE_INTO_CGROUP)` creates the child already inside, and the
@@ -7781,7 +7886,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     let cg_target = cg
         .as_ref()
         .filter(|g| g.supervisor_is_outside())
-        .map(|g| g.box_dir());
+        .map(|g| g.workload_dir());
     let cg_ref = match cg_target.map(crate::cgroup::CgroupRef::open) {
         None => None,
         Some(Some(r)) => Some(r),
@@ -8223,6 +8328,13 @@ fn cap_drop_mask(spec: &CapSpec, tun: bool, privileged: bool) -> u64 {
         } else {
             (1u64 << (last + 1)) - 1
         }
+    } else if privileged {
+        // `--privileged` keeps EVERY capability, as Docker's does: a runtime in the box sets up
+        // bridges and NAT (`CAP_NET_ADMIN`), mounts and cgroups of its own. Each is a capability in the
+        // box's OWN user namespace and acts on the box's namespaces only; what would reach the host
+        // (modules, kexec, raw devices) stays refused by seccomp and by the host's user namespace.
+        // `--cap-drop` still applies below.
+        0
     } else {
         DEFAULT_DROP.iter().fold(0u64, |m, &c| m | (1u64 << c))
     };
@@ -12192,7 +12304,7 @@ mod cap_mask_tests {
     fn tun_keeps_net_admin_and_privileged_keeps_sys_admin() {
         // The two CONDITIONAL keeps, verified against the default spec. Bit 12 = CAP_NET_ADMIN, bit 21 =
         // CAP_SYS_ADMIN. Default (no flag) drops BOTH; `--tun` keeps NET_ADMIN; `--privileged` keeps
-        // SYS_ADMIN; each keep touches ONLY its own cap (no cross-leak).
+        // every one; under `--cap-drop ALL` each keep touches ONLY its own cap (no cross-leak).
         let d = CapSpec::default();
         let base = cap_drop_mask(&d, false, false);
         assert!(base & (1u64 << 12) != 0, "default drops NET_ADMIN");
@@ -12202,11 +12314,18 @@ mod cap_mask_tests {
         assert!(tun & (1u64 << 12) == 0, "--tun keeps NET_ADMIN");
         assert!(tun & (1u64 << 21) != 0, "--tun does NOT keep SYS_ADMIN");
 
+        // `--privileged` keeps every capability, as Docker's does; an explicit `--cap-drop` still
+        // applies.
         let priv_ = cap_drop_mask(&d, false, true);
-        assert!(priv_ & (1u64 << 21) == 0, "--privileged keeps SYS_ADMIN");
-        assert!(
-            priv_ & (1u64 << 12) != 0,
-            "--privileged does NOT keep NET_ADMIN"
+        assert_eq!(priv_, 0, "--privileged keeps every capability: {priv_:#x}");
+        let priv_drop = CapSpec {
+            drops: vec![12],
+            ..Default::default()
+        };
+        assert_eq!(
+            cap_drop_mask(&priv_drop, false, true),
+            1u64 << 12,
+            "--privileged --cap-drop NET_ADMIN drops exactly that one"
         );
 
         // A conditional keep wins over a contradictory explicit `--cap-drop` (same "keep wins" rule as

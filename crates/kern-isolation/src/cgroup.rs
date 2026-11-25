@@ -20,6 +20,10 @@ use std::sync::OnceLock;
 /// `exec`s or `_exit`s), so only the supervisor cleans up - exactly once.
 pub struct CgroupGuard {
     dir: PathBuf,
+    /// The leaf the workload runs in when it may manage cgroups of its own (`--privileged`, see
+    /// [`CgroupGuard::nest_workload`]): `<dir>/box`, with the caps on `dir` above it. `None` otherwise,
+    /// and the workload runs in `dir` itself.
+    nested: Option<PathBuf>,
     /// The SIBLING leaf the supervisor was parked in, when the no-blast-radius layout was built. Removed
     /// alongside `dir` on drop. `None` when the supervisor stayed in `dir` (the layout could not be built
     /// here, e.g. the parent refuses a second child or `memory` did not reach the children).
@@ -40,6 +44,65 @@ impl CgroupGuard {
     #[must_use]
     pub fn box_dir(&self) -> &std::path::Path {
         &self.dir
+    }
+
+    /// The cgroup the workload is PLACED in: the nested leaf when [`CgroupGuard::nest_workload`] built
+    /// one, else [`CgroupGuard::box_dir`].
+    #[must_use]
+    pub fn workload_dir(&self) -> &std::path::Path {
+        self.nested.as_deref().unwrap_or(&self.dir)
+    }
+
+    /// Give the workload a cgroup tree it may write, for a box that runs a container runtime of its
+    /// own (`--privileged`: docker-in-docker, BuildKit, a nested kern). Docker mounts such a
+    /// container's cgroup read-write; kern cannot do that over the box's own cgroup, because the caps
+    /// are written THERE and the box's root owns those files on a delegated tree: a writable mount
+    /// would let the box raise its own `memory.max` and `pids.max`.
+    ///
+    /// So the workload goes one level down, into `<box>/box`, and the cgroup namespace it unshares is
+    /// rooted at that leaf. Whatever it writes there, and below, is bounded by the caps on `<box>`,
+    /// which it cannot see. A host that mounts cgroup2 with `nsdelegate` refuses the box even its own
+    /// root's files (MEASURED: `echo max > memory.max` answers EPERM inside), so there the leaf is
+    /// the second wall; on one without it, it is the only one. The leaf gets copies of the caps, so a runtime that sizes itself from
+    /// `memory.max` at its root still reads the box's figure. The controllers `<box>` has are enabled
+    /// for its subtree, which cgroup v2 allows only while `<box>` holds no process: the supervisor is
+    /// outside (`supervisor_is_outside`) and the workload is not forked yet.
+    ///
+    /// Best-effort, and false leaves the box exactly as without it (its cgroup, mounted read-only):
+    /// the supervisor inside the capped cgroup, a parent that refuses the `mkdir`, or `memory` not
+    /// reaching the leaf, where a cap the workload reads would be missing.
+    pub fn nest_workload(&mut self) -> bool {
+        if self.nested.is_some() {
+            return true;
+        }
+        if !self.outside || holds_processes(&self.dir) {
+            return false;
+        }
+        enable_subtree_controllers(&self.dir);
+        let leaf = self.dir.join(NESTED_LEAF);
+        if fs::create_dir(&leaf).is_err() && !leaf.is_dir() {
+            return false;
+        }
+        if !leaf.join("memory.max").exists() {
+            let _ = fs::remove_dir(&leaf);
+            return false;
+        }
+        for f in [
+            "memory.max",
+            "memory.swap.max",
+            "memory.high",
+            "pids.max",
+            "cpu.max",
+        ] {
+            if let Ok(v) = fs::read_to_string(self.dir.join(f)) {
+                let v = v.trim();
+                if !v.is_empty() && !v.starts_with("max") {
+                    let _ = fs::write(leaf.join(f), v);
+                }
+            }
+        }
+        self.nested = Some(leaf);
+        true
     }
 
     /// Is the supervisor parked outside the capped cgroup? False when the layout could not be built and
@@ -753,11 +816,59 @@ impl Drop for CgroupGuard {
         // Best-effort: a non-empty cgroup or an already-removed dir (ENOENT - an outer `--collect` beat
         // us to it) are both fine to ignore. `sup` after `dir` so a failure on either still attempts the
         // other; they are siblings, so there is no ordering constraint between them.
-        let _ = fs::remove_dir(&self.dir);
+        remove_box_tree(&self.dir);
         if let Some(sup) = &self.sup {
             let _ = fs::remove_dir(sup);
         }
     }
+}
+
+/// The name of the leaf a `--privileged` box's workload runs in, below the box's own cgroup (see
+/// [`CgroupGuard::nest_workload`]).
+const NESTED_LEAF: &str = "box";
+
+/// Remove a box's cgroup and every cgroup below it, deepest first. A box's tree is one directory,
+/// except for a `--privileged` box: its workload runs in a nested leaf and may make cgroups of its own
+/// (a runtime's `docker/<id>`, `init`), all empty once the box is down. `rmdir` removes only an empty
+/// cgroup, so a populated one stays, as with a single `rmdir`. Depth-bounded, as the kernel's
+/// `cgroup.max.depth` would be on a hostile tree; cgroupfs has no symlinks to follow.
+pub fn remove_box_tree(dir: &std::path::Path) {
+    fn walk(dir: &std::path::Path, depth: u32) {
+        if depth > 0 {
+            if let Ok(rd) = fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    if e.file_type().is_ok_and(|t| t.is_dir()) {
+                        walk(&e.path(), depth - 1);
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_dir(dir);
+    }
+    walk(dir, 32);
+}
+
+/// Every pid in a box's cgroup and the cgroups below it: a `--privileged` box's processes are in its
+/// nested leaf and whatever cgroups its runtime made, none in the box's own directory.
+pub fn box_tree_pids(dir: &std::path::Path) -> Vec<i32> {
+    fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<i32>) {
+        if let Ok(t) = fs::read_to_string(dir.join("cgroup.procs")) {
+            out.extend(t.lines().filter_map(|l| l.trim().parse::<i32>().ok()));
+        }
+        if depth == 0 {
+            return;
+        }
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    walk(&e.path(), depth - 1, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, 32, &mut out);
+    out
 }
 
 /// The current process's cgroup v2 directory under `/sys/fs/cgroup`, from the `0::<path>` line of
@@ -2547,7 +2658,7 @@ fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
             if may_kill {
                 let _ = kill_cgroup(&path);
             }
-            let _ = fs::remove_dir(&path);
+            remove_box_tree(&path);
         }
     }
 }
@@ -3004,11 +3115,21 @@ fn is_kern_box_leaf(leaf: &str) -> bool {
 /// the user's whole session. The `kern-box-` prefix is the proof of ownership.
 fn parse_box_cgroup_line(raw: &str) -> Option<PathBuf> {
     let rel = raw.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
-    let leaf = rel.rsplit('/').next()?;
+    let comps: Vec<&str> = rel.trim_start_matches('/').split('/').collect();
+    // A `--privileged` box's processes run in `<box>/box` and below, in cgroups the box itself may
+    // create and name (see `CgroupGuard::nest_workload`): the box is the directory above the FIRST
+    // nested leaf, whatever lies under it, so a cgroup the workload names `kern-box-*` is never taken
+    // for a box.
+    let end = comps
+        .windows(2)
+        .position(|w| is_kern_box_leaf(w[0]) && w[1] == NESTED_LEAF)
+        .map_or(comps.len(), |i| i + 1);
+    let kept = comps.get(..end)?;
+    let leaf = kept.last()?;
     if !is_kern_box_leaf(leaf) {
         return None; // only ever a box leaf - never the shared slice/root
     }
-    Some(PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+    Some(PathBuf::from("/sys/fs/cgroup").join(kept.join("/")))
 }
 
 /// The cgroup v2 directory host-pid `pid` currently belongs to (the `0::<path>` line of
@@ -4238,6 +4359,7 @@ pub fn apply_limits(
     // `BOX_CGROUP_DIR`). `set` is idempotent-by-first-write; one box per process, so it fires once.
     let _ = BOX_CGROUP_DIR.set(child.clone());
     Some(CgroupGuard {
+        nested: None,
         outside,
         dir: child,
         sup,
@@ -7538,6 +7660,7 @@ mod tests {
         assert!(d.exists());
         {
             let _g = CgroupGuard {
+                nested: None,
                 dir: d.clone(),
                 sup: None, // the sibling layout is not built in this unit test
                 outside: false,
@@ -7738,6 +7861,20 @@ mod tests {
             parse_box_cgroup_line("0::/user.slice/user-1000.slice/session-3.scope\n"),
             None
         );
+        // A `--privileged` box's processes are in its nested leaf and in cgroups the box made below
+        // it, with names of its choosing: the box is the directory above the FIRST nested leaf, a
+        // `kern-box-*` the workload names is not taken for one, and a nested leaf alone names none.
+        let boxdir = PathBuf::from("/sys/fs/cgroup/kern.slice/kern-box-dind-7");
+        for line in [
+            "0::/kern.slice/kern-box-dind-7/box\n",
+            "0::/kern.slice/kern-box-dind-7/box/init\n",
+            "0::/kern.slice/kern-box-dind-7/box/docker/abc\n",
+            "0::/kern.slice/kern-box-dind-7/box/kern-box-evil-1\n",
+            "0::/kern.slice/kern-box-dind-7/box/kern-box-evil-1/box\n",
+        ] {
+            assert_eq!(parse_box_cgroup_line(line), Some(boxdir.clone()), "{line}");
+        }
+        assert_eq!(parse_box_cgroup_line("0::/kern.slice/box\n"), None);
         // NOT a box leaf → never reaped.
         assert_eq!(parse_box_cgroup_line("0::/kern.slice\n"), None);
         assert_eq!(parse_box_cgroup_line("0::/\n"), None);
@@ -7763,6 +7900,7 @@ mod tests {
         // tolerate ENOENT, not panic.
         let d = std::env::temp_dir().join(format!("kern-guard-gone-{}", std::process::id()));
         let g = CgroupGuard {
+            nested: None,
             dir: d.clone(),
             sup: None, // no sibling leaf was built, so there is none to remove
             outside: false,

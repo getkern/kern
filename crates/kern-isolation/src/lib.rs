@@ -135,6 +135,7 @@ pub use cgroup::set_whole_box_oom;
 pub use cgroup::Leaf as CgroupLeaf;
 pub use cgroup::DEFAULT_COMPOSE_PIDS_MAX;
 pub use cgroup::DEFAULT_MEMORY_MAX;
+pub use cgroup::{box_tree_pids, remove_box_tree};
 /// A `memory.high` above a box that the kernel applies before the box's own ceiling can OOM-kill it,
 /// for the surfaces that report it (`kern doctor`, `kern inspect`). See [`cgroup::OuterMemoryHigh`].
 pub use cgroup::{

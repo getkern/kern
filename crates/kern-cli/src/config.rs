@@ -170,15 +170,17 @@ pub struct KernSettings {
     /// lowered `net.ipv4.ip_unprivileged_port_start`, or a proxy in front that owns the two ports.
     /// kern says so at bring-up when the moved set contains 80 or 443.
     pub privileged_port: Option<String>,
-    /// `compose_privileged` - may a compose file's `privileged: true` be honoured?
+    /// `compose_privileged` - may a compose file's `privileged: true`, or a Docker client's
+    /// `HostConfig.Privileged` through kern's socket, be honoured?
     ///
     /// DEFAULT FALSE, and the default is the point. The key relaxes the seccomp filter, and the rule
     /// this codebase does not bend is that a policy a downloaded file can defeat is not a policy.
     /// The operator grants it here or with `--allow-privileged`; the file can never grant itself.
     ///
     /// WHAT THE GRANT IS WORTH, rootless: every capability the box's own user namespace can hold,
-    /// which confers nothing over the host, plus the relaxed seccomp a nested runtime needs. `/proc`
-    /// and `/sys` stay masked either way.
+    /// which confers nothing over the host, plus the relaxed seccomp, a cgroup tree below the box's
+    /// caps and a sysfs a nested runtime needs (`kern box --privileged`). The host's kernel settings
+    /// and devices stay the host root's (`pentest/pentest-privileged.sh`).
     pub compose_privileged: bool,
     /// `compose_memory_max` - the ceiling a `kern compose` SERVICE gets when its file names none.
     ///
@@ -340,7 +342,7 @@ pub(crate) const SETTABLE_KERN_KEYS: &[(&str, SettingKind, &str)] = &[
     (
         "compose_privileged",
         SettingKind::Bool,
-        "compose `privileged: true` is honoured",
+        "compose `privileged: true` and a Docker client's Privileged are honoured",
     ),
     (
         "log_level",

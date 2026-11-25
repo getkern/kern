@@ -3802,6 +3802,28 @@ pub(crate) fn cap_fields(caps: &kern_isolation::CapSpec) -> (bool, String, Strin
     (caps.drop_all, csv(&caps.drops), csv(&caps.adds))
 }
 
+/// [`cap_fields`] for a box as it RUNS: a `--privileged` box keeps every capability but the ones it
+/// dropped (see `cap_drop_mask`), and a `kern exec` into it reapplies its record, so the record names
+/// them as added, as `docker exec` into a privileged container runs with the container's set. The
+/// kernel's last capability is read once; an unreadable one takes the 6.x kernels' 40 (CAP_CHECKPOINT_
+/// RESTORE), a bit past it being refused at the drop.
+pub(crate) fn cap_fields_running(
+    caps: &kern_isolation::CapSpec,
+    privileged: bool,
+) -> (bool, String, String) {
+    if !privileged || caps.drop_all {
+        return cap_fields(caps);
+    }
+    let last = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(40)
+        .min(63);
+    let mut all = caps.clone();
+    all.adds = (0..=last).filter(|c| !caps.drops.contains(c)).collect();
+    cap_fields(&all)
+}
+
 /// Rebuild the box's `CapSpec` from the three registry fields (the inverse of [`cap_fields`]), so
 /// `kern exec` reapplies the box's OWN drop set - not the always-dropped baseline. An unparseable
 /// cap number is dropped rather than errored: a corrupt field must never make an `exec` MORE
@@ -4548,6 +4570,37 @@ mod tests {
             assert_eq!(back.drops, c.drops, "drops lost for {c:?}");
             assert_eq!(back.adds, c.adds, "adds lost for {c:?}");
         }
+        // A `--privileged` box is recorded with every capability added but the ones it dropped, so a
+        // `kern exec` into it holds what its PID 1 holds; `--cap-drop ALL` keeps its own record, and
+        // a box that is not privileged is recorded as `cap_fields` records it.
+        let last: u32 = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(40);
+        let dropped = CapSpec {
+            drop_all: false,
+            drops: vec![12],
+            adds: vec![],
+        };
+        let (da, dr, ad) = cap_fields_running(&dropped, true);
+        let back = cap_spec_from_fields(da, &dr, &ad);
+        assert!(
+            !back.adds.contains(&12) && back.adds.contains(&21),
+            "{back:?}"
+        );
+        assert_eq!(
+            back.adds.len() as u32,
+            last,
+            "every capability but NET_ADMIN: {back:?}"
+        );
+        assert_eq!(back.drops, vec![12]);
+        let all = CapSpec {
+            drop_all: true,
+            drops: vec![],
+            adds: vec![],
+        };
+        assert_eq!(cap_fields_running(&all, true), cap_fields(&all));
+        assert_eq!(cap_fields_running(&dropped, false), cap_fields(&dropped));
         // The empty spec round-trips to the default (the pre-record `exec` behaviour for old boxes).
         let (da, dr, ad) = cap_fields(&CapSpec::default());
         let back = cap_spec_from_fields(da, &dr, &ad);

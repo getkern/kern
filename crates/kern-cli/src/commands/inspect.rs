@@ -3171,7 +3171,7 @@ pub fn stop_with_grace(
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.ends_with(".scope"));
                 if !is_unit {
-                    let _ = std::fs::remove_dir(cg);
+                    kern_isolation::remove_box_tree(cg);
                 }
             }
             narrate_stop(&format!("stopped '{}' (pid {})", b.name, b.pid));

@@ -720,7 +720,7 @@ fn hard_limit_of(name: &str) -> Option<u64> {
 
 #[cfg(test)]
 fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
-    create_argv_gated(name, body, false)
+    create_argv_gated(name, body, false, false)
 }
 
 /// `HostConfig.DeviceRequests` as `kern box --gpus`: GPU requests only (driver `nvidia`, or a `gpu`
@@ -783,8 +783,14 @@ fn gpu_spec(host: Option<&Value>) -> Result<Option<String>, String> {
 
 /// [`create_argv`], with `gpu_allowed` the operator's `allow_gpu_grants` (or `allow_device_grants`):
 /// the same gate `kern compose` applies, since a Docker client can no more grant itself a card than a
-/// compose file can.
-fn create_argv_gated(name: &str, body: &Value, gpu_allowed: bool) -> Result<Created, String> {
+/// compose file can. `privileged_allowed` is the operator's `compose_privileged`, the gate a compose
+/// file's `privileged: true` passes too.
+fn create_argv_gated(
+    name: &str,
+    body: &Value,
+    gpu_allowed: bool,
+    privileged_allowed: bool,
+) -> Result<Created, String> {
     let image = body
         .get("Image")
         .and_then(Value::as_str)
@@ -792,14 +798,7 @@ fn create_argv_gated(name: &str, body: &Value, gpu_allowed: bool) -> Result<Crea
         .ok_or("Image is required")?
         .to_string();
     let host = body.get("HostConfig");
-    for f in [
-        "Privileged",
-        "Devices",
-        "CapAdd",
-        "SecurityOpt",
-        "VolumesFrom",
-        "Links",
-    ] {
+    for f in ["Devices", "CapAdd", "SecurityOpt", "VolumesFrom", "Links"] {
         refuse_if_set(host, f)?;
     }
     let mounts = translate_mounts(host)?;
@@ -1276,6 +1275,26 @@ fn create_argv_gated(name: &str, body: &Value, gpu_allowed: bool) -> Result<Crea
             }
         }
     }
+    // `Privileged`: `kern box --privileged`, every capability in the box's own user namespace, the
+    // seccomp a nested runtime needs and a cgroup tree it may write below the box's caps. Granted by
+    // the operator only, as a compose file's `privileged: true` is: a client that could grant it to
+    // itself would make it no gate.
+    if host
+        .and_then(|h| h.get("Privileged"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        if !privileged_allowed {
+            return Err(
+                "HostConfig.Privileged: a Docker client cannot grant itself privileges: set \
+                 compose_privileged in YOUR OWN kern.toml (`kern config set compose_privileged \
+                 true`), the gate a compose file's `privileged: true` passes too. Rootless, it is \
+                 every capability in the box's own user namespace, nothing over the host's"
+                    .into(),
+            );
+        }
+        argv.push("--privileged".into());
+    }
     if let Some(spec) = gpu_spec(host)? {
         if !gpu_allowed {
             return Err(
@@ -1402,10 +1421,11 @@ fn inspect(bin: &Path, name: &str) -> Response {
         let (net, aliases) = crate::netvol::created_network(&c.argv);
         let nets = crate::netvol::container_networks_json(name, net.as_deref(), &aliases);
         let policy = restart_policy_json(&c.argv);
+        let privileged = c.argv.iter().any(|a| a == "--privileged");
         return json_response(
             200,
             format!(
-                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"RestartCount\":0,\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
+                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"RestartCount\":0,\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"Privileged\":{privileged},\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
                 json_str(&id),
                 json_str(&rfc3339(c.created)),
                 json_str(&format!("/{name}")),
@@ -1489,6 +1509,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
     // Docker's `HostConfig.RestartPolicy`, from the argv the box was kept with, or the systemd unit
     // a standalone `always`/`unless-stopped` box runs under (its argv carries no `--restart`: systemd
     // does the restarting). MEASURED before: empty for every container.
+    let privileged = kept_argv(name).iter().any(|a| a == "--privileged");
     let policy = match unit_restart_policy(name) {
         Some(p) => format!("{{\"Name\":{},\"MaximumRetryCount\":0}}", json_str(&p)),
         None => restart_policy_json(&kept_argv(name)),
@@ -1496,7 +1517,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{},\"Paused\":{paused},\"Restarting\":{restarting},\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{},\"Paused\":{paused},\"Restarting\":{restarting},\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"Privileged\":{privileged},\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
             json_str(&id),
             json_str(&created),
             json_str(&format!("/{name}")),
@@ -5231,7 +5252,17 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                     let (code, out, _) = kern(bin, &["config", "get", k]);
                     code == 0 && out.trim() == "true"
                 });
-            match create_argv_gated(&name, &body, gpu_allowed)
+            // The privilege gate, likewise, only for a create that asks for it.
+            let wants_privileged = body
+                .get("HostConfig")
+                .and_then(|h| h.get("Privileged"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let privileged_allowed = wants_privileged && {
+                let (code, out, _) = kern(bin, &["config", "get", "compose_privileged"]);
+                code == 0 && out.trim() == "true"
+            };
+            match create_argv_gated(&name, &body, gpu_allowed, privileged_allowed)
                 .map(|c| match &by_id {
                     Some((image, _)) => with_image_name(c, image),
                     None => c,
@@ -5937,7 +5968,7 @@ mod tests {
             ))
         };
         let spec = |dr: &str| {
-            let a = create_argv_gated("n", &b(dr), true).unwrap().argv;
+            let a = create_argv_gated("n", &b(dr), true, false).unwrap().argv;
             let i = a.iter().position(|x| x == "--gpus").unwrap();
             assert!(i < a.iter().position(|x| x == "--image").unwrap());
             a[i + 1].clone()
@@ -5951,14 +5982,15 @@ mod tests {
             spec(r#"[{"Driver":"nvidia","DeviceIDs":["1"]}]"#),
             "device=1"
         );
-        let refused = create_argv_gated("n", &b(r#"[{"Driver":"nvidia","Count":-1}]"#), false)
-            .map(|c| c.argv);
+        let refused =
+            create_argv_gated("n", &b(r#"[{"Driver":"nvidia","Count":-1}]"#), false, false)
+                .map(|c| c.argv);
         assert!(
             matches!(&refused, Err(m) if m.contains("allow_gpu_grants")),
             "{refused:?}"
         );
-        let other =
-            create_argv_gated("n", &b(r#"[{"Driver":"amd","Count":1}]"#), true).map(|c| c.argv);
+        let other = create_argv_gated("n", &b(r#"[{"Driver":"amd","Count":1}]"#), true, false)
+            .map(|c| c.argv);
         assert!(
             matches!(&other, Err(m) if m.contains("NVIDIA")),
             "{other:?}"
@@ -5967,6 +5999,7 @@ mod tests {
             "n",
             &b(r#"[{"Driver":"nvidia","DeviceIDs":["0;rm"]}]"#),
             true,
+            false,
         );
         assert!(bad_id.is_err());
     }
@@ -5987,6 +6020,22 @@ mod tests {
             let r = create_argv("n", &b).map(|c| c.argv);
             assert!(matches!(&r, Err(m) if m.contains(field)), "{field}: {r:?}");
         }
+        // `Privileged` is the operator's to grant, named by its key, and becomes `--privileged`
+        // before the image when granted.
+        let p = body(r#"{"Image":"x","HostConfig":{"Privileged":true}}"#);
+        let refused = create_argv_gated("n", &p, false, false).map(|c| c.argv);
+        assert!(
+            matches!(&refused, Err(m) if m.contains("compose_privileged")),
+            "{refused:?}"
+        );
+        let granted = create_argv_gated("n", &p, false, true)
+            .map(|c| c.argv)
+            .unwrap_or_default();
+        let at = |f: &str| granted.iter().position(|a| a == f);
+        assert!(
+            matches!((at("--privileged"), at("--image")), (Some(a), Some(b)) if a < b),
+            "{granted:?}"
+        );
         // Their empty values are not a request.
         let b =
             body(r#"{"Image":"x","HostConfig":{"Privileged":false,"CapAdd":null,"Devices":[]}}"#);

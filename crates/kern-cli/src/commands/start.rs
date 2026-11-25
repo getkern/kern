@@ -3200,7 +3200,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // `[kern] log_keep_ended`: a new log is being made, so the old ones are bounded now.
             let _ = registry::expire_ended_logs();
         }
-        let (cap_drop_all, cap_drops, cap_adds) = registry::cap_fields(&spec.caps);
+        let (cap_drop_all, cap_drops, cap_adds) =
+            registry::cap_fields_running(&spec.caps, spec.privileged);
         let inst = registry::Instance {
             name: name.as_str().to_string(),
             pid,
@@ -6322,7 +6323,8 @@ fn run_detached(
     // `[kern] log_keep_ended`: a new log is being made, so the old ones are bounded now. After the
     // log is open, so this box's own file is the youngest in the store and never a candidate.
     let _ = registry::expire_ended_logs();
-    let (cap_drop_all, cap_drops, cap_adds) = registry::cap_fields(&spec.caps);
+    let (cap_drop_all, cap_drops, cap_adds) =
+        registry::cap_fields_running(&spec.caps, spec.privileged);
     let mut inst = registry::Instance {
         name: name.as_str().to_string(),
         pid,

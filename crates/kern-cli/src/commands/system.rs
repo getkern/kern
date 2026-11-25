@@ -472,8 +472,10 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         on a host with no /etc/subuid entry, or with --cap-drop ALL
     --bind-rootfs       Bind --rootfs directly instead of an overlay, faster on kernels with a
                         slow overlayfs, but the source is mutable & shared (no per-box isolation)
-    --privileged        Relax seccomp so a NESTED `kern box` (a runtime inside a box) can start,
-                        rootless-only; still blocks kexec/modules/bpf/io_uring
+    --privileged        A box a container runtime runs in (docker-in-docker, BuildKit, a nested
+                        kern): every capability in its own user namespace, a cgroup tree below
+                        its caps, a sysfs of its own; rootless-only; no host device, and
+                        kexec/modules/bpf/io_uring stay blocked
     --require-limits    Refuse to start unless the memory and pids caps (incl. their defaults) are
                         actually enforced (the OOM/fork-bomb backstop); cpu/cpuset stay best-effort,
                         as on the scope path. Default warns and runs uncapped
