@@ -120,7 +120,9 @@ struct Flow<'a> {
     i: usize,
 }
 
-const FLOW_MAX_DEPTH: usize = 64;
+/// The deepest flow collection read. `prescreen` in `yaml.rs` refuses a deeper one BY NAME before
+/// any parsing, so the cut below is never what a reader sees.
+pub(crate) const FLOW_MAX_DEPTH: usize = 64;
 
 impl Flow<'_> {
     fn peek(&self) -> Option<u8> {
@@ -136,6 +138,10 @@ impl Flow<'_> {
     fn value(&mut self, depth: usize) -> Val {
         self.skip_ws();
         if depth > FLOW_MAX_DEPTH {
+            // CONSUME the rest: returning without moving `i` left the caller's item loop facing the
+            // same `[` forever, pushing a Null each turn. MEASURED: `labels:` with 70 nested `[`
+            // grew `kern compose config` past 4 GiB in 0.8 s and aborted.
+            self.i = self.s.len();
             return Val::Null;
         }
         match self.peek() {
@@ -1328,6 +1334,22 @@ mod tests {
             Val::from_flow("http://x:8080/y"),
             Val::Scalar("http://x:8080/y".into(), false)
         );
+    }
+
+    /// Past the depth the reader stops and CONSUMES the input: the item loop used to face the same
+    /// `[` forever and push a Null each turn, until the allocator gave up.
+    #[test]
+    fn a_flow_value_past_the_depth_ends() {
+        let n = FLOW_MAX_DEPTH + 10;
+        let raw = "[".repeat(n) + &"]".repeat(n);
+        let mut v = Val::from_flow(&raw);
+        let mut levels = 0;
+        while let Val::Seq(mut items) = v {
+            assert!(items.len() <= 1, "level {levels} has {} items", items.len());
+            levels += 1;
+            v = items.pop().unwrap_or(Val::Null);
+        }
+        assert!(levels <= FLOW_MAX_DEPTH + 1, "{levels}");
     }
 }
 

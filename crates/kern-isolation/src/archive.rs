@@ -1008,24 +1008,39 @@ pub fn read_archive<R: Read>(r: &mut R, dest: &Dest) -> std::io::Result<u64> {
             skip(r, padded(if regular { size } else { 0 }))?;
             continue;
         }
-        match kind {
-            b'5' => {
-                dest.make_dir(&member)?;
-                dirs.push((member, mode, mtime));
+        // A failure from the OS names the MEMBER it happened on: a bare "No such file or directory"
+        // read as "the destination is missing" (the API answered 404 for a `/tmp` that exists when
+        // an entry below a symlink resolved, inside the box, to nothing). kern's own refusals
+        // already name the member and keep their wording.
+        let made = match kind {
+            b'5' => dest.make_dir(&member),
+            b'0' | 0 | b'7' => dest.write_file(r, &member, size, mode, mtime),
+            b'2' => dest.make_symlink(&member, &link),
+            b'1' => dest.make_hardlink(&member, &link),
+            b'6' => dest.make_fifo(&member, mode),
+            _ => {
+                eprintln!(
+                    "kern cp: skipping {} (a device is not created)",
+                    String::from_utf8_lossy(&member)
+                );
+                Ok(())
             }
+        };
+        made.map_err(|e| match e.raw_os_error() {
+            Some(_) => std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", String::from_utf8_lossy(&member)),
+            ),
+            None => e,
+        })?;
+        match kind {
+            b'5' => dirs.push((member, mode, mtime)),
             b'0' | 0 | b'7' => {
-                dest.write_file(r, &member, size, mode, mtime)?;
                 skip(r, padded(size) - size)?;
                 written += size;
                 continue;
             }
-            b'2' => dest.make_symlink(&member, &link)?,
-            b'1' => dest.make_hardlink(&member, &link)?,
-            b'6' => dest.make_fifo(&member, mode)?,
-            _ => eprintln!(
-                "kern cp: skipping {} (a device is not created)",
-                String::from_utf8_lossy(&member)
-            ),
+            _ => {}
         }
         skip(r, padded(if regular { size } else { 0 }))?;
     }
@@ -1250,5 +1265,26 @@ mod tests {
             "a write left the destination"
         );
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn a_member_that_fails_in_the_os_names_itself() {
+        // `d` points at nothing inside the destination, so `d/x` fails with ENOENT. The error
+        // must say WHICH member: bare, it read as "the destination is missing".
+        let mut w = TarWriter {
+            out: Vec::new(),
+            ids: IdMap::default(),
+            links: std::collections::HashMap::new(),
+            bytes: 0,
+        };
+        let st: libc::stat = unsafe { std::mem::zeroed() };
+        w.header(b"d", b'2', 0, &st, b"nowhere").expect("header");
+        w.header(b"d/x", b'0', 0, &st, b"").expect("header");
+        w.out.write_all(&[0u8; 1024]).expect("end");
+        let out = tmp("named");
+        let e = read_archive(&mut w.out.as_slice(), &host_dest(&out)).expect_err("extracted");
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+        assert!(e.to_string().starts_with("d/x: "), "{e}");
+        let _ = std::fs::remove_dir_all(out);
     }
 }

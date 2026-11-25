@@ -2753,6 +2753,23 @@ fn copy_refusal(id: &str, path: &str, why: &str) -> Response {
     error(500, why)
 }
 
+/// The same for `PUT`, where only a missing DESTINATION is Docker's 404. An archive entry that
+/// fails on its way in (a member under a link that resolves, inside the box, to nothing) is named
+/// by kern and is the 500 Docker gives for an extraction error: answering "Could not find the file
+/// /tmp" for a `/tmp` that exists sent the reader looking for the wrong thing.
+fn put_refusal(id: &str, path: &str, why: &str) -> Response {
+    if why.contains("no such directory in the box") {
+        return error(
+            404,
+            &format!("Could not find the file {path} in container {id}"),
+        );
+    }
+    if why.contains("No such file") {
+        return error(500, why);
+    }
+    copy_refusal(id, path, why)
+}
+
 /// `HEAD`/`GET /containers/{id}/archive?path=P`: the stat of P in `X-Docker-Container-Path-Stat`
 /// (what `docker cp` reads to know a file from a directory), and for `GET` P as a tar, streamed from
 /// `kern cp <box>:P -`, which resolves P inside the box and never follows a link out of it.
@@ -2972,7 +2989,7 @@ pub(crate) fn archive_put(
         .map(|v| String::from_utf8_lossy(&v).into_owned())
         .unwrap_or_default();
     if code != 0 {
-        return copy_refusal(&id, path, &kern_error(&err));
+        return put_refusal(&id, path, &kern_error(&err));
     }
     if let Err(why) = copied {
         return error(400, why);
@@ -6844,6 +6861,23 @@ mod tests {
     /// `--pids-limit 32` through the socket let 100 forks through.
     /// An image id as a client hands one back is recognised, and another platform's entry of a
     /// tag has an id of its own; a create given an id runs the entry's name.
+    /// A `PUT` archive answers 404 only for a missing destination; an entry that fails inside an
+    /// existing one is a 500 that names the entry, not "Could not find the file /tmp".
+    #[test]
+    fn a_put_is_404_only_for_a_missing_destination() {
+        let status = |why: &str| match put_refusal("c", "/tmp", why) {
+            Response::Full { status, body, .. } => {
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+            _ => (0, String::new()),
+        };
+        assert_eq!(status("box:/nope: no such directory in the box").0, 404);
+        let (code, body) = status("kern cp: d/x: No such file or directory (os error 2)");
+        assert_eq!(code, 500);
+        assert!(body.contains("d/x"), "{body}");
+        assert_eq!(status("no box named 'c'").0, 409);
+    }
+
     /// `docker update` asks kern for the caps it changes, and a field it does not change is refused
     /// by name rather than answered 200 with nothing done.
     #[test]

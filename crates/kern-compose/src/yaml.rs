@@ -1464,6 +1464,15 @@ fn prescreen(text: &str) -> Result<(), String> {
         // key with an alias-LIST value (`<<: [*a, *b]`, and the `<< :` spacing) is the standard way to
         // merge several templates - `resolve_anchors` expands it, so it's allowed. Everything else with
         // an aliased flow token is refused.
+        // Flow collections nested past the reader's depth are refused here, by name: the reader
+        // stops at `FLOW_MAX_DEPTH` and has no error path to say so. This runs on the FOLDED text,
+        // where a flow value split over lines is already one line.
+        if flow_depth(line) > crate::canon::FLOW_MAX_DEPTH {
+            return Err(format!(
+                "line {ln}: a flow collection (`[...]`/`{{...}}`) nested deeper than {} levels",
+                crate::canon::FLOW_MAX_DEPTH
+            ));
+        }
         let is_merge_line = colon_index(line).map(|ci| line[..ci].trim()) == Some("<<");
         if !is_merge_line && line_has_inline_anchor(line) && !flow_map_of_whole_aliases(line) {
             return Err(format!(
@@ -1698,6 +1707,34 @@ fn flow_aliases_expandable(v: &str, depth: usize) -> bool {
         });
     }
     false
+}
+
+/// The deepest `[`/`{` nesting on a line, outside quotes.
+fn flow_depth(line: &str) -> usize {
+    let (mut q, mut depth, mut max) = (0u8, 0usize, 0usize);
+    let mut escaped = false;
+    for &c in line.as_bytes() {
+        if q != 0 {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' && q == b'"' {
+                escaped = true;
+            } else if c == q {
+                q = 0;
+            }
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => q = c,
+            b'[' | b'{' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
 }
 
 fn line_has_inline_anchor(line: &str) -> bool {
@@ -12745,6 +12782,38 @@ services:
     #[test]
     fn unknown_alias_is_a_clear_error_not_a_silent_literal() {
         assert!(parse("services:\n  a:\n    image: alpine\n    command: *nope\n").is_err());
+    }
+
+    #[test]
+    fn a_flow_collection_past_the_reader_depth_is_refused_by_name() {
+        // MEASURED before: `labels:` with 70 nested `[` on one line, or one per line, grew
+        // `kern compose config` past 4 GiB in 0.8 s and aborted.
+        let deep = |n: usize| "[".repeat(n) + &"]".repeat(n);
+        let one_line = format!(
+            "services:\n  a:\n    image: alpine\n    labels: {}\n",
+            deep(70)
+        );
+        let e = parse(&one_line).expect_err("70 levels parsed");
+        assert!(e.contains("nested deeper than 64"), "{e}");
+        let mut split = String::from("services:\n  a:\n    image: alpine\n    labels:\n");
+        split.push_str(&"      [\n".repeat(70));
+        split.push_str(&"      ]\n".repeat(70));
+        let e = parse(&split).expect_err("70 split levels parsed");
+        assert!(e.contains("nested deeper than 64"), "{e}");
+        // At the limit, and with brackets inside quotes, nothing is refused for depth.
+        let at = format!(
+            "services:\n  a:\n    image: alpine\n    command: {}\n",
+            deep(64)
+        );
+        assert!(!parse(&at)
+            .err()
+            .unwrap_or_default()
+            .contains("nested deeper"));
+        let quoted = format!(
+            "services:\n  a:\n    image: alpine\n    command: [\"{}\"]\n",
+            deep(70)
+        );
+        assert!(parse(&quoted).is_ok());
     }
 
     #[test]
