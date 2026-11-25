@@ -426,6 +426,9 @@ pub struct BoxRunArgs<'a> {
     /// A box joining a compose stack's bridge network gets its own NAT, attached while it waits
     /// at its pre-exec gate, as each of the stack's services does. See `stack_network_join`.
     pub stack_outbound: bool,
+    /// The box's OWN NAT and the host's resolvers, Docker's default network: a box that named no
+    /// network (`--net`, `--network`, `--pod`, `--egress-allow`) and was not told `none`.
+    pub own_outbound: bool,
     /// `--dns-search DOMAIN`: the `search` line of the box's `/etc/resolv.conf`.
     pub dns_search: &'a [String],
     /// `--dns-option OPT`: the `options` line of the box's `/etc/resolv.conf`.

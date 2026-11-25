@@ -729,7 +729,11 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 19] = [
+const AUTHORITATIVE_DIRS: [&str; 20] = [
+    // `outbound/` holds the state of a box's OWN NAT (Docker's default network): the pid of its pasta,
+    // which kern signals when the box ends. A box able to rewrite it would aim that signal at a
+    // process of its choosing, `relays/`'s reason.
+    "outbound",
     // `seccomp-kill/` marks a box whose denied syscalls KILL; `kern exec` and the health probe read it
     // to give what they run PID 1's verdict. A box able to remove a peer's marker would turn that
     // peer's kills into EPERM (the syscall still never runs, but a supervisor reading the kill as

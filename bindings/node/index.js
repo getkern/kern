@@ -58,6 +58,9 @@ const DEFAULT_IMAGE_HAS_NODE = false;
 // A denied syscall KILLS in a sandbox: a kern box answers one with EPERM, as docker does, and the
 // kill is the verdict this binding reads as `escape_blocked`. The syscall never runs either way.
 const SANDBOX_POSTURE = [
+  // No network unless asked: a kern box gets a NAT by default, as docker's does; a sandbox does not.
+  // `network: true` adds `--net` and `egressAllow` its proxy, both after this, so either replaces it.
+  "--network", "none",
   "--security-opt", "no-new-privileges",
   "--security-opt", "seccomp-deny=kill",
   // An OOM ends the whole box: the verdict reported as `oom` (a kern box follows docker by default).

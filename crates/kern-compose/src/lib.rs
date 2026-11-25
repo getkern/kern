@@ -901,6 +901,10 @@ impl ComposeBox {
         }
         if self.net {
             cmd.arg("--net");
+        } else if self.net_none {
+            // Said explicitly: a box that names no network gets a NAT of its own (Docker's default),
+            // and `network_mode: none` asked for none at all.
+            cmd.arg("--network").arg("none");
         }
         // Forward the box's STATED intent only, never the per-image default: `kern box` applies that
         // default itself for any `--image` box (see `wants_uid_range`), so re-deriving it here would
@@ -3952,6 +3956,28 @@ mod dotenv_tests {
     }
 
     /// The injected pair must travel in the argv, and must not appear when there is nothing to inject.
+    #[test]
+    fn push_box_flags_says_network_none_out_loud() {
+        // `network_mode: none` must be SAID: a box that names no network gets a NAT of its own (Docker's
+        // default, since 0.57), so leaving the flag out would hand a `none` service the internet.
+        let mut s = parse("[box.a]\nimage = \"alpine\"\n").expect("parses");
+        s[0].net_none = true;
+        let mut cmd = std::process::Command::new("kern");
+        s[0].push_box_flags(&mut cmd);
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv.windows(2).any(|w| w == ["--network", "none"]),
+            "got {argv:?}"
+        );
+        s[0].net_none = false;
+        let mut cmd = std::process::Command::new("kern");
+        s[0].push_box_flags(&mut cmd);
+        assert!(!cmd.get_args().any(|a| a == "none"));
+    }
+
     #[test]
     fn push_box_flags_carries_the_injected_port() {
         let argv = |src: &str| -> Vec<String> {

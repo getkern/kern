@@ -104,6 +104,14 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**A box reaches the internet by default, as a Docker container does.** `kern run alpine wget
+example.com` had no interface but `lo` and no `/etc/resolv.conf`; a box that names no network now
+gets a NAT of its own (`eth0`, the host's resolvers), and so do `docker run` through kern's socket and
+`--network bridge`. `--network none` is the box with loopback only it used to be by default, and
+`network_mode: none` in a compose file says it. The NAT costs one pasta per box, about 11 ms of its
+start (14.7 ms against 4.0 ms with `--network none`). The Python and Node sandboxes ask for
+`--network none` and are isolated as before.
+
 **An OOM kills the process the kernel picks, and the box goes on, as under Docker.** kern wrote
 `memory.oom.group=1` on every box, so an `exec` that ran out of memory took the whole box with it
 (`exited`), where Docker's container stays `running`. That is now `--oom-group`, which the Python and

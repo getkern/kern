@@ -372,8 +372,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --health-start-interval N  Probe this often INSIDE the start period (default: the interval)
     --health-timeout N  Kill a single check that exceeds N seconds (default 0 = none)
     --health-action A   On unhealthy: restart | stop | none (default none)
-    --net [host|none]   Share the host network (bare/host); none = isolated (default)
-    --network <mode>    host = share host net (= --net); none = isolated (default); the NAME of
+    --net [host|none]   Share the host network (bare/host); none = loopback only. Default: a NAT of
+                        the box's own (outbound + the host's DNS), as Docker's bridge
+    --network <mode>    host = share host net (= --net); none = loopback only; bridge = the default; the NAME of
                         a running pod; or a running `kern compose` stack, by its project name or
                         as <project>_<network>: the box joins that network, with an address of
                         its own on a bridge stack and every name of that network in its

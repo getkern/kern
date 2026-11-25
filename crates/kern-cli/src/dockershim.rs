@@ -526,11 +526,6 @@ fn generated_name() -> Option<String> {
     ))
 }
 
-/// The note `run` says when the box gets kern's default network rather than docker's.
-const NETWORK_NOTE: &str = "kern-docker: run without --network: the box has no network, which is \
-     kern's default (docker's default bridge reaches the internet). --network <project>_default \
-     joins a running stack with its outbound; --network host shares this machine's";
-
 /// `docker run`/`docker create`: flags, then the image, then the command.
 fn run_like(
     verb: &str,
@@ -544,10 +539,8 @@ fn run_like(
         return Err(Refused(format!("docker {verb} needs an image")));
     };
     let detach = p.has("--detach");
-    // docker's default network is a bridge with outbound; kern's is none. `bridge` and `default`
-    // name that default, so they are taken as "the default" and said, never sent to kern as a pod.
-    let network = p.value_of("--network");
-    let default_net = matches!(network, None | Some("bridge") | Some("default"));
+    // docker's default network is a bridge with outbound, and so is kern's (a NAT of the box's own).
+    // `bridge` and `default` name that default, so they are dropped, never sent to kern as a pod.
     let mut argv = vec![kern_verb.to_string()];
     argv.extend(p.kern_flags(|s| {
         s.flag.kern == "--network" && matches!(s.value.as_deref(), Some("bridge") | Some("default"))
@@ -578,7 +571,7 @@ fn run_like(
     Ok(Plan {
         argv,
         print_after: if announce { name } else { None },
-        note: (kern_verb == "box" && default_net).then(|| NETWORK_NOTE.to_string()),
+        note: None,
     })
 }
 
@@ -1855,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_network_is_said_not_sent_as_a_pod_name() {
+    fn the_default_network_is_kerns_default_not_a_pod_name() {
         for net in [None, Some("bridge"), Some("default")] {
             let mut a = vec!["--rm"];
             if let Some(n) = net {
@@ -1867,7 +1860,8 @@ mod tests {
                 panic!("refused: {p:?}");
             };
             assert_eq!(p.argv, s(&["box", "--rm", "--image", "img"]), "{net:?}");
-            assert_eq!(p.note.as_deref(), Some(NETWORK_NOTE), "{net:?}");
+            // Nothing to say: kern's default network is docker's (a NAT), since 0.57.
+            assert_eq!(p.note, None, "{net:?}");
         }
         let p = run_like("run", "box", RUN, &s(&["--network", "host", "img"]), || {
             None

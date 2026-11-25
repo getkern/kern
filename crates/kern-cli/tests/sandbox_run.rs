@@ -5147,12 +5147,15 @@ fn box_run_hardening_uts_net_seccomp() {
         "UTS namespace: hostname should be the box name"
     );
 
-    // NET: the network namespace exposes only loopback.
+    // NET: `--network none` exposes only loopback. (Without it a box gets Docker's default, a NAT of
+    // its own on `eth0`, since 0.57; see `a_plain_box_gets_dockers_default_network`.)
     let net = kern_out(&[
         "box",
         "isobox",
         "--rootfs",
         rootfs,
+        "--network",
+        "none",
         "--",
         "/bin/busybox",
         "cat",
@@ -5394,6 +5397,71 @@ int main(void) {
 /// KILL prologue, so an attempt is `SIGSYS`, not a survivable `ENOSYS` the workload can branch on.
 /// This asserts each by its ARCH-CORRECT number (`libc::SYS_*`, so it holds on x86_64 and aarch64
 /// where the numbers differ), closing the "safe by construction != killed" gap for the whole family.
+/// A PLAIN BOX GETS DOCKER'S DEFAULT NETWORK: a NAT of its own on `eth0`, a default route and the
+/// host's resolvers, and its state goes with it. `--network none` is loopback only. MEASURED before
+/// (owner's decision, 22/11): `kern run alpine wget example.com` had no interface but `lo` and no
+/// `/etc/resolv.conf`, where Docker's printed the page. Offline: what is asserted is the wiring
+/// (interface, route, resolv.conf), not a reply from the internet. Skips without pasta.
+#[test]
+fn a_plain_box_gets_dockers_default_network() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let has_pasta = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("pasta").is_file()));
+    if !has_pasta {
+        eprintln!("skip: no pasta on this host");
+        return;
+    }
+    let root = build_rootfs(&busybox, "defnet");
+    let rootfs = root.to_str().unwrap().to_string();
+    let probe = "/bin/busybox cat /proc/net/dev; /bin/busybox cat /proc/net/route; \
+                 /bin/busybox cat /etc/resolv.conf 2>/dev/null || echo NO-RESOLV";
+    let run = |extra: &[&str]| {
+        let mut c = kern();
+        c.args(["box", "defnet", "--rootfs", &rootfs]);
+        c.args(extra);
+        c.args(["--", "/bin/busybox", "sh", "-c", probe]);
+        c.output().expect("run kern")
+    };
+    let plain = run(&[]);
+    if String::from_utf8_lossy(&plain.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let none = run(&["--network", "none"]);
+    let _ = fs::remove_dir_all(&root);
+    let p = String::from_utf8_lossy(&plain.stdout);
+    let n = String::from_utf8_lossy(&none.stdout);
+    assert!(p.contains("eth0:"), "a plain box has eth0: {p}");
+    assert!(
+        p.lines().any(|l| l.starts_with("eth0\t00000000")),
+        "a plain box has a default route on eth0: {p}"
+    );
+    assert!(p.contains("nameserver"), "a plain box has resolvers: {p}");
+    assert!(
+        !n.contains("eth0:") && n.contains("NO-RESOLV"),
+        "--network none is loopback only: {n}"
+    );
+    // Its NAT's state went with it.
+    let leftover = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|r| std::path::PathBuf::from(r).join("kern/outbound"))
+        .and_then(|d| fs::read_dir(d).ok())
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("box-defnet-"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(leftover, 0, "the box's NAT directory outlived it");
+}
+
 /// A DENIED SYSCALL ANSWERS EPERM, AS DOCKER'S, UNLESS THE BOX ASKED FOR THE KILL, and `kern exec`
 /// gets the box's own verdict. MEASURED before (owner's decision, 22/11): `unshare -U true` in a box
 /// died with "Bad system call" (159) where Docker's answered "Operation not permitted" and the script

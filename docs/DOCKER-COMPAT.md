@@ -39,9 +39,10 @@ no flag with the same meaning, so the command is not run`.
 
 - `docker version` and `--version` print kern and kern's version. A script that checks for a
   Docker version number stops there.
-- `docker run` without `--network`, or with `--network bridge`, gets kern's default, no network,
-  and says so on stderr. `--network <project>_default` joins a running stack with its outbound;
-  `--network host` shares this machine's.
+- `docker run` without `--network`, or with `--network bridge`, gets kern's default, which is
+  Docker's: a NAT of the box's own, `eth0` on `10.0.2.15`, and the host's resolvers (measured: `wget
+  example.com` from `alpine` answers). `--network none` is loopback only; `--network
+  <project>_default` joins a running stack with its outbound; `--network host` shares this machine's.
 - `docker run -d` and `docker create` print the box's name where docker prints an id (`kd-` and 8
   hex digits when no `--name` is given), so `id=$(docker run -d ...)` feeds `docker logs "$id"`.
 - `DOCKER_HOST` or `DOCKER_CONTEXT` set, or `-H`/`--context` given, is refused: the command asked
@@ -743,7 +744,9 @@ publishes. What the host keeps on `127.0.0.1` is not reachable, through this nam
 address. Three spellings are accepted (`extra_hosts`, `--add-host`, and `add_host = [...]`
 in a `kern.toml`), and [examples/edge/add-host.sh](../examples/edge/add-host.sh) runs it.
 
-**A box is on its own network namespace by default**, so nothing reaches the host until you say so.
+**A box is on its own network namespace by default**, with a NAT out of it and nothing in: nothing
+reaches the box from the host until a port is published. The NAT costs one pasta per box, about 11 ms
+of its start (measured: 14.7 ms against 4.0 ms with `--network none`, medians of 30, release build).
 
 ### A private registry: `docker login`
 

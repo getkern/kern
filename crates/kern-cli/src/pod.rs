@@ -2131,6 +2131,57 @@ pub fn attach_box_outbound(dir: &std::path::Path, pid1: i32) -> Result<(), Strin
     }
 }
 
+/// Attach a NAT to a box ALONE in its network namespace (a `kern run` with no network flag, as Docker's
+/// default bridge gives one): pasta's tap is `eth0`, the name a workload expects, since nothing else
+/// in that namespace has it. `dir` holds pasta's state; [`release_own_outbound`] removes it.
+pub fn attach_own_outbound(dir: &std::path::Path, pid1: i32) -> Result<(), String> {
+    if std::fs::create_dir_all(dir).is_err() {
+        return Err(format!("could not create {}", dir.display()));
+    }
+    stop_recorded_pasta(dir);
+    match setup_outbound_in(dir, pid1, PASTA_IF_ALONE) {
+        // The box writes its own `/etc/resolv.conf` from the `--dns` it was given, as on a bridge.
+        Outbound::Up | Outbound::NoDns => Ok(()),
+        Outbound::NotInstalled => Err("pasta (passt) is not installed".to_string()),
+        Outbound::Failed(why) => Err(why),
+    }
+}
+
+/// The box with its own NAT has ended: its pasta (which normally quits with the namespace) and its
+/// state directory go.
+pub fn release_own_outbound(dir: &std::path::Path) {
+    // A pasta that watches the namespace (`pasta.watched`, the healthy case) quits with it, so the
+    // box's end owes it nothing: stopping it waited for that exit on the box's critical path, 13 ms
+    // of every `kern run` (measured with strace). Only one that could not watch is signalled.
+    if !dir.join(PASTA_WATCHED).exists() {
+        stop_recorded_pasta(dir);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Remove the own-NAT directories (`box-<name>-<supervisor pid>`) whose supervisor is gone: one that
+/// was ended by a signal (`kern rm -f` of a detached box) runs no destructor to remove its own. Its
+/// pasta quit with the namespace; [`release_own_outbound`] stops one that did not.
+pub fn sweep_own_outbound(root: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(n) = name.to_str() else { continue };
+        let Some(pid) = n
+            .strip_prefix("box-")
+            .and_then(|r| r.rsplit_once('-'))
+            .and_then(|(_, p)| p.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            release_own_outbound(&e.path());
+        }
+    }
+}
+
 /// Locate the `pasta` binary (part of passt), or `None` if it isn't installed.
 fn which_pasta() -> Option<PathBuf> {
     crate::global_env("PATH").and_then(|paths| {

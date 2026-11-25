@@ -3132,7 +3132,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             log_cap,
             args.image.unwrap_or(""),
             args.gpus.unwrap_or(""),
-            args.pod.filter(|_| args.stack_outbound),
+            args.pod
+                .filter(|_| args.stack_outbound)
+                .or(args.own_outbound.then_some("")),
             egress_plan,
         );
     }
@@ -3309,9 +3311,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // "started"), and this path had no reader, so it passed `None`. An SDK is a reader: it needs to
     // tell "the workload was slow" from "kern never reached `execvp`", and those are the same overrun
     // without this fd.
+    // `""` is the box's OWN NAT (see `HeldNat::arm`): Docker's default network, for a box that named
+    // no network of its own.
     let mut held_nat = args
         .pod
         .filter(|_| args.stack_outbound)
+        .or(args.own_outbound.then_some(""))
         .and_then(|p| HeldNat::arm(p, name.as_str()));
     // THE WORKLOAD WAITS FOR ITS FILTER: armed after `HeldNat`, which `--egress-allow` never meets
     // (it refuses `--pod`), so the two never compete for the one gate a box has.
@@ -8009,6 +8014,8 @@ fn kept_argv(argv: Vec<std::ffi::OsString>, name: &str) -> Vec<std::ffi::OsStrin
 /// attached is said and the box is released anyway, as a service is: it still reaches the stack.
 pub(crate) struct HeldNat {
     helper: libc::pid_t,
+    /// A box's OWN NAT (no stack): its state directory, removed when this ends with the box.
+    own_dir: Option<std::path::PathBuf>,
     pid_write: Option<std::os::fd::OwnedFd>,
     // The gate's read end, named in `KERN_GATE_FD` for the box this process forks next; held until
     // the attempt is over so the number stays valid for the fork.
@@ -8031,13 +8038,30 @@ impl HeldNat {
                  services; it cannot reach the internet"
             );
         };
-        let dir = match crate::relayhold::stack_dir(pod) {
-            Ok(d) => d.join("outbound").join(format!("box-{name}")),
-            Err(e) => {
-                warn(format!("the stack directory is unavailable ({e})"));
-                return None;
+        // `pod` empty: the box's OWN NAT, Docker's default network for a box that named none. Its
+        // state lives in kern's runtime dir, one directory per box, and goes with the box.
+        let own = pod.is_empty();
+        let dir = if own {
+            match crate::registry::runtime_subdir_public("outbound") {
+                Ok(d) => {
+                    crate::pod::sweep_own_outbound(&d);
+                    d.join(format!("box-{name}-{}", std::process::id()))
+                }
+                Err(e) => {
+                    warn(format!("kern's runtime directory is unavailable ({e})"));
+                    return None;
+                }
+            }
+        } else {
+            match crate::relayhold::stack_dir(pod) {
+                Ok(d) => d.join("outbound").join(format!("box-{name}")),
+                Err(e) => {
+                    warn(format!("the stack directory is unavailable ({e})"));
+                    return None;
+                }
             }
         };
+        let own_dir = own.then(|| dir.clone());
         let pipe = || -> Option<(OwnedFd, OwnedFd)> {
             let mut fds = [-1i32; 2];
             // SAFETY: `fds` is a two-element array, which is what `pipe2` writes.
@@ -8120,12 +8144,23 @@ impl HeldNat {
                 std::thread::sleep(pause);
                 pause = (pause * 2).min(std::time::Duration::from_millis(50));
             }
-            let attached = crate::pod::attach_box_outbound(&dir, pid1);
+            let attached = if own {
+                crate::pod::attach_own_outbound(&dir, pid1)
+            } else {
+                crate::pod::attach_box_outbound(&dir, pid1)
+            };
             if let Err(why) = attached {
-                eprintln!(
-                    "kern: warning: box '{name}': no outbound - {why}. The box starts, and reaches \
-                     the stack's services; it cannot reach the internet"
-                );
+                if own {
+                    eprintln!(
+                        "kern: warning: box '{name}': no outbound - {why}. The box starts with \
+                         its own loopback only; `--net host` shares the host's network"
+                    );
+                } else {
+                    eprintln!(
+                        "kern: warning: box '{name}': no outbound - {why}. The box starts, and \
+                         reaches the stack's services; it cannot reach the internet"
+                    );
+                }
             }
             let byte = [1u8];
             loop {
@@ -8147,9 +8182,17 @@ impl HeldNat {
         crate::set_global_env("KERN_GATE_FD", gate_read.as_raw_fd().to_string());
         Some(HeldNat {
             helper,
+            own_dir,
             pid_write: Some(pid_write),
             _gate_read: gate_read,
         })
+    }
+
+    /// The box with its own NAT has ended: remove what its NAT left (see `release_own_outbound`).
+    pub(crate) fn finish(&mut self) {
+        if let Some(d) = self.own_dir.take() {
+            crate::pod::release_own_outbound(&d);
+        }
     }
 
     /// Hand PID 1 to the helper, which attaches the NAT and releases the box. Once.
@@ -8251,6 +8294,9 @@ impl Drop for HeldNat {
         self.pid_write = None;
         crate::eintr::reap(self.helper);
         crate::unset_global_env("KERN_GATE_FD");
+        // Dropped once the box's attempt is over (both launch paths drop it after the box exits):
+        // its own NAT's state goes with it.
+        self.finish();
     }
 }
 

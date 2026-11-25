@@ -147,6 +147,9 @@ pub enum Command {
         /// `--oom-group`: an OOM kills every process in the box at once (see
         /// [`kern_isolation::set_whole_box_oom`]); without it, the process the kernel picks, as Docker.
         oom_group: bool,
+        /// `--net none` / `--network none` said explicitly: no NAT, the box's own loopback only.
+        /// Without it (and with no other network named), the box gets Docker's default: a NAT.
+        net_none: bool,
         /// `--require-limits`: refuse to start (non-zero exit) if a requested/default resource cap
         /// cannot actually be enforced here, instead of running best-effort UNCAPPED with a warning.
         require_limits: bool,
@@ -4280,6 +4283,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut detached = false;
     let mut read_only = false;
     let mut share_net = false;
+    let mut net_none = false;
     let mut pod: Option<String> = None;
     let mut net_container: Option<String> = None;
     let mut ipc: Option<String> = None;
@@ -4397,10 +4401,12 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--net" => match rest.get(i + 1).copied() {
                     Some("host") => {
                         share_net = true;
+                        net_none = false;
                         i += 1;
                     }
                     Some("none") => {
                         share_net = false;
+                        net_none = true;
                         i += 1;
                     }
                     // A non-flag token that isn't host|none is a Docker network mode kern has no
@@ -4413,7 +4419,10 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         ));
                     }
                     // Bare `--net`, or `--net` before another flag / `--` / end-of-args = share host net.
-                    _ => share_net = true,
+                    _ => {
+                        share_net = true;
+                        net_none = false;
+                    }
                 },
                 "--pod" => {
                     i += 1;
@@ -4470,8 +4479,20 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--network" => {
                     i += 1;
                     match rest.get(i).copied() {
-                        Some("host") => share_net = true,
-                        Some("none") => share_net = false,
+                        Some("host") => {
+                            share_net = true;
+                            net_none = false;
+                        }
+                        Some("none") => {
+                            share_net = false;
+                            net_none = true;
+                        }
+                        // Docker's own network names: its default bridge, which is kern's default
+                        // too (a NAT of the box's own), so they name no pod.
+                        Some("bridge" | "default") => {
+                            share_net = false;
+                            net_none = false;
+                        }
                         // `container:<box>`: Docker's way to put a container in another's network
                         // namespace, and what compose's `network_mode: service:` becomes. The name is
                         // recorded like a pod's, and resolved at start.
@@ -5741,6 +5762,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             privileged,
             require_limits,
             oom_group,
+            net_none,
             allow_uncapped,
             security_profile,
             overlay_lower,
@@ -7163,6 +7185,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             privileged,
             require_limits,
             oom_group,
+            net_none,
             allow_uncapped,
             security_profile,
             overlay_lower,
@@ -7239,7 +7262,23 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             // ITS RESOLVERS WITH ITS NAT, as `compose up` hands them to each service it gives one:
             // the host's, reachable through the NAT. A `--dns` the caller gave is theirs and is
             // not appended to.
-            let dns: Vec<String> = if stack_outbound && dns.is_empty() {
+            // DOCKER'S DEFAULT NETWORK: a box that named none gets a NAT of its own and the host's
+            // resolvers. MEASURED before (owner's decision, 22/11): `kern run alpine wget
+            // example.com` had no interface but `lo` and no `/etc/resolv.conf`; Docker's printed the
+            // page. `--net none` is the isolated box it used to be by default.
+            let own_outbound = !share_net
+                && !net_none
+                && pod.is_none()
+                && net_container.is_none()
+                && egress_allow.is_empty()
+                && egress_secret.is_empty()
+                // A LAUNCHER THAT HOLDS THE BOX'S GATE WIRES ITS NETWORK ITSELF (`compose up`), the
+                // rule `HeldNat::arm` already keeps. Decided here too, because the `-d` launcher reads
+                // `own_outbound` as "this box gates itself" and waits past the prepared report the
+                // compose launcher waits for: MEASURED, a `--no-pod` stack's boxes hung at start for
+                // ten minutes, each side waiting on the other.
+                && crate::global_env("KERN_GATE_FD").is_none();
+            let dns: Vec<String> = if (stack_outbound || own_outbound) && dns.is_empty() {
                 crate::pod::host_nameservers()
             } else {
                 dns
@@ -7343,6 +7382,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     add_hosts: &add_hosts,
                     dns: &dns,
                     stack_outbound,
+                    own_outbound,
                     dns_search: &dns_search,
                     dns_options: &dns_options,
                     log_max_size,

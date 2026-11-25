@@ -104,6 +104,10 @@ _DEFAULT_IMAGE_HAS_NODE = False
 # probes a capability goes on; a sandbox wants the kill instead, because the kill is the verdict
 # this binding reads as `escape_blocked` (code that tried to leave). The syscall never runs either way.
 _SANDBOX_POSTURE = (
+    # NO NETWORK UNLESS ASKED: a kern box gets a NAT by default, as docker's does; a sandbox does not.
+    # `network=True` adds `--net`, and `egress_allow` its filtering proxy, both after this, so either
+    # replaces it.
+    "--network", "none",
     "--security-opt", "no-new-privileges",
     "--security-opt", "seccomp-deny=kill",
     # And an OOM ends the whole box, which is the verdict this binding reports as `oom`; a kern box
