@@ -1214,8 +1214,16 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance, oom: bool
         // reads the record later can count it again (the cgroup is gone). MEASURED before: a
         // container killed for its memory cap read `OOMKilled: false` through kern's socket, where
         // Docker says true.
+        // AND WHAT IT MOUNTED, so `--volumes-from` finds the mounts of a box that has exited, as
+        // Docker's finds a stopped container's. WHOLE OR NOT AT ALL: a record cut at a cap would
+        // name a shorter path than the one the box mounted, and a later box would mount that.
+        let mounts = if b.mounts.len() <= 16384 && !b.mounts.contains(['\n', '\r']) {
+            b.mounts.as_str()
+        } else {
+            ""
+        };
         let body = format!(
-            "{code}\n{}\n{}\n{}\nimage\t{}\nimageid\t{}\nlabels\t{}\nrestarts\t{restarts}\noom\t{}",
+            "{code}\n{}\n{}\n{}\nimage\t{}\nimageid\t{}\nlabels\t{}\nrestarts\t{restarts}\noom\t{}\nmounts\t{mounts}",
             b.name,
             b.pod,
             one_line(&b.command, 512),
@@ -1614,6 +1622,9 @@ pub struct ExitedBox {
     pub restarts: u32,
     /// The OOM killer struck in the box (Docker's `State.OOMKilled`); false when not recorded.
     pub oom: bool,
+    /// What it mounted, as [`Instance::mounts`], for `--volumes-from` a box that has exited; empty
+    /// when not recorded.
+    pub mounts: String,
     /// Seconds since the box exited, from the sidecar's mtime.
     pub exited_ago: u64,
 }
@@ -1714,6 +1725,7 @@ pub fn list_exited_among(boxes: &[Instance]) -> Vec<ExitedBox> {
             labels: crate::ui::scrub(&keyed("labels")),
             restarts: keyed("restarts").trim().parse().unwrap_or(0),
             oom: keyed("oom").trim() == "1",
+            mounts: keyed("mounts"),
             exited_ago: ago,
         });
     }

@@ -891,6 +891,7 @@ mod ps_exited_tests {
             image: String::new(),
             image_id: String::new(),
             labels: String::new(),
+            mounts: String::new(),
             exited_ago: 5,
         }
     }

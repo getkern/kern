@@ -1581,9 +1581,16 @@ fn resolve_volumes_from(
         };
         let record = match registry::find_ref(name) {
             Some(inst) => inst.mounts,
+            // A kept box's record beside its layer, else the exit record of one that ended.
             None => crate::keepbox::dir_of(name)
                 .filter(|d| crate::keepbox::read(d).is_some())
                 .map(|d| std::fs::read_to_string(d.join(VOLUMES_FROM_FILE)).unwrap_or_default())
+                .or_else(|| {
+                    registry::list_exited()
+                        .into_iter()
+                        .find(|e| e.name == name)
+                        .map(|e| e.mounts)
+                })
                 .ok_or_else(|| {
                     Error::Sandbox(format!(
                         "--volumes-from {name}: no box of that name, running or kept (`kern ps -a`)"
