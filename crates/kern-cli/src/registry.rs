@@ -1144,6 +1144,64 @@ pub fn clear_exited_named(name: &str, keep: Option<(i32, u64)>) -> Vec<i32> {
     cleared
 }
 
+/// Move the exit records (and their runs' logs) of the box named `old` to `new`: what `kern rename`
+/// does to the runs that ended before the rename, which are the SAME box (a box that ends under a
+/// name replaces the records the name had, [`set_box_exit`]), as Docker's renamed container keeps
+/// its history. MEASURED (Grok round 7, case 42): `kern run -d --keep`, `kern restart`, `kern rename`
+/// left a `<old> exited` row in `ps -a` beside `<new> running`, and it outlived `kern rm -f <new>`.
+/// A record of a live process is left alone (the registry rename moved that one). Best-effort per
+/// record: the rewrite goes through a hidden temp, so a reader sees the old body or the new one.
+pub fn rename_exited(old: &str, new: &str) {
+    let Ok(d) = waitexit_dir() else {
+        return;
+    };
+    let Ok(rd) = fs::read_dir(&d) else {
+        return;
+    };
+    let registered = registered_pairs(&list());
+    let logs = logs_dir().ok();
+    for e in rd.flatten() {
+        let Some((pid, starttime)) = waitexit_split(&e.file_name()) else {
+            continue;
+        };
+        if registered.contains(&(pid, starttime)) {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(e.path()) else {
+            continue;
+        };
+        if body.lines().nth(1) != Some(old) {
+            continue;
+        }
+        let renamed: String = body
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 1 {
+                    let nl = if l.ends_with('\n') { "\n" } else { "" };
+                    format!("{new}{nl}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        let tmp = d.join(format!(".{pid}-{starttime}.rename"));
+        if fs::write(&tmp, renamed).is_err() {
+            let _ = fs::remove_file(&tmp);
+            continue;
+        }
+        if fs::rename(&tmp, e.path()).is_err() {
+            let _ = fs::remove_file(&tmp);
+            continue;
+        }
+        if let Some(l) = &logs {
+            for (from, suffix) in run_log_files(l, &format!("{old}-{pid}")) {
+                let _ = fs::rename(from, l.join(format!("{new}-{pid}.log{suffix}")));
+            }
+        }
+    }
+}
+
 /// A completed box's recorded exit code for `(pid, starttime)`, or `None` if it never completed here.
 /// NON-consuming: several `kern wait` on the same box all read the same code (matching Docker); the
 /// sidecar is reaped by `prune`/`gc` once the pid is dead, not on read.
@@ -6076,6 +6134,73 @@ mod removed_record_tests {
             box_exit(pid - 1, st),
             Some(3),
             "a normal record is never swept"
+        );
+    }
+
+    /// `kern rename` moves the records of the runs that ended before it (the same box) to the new
+    /// name, with their logs; another box's record and a live box's are left alone. Grok round 7,
+    /// case 42: the old name's record stayed as a second `ps -a` row and outlived `kern rm -f`.
+    #[test]
+    fn rename_moves_the_exit_records_and_logs_of_the_name() {
+        let _g = crate::env_guard();
+        let base = std::env::temp_dir().join(format!("kern-renrec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        assert!(fs::create_dir_all(base.join("kern")).is_ok());
+        struct Restore(Option<std::ffi::OsString>, PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+                    None => crate::unset_global_env("XDG_RUNTIME_DIR"),
+                }
+                let _ = fs::remove_dir_all(&self.1);
+            }
+        }
+        let _restore = Restore(crate::global_env("XDG_RUNTIME_DIR"), base.clone());
+        crate::set_global_env("XDG_RUNTIME_DIR", &base);
+
+        let (pid, st) = (i32::MAX - 11, 77u64);
+        let rec = |name: &str| {
+            parse(&format!(
+                "name={name}\npid=1\ncommand=sleep 100\nimage=alpine:3.21\n"
+            ))
+            .expect("an instance record")
+        };
+        set_box_exit(pid, st, 137, &rec("renold"), false);
+        set_box_exit(pid - 1, st, 5, &rec("renother"), false);
+        let Ok(logs) = logs_dir() else {
+            panic!("logs dir");
+        };
+        fs::write(logs.join(format!("renold-{pid}.log")), "line").expect("a log");
+        fs::write(logs.join(format!("renold-{pid}.log.1")), "older").expect("a rotated log");
+
+        rename_exited("renold", "rennew");
+
+        let exited = list_exited();
+        assert!(
+            !exited.iter().any(|e| e.name == "renold"),
+            "the old name still has a record"
+        );
+        assert!(
+            exited
+                .iter()
+                .any(|e| e.name == "rennew" && e.code == 137 && e.image == "alpine:3.21"),
+            "the record did not follow the name, or lost its fields"
+        );
+        assert!(
+            exited.iter().any(|e| e.name == "renother" && e.code == 5),
+            "another box's record was touched"
+        );
+        assert!(
+            logs.join(format!("rennew-{pid}.log")).exists()
+                && logs.join(format!("rennew-{pid}.log.1")).exists()
+                && !logs.join(format!("renold-{pid}.log")).exists(),
+            "the run's log files did not follow the name"
+        );
+        assert_eq!(
+            clear_exited_named("rennew", None),
+            vec![pid],
+            "rm of the new name clears it"
         );
     }
 }

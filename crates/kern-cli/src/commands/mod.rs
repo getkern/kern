@@ -2752,16 +2752,60 @@ fn unit_active_state(unit: &str) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-/// What systemd says of the unit a `--restart always` box runs under: whether it is between two runs
-/// (Docker's `restarting`), and how many times it ran it again (Docker's `RestartCount`, which the
-/// box's own supervisor cannot count: each run is a new one). `None` for a name with no kern unit,
-/// which costs one `stat`; one `systemctl show` otherwise.
 /// Does `name` have a unit kern wrote (`--restart always|unless-stopped`)? One `stat` and a read.
 pub(crate) fn has_managed_unit(name: &str) -> bool {
     managed_unit_path(name).is_some_and(|p| is_kern_managed_unit(&p))
 }
 
-pub(crate) fn managed_unit_runs(name: &str) -> Option<(bool, u32)> {
+/// What systemd says of the unit a `--restart` box runs under ([`managed_unit_runs`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnitRuns {
+    /// Between two runs: Docker's `restarting`.
+    pub restarting: bool,
+    /// How many times systemd ran it again: Docker's `RestartCount`, which the box's own supervisor
+    /// cannot count (each run is a new one).
+    pub restarts: u32,
+    /// The code the last run exited with, while systemd still holds it (between two runs; the next
+    /// run's process replaces it). A unit runs `kern run` in the foreground, which leaves no exit
+    /// record, so this is the only place the code of a unit-only box is kept.
+    pub last_code: Option<i32>,
+}
+
+/// The code a kept row shows: its own record's, else the one its unit still holds.
+pub(crate) fn kept_last_exit(k: &crate::keepbox::KeptBox, unit: Option<&UnitRuns>) -> Option<i32> {
+    k.meta.last_exit.or(unit.and_then(|u| u.last_code))
+}
+
+/// [`UnitRuns`] from `systemctl show -p ActiveState,NRestarts,ExecMainCode,ExecMainStatus`. PURE.
+fn parse_unit_runs(text: &str) -> UnitRuns {
+    let field = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k).and_then(|v| v.strip_prefix('=')))
+            .unwrap_or_default()
+            .trim()
+    };
+    let state = field("ActiveState");
+    // `active` IS THE SAME GAP for every caller, which asks this of a box its own snapshot saw not
+    // live: systemd has started the next supervisor and the box is not up yet. MEASURED before,
+    // kern's Docker API listed a `--restart always` box as `exited` for that instant between two
+    // `restarting` samples, and a re-read of the registry here raced the box registering.
+    let restarting = matches!(state, "activating" | "deactivating" | "active");
+    // `ExecMainCode` 1 is CLD_EXITED; a signal (2, 3) is not an exit code, and `kern run` turns a
+    // box's signal into 128+N itself, so a kill of the `kern` process is not the box's code.
+    let last_code = (field("ExecMainCode") == "1")
+        .then(|| field("ExecMainStatus").parse().ok())
+        .flatten();
+    UnitRuns {
+        restarting,
+        restarts: field("NRestarts").parse().unwrap_or(0),
+        last_code,
+    }
+}
+
+/// What systemd says of the unit a `--restart` box runs under, asked of a box the caller saw NOT
+/// live (`restarting` reads `active` as the gap before the next run). `None` for a name with no kern
+/// unit, which costs one `stat`; one `systemctl show` otherwise (about 3.4 ms, measured).
+pub(crate) fn managed_unit_runs(name: &str) -> Option<UnitRuns> {
     let path = managed_unit_path(name)?;
     if !is_kern_managed_unit(&path) {
         return None;
@@ -2772,24 +2816,14 @@ pub(crate) fn managed_unit_runs(name: &str) -> Option<(bool, u32)> {
             "--user",
             "show",
             "-p",
-            "ActiveState,NRestarts",
+            "ActiveState,NRestarts,ExecMainCode,ExecMainStatus",
             &unit_file_name(name),
         ])
         .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let field = |k: &str| {
-        text.lines()
-            .find_map(|l| l.strip_prefix(k).and_then(|v| v.strip_prefix('=')))
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    };
-    let state = field("ActiveState");
-    let restarting = matches!(state.as_str(), "activating" | "deactivating");
-    Some((restarting, field("NRestarts").parse().unwrap_or(0)))
+    Some(parse_unit_runs(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// Did a freshly started unit come up? `active`, or `activating`, which is also where a
@@ -5797,6 +5831,60 @@ const MANAGED_MARKER: &str = "X-KernManagedBox";
 ///
 /// Fail-safe by construction: a file that cannot be read, or is too large to be one of ours, is NOT
 /// ours. The read is bounded because this runs over every candidate in a directory kern does not own.
+/// A `--restart` box that only its unit knows (made without `--keep`), as `kern ps -a` lists a kept
+/// one: its name, the unit file's age as its creation, and the argv after `run` as its command.
+pub(crate) fn unit_only_box(name: &str) -> Option<crate::keepbox::KeptBox> {
+    let path = managed_unit_path(name)?;
+    if !is_kern_managed_unit(&path) || crate::keepbox::dir_of(name).is_some_and(|d| d.is_dir()) {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let exec = text.lines().find_map(|l| l.strip_prefix("ExecStart="))?;
+    let argv: Vec<String> = exec
+        .split('"')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, a)| a.replace("\\\\", "\\"))
+        .collect();
+    // THE CLI'S OWN PARSER splits the image from the workload, as it did when the unit ran: a
+    // count of flags here would be a second parser of `kern run`. MEASURED before: the COMMAND
+    // column read `--name g13r1 alpine:3.21 sh -c ...` and the image was empty. An argv the parser
+    // refuses (a unit from another kern) shows whole, with no image.
+    let (image, command) = match argv.get(1..).map(crate::cli::parse) {
+        Some(Ok((_, crate::cli::Command::BoxRun { image, command, .. }))) => {
+            (image.unwrap_or_default(), command.join(" "))
+        }
+        _ => (
+            String::new(),
+            argv.iter()
+                .skip_while(|a| a.as_str() != "run" && a.as_str() != "box")
+                .skip(1)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    };
+    let created = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    // The run that ended last, from its exit record (one per name): Docker's `Restarting (1)`.
+    let last = registry::list_exited().into_iter().find(|e| e.name == name);
+    Some(crate::keepbox::KeptBox {
+        name: name.to_string(),
+        meta: crate::keepbox::Meta {
+            created,
+            last_exit: last.as_ref().map(|e| e.code),
+            image,
+            cwd: String::new(),
+        },
+        command,
+        labels: Vec::new(),
+        exited_ago: last.map(|e| e.exited_ago),
+    })
+}
+
 /// The names of the boxes kern's `--restart` units run, read from the unit files kern wrote.
 pub(crate) fn managed_unit_names() -> Vec<String> {
     let Ok(dir) = user_systemd_dir() else {

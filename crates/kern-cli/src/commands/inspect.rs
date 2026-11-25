@@ -506,7 +506,24 @@ pub fn ps(
             .into_iter()
             .filter(|k| !live_names.contains(&k.name))
             .filter(|k| kept_matches(k, filters) && named(&k.name))
-            .collect()
+            .chain(
+                // A `--restart always|unless-stopped` box made WITHOUT `--keep` has a unit and no
+                // kept record: between two runs it was in no list, so `ps -a`, kern's Docker API
+                // and `docker rm -f` through it said it did not exist while systemd kept running
+                // it (Grok's round 7, case 41: 7 restarts, nothing listed). Listed from its unit.
+                crate::commands::managed_unit_names()
+                    .into_iter()
+                    .filter(|n| name_want.is_none_or(|w| n.contains(w)))
+                    .filter(|n| !live_names.contains(n))
+                    .filter_map(|n| crate::commands::unit_only_box(&n)),
+            )
+            .filter(|k| kept_matches(k, filters) && named(&k.name))
+            .fold(Vec::new(), |mut v: Vec<crate::keepbox::KeptBox>, k| {
+                if !v.iter().any(|x| x.name == k.name) {
+                    v.push(k);
+                }
+                v
+            })
     } else {
         Vec::new()
     };
@@ -776,7 +793,13 @@ pub fn ps(
             // row has no `started`, `ports` or `rootfs`). `labels` it has: they are in the
             // recorded command the next `kern start` runs, and a client finds a stopped container
             // by them. `exited_ago` once a run has ended, as on an exited row.
-            let exit = match (k.meta.last_exit, k.exited_ago) {
+            // A `--restart always` box between two runs is `restarting`, and its count is the
+            // unit's: systemd runs it again with a new supervisor each time, which counts nothing.
+            let unit = crate::commands::managed_unit_runs(&k.name);
+            let exit = match (
+                crate::commands::kept_last_exit(k, unit.as_ref()),
+                k.exited_ago,
+            ) {
                 (Some(c), Some(ago)) => format!(",\"exit_code\":{c},\"exited_ago\":{ago}"),
                 (Some(c), None) => format!(",\"exit_code\":{c}"),
                 (None, _) => String::new(),
@@ -795,11 +818,9 @@ pub fn ps(
                 .iter()
                 .find(|e| e.name == k.name)
                 .is_some_and(|e| e.oom);
-            // A `--restart always` box between two runs is `restarting`, and its count is the
-            // unit's: systemd runs it again with a new supervisor each time, which counts nothing.
-            let (status, restarts) = match crate::commands::managed_unit_runs(&k.name) {
-                Some((true, n)) => ("restarting", n.max(restarts)),
-                Some((false, n)) => ("kept", n.max(restarts)),
+            let (status, restarts) = match unit {
+                Some(u) if u.restarting => ("restarting", u.restarts.max(restarts)),
+                Some(u) => ("kept", u.restarts.max(restarts)),
                 None => ("kept", restarts),
             };
             items.push(format!(
@@ -1123,19 +1144,16 @@ pub fn ps(
                 // `restarting (code)` between two runs of a `--restart always` box, the word `ps
                 // --json` and kern's Docker API use (Docker: `Restarting (3) ...`). MEASURED
                 // before: the JSON said `restarting` and this cell `exit 3`.
-                let restarting =
-                    crate::commands::managed_unit_runs(&k.name).is_some_and(|(r, _)| r);
-                let status = match (restarting, k.meta.last_exit) {
+                let unit = crate::commands::managed_unit_runs(&k.name);
+                let restarting = unit.is_some_and(|u| u.restarting);
+                let last_exit = crate::commands::kept_last_exit(k, unit.as_ref());
+                let status = match (restarting, last_exit) {
                     (true, Some(code)) => format!("restarting ({code})"),
                     (true, None) => "restarting".to_string(),
                     (false, Some(code)) => format!("exit {code}"),
                     (false, None) => "never ran".to_string(),
                 };
-                let hc = if k.meta.last_exit == Some(0) {
-                    p.g
-                } else {
-                    p.d
-                };
+                let hc = if last_exit == Some(0) { p.g } else { p.d };
                 let status_cell = format!("{hc}{:<hw$}{}", status, p.z);
                 let age = now.saturating_sub(k.meta.created);
                 emit_row(&name, None, &fmt_uptime(age), &status_cell, "-", &k.command);
@@ -1161,7 +1179,9 @@ fn kept_matches(k: &crate::keepbox::KeptBox, filters: &[(String, String)]) -> bo
             "exited" => k.meta.last_exit.is_some(),
             // Between two runs systemd makes of a `--restart always` box: the state `ps --json`
             // and kern's Docker API report, from the same function.
-            "restarting" => crate::commands::managed_unit_runs(&k.name).is_some_and(|(r, _)| r),
+            "restarting" => {
+                crate::commands::managed_unit_runs(&k.name).is_some_and(|u| u.restarting)
+            }
             // NOT `created`: the usage message for this flag says kern has no created state, and a
             // mapping here would have made that sentence false for one row kind only. A kept box
             // that has never run is `status=kept` with no `exit_code` in `--json`, which answers the
@@ -2089,6 +2109,7 @@ pub fn rename(old: &str, new: &str) -> Result<(), Error> {
         // A KEPT BOX THAT IS NOT RUNNING is renamed too, as Docker renames a stopped or created
         // container: only its layer and its record carry the name.
         if crate::keepbox::rename(old, new)? {
+            registry::rename_exited(old, new);
             println!("{}renamed{} {old} → {new}", p.g, p.z);
             return Ok(());
         }
@@ -2111,6 +2132,8 @@ pub fn rename(old: &str, new: &str) -> Result<(), Error> {
             inst.name
         )));
     }
+    // The runs that ended before this one are this box too: their records follow the name.
+    registry::rename_exited(&inst.name, new);
     println!("{}renamed{} {} → {new}", p.g, p.z, inst.name);
     Ok(())
 }
@@ -2723,8 +2746,8 @@ pub(crate) fn box_oom_kills(b: &registry::Instance) -> u64 {
 /// a `--restart always` box, which systemd runs again each time. `unit` is that count when the caller
 /// already has it (`kern top` caches it, a `systemctl show` costs about 4 ms); `None` asks systemd.
 pub(crate) fn box_restarts(b: &registry::Instance, unit: Option<u32>) -> u32 {
-    let unit =
-        unit.unwrap_or_else(|| crate::commands::managed_unit_runs(&b.name).map_or(0, |(_, n)| n));
+    let unit = unit
+        .unwrap_or_else(|| crate::commands::managed_unit_runs(&b.name).map_or(0, |u| u.restarts));
     registry::box_attempt(&b.name, b.pid)
         .map_or(0, registry::Attempt::restarts)
         .max(unit)

@@ -2996,7 +2996,7 @@ fn unit_restarts(name: &str) -> u32 {
             return *n;
         }
     }
-    let n = crate::commands::managed_unit_runs(name).map_or(0, |(_, n)| n);
+    let n = crate::commands::managed_unit_runs(name).map_or(0, |u| u.restarts);
     seen.insert(name.to_string(), (Instant::now(), n));
     n
 }

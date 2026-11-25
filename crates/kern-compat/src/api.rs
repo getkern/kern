@@ -1790,19 +1790,18 @@ fn list(bin: &Path, req: &Request) -> Response {
                 .or_else(|| v.get("started"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
-            json_str(if paused {
-                "paused"
-            } else if running {
-                "running"
-            } else {
-                "exited"
-            }),
-            json_str(if paused {
-                "Up (Paused)"
-            } else if running {
-                "Up"
-            } else {
-                "Exited"
+            // ONE STATE, the one the filter above was asked about: this wrote its own `paused` /
+            // `running` / `exited`, so a box between two runs of its `--restart` policy was
+            // filtered as `restarting` and listed as `Up`. Docker: `Restarting (1) ...`.
+            json_str(state),
+            json_str(&match state {
+                "paused" => "Up (Paused)".to_string(),
+                "running" => "Up".to_string(),
+                "restarting" => match v.get("exit_code").and_then(Value::as_i64) {
+                    Some(c) => format!("Restarting ({c})"),
+                    None => "Restarting".to_string(),
+                },
+                _ => "Exited".to_string(),
             }),
             ports.join(","),
             labels_json(&labels),

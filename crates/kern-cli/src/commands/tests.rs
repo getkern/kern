@@ -9241,3 +9241,105 @@ fn a_unit_waiting_to_restart_came_up_and_a_failed_one_did_not() {
         assert_eq!(super::unit_came_up(s), None, "{s:?}");
     }
 }
+
+/// A `--restart` box kept only by its unit (no `--keep`) is listed from the unit's argv, split by
+/// the CLI's own parser: the image apart, the workload as the command, the last run's code from its
+/// exit record. Grok round 7, case 41: the box was invisible between runs, then listed with its
+/// flags as the command and no image.
+#[test]
+fn a_unit_only_box_is_listed_with_its_image_command_and_last_code() {
+    let _g = crate::env_guard();
+    let base = std::env::temp_dir().join(format!("kern-unitonly-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    struct Restore(
+        Vec<(&'static str, Option<std::ffi::OsString>)>,
+        std::path::PathBuf,
+    );
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => crate::set_global_env(k, v),
+                    None => crate::unset_global_env(k),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let keys = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"];
+    let _restore = Restore(
+        keys.iter().map(|k| (*k, crate::global_env(k))).collect(),
+        base.clone(),
+    );
+    for k in keys {
+        let d = base.join(k);
+        assert!(std::fs::create_dir_all(d.join("kern")).is_ok());
+        crate::set_global_env(k, &d);
+    }
+    let units = base.join("XDG_CONFIG_HOME/systemd/user");
+    assert!(std::fs::create_dir_all(&units).is_ok());
+    std::fs::write(
+        units.join("kern-uo1.service"),
+        "[Unit]\nDescription=kern box uo1\n[Service]\nExecStart=\"/bin/kern\" \"run\" \"--name\" \
+         \"uo1\" \"-e\" \"A=1\" \"-p\" \"18081:80\" \"alpine:3.21\" \"sh\" \"-c\" \"exit 1\"\n\
+         X-KernManagedBox=uo1\n",
+    )
+    .expect("a unit");
+    // A unit someone else wrote under a kern-like name is not a box.
+    std::fs::write(
+        units.join("kern-other.service"),
+        "[Service]\nExecStart=/bin/true\n",
+    )
+    .expect("a foreign unit");
+    // Its last run's exit record, in the layout `set_box_exit` writes (code, name, pod, command).
+    let waitexit = base.join("XDG_RUNTIME_DIR/kern/waitexit");
+    assert!(std::fs::create_dir_all(&waitexit).is_ok());
+    std::fs::write(
+        waitexit.join(format!("{}-9", i32::MAX - 13)),
+        "1\nuo1\n\nsh -c exit 1\n",
+    )
+    .expect("an exit record");
+
+    assert_eq!(super::managed_unit_names(), vec!["uo1".to_string()]);
+    let Some(k) = super::unit_only_box("uo1") else {
+        panic!("the unit-only box is not listed");
+    };
+    assert_eq!(k.meta.image, "alpine:3.21", "the image");
+    assert_eq!(k.command, "sh -c exit 1", "the workload alone, no flags");
+    assert_eq!(k.meta.last_exit, Some(1), "the last run's code");
+    assert!(super::unit_only_box("other").is_none());
+}
+
+/// What `systemctl show` says of a `--restart` unit, read for a box the caller saw not live: every
+/// state on the way between two runs is `restarting`, including `active` (the next supervisor is up,
+/// the box not yet registered); the last code only while systemd holds an EXIT (CLD_EXITED = 1),
+/// never a signal's number.
+#[test]
+fn unit_runs_read_the_gap_and_only_an_exit_code() {
+    let r = |t: &str| super::parse_unit_runs(t);
+    for s in ["activating", "deactivating", "active"] {
+        assert!(r(&format!("ActiveState={s}\n")).restarting, "{s}");
+    }
+    for s in ["inactive", "failed", ""] {
+        assert!(!r(&format!("ActiveState={s}\n")).restarting, "{s}");
+    }
+    let between = r("ActiveState=activating\nNRestarts=3\nExecMainCode=1\nExecMainStatus=7\n");
+    assert_eq!(
+        between,
+        super::UnitRuns {
+            restarting: true,
+            restarts: 3,
+            last_code: Some(7)
+        }
+    );
+    assert_eq!(
+        r("ActiveState=activating\nExecMainCode=2\nExecMainStatus=9\n").last_code,
+        None,
+        "a signal number is not an exit code"
+    );
+    assert_eq!(
+        r("ActiveState=active\nExecMainCode=0\nExecMainStatus=0\n").last_code,
+        None,
+        "a running process has no code yet"
+    );
+}
