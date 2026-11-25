@@ -52,6 +52,10 @@ pub struct Instance {
     /// Comma-separated **named volumes** this box mounts (from `-v name:/dst`) - so `kern volume rm`
     /// can refuse to delete a volume still in use. Empty when none; absent in older entries.
     pub volumes: String,
+    /// Every mount this box was started with, as flags kern can apply again (`--volumes-from`): each
+    /// entry is `v<TAB><-v spec>` (host paths absolute, anonymous volumes included) or
+    /// `m<TAB><src><TAB><dst><TAB><0|1>` for a `--mount`; encoded as [`encode_labels`] encodes.
+    pub mounts: String,
     /// The **pod** (`--pod <name>`, e.g. a compose stack) this box belongs to - the grouping key for
     /// `kern ps`'s tree view and `kern stop <pod>`. Empty for a standalone box; absent in older entries.
     pub pod: String,
@@ -365,7 +369,10 @@ pub(crate) fn open_ancestor(dir: &Path) -> Option<PathBuf> {
 /// `dir`, created `0700` when missing, and accepted only as a real directory this user owns.
 pub(crate) fn private_own_dir(dir: &Path) -> io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
     let m = fs::symlink_metadata(dir)?;
     // SAFETY: getuid has no preconditions.
     let me = unsafe { libc::getuid() };
@@ -2297,7 +2304,7 @@ pub fn forget_stop_record(name: &str, pid: i32) {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\nimageid={}\ngpus={}\ntimeout={}\nbridges={}\nlogdriver={}\nrm={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\nimageid={}\ngpus={}\ntimeout={}\nbridges={}\nlogdriver={}\nrm={}\nmounts={}\n",
         inst.name,
         inst.pid,
         inst.pid1_recorded,
@@ -2345,6 +2352,7 @@ fn encode(inst: &Instance) -> String {
         one_line(&inst.bridges),
         one_line(&inst.log_driver),
         u8::from(inst.auto_remove),
+        one_line(&inst.mounts),
     )
 }
 
@@ -3633,10 +3641,8 @@ pub fn expire_ended_logs() -> (usize, u64) {
                 .collect()
         })
         .unwrap_or_default();
-    let live: std::collections::HashSet<String> = live
-        .into_iter()
-        .chain(kept_log_keys(&d, &kept))
-        .collect();
+    let live: std::collections::HashSet<String> =
+        live.into_iter().chain(kept_log_keys(&d, &kept)).collect();
     let instances = dir().ok();
     expire_ended_logs_in(
         &d,
@@ -3837,6 +3843,7 @@ fn parse(body: &str) -> Option<Instance> {
     let mut bridges = String::new();
     let mut log_driver = String::new();
     let mut auto_remove = false;
+    let mut mounts = String::new();
     let (mut memory_max, mut pids_max) = (None, None);
     let mut labels = String::new();
     let (mut stop_signal, mut stop_grace) = (0i32, 0u64);
@@ -3908,6 +3915,7 @@ fn parse(body: &str) -> Option<Instance> {
             "bridges" => bridges = v.to_string(),
             "logdriver" => log_driver = v.to_string(),
             "rm" => auto_remove = v == "1",
+            "mounts" => mounts = v.to_string(),
             "landlock" => landlock_rw = v.to_string(),
             // empty string (uncapped) parses to None; a bad value is ignored, not fatal
             "memory_max" => memory_max = v.parse().ok(),
@@ -4042,6 +4050,7 @@ fn parse(body: &str) -> Option<Instance> {
         cgroup,
         cgroup_id,
         auto_remove,
+        mounts,
         // Never serialised: this is a LIVENESS verdict, derived by `load_live` after comparing the
         // supervisor pid against the recorded cgroup. A freshly parsed record carries no verdict yet.
         orphaned: false,
@@ -4302,7 +4311,11 @@ mod tests {
         fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).expect("chmod");
         assert_eq!(open_ancestor(&d.join("vols/x")), Some(d.clone()));
         fs::set_permissions(&d, fs::Permissions::from_mode(0o1777)).expect("chmod");
-        assert_eq!(open_ancestor(&d.join("vols/x")), None, "the sticky bit protects it, as /tmp");
+        assert_eq!(
+            open_ancestor(&d.join("vols/x")),
+            None,
+            "the sticky bit protects it, as /tmp"
+        );
         fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).expect("chmod");
         assert_eq!(open_ancestor(&d.join("vols")), None);
         let _ = fs::remove_dir_all(&d);
@@ -4331,7 +4344,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, vec!["web-420.log".to_string(), "web-7.log".to_string()]);
+        assert_eq!(
+            left,
+            vec!["web-420.log".to_string(), "web-7.log".to_string()]
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -5002,6 +5018,7 @@ mod tests {
             pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
+            mounts: String::new(),
             pod: "stack".into(),
             workdir: "/app".into(),
             run_as: None,
@@ -5281,6 +5298,7 @@ mod tests {
             pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
+            mounts: String::new(),
             pod: "stack".into(),
             workdir: String::new(),
             run_as: None,
@@ -5727,6 +5745,7 @@ mod tests {
                 pid1_starttime: 0,
                 ports: String::new(),
                 volumes: String::new(),
+                mounts: String::new(),
                 pod: String::new(),
                 workdir: String::new(),
                 run_as: None,
@@ -5813,6 +5832,7 @@ mod tests {
             pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
+            mounts: String::new(),
             pod: String::new(),
             workdir: String::new(),
             run_as: None,
@@ -5902,6 +5922,7 @@ mod tests {
             pid1_starttime: 0,
             ports: String::new(),
             volumes: String::new(),
+            mounts: String::new(),
             pod: String::new(),
             workdir: String::new(),
             run_as: None,

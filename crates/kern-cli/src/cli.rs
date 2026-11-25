@@ -99,6 +99,8 @@ pub enum Command {
         read_only: bool,
         /// `-v src:dst[:ro]` (repeatable): host paths bind-mounted in.
         volumes: Vec<String>,
+        /// `--volumes-from BOX[:ro|:rw]` (repeatable): every mount of another box.
+        volumes_from: Vec<String>,
         /// `--mount type=…,src=…,dst=…[,ro]` (repeatable), ALREADY split into (source, target, ro).
         ///
         /// Apart from `volumes` because that one holds `-v` strings: turning these back into one is
@@ -4241,6 +4243,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--ulimit",
     "--user",
     "--volume",
+    "--volumes-from",
     "--workdir",
 ];
 
@@ -4439,6 +4442,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut cpus: Option<f64> = None;
     let mut cpuset: Option<String> = None;
     let mut volumes: Vec<String> = Vec::new();
+    let mut volumes_from: Vec<String> = Vec::new();
     // `--mount`'s mounts, ALREADY SPLIT INTO FIELDS. Kept apart from `volumes` because that one holds
     // `-v` STRINGS, and putting a `--mount` back into that form is exactly the defect being fixed: a
     // source containing a `:` cannot survive the round trip.
@@ -5188,6 +5192,15 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         volumes.push((*v).to_string());
                     }
                 }
+                // Docker's `--volumes-from BOX[:ro|:rw]`: resolved when the box starts (the parser
+                // reads no state).
+                "--volumes-from" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) if !v.is_empty() => volumes_from.push((*v).to_string()),
+                        _ => return Err(Error::Usage("--volumes-from <box>[:ro|:rw]")),
+                    }
+                }
                 // `--mount type=…,src=…,dst=…`: the long form of `-v`/`--tmpfs`, translated into
                 // them by `parse_mount_spec` so one resolver serves both spellings.
                 "--mount" => {
@@ -5521,9 +5534,10 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     i += 1;
                     log_driver_given = true;
                     let v = rest.get(i).map(|v| v.to_string());
-                    (log_none, log_journald) = log_driver_flags(v.as_deref().ok_or(
-                        Error::Usage("--log-driver <json-file|local|journald|none>"),
-                    )?)
+                    (log_none, log_journald) = log_driver_flags(
+                        v.as_deref()
+                            .ok_or(Error::Usage("--log-driver <json-file|local|journald|none>"))?,
+                    )
                     .map_err(|e| Error::Cli(format!("--log-driver {e}")))?;
                 }
                 // A SIZE, AND NOT ZERO. `memory.low = 0` is the kernel's default (no protection), so
@@ -5847,6 +5861,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             detached,
             read_only,
             volumes,
+            volumes_from,
             mounts,
             env,
             egress_allow,
@@ -7117,6 +7132,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             detached,
             read_only,
             volumes,
+            volumes_from,
             mounts,
             env,
             egress_allow,
@@ -7273,6 +7289,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     detached,
                     read_only,
                     volumes: &volumes,
+                    volumes_from: &volumes_from,
                     mounts: &mounts,
                     env: &env,
                     egress_allow: &egress_allow,

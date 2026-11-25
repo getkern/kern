@@ -297,6 +297,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --read-only         Read-only root (default is a writable overlay)
     -v, --volume S:D[:ro]   Mount into the box (repeatable). S = a host path, a named volume
                         (auto-created; see `kern volume`), or nfs://|smb://|sshfs:// URL
+    --volumes-from BOX[:ro|:rw]  Every mount of another box, running or kept (repeatable); :ro
+                        makes them all read-only
     --mount type=…,src=…,dst=…  The same mount, written with named fields (repeatable).
                         type=bind|volume|tmpfs, src=|source=, dst=|destination=|target=,
                         ro|readonly, tmpfs-size=<sz>. A type= that disagrees with its src is

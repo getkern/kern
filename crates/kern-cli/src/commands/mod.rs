@@ -233,6 +233,8 @@ pub struct BoxRunArgs<'a> {
     pub detached: bool,
     pub read_only: bool,
     pub volumes: &'a [String],
+    /// `--volumes-from BOX[:ro|:rw]`, resolved into `volumes` and `mounts` when the box starts.
+    pub volumes_from: &'a [String],
     /// `--mount` mounts, ALREADY split into (source, target, read_only).
     ///
     /// Separate from `volumes` because that one holds `-v` STRINGS. Re-joining a mount into that form
@@ -4828,7 +4830,9 @@ pub(crate) fn box_log_tail(name: &str, max: u64) -> Option<String> {
     let mut buf = Vec::with_capacity(usize::try_from(len - from).unwrap_or(0));
     f.take(max).read_to_end(&mut buf).ok()?;
     let start = if from > 0 {
-        buf.iter().position(|&b| b == b'\n').map_or(buf.len(), |i| i + 1)
+        buf.iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |i| i + 1)
     } else {
         0
     };

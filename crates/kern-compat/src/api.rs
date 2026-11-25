@@ -798,7 +798,7 @@ fn create_argv_gated(
         .ok_or("Image is required")?
         .to_string();
     let host = body.get("HostConfig");
-    for f in ["Devices", "CapAdd", "SecurityOpt", "VolumesFrom", "Links"] {
+    for f in ["Devices", "CapAdd", "SecurityOpt", "Links"] {
         refuse_if_set(host, f)?;
     }
     let mounts = translate_mounts(host)?;
@@ -940,6 +940,20 @@ fn create_argv_gated(
     for m in mounts {
         argv.push("--mount".into());
         argv.push(m);
+    }
+    // `VolumesFrom: ["<container>[:ro|:rw]"]`: kern's `--volumes-from`, which applies every check a
+    // mount of the box gets. A container ID is turned into its box name by the caller.
+    if let Some(list) = host
+        .and_then(|h| h.get("VolumesFrom"))
+        .and_then(Value::as_array)
+    {
+        for v in list {
+            let Some(v) = v.as_str().filter(|v| !v.is_empty()) else {
+                return Err("HostConfig.VolumesFrom: each entry is a container name".into());
+            };
+            argv.push("--volumes-from".into());
+            argv.push(v.to_string());
+        }
     }
     if let Some(m) = host
         .and_then(|h| h.get("Memory"))
@@ -5491,6 +5505,25 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 code == 0 && out.trim() == "true"
             };
             match create_argv_gated(&name, &body, gpu_allowed, privileged_allowed)
+                .map(|mut c| {
+                    // A `VolumesFrom` entry may be a container ID: the box's name for kern.
+                    let mut i = 0;
+                    while i + 1 < c.argv.len() {
+                        if c.argv[i] == "--volumes-from" {
+                            let v = c.argv[i + 1].clone();
+                            let (id, mode) = match v.rsplit_once(':') {
+                                Some((n, m @ ("ro" | "rw"))) => (n.to_string(), format!(":{m}")),
+                                _ => (v.clone(), String::new()),
+                            };
+                            if let Some(n) = resolve(bin, &id) {
+                                c.argv[i + 1] = format!("{n}{mode}");
+                            }
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    c
+                })
                 .map(|c| match &by_id {
                     Some((image, _)) => with_image_name(c, image),
                     None => c,
@@ -5849,6 +5882,22 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    /// `HostConfig.VolumesFrom` becomes `--volumes-from`, each entry as given (the handler turns an
+    /// ID into a name); it was refused outright before kern had the flag.
+    #[test]
+    fn volumes_from_becomes_the_flag() {
+        let body = json::parse(
+            r#"{"Image":"alpine","HostConfig":{"VolumesFrom":["data","logs:ro"]}}"#,
+        )
+        .expect("json");
+        let c = create_argv("web", &body).expect("accepted");
+        let pairs: Vec<&[String]> = c.argv.windows(2).filter(|w| w[0] == "--volumes-from").collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0][1], "data");
+        assert_eq!(pairs[1][1], "logs:ro");
+    }
+
     use super::*;
 
     fn body(s: &str) -> Value {

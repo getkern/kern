@@ -1506,7 +1506,110 @@ pub(crate) fn resolve_run_as(
     }
 }
 
+/// The file beside a kept box's record that holds its mounts for `--volumes-from`.
+const VOLUMES_FROM_FILE: &str = "mounts";
+
+/// A box's mounts as `--volumes-from` applies them again: each `-v` spec (a relative host path made
+/// absolute, so another directory's box gets the same source) and each anonymous volume of its
+/// image as `v<TAB>spec`, each `--mount` as `m<TAB>src<TAB>dst<TAB>0|1`; encoded for one line.
+fn mount_record_of(
+    volumes: &[String],
+    anon: &[String],
+    mounts: &[(String, String, bool)],
+) -> String {
+    let cwd = std::env::current_dir().ok();
+    let mut out: Vec<String> = Vec::new();
+    for v in volumes.iter().chain(anon) {
+        let spec = match (v.split_once(':'), &cwd) {
+            (Some((src, rest)), Some(cwd))
+                if !crate::volume::is_network(v)
+                    && crate::volume::classify(src) == crate::volume::SourceKind::Path
+                    && !src.starts_with('/') =>
+            {
+                format!("{}:{rest}", cwd.join(src).display())
+            }
+            _ => v.clone(),
+        };
+        out.push(format!("v\t{spec}"));
+    }
+    for (src, dst, ro) in mounts {
+        out.push(format!("m\t{src}\t{dst}\t{}", u8::from(*ro)));
+    }
+    registry::encode_labels(&out)
+}
+
+/// `--volumes-from BOX[:ro|:rw]`: the mounts of BOX (running, or kept and stopped), as Docker's
+/// `--volumes-from` takes a container's, `:ro` making every one read-only. Each still goes through
+/// every check a `-v` or `--mount` of this box would.
+/// Adds the mounts a [`mount_record_of`] record names to `volumes`/`mounts`; `ro` makes each read-only.
+fn decode_mount_record(
+    record: &str,
+    ro: bool,
+    volumes: &mut Vec<String>,
+    mounts: &mut Vec<(String, String, bool)>,
+) {
+    for item in registry::decode_labels(record.trim_end()) {
+        let parts: Vec<&str> = item.split('\t').collect();
+        match parts.as_slice() {
+            ["v", spec] => volumes.push(if ro {
+                let body = match spec.rsplit_once(':') {
+                    Some((b, "ro" | "rw")) => b,
+                    _ => spec,
+                };
+                format!("{body}:ro")
+            } else {
+                (*spec).to_string()
+            }),
+            ["m", src, dst, r] => {
+                mounts.push(((*src).to_string(), (*dst).to_string(), ro || *r == "1"))
+            }
+            _ => {}
+        }
+    }
+}
+
+fn resolve_volumes_from(
+    entries: &[String],
+) -> Result<(Vec<String>, Vec<(String, String, bool)>), Error> {
+    let mut volumes = Vec::new();
+    let mut mounts = Vec::new();
+    for e in entries {
+        let (name, ro) = match e.rsplit_once(':') {
+            Some((n, "ro")) => (n, true),
+            Some((n, "rw")) => (n, false),
+            _ => (e.as_str(), false),
+        };
+        let record = match registry::find_ref(name) {
+            Some(inst) => inst.mounts,
+            None => crate::keepbox::dir_of(name)
+                .filter(|d| crate::keepbox::read(d).is_some())
+                .map(|d| std::fs::read_to_string(d.join(VOLUMES_FROM_FILE)).unwrap_or_default())
+                .ok_or_else(|| {
+                    Error::Sandbox(format!(
+                        "--volumes-from {name}: no box of that name, running or kept (`kern ps -a`)"
+                    ))
+                })?,
+        };
+        decode_mount_record(&record, ro, &mut volumes, &mut mounts);
+    }
+    Ok((volumes, mounts))
+}
+
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
+    // `--volumes-from`: the other box's mounts join this box's own, before anything reads them.
+    let (from_v, from_m);
+    let args = if args.volumes_from.is_empty() {
+        args
+    } else {
+        let (v, m) = resolve_volumes_from(args.volumes_from)?;
+        from_v = [args.volumes, v.as_slice()].concat();
+        from_m = [args.mounts, m.as_slice()].concat();
+        BoxRunArgs {
+            volumes: &from_v,
+            mounts: &from_m,
+            ..args
+        }
+    };
     // The PARENT was not instrumented: `KERN_TIMING` covered only the child's setup, so the time
     // spent here was invisible and nobody could optimise it, because nobody could see it. The marks
     // below cost one `getenv` when the variable is unset.
@@ -3208,6 +3311,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // volume dir (which would disturb the sandbox's mount setup).
     // The anonymous volumes too, so `kern volume rm` leaves them alone while the box runs.
     let mounted_vols = mounted_named_volumes(&[args.volumes, anon_specs.as_slice()].concat());
+    // EVERY MOUNT, as flags another box can take with `--volumes-from` (Docker's): recorded with the
+    // box, and beside a kept box's record so a stopped one still answers.
+    let mount_record = mount_record_of(args.volumes, &anon_specs, args.mounts);
     if standalone_persistent && !systemd_supervises {
         // Fell through the systemd branch above because no `systemd --user` manager is reachable. The
         // box still runs and restarts on any exit (in-process, via `restart_always` above); it just does
@@ -3303,11 +3409,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let log_cap = crate::commands::boxlog::LogCap {
         streams: args.log_streams,
         journald: log_journald,
-        ..crate::commands::boxlog::LogCap::resolve(
-            args.log_max_size,
-            args.log_max_file,
-            !log_none,
-        )
+        ..crate::commands::boxlog::LogCap::resolve(args.log_max_size, args.log_max_file, !log_none)
     };
     // A CONFIG THAT CANNOT BE READ AND SAYS WHERE THE DATA GOES stops the box: see
     // `config::unread_data_place`.
@@ -3379,6 +3481,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 dir.display()
             ))
         })?;
+        // Beside the record, now that it exists (a first `--keep` run writes it just above): a
+        // stopped kept box still answers `--volumes-from`.
+        let _ = std::fs::write(dir.join(VOLUMES_FROM_FILE), &mount_record);
     }
     if args.detached {
         let egress_plan = EgressPlan::from_args(&args)?;
@@ -3389,6 +3494,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             scratch,
             ports,
             &mounted_vols,
+            &mount_record,
             &pod_label,
             restart,
             restart_always,
@@ -3459,6 +3565,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             starttime: registry::proc_starttime(pid),
             ports: ports_summary(ports),
             volumes: mounted_vols.clone(),
+            mounts: mount_record.clone(),
             pod: pod_label.clone(),
             workdir: spec.workdir.clone().unwrap_or_default(),
             run_as: spec.run_as,
@@ -5935,6 +6042,8 @@ fn run_detached(
     scratch: Option<PathBuf>,
     ports: &[kern_isolation::PortMap],
     volumes: &str,
+    // Every mount of the box, as `--volumes-from` reads it (see `mount_record_of`).
+    mounts: &str,
     pod: &str,
     restart: bool,
     // Docker `always`/`unless-stopped` on a pod member: in-process supervisor, restart on ANY exit
@@ -6080,6 +6189,7 @@ fn run_detached(
         starttime: registry::proc_starttime(pid),
         ports: ports_summary(ports),
         volumes: volumes.to_string(),
+        mounts: mounts.to_string(),
         pod: pod.to_string(),
         workdir: spec.workdir.clone().unwrap_or_default(),
         run_as: spec.run_as,
@@ -6821,6 +6931,45 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
             unsafe { libc::close(write_fd) };
             scope_reexec_proxy(child, read_fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod volumes_from_tests {
+    use super::{decode_mount_record, mount_record_of};
+
+    fn decoded(record: &str, ro: bool) -> (Vec<String>, Vec<(String, String, bool)>) {
+        let (mut v, mut m) = (Vec::new(), Vec::new());
+        decode_mount_record(record, ro, &mut v, &mut m);
+        (v, m)
+    }
+
+    #[test]
+    fn a_record_gives_back_the_mounts_it_was_made_from() {
+        let vols = vec!["data:/data".to_string(), "/srv/x:/x:ro".to_string()];
+        let anon = vec!["/cache".to_string()];
+        let mounts = vec![("/etc/hosts".to_string(), "/h".to_string(), true)];
+        let rec = mount_record_of(&vols, &anon, &mounts);
+        let (v, m) = decoded(&rec, false);
+        assert!(v.contains(&"data:/data".to_string()), "{v:?}");
+        assert!(v.contains(&"/srv/x:/x:ro".to_string()), "{v:?}");
+        assert_eq!(m, mounts);
+    }
+
+    #[test]
+    fn ro_makes_every_mount_read_only() {
+        let vols = vec!["data:/data:rw".to_string(), "logs:/logs".to_string()];
+        let mounts = vec![("/srv/a".to_string(), "/a".to_string(), false)];
+        let (v, m) = decoded(&mount_record_of(&vols, &[], &mounts), true);
+        assert!(v.iter().all(|s| s.ends_with(":ro")), "{v:?}");
+        assert!(v.contains(&"data:/data:ro".to_string()), "{v:?}");
+        assert!(m.iter().all(|x| x.2), "{m:?}");
+    }
+
+    #[test]
+    fn an_empty_or_foreign_record_adds_nothing() {
+        assert_eq!(decoded("", true), (vec![], vec![]));
+        assert_eq!(decoded("garbage", false), (vec![], vec![]));
     }
 }
 
