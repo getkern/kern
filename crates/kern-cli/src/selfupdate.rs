@@ -306,10 +306,45 @@ fn current_version() -> Result<Version, Error> {
         Some(v) if v != Version(0, 0, 0) => Ok(v),
         _ => Err(Error::SelfUpdate(format!(
             "this kern ({}) was built from source, not cut from a release, so there is no release \
-             version to compare: rebuild it, or install a release with `curl -fsSL \
-             https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh`",
-            kern_common::VERSION
+             version to compare: rebuild it, or install a release with {}",
+            kern_common::VERSION,
+            release_installer(std::path::Path::new(crate::wslentry::MARKER).exists())
         ))),
+    }
+}
+
+/// The command that installs a release HERE. In kern's WSL distro (the one `install.ps1` made, which
+/// writes [`crate::wslentry::MARKER`]) that is the Windows installer, run in PowerShell: MEASURED on
+/// Windows 10, `kern.exe self-update --check` on a source build told a Windows user to pipe
+/// `install.sh` into `sh`, which installs a second kern inside the distro beside the one `kern.exe`
+/// manages. The same lines as README.md and docs/INSTALL.md.
+fn release_installer(in_kerns_wsl_distro: bool) -> &'static str {
+    if in_kerns_wsl_distro {
+        "`irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex` in PowerShell on \
+         Windows"
+    } else {
+        "`curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh`"
+    }
+}
+
+#[cfg(test)]
+mod installer_hint_tests {
+    /// kern's WSL distro is told the Windows installer, every other host the shell one, and both
+    /// are the lines the install docs give.
+    #[test]
+    fn the_release_installer_named_is_the_one_for_this_host() {
+        let wsl = super::release_installer(true);
+        let other = super::release_installer(false);
+        assert!(
+            wsl.contains("install.ps1 | iex") && wsl.contains("PowerShell"),
+            "{wsl}"
+        );
+        assert!(
+            other.contains("install.sh | sh") && !other.contains("ps1"),
+            "{other}"
+        );
+        assert_eq!(wsl.matches('`').count(), 2, "{wsl}");
+        assert_eq!(other.matches('`').count(), 2, "{other}");
     }
 }
 
