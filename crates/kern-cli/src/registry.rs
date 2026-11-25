@@ -1017,7 +1017,11 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance) {
     // runs of `kern run -d --name l19 ...` left three `l19` rows in `ps -a` (0.56.0 the same), where
     // Docker has one container per name. Done here, at the exit, and not at the start, which is
     // the path a box's latency is measured on.
-    for old in clear_exited_named(&b.name) {
+    // NOT THIS RUN'S OWN RECORD: `kern stop` writes it first (it may SIGKILL the supervisor), and a
+    // box that then ends by itself has its supervisor write it again. MEASURED: a box ending 0 on
+    // its SIGTERM lost its log at `kern stop` ("no logs for box"), the second write taking the first
+    // for an older run of the name.
+    for old in clear_exited_named(&b.name, Some((pid, starttime))) {
         crate::commands::boxlog::remove_run_logs(&format!("{}-{old}", b.name));
     }
     if let Ok(d) = waitexit_dir() {
@@ -1063,8 +1067,8 @@ fn registered_pairs(boxes: &[Instance]) -> std::collections::HashSet<(i32, u64)>
 /// Remove every exit record (`waitexit`) of a box named `name` whose process is gone, and return
 /// the pids of those runs: what `kern rm` does to an exited box, as `docker rm` removes an exited
 /// container from `docker ps -a`; the caller removes those runs' logs with them. A record of a live
-/// process is left alone.
-pub fn clear_exited_named(name: &str) -> Vec<i32> {
+/// process is left alone, and so is the run `keep` (`(pid, starttime)`), when given.
+pub fn clear_exited_named(name: &str, keep: Option<(i32, u64)>) -> Vec<i32> {
     let Ok(d) = waitexit_dir() else {
         return Vec::new();
     };
@@ -1077,7 +1081,7 @@ pub fn clear_exited_named(name: &str) -> Vec<i32> {
         let Some((pid, starttime)) = waitexit_split(&e.file_name()) else {
             continue;
         };
-        if registered.contains(&(pid, starttime)) {
+        if registered.contains(&(pid, starttime)) || keep == Some((pid, starttime)) {
             continue;
         }
         let named = fs::read_to_string(e.path())

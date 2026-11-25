@@ -3643,7 +3643,7 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
         // ITS LOGS GO WITH IT, as `docker rm` removes a container's log: they stayed in the
         // runtime dir until the hour-long expiry, and kern's Docker API removes a `docker run --rm`
         // box this way once it has read the box's output.
-        let records = registry::clear_exited_named(name);
+        let records = registry::clear_exited_named(name, None);
         for pid in &records {
             crate::commands::boxlog::remove_run_logs(&format!("{name}-{pid}"));
         }
