@@ -6006,9 +6006,7 @@ fn apply_userns_range(
         // aborting the box - mirroring how an *absent* helper already degrades gracefully. (If a
         // partial map already populated uid_map, the self-map write fails and that unrecoverable
         // half-mapped state is surfaced as the error.)
-        eprintln!(
-            "kern: --uid-range mapping via newuidmap/newgidmap failed (helper present but not usable here) - using single-uid map"
-        );
+        eprintln!("{RANGE_HELPERS_FAILED}");
         // No range, so no idmapped bind can describe this box: release any that arrived.
         for (_, _, fd) in prepared {
             unsafe { libc::close(fd) };
@@ -6016,6 +6014,421 @@ fn apply_userns_range(
         return write_single_uid_map(euid, egid).map(|()| Vec::new());
     }
     Ok(prepared)
+}
+
+/// What a box says when `newuidmap`/`newgidmap` exist but would not map it: one sentence, written
+/// once, so the early path and the in-place path cannot drift into two wordings of one fact.
+const RANGE_HELPERS_FAILED: &str = "kern: --uid-range mapping via newuidmap/newgidmap failed \
+     (helper present but not usable here) - using single-uid map";
+
+// THE ID MAP, STARTED BEFORE IT IS NEEDED.
+//
+// THE COST. On the default `--image` path the two setuid helpers are the largest single item of a
+// box start: `parent:idmap` 928 us of 4036 measured on 2026-11-20 (load 0.83), against 680 us for
+// one `newuidmap` alone and 792 us for the two run side by side. The helpers already overlap each
+// other; what they did not overlap was ANYTHING ELSE, because they map a process that has already
+// unshared, and an unshared, still-unmapped process cannot touch the filesystem.
+//
+// THE SHAPE. The two attempts recorded above `apply_userns_range` bound the idea: the carrier works,
+// and it only pays when the window it hides in is wider than the chain it hides. Both started inside
+// this function, where the window is ~226 us. This one starts in the CLI, right after the scope
+// re-exec decision, so the window is the claim, the image resolution, the volume and port setup and
+// the cgroup (about 600 us), and kern itself pays one `fork`:
+//
+//   kern ──fork──> helper ──fork──> carrier: unshare(CLONE_NEWUSER), says so, waits
+//                  helper: opens /proc/<carrier>/ns/user, runs newuidmap + newgidmap at the carrier,
+//                          releases it, sends kern the namespace FD (SCM_RIGHTS) and exits
+//   kern (later, in `run_in_sandbox_with`): setns(fd), checks the map, unshares the rest
+//
+// An fd and not a pid, so nothing can be reused under kern: the namespace lives exactly as long as
+// someone holds the descriptor, and the carrier can be gone by the time kern joins.
+//
+// ⛔ THE JOINED MAP IS READ BACK, NOT TRUSTED. After the `setns` kern reads its own `uid_map` and
+// `gid_map` and refuses the box unless they are exactly `0 <euid> 1` + `1 <sub> <count>` (and the
+// same for gids): whatever happened in the helper, the box runs on the map the host's `/etc/subuid`
+// describes or not at all. That check is fail-CLOSED because after a `setns` there is no way back.
+//
+// ⛔ NO WAY AROUND A HOST POLICY. A restriction that strips the creator of its capabilities
+// (Ubuntu's `apparmor_restrict_unprivileged_userns`) would not reach kern through a `setns`, so the
+// carrier proves it holds them before the namespace is offered; see `early_userns_helper`.
+//
+// NO NEW EXPOSURE. Between its `unshare` and kern's `setns` the namespace is reachable through the
+// carrier's `/proc/<pid>/ns/user`, which needs the same uid; on the in-place path it is reachable for
+// the same span through kern's own. Either way it is the caller's uid, which already owns every box
+// it starts.
+//
+// EVERY FAILURE FALLS BACK TO THE PATH THAT EXISTED BEFORE: no helper started (multi-threaded,
+// no range, real root), a helper that died, a namespace the kernel refused, a `setns` that failed
+// before changing anything. Only "the helpers ran and refused to map" is answered here, the same way
+// the in-place path answers it: the single-uid map and the same sentence.
+
+/// The early helper's pid and kern's end of its socket, or -1 when nothing is prepared. Two atomics
+/// rather than a lock: taking the preparation is one `swap`, so it can happen exactly once per
+/// process however the code above it is arranged.
+static EARLY_USERNS_SOCK: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static EARLY_USERNS_HELPER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// A helper whose namespace was taken but which had not exited yet: reaped after the box's fork,
+/// where waiting costs the box nothing, instead of on the path to it.
+static EARLY_USERNS_REAP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// The verdicts the helper sends, as the index of the one message on its socket.
+const EARLY_MAPPED: u32 = 1;
+const EARLY_HELPERS_FAILED: u32 = 0;
+
+/// Start building this box's ranged user namespace NOW, in a helper, so the setuid `newuidmap` and
+/// `newgidmap` run while the caller resolves the image, claims the name and builds the cgroup.
+/// `run_in_sandbox_with` takes the result; when it finds none it maps in place as it always did.
+///
+/// Returns whether a helper was started. Call it once the caller knows the box will ask for a range
+/// (`SandboxSpec::uid_range` on, no pod) and AFTER any re-exec of the calling process: an `execve`
+/// closes the socket and the work is lost (harmlessly: the helper's send fails and it exits).
+///
+/// Not started, and `false`: a multi-threaded caller (the helper runs Rust after a `fork`), real
+/// root (whose idmapped binds are made by the in-place helper, see `prepare_idmapped_binds`), no
+/// usable range on this host, or a `fork`/`socketpair` failure.
+pub fn prepare_id_mapped_userns_early() -> bool {
+    use std::sync::atomic::Ordering;
+    if EARLY_USERNS_SOCK.load(Ordering::Acquire) >= 0 {
+        return true;
+    }
+    if is_initial_root() {
+        return false;
+    }
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let Some(range) = detect_id_range(euid, egid) else {
+        return false;
+    };
+    if !single_threaded() {
+        return false;
+    }
+    let mut sv = [-1 as libc::c_int; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return false;
+    }
+    let kern = unsafe { libc::getpid() };
+    let helper = unsafe { libc::fork() };
+    if helper < 0 {
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+        return false;
+    }
+    if helper == 0 {
+        unsafe { libc::close(sv[0]) };
+        early_userns_helper(sv[1], kern, &range, euid, egid);
+    }
+    unsafe { libc::close(sv[1]) };
+    EARLY_USERNS_HELPER.store(helper, Ordering::Release);
+    EARLY_USERNS_SOCK.store(sv[0], Ordering::Release);
+    true
+}
+
+/// `read` one byte, retrying on EINTR. `true` only for exactly that byte.
+fn read_byte_is(fd: libc::c_int, want: u8) -> bool {
+    let mut b = [0u8; 1];
+    loop {
+        let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return n == 1 && b[0] == want;
+    }
+}
+
+/// Reap `pid`, retrying on EINTR, when its status is of no interest.
+fn reap_blocking(pid: libc::pid_t) {
+    let mut status = 0;
+    let _ = reap_retry_eintr(pid, &mut status);
+}
+
+/// The helper process. Never returns. Sends at most one message on `sock`: `EARLY_MAPPED` with the
+/// mapped namespace's fd, `EARLY_HELPERS_FAILED` with the unmapped one's, or nothing when no
+/// namespace could be made (kern then reads EOF and maps in place, where the error is reported).
+fn early_userns_helper(
+    sock: libc::c_int,
+    kern: libc::pid_t,
+    range: &IdRange,
+    euid: u32,
+    egid: u32,
+) -> ! {
+    // Dies with kern: a kern killed before it joins must not leave a helper, or through the helper's
+    // own death signal a carrier, holding a namespace nobody will use.
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+        if libc::getppid() != kern {
+            libc::_exit(0);
+        }
+    }
+    // Keep stdio (the helpers' own error messages reach the caller's terminal, as on the in-place
+    // path) and the socket; drop every other descriptor kern held, so a lock or a pipe end of
+    // kern's is not kept alive by this process. `close_range` is Linux 5.9+; without it the copies
+    // close when this process exits a moment later, which is all the cost there is.
+    unsafe {
+        if sock > 3 {
+            libc::syscall(libc::SYS_close_range, 3u32, (sock - 1) as u32, 0u32);
+        }
+        libc::syscall(libc::SYS_close_range, (sock + 1) as u32, u32::MAX, 0u32);
+    }
+    let mut ready = [-1 as libc::c_int; 2];
+    let mut release = [-1 as libc::c_int; 2];
+    if unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) } != 0
+        || unsafe { libc::pipe2(release.as_mut_ptr(), libc::O_CLOEXEC) } != 0
+    {
+        unsafe { libc::_exit(0) };
+    }
+    let me = unsafe { libc::getpid() };
+    let carrier = unsafe { libc::fork() };
+    if carrier == 0 {
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            );
+            if libc::getppid() != me {
+                libc::_exit(0);
+            }
+            libc::close(sock);
+            libc::close(ready[0]);
+            libc::close(release[1]);
+            // ⛔ MADE *AND USABLE*. Ubuntu's `apparmor_restrict_unprivileged_userns=1` lets an
+            // unconfined task create the namespace and then strips the CREATOR of every capability
+            // in it; kern, joining by `setns`, would get them anyway and start a box the host's
+            // policy refuses. MEASURED on Ubuntu 24.04 with the restriction on and kern outside its
+            // profile: the in-place path refused (exit 125), this one started the box. So the
+            // carrier, which carries kern's own label, exercises a capability in its new namespace
+            // (`CLONE_NEWUTS` needs CAP_SYS_ADMIN there) and reports failure when it is denied; kern
+            // then maps in place and refuses in the words it always used. Any LSM that limits the
+            // creator is caught the same way, because this checks the fact and not the policy.
+            let made =
+                libc::unshare(libc::CLONE_NEWUSER) == 0 && libc::unshare(libc::CLONE_NEWUTS) == 0;
+            let say: &[u8] = if made { b"1" } else { b"0" };
+            libc::write(ready[1], say.as_ptr() as *const libc::c_void, 1);
+            // Held until the helper has mapped it and opened it; EOF (the helper gone) releases too.
+            let _ = read_byte_is(release[0], b'x');
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(release[0]);
+    }
+    if carrier < 0 {
+        unsafe { libc::_exit(0) };
+    }
+    let unshared = read_byte_is(ready[0], b'1');
+    let ns = if unshared {
+        match CString::new(format!("/proc/{carrier}/ns/user")) {
+            Ok(path) => unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) },
+            Err(_) => -1,
+        }
+    } else {
+        -1
+    };
+    let mapped = ns >= 0 && run_both_idmaps(range, carrier, euid, egid);
+    // Release the carrier BEFORE telling kern, so its exit overlaps kern's `setns` instead of
+    // following it; the namespace stays alive through `ns`.
+    unsafe { libc::close(release[1]) };
+    if ns >= 0 {
+        let verdict = if mapped {
+            EARLY_MAPPED
+        } else {
+            EARLY_HELPERS_FAILED
+        };
+        let _ = send_indexed_fd(sock, verdict, ns);
+    }
+    reap_blocking(carrier);
+    unsafe { libc::_exit(0) }
+}
+
+/// What the early helper left for this box.
+enum EarlyUserns {
+    /// The namespace, mapped with the range: join it.
+    Mapped(libc::c_int),
+    /// The helpers ran and refused: the single-uid map, as on the in-place path.
+    HelpersFailed,
+}
+
+/// Take the early preparation, if this process holds one, waiting for the helper's verdict. `None`
+/// when there is none or the helper sent nothing; the caller then maps in place.
+///
+/// The socket is shared with any process forked from this one after the preparation, and its one
+/// message can be read once: whoever reads it first gets the namespace and every other reader EOF,
+/// so a forked supervisor and its parent cannot both join it.
+fn take_early_userns() -> Option<EarlyUserns> {
+    use std::sync::atomic::Ordering;
+    let sock = EARLY_USERNS_SOCK.swap(-1, Ordering::AcqRel);
+    if sock < 0 {
+        return None;
+    }
+    let helper = EARLY_USERNS_HELPER.swap(-1, Ordering::AcqRel);
+    let got = recv_indexed_fd(sock);
+    unsafe { libc::close(sock) };
+    if helper > 0 {
+        let r = unsafe { libc::waitpid(helper, ptr::null_mut(), libc::WNOHANG) };
+        if r == 0 {
+            EARLY_USERNS_REAP.store(helper, Ordering::Release);
+        }
+    }
+    match got {
+        Some((EARLY_MAPPED, fd)) => Some(EarlyUserns::Mapped(fd)),
+        Some((_, fd)) => {
+            unsafe { libc::close(fd) };
+            Some(EarlyUserns::HelpersFailed)
+        }
+        None => None,
+    }
+}
+
+/// Reap a helper `take_early_userns` left running. Called after the box's fork, where the wait (the
+/// helper is already past its last message) overlaps the box's own setup.
+fn reap_early_userns_helper() {
+    use std::sync::atomic::Ordering;
+    let pid = EARLY_USERNS_REAP.swap(-1, Ordering::AcqRel);
+    if pid > 0 {
+        reap_blocking(pid);
+    }
+}
+
+/// A preparation this box did not use (a pod member, no range after all, real root's idmapped
+/// binds): release it and reap its helper, so it is neither a zombie for the box's lifetime nor a
+/// namespace held for nothing.
+fn discard_early_userns() {
+    use std::sync::atomic::Ordering;
+    let sock = EARLY_USERNS_SOCK.swap(-1, Ordering::AcqRel);
+    if sock < 0 {
+        return;
+    }
+    unsafe { libc::close(sock) };
+    let helper = EARLY_USERNS_HELPER.swap(-1, Ordering::AcqRel);
+    if helper > 0 {
+        reap_blocking(helper);
+    }
+}
+
+/// Stop an early preparation NOW, for a process about to `execve` into something else (the scope
+/// re-exec): its helper is killed rather than waited for, because the new image starts its own and
+/// would otherwise wait the whole helper chain here first. The carrier dies with the helper (its
+/// `PR_SET_PDEATHSIG`); a setuid map helper already running finishes against a namespace nobody
+/// holds and is reaped by whoever inherits it.
+pub fn abandon_id_mapped_userns_early() {
+    use std::sync::atomic::Ordering;
+    let sock = EARLY_USERNS_SOCK.swap(-1, Ordering::AcqRel);
+    if sock < 0 {
+        return;
+    }
+    unsafe { libc::close(sock) };
+    let helper = EARLY_USERNS_HELPER.swap(-1, Ordering::AcqRel);
+    if helper > 0 {
+        unsafe { libc::kill(helper, libc::SIGKILL) };
+        reap_blocking(helper);
+    }
+}
+
+/// The rows of a `/proc/self/{uid,gid}_map`, sorted, or `None` when it cannot be read or parsed.
+fn read_id_map(path: &str) -> Option<Vec<(u64, u64, u64)>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let mut f = line.split_whitespace().map(str::parse::<u64>);
+        match (f.next(), f.next(), f.next(), f.next()) {
+            (Some(Ok(a)), Some(Ok(b)), Some(Ok(c)), None) => rows.push((a, b, c)),
+            _ => return None,
+        }
+    }
+    rows.sort_unstable();
+    Some(rows)
+}
+
+/// The map a ranged box must carry: box id 0 → the caller, box ids 1.. → the subordinate range.
+fn expected_id_map(own: u32, sub: u32, count: u32) -> Vec<(u64, u64, u64)> {
+    let mut rows = vec![
+        (0, u64::from(own), 1),
+        (1, u64::from(sub), u64::from(count)),
+    ];
+    rows.sort_unstable();
+    rows
+}
+
+/// Is the user namespace this process is now in mapped exactly as `range` says? Read from the
+/// kernel, after the join, so the answer is about the namespace and not about the helper's report.
+fn joined_map_is(range: &IdRange, euid: u32, egid: u32) -> bool {
+    read_id_map("/proc/self/uid_map") == Some(expected_id_map(euid, range.sub_uid, range.uid_count))
+        && read_id_map("/proc/self/gid_map")
+            == Some(expected_id_map(egid, range.sub_gid, range.gid_count))
+}
+
+/// `unshare(flags)`, with the two errors the box path tells apart: EPERM is "no user namespaces
+/// here", anything else is the syscall failing.
+fn unshare_namespaces(flags: libc::c_int) -> Result<(), Error> {
+    if flags == 0 || unsafe { libc::unshare(flags) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EPERM) {
+        return Err(Error::Unsupported(USERNS_UNAVAILABLE));
+    }
+    Err(Error::Syscall("unshare(namespaces)", e))
+}
+
+/// The ranged map through the early preparation, when there is one. `Ok(true)`: this process is in
+/// a mapped namespace with `ns_flags` unshared. `Ok(false)`: nothing usable was prepared and nothing
+/// has changed, so the caller maps in place.
+fn join_early_userns(
+    ns_flags: libc::c_int,
+    euid: u32,
+    egid: u32,
+    range: &IdRange,
+    pt: &mut PhaseTimer,
+) -> Result<bool, Error> {
+    match take_early_userns() {
+        None => Ok(false),
+        Some(EarlyUserns::HelpersFailed) => {
+            unshare_namespaces(ns_flags)?;
+            pt.mark("parent:unshare(ns)");
+            eprintln!("{RANGE_HELPERS_FAILED}");
+            write_single_uid_map(euid, egid)?;
+            pt.mark("parent:idmap");
+            Ok(true)
+        }
+        Some(EarlyUserns::Mapped(fd)) => {
+            let joined = unsafe { libc::setns(fd, libc::CLONE_NEWUSER) };
+            unsafe { libc::close(fd) };
+            if joined != 0 {
+                // Refused before anything changed (a thread appeared, a kernel that will not): the
+                // in-place path is still open and still correct.
+                return Ok(false);
+            }
+            if !joined_map_is(range, euid, egid) {
+                return Err(Error::Spec(
+                    "the prepared user namespace does not carry the id map /etc/subuid and \
+                     /etc/subgid describe; refusing to start the box on it"
+                        .to_string(),
+                ));
+            }
+            pt.mark("parent:idmap");
+            unshare_namespaces(ns_flags & !libc::CLONE_NEWUSER)?;
+            pt.mark("parent:unshare(ns)");
+            Ok(true)
+        }
+    }
 }
 
 /// Is a subordinate id RANGE usable on this host (a `newuidmap`/`newgidmap` pair plus an
@@ -6958,21 +7371,27 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
                 // inner `parent:unshare(ns)` is emitted by `apply_userns_range` itself, so the
                 // difference between the two arms is exactly the id map and nothing else.
                 let idmap = (!spec.idmap_binds.is_empty() && is_initial_root()).then_some(spec);
-                let prepared =
-                    apply_userns_range(ns_flags, euid, egid, &range, Some(&mut pt_spawn), idmap)?;
-                if !prepared.is_empty() {
-                    let _ = IDMAPPED_BINDS.set(prepared);
+                // The map started early by the CLI (`prepare_id_mapped_userns_early`) when there is
+                // one; real root's idmapped binds need the in-place helper, which makes them.
+                let joined = idmap.is_none()
+                    && join_early_userns(ns_flags, euid, egid, &range, &mut pt_spawn)?;
+                if !joined {
+                    let prepared = apply_userns_range(
+                        ns_flags,
+                        euid,
+                        egid,
+                        &range,
+                        Some(&mut pt_spawn),
+                        idmap,
+                    )?;
+                    if !prepared.is_empty() {
+                        let _ = IDMAPPED_BINDS.set(prepared);
+                    }
+                    pt_spawn.mark("parent:idmap");
                 }
-                pt_spawn.mark("parent:idmap");
             }
             None => {
-                if unsafe { libc::unshare(ns_flags) } != 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.raw_os_error() == Some(libc::EPERM) {
-                        return Err(Error::Unsupported(USERNS_UNAVAILABLE));
-                    }
-                    return Err(Error::Syscall("unshare(namespaces)", e));
-                }
+                unshare_namespaces(ns_flags)?;
                 pt_spawn.mark("parent:unshare(ns)");
                 write_single_uid_map(euid, egid)?;
                 pt_spawn.mark("parent:idmap");
@@ -6987,6 +7406,9 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     // mapping is the holder's, so an euid-only proxy could relax a box whose root maps to host root;
     // reading the actual map closes that. Fails CLOSED on anything it can't confirm. (The CLI also
     // refuses `--privileged` as real root up front; this is the authoritative, property-based gate.)
+    // A preparation the branch above did not take (a pod member, a range this host could not build,
+    // real root's idmapped binds) is released here, before the fork, so no box inherits it.
+    discard_early_userns();
     let allow_nesting = spec.privileged && box_root_is_unprivileged();
 
     // THE WORKLOAD'S CGROUP IS DECIDED BEFORE THE FORK, because that is the only place it can be used
@@ -7139,6 +7561,9 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
         pid,
         box_own_ip(spec).map_or(u32::from(std::net::Ipv4Addr::LOCALHOST), u32::from),
     );
+    // The early id-map helper, if it was still exiting when its namespace was taken: reaped now,
+    // while the box sets itself up, rather than on the path to the fork.
+    reap_early_userns_helper();
     // `-it`: hand the terminal to the box. Drop our copy of the slave so the master sees EOF when
     // the box exits, then pump host stdio <-> master until then. Single-threaded by design - the
     // fork above must run in a single-threaded process (the child does non-async-signal-safe setup),
@@ -13041,5 +13466,308 @@ mod mount_order_tests {
                 "/tmpx".to_string()
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod early_userns_tests {
+    use super::*;
+
+    /// The exit code a forked case uses for "this host cannot make the precondition".
+    const SKIP: i32 = 99;
+
+    /// Run `case` in a FORKED child and return its exit code. Every case here changes the calling
+    /// process (a user namespace, the early-preparation statics, its children), and cargo's harness
+    /// is multi-threaded, so none of it may happen in-process.
+    fn in_child(case: fn() -> i32) -> i32 {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let rc = case();
+            unsafe { libc::_exit(rc) };
+        }
+        let mut st = 0i32;
+        assert_eq!(reap_retry_eintr(pid, &mut st), pid, "waitpid");
+        assert!(libc::WIFEXITED(st), "the case died: status {st}");
+        libc::WEXITSTATUS(st)
+    }
+
+    /// The inode of the user namespace this process is in.
+    fn userns_inode() -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self/ns/user").map_or(0, |m| m.ino())
+    }
+
+    /// No child of this process is left, running or zombie.
+    fn no_children_left() -> bool {
+        let r = unsafe { libc::waitpid(-1, ptr::null_mut(), libc::WNOHANG) };
+        r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    }
+
+    /// Put a socket in the early-preparation statics, as `prepare_id_mapped_userns_early` would,
+    /// and return the sending end. `-1` when no socket could be made.
+    fn plant_socket() -> libc::c_int {
+        let mut sp = [-1 as libc::c_int; 2];
+        let made = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                sp.as_mut_ptr(),
+            )
+        };
+        if made != 0 {
+            return -1;
+        }
+        EARLY_USERNS_SOCK.store(sp[0], std::sync::atomic::Ordering::Release);
+        sp[1]
+    }
+
+    /// A range description that does not depend on the host: only the four numbers are read.
+    fn fake_range() -> IdRange {
+        IdRange {
+            newuidmap: std::path::PathBuf::new(),
+            newgidmap: std::path::PathBuf::new(),
+            sub_uid: 100_000,
+            uid_count: 65_536,
+            sub_gid: 100_000,
+            gid_count: 65_536,
+        }
+    }
+
+    #[test]
+    fn a_kernel_id_map_parses_as_sorted_rows_and_garbage_is_refused() {
+        let dir = std::env::temp_dir().join(format!("kern-idmap-{}", std::process::id()));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let good = dir.join("good");
+        let bad = dir.join("bad");
+        assert!(std::fs::write(
+            &good,
+            "         1     100000      65536\n         0       1000          1\n"
+        )
+        .is_ok());
+        assert!(std::fs::write(&bad, "0 1000\n").is_ok());
+        let rows = read_id_map(&good.to_string_lossy());
+        assert_eq!(rows, Some(vec![(0, 1000, 1), (1, 100_000, 65_536)]));
+        assert_eq!(rows, Some(expected_id_map(1000, 100_000, 65_536)));
+        assert_ne!(rows, Some(expected_id_map(1000, 100_000, 65_535)));
+        assert_eq!(read_id_map(&bad.to_string_lossy()), None);
+        assert_eq!(read_id_map("/nonexistent/kern/uid_map"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole path, against the host's real helpers: prepared, joined, the map read back equal
+    /// to `/etc/subuid`, and nothing left behind, not even a zombie.
+    #[test]
+    fn an_early_namespace_is_joined_with_the_hosts_range_and_leaves_no_process() {
+        let code = in_child(|| {
+            if !id_range_available() || is_initial_root() {
+                return SKIP;
+            }
+            let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            let Some(range) = detect_id_range(euid, egid) else {
+                return SKIP;
+            };
+            let before = userns_inode();
+            if !prepare_id_mapped_userns_early() {
+                return 10;
+            }
+            let mut pt = PhaseTimer::new();
+            match join_early_userns(libc::CLONE_NEWUSER, euid, egid, &range, &mut pt) {
+                Ok(true) => {}
+                Ok(false) => return SKIP, // helpers absent or refused before mapping: no range here
+                Err(_) => return 11,
+            }
+            if userns_inode() == before {
+                return 12;
+            }
+            if !joined_map_is(&range, euid, egid) {
+                return 13;
+            }
+            reap_early_userns_helper();
+            if !no_children_left() {
+                return 14;
+            }
+            0
+        });
+        if code == SKIP {
+            eprintln!(
+                "skipped: no usable subordinate id range (newuidmap/newgidmap + /etc/subuid)"
+            );
+            return;
+        }
+        assert_eq!(code, 0, "early user namespace failed at step {code}");
+    }
+
+    /// A helper that died without a word leaves the process exactly where it was, so the in-place
+    /// path can still run.
+    #[test]
+    fn a_helper_that_sent_nothing_changes_nothing() {
+        let code = in_child(|| {
+            let tx = plant_socket();
+            if tx < 0 {
+                return 10;
+            }
+            unsafe { libc::close(tx) };
+            let before = userns_inode();
+            let mut pt = PhaseTimer::new();
+            let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            match join_early_userns(libc::CLONE_NEWUSER, euid, egid, &fake_range(), &mut pt) {
+                Ok(false) => {}
+                _ => return 11,
+            }
+            if userns_inode() != before {
+                return 12;
+            }
+            if EARLY_USERNS_SOCK.load(std::sync::atomic::Ordering::Acquire) >= 0 {
+                return 13; // taken once means gone
+            }
+            0
+        });
+        assert_eq!(code, 0, "a silent helper was not a no-op (step {code})");
+    }
+
+    /// Helpers that ran and refused give the box the single-uid map, as the in-place path does.
+    #[test]
+    fn helpers_that_refused_give_the_single_uid_map() {
+        let code = in_child(|| {
+            let tx = plant_socket();
+            if tx < 0 {
+                return 10;
+            }
+            let mut pipe = [-1 as libc::c_int; 2];
+            if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+                return 10;
+            }
+            if !send_indexed_fd(tx, EARLY_HELPERS_FAILED, pipe[0]) {
+                return 10;
+            }
+            unsafe { libc::close(tx) };
+            let mut pt = PhaseTimer::new();
+            let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            match join_early_userns(libc::CLONE_NEWUSER, euid, egid, &fake_range(), &mut pt) {
+                Ok(true) => {}
+                Err(Error::Unsupported(_)) => return SKIP,
+                _ => return 11,
+            }
+            let single = vec![(0, u64::from(euid), 1)];
+            if read_id_map("/proc/self/uid_map") != Some(single) {
+                return 12;
+            }
+            0
+        });
+        if code == SKIP {
+            eprintln!("skipped: no unprivileged user namespace on this host");
+            return;
+        }
+        assert_eq!(
+            code, 0,
+            "refused helpers did not degrade to the single map (step {code})"
+        );
+    }
+
+    /// ⛔ THE FAIL-CLOSED CHECK: a namespace whose map is not the range is refused AFTER the join,
+    /// whatever the helper claimed. Here the "mapped" namespace carries a single-uid map.
+    #[test]
+    fn a_namespace_with_another_map_is_refused_after_the_join() {
+        let code = in_child(|| {
+            let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            let mut ready = [-1 as libc::c_int; 2];
+            let mut hold = [-1 as libc::c_int; 2];
+            if unsafe { libc::pipe(ready.as_mut_ptr()) } != 0
+                || unsafe { libc::pipe(hold.as_mut_ptr()) } != 0
+            {
+                return 10;
+            }
+            let other = unsafe { libc::fork() };
+            if other < 0 {
+                return 10;
+            }
+            if other == 0 {
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::close(hold[1]);
+                }
+                let ok = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0
+                    && write_single_uid_map(euid, egid).is_ok();
+                let say: &[u8] = if ok { b"1" } else { b"0" };
+                unsafe { libc::write(ready[1], say.as_ptr().cast(), 1) };
+                let _ = read_byte_is(hold[0], b'x');
+                unsafe { libc::_exit(0) };
+            }
+            unsafe {
+                libc::close(ready[1]);
+                libc::close(hold[0]);
+            }
+            if !read_byte_is(ready[0], b'1') {
+                unsafe { libc::close(hold[1]) };
+                reap_blocking(other);
+                return SKIP;
+            }
+            let ns = match CString::new(format!("/proc/{other}/ns/user")) {
+                Ok(p) => unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) },
+                Err(_) => -1,
+            };
+            unsafe { libc::close(hold[1]) };
+            reap_blocking(other);
+            if ns < 0 {
+                return 11;
+            }
+            let tx = plant_socket();
+            if tx < 0 || !send_indexed_fd(tx, EARLY_MAPPED, ns) {
+                return 12;
+            }
+            unsafe {
+                libc::close(tx);
+                libc::close(ns);
+            }
+            let mut pt = PhaseTimer::new();
+            match join_early_userns(libc::CLONE_NEWUSER, euid, egid, &fake_range(), &mut pt) {
+                Err(Error::Spec(_)) => 0,
+                Ok(_) => 13,
+                Err(_) => 14,
+            }
+        });
+        if code == SKIP {
+            eprintln!("skipped: no unprivileged user namespace on this host");
+            return;
+        }
+        assert_eq!(
+            code, 0,
+            "a wrongly mapped namespace was not refused (step {code})"
+        );
+    }
+
+    /// Prepare, release with `release`, and check that nothing is prepared and no child is left.
+    fn released_leaves_nothing(release: fn()) -> i32 {
+        if !id_range_available() || is_initial_root() {
+            return SKIP;
+        }
+        if !prepare_id_mapped_userns_early() {
+            return 1;
+        }
+        release();
+        if EARLY_USERNS_SOCK.load(std::sync::atomic::Ordering::Acquire) >= 0 {
+            return 2;
+        }
+        if no_children_left() {
+            0
+        } else {
+            3
+        }
+    }
+
+    /// Abandoned (the scope re-exec) or discarded (a box that did not use it): either way the
+    /// helper is gone and reaped, and nothing is prepared any more.
+    #[test]
+    fn an_abandoned_or_discarded_preparation_leaves_no_process() {
+        let abandoned = in_child(|| released_leaves_nothing(abandon_id_mapped_userns_early));
+        let discarded = in_child(|| released_leaves_nothing(discard_early_userns));
+        if abandoned == SKIP && discarded == SKIP {
+            eprintln!("skipped: no usable subordinate id range");
+            return;
+        }
+        assert_eq!(abandoned, 0, "abandon failed at step {abandoned}");
+        assert_eq!(discarded, 0, "discard failed at step {discarded}");
     }
 }

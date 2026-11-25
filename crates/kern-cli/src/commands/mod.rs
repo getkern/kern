@@ -967,19 +967,12 @@ fn print_resolved_config(
     println!("cap_drop: {}", args.cap_drop.join(","));
     println!("hostname: {}", args.hostname.unwrap_or("-"));
     println!("user: {}", args.run_as.unwrap_or("-"));
-    // The effective uid-range rule the box will actually apply (mirror of `box_run`): explicit
-    // --uid-range, OR --ssh, OR a non-root --user (its uid must be mapped in). Derived the same way
-    // here so the dry run can't report a different value than the box uses.
-    let non_root_user = parse_user(args.run_as)
-        .ok()
-        .flatten()
-        .is_some_and(|(u, _)| u != 0);
     // Report the range AND where it came from. The bare boolean stays a bare boolean (scripts parse
     // these lines), so the provenance is its own key: a caller can see that kern, not they, turned it
     // on, which is the difference between a default one may opt out of and a request one asked for.
     // The dry run runs before the image is resolved, so an image that declares a non-root USER can
     // still promote this to `request` at run time; `image-default` is a floor, never a ceiling.
-    let asked = args.uid_range || args.ssh_port.is_some() || non_root_user;
+    let asked = uid_range_asked_by_args(args);
     let by_image = image_default_uid_range(args);
     println!("uid_range: {}", asked || by_image);
     println!(

@@ -23,6 +23,22 @@ pub(crate) fn image_default_uid_range(args: &BoxRunArgs) -> bool {
     args.image.is_some() && !args.no_uid_range && !range_buys_nothing(args)
 }
 
+/// Does the COMMAND LINE ask for the subordinate uid range: `--uid-range`, `--ssh`, or a numeric
+/// non-root `--user` (its uid must be mapped in)? The dry run reports it as `uid_range_source:
+/// request`, and `box_run` starts the id map early on it; one statement so the two cannot disagree.
+///
+/// A FLOOR, NEVER A CEILING: a `--user` given by NAME, or an image whose `USER` is non-root, is only
+/// known after the image is read and can still turn the range on. `box_run` decides the real map
+/// from the resolved user; what reads this only acts on the cases already certain.
+pub(crate) fn uid_range_asked_by_args(args: &BoxRunArgs) -> bool {
+    args.uid_range
+        || args.ssh_port.is_some()
+        || parse_user(args.run_as)
+            .ok()
+            .flatten()
+            .is_some_and(|(u, _)| u != 0)
+}
+
 /// Would the sub-uid range buy this box anything at all, given the capabilities it will actually
 /// hold? When it would not, the default is dropped and the box skips two setuid helper execs.
 ///

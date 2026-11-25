@@ -77,6 +77,13 @@ interleaved series), the load average before and after, and saves each run as JS
 `--compare docker|podman` runs the same image there, paired run by run, reported as the median of the
 per-pair differences with a 95% interval. `--json` prints one object. See [BENCHMARKS.md](BENCHMARKS.md).
 
+**An image box starts about half a millisecond sooner.** The two setuid helpers that write its
+subordinate uid range (`newuidmap`, `newgidmap`) now run from the moment the command line is read,
+while kern resolves the image and builds the cgroup, instead of after; kern then joins the mapped
+namespace and checks its map against `/etc/subuid` and `/etc/subgid`. Measured on an x86 desktop,
+`kern box --image alpine -- /bin/true`, 200 paired runs: median 4.28 -> 3.69 ms, -0.56 ms (95%
+interval -0.60 to -0.53 ms; the same binary against itself: 0.00 ms, -0.06 to +0.05). A box without the range (`--no-uid-range`, a pod member) is unchanged.
+
 **Busybox `wget` reaches an allowlisted HTTPS host through `--egress-allow`.** It sends the whole
 `https://` URL to the proxy instead of a `CONNECT`; the proxy now makes that HTTPS request itself, over
 the vetted and pinned leg `--egress-secret` uses, where it used to dial port 80 and fail.

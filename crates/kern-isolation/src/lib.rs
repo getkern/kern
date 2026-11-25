@@ -159,6 +159,7 @@ pub use real::BOX_ADDR;
 /// The readiness-pipe byte a gated box writes when it is set up and waiting on its pre-exec gate.
 /// Exported so the launcher and the box agree on one symbol instead of two literals.
 pub use real::READY_PREPARED;
+pub use real::{abandon_id_mapped_userns_early, prepare_id_mapped_userns_early};
 /// Run a program as uid 0 of a user namespace with kern's subordinate id range (`kern unshare`).
 pub use real::{exec_in_id_mapped_userns, MappedExit};
 

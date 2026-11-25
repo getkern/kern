@@ -1366,11 +1366,18 @@ struct Supervision {
 ///
 /// The systemd probe runs ONLY for a standalone persistent box, so an ordinary box start pays no
 /// socket connect for it.
+/// A detached box with a persistent restart policy and no pod: the one shape that may hand itself to
+/// a systemd unit instead of running here. Read by `decide_supervision` and by the early id map,
+/// which must not start work for a box this process may never run.
+fn standalone_persistent(args: &BoxRunArgs) -> bool {
+    args.detached && args.restart.persistent() && args.pod.is_none()
+}
+
 fn decide_supervision(args: &BoxRunArgs) -> Result<Supervision, Error> {
     let health_action = parse_health_action(args.health_action)?;
     let restart =
         args.restart == RestartPolicy::OnFailure || health_action == HealthAction::Restart;
-    let standalone_persistent = args.detached && args.restart.persistent() && args.pod.is_none();
+    let standalone_persistent = standalone_persistent(args);
     let systemd_present = standalone_persistent && kern_isolation::user_systemd_present();
     let (systemd_supervises, restart_always) = persistent_supervision(
         args.detached,
@@ -1515,6 +1522,22 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         )));
     }
     pt.mark("parent:name-check");
+    // THE ID MAP STARTS HERE, before everything the rest of this function does, because that is the
+    // window it runs in: the two setuid helpers were ~0.9 ms on the path to the fork (measured
+    // 2026-11-20, `parent:idmap` 928 of 4036 us), and the scope decision, the volumes, the claim,
+    // the image, the ports and the cgroup can all happen while they run. Only where the command
+    // line already makes the range certain and the box will build its own namespace (a pod member
+    // joins the pod's; a persistent detached box may hand itself to systemd and never run here).
+    // Every other box maps in place exactly as before, and so does this one if the preparation
+    // fails. A scope re-exec below abandons it before its `execve`. See
+    // `prepare_id_mapped_userns_early`.
+    if args.pod.is_none()
+        && !standalone_persistent(&args)
+        && (image_default_uid_range(&args) || uid_range_asked_by_args(&args))
+    {
+        kern_isolation::prepare_id_mapped_userns_early();
+        pt.mark("parent:userns-early");
+    }
     // FLEET LIMITS (env-configured, deployment-level). Checked only in the OUTER process (KERN_SCOPE
     // unset), like the name check: the scoped inner re-run is the SAME box, already counted.
     if crate::global_env("KERN_SCOPE").is_none() {
@@ -6697,6 +6720,10 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     if allow_direct && kern_isolation::choose_direct_cap_path_given(manager_present) {
         return;
     }
+    // FROM HERE THIS PROCESS IS REPLACED (every path below ends in an `execve`), so an id map started
+    // early for it would be left to a process image that never asked for it: stop it now. The
+    // re-executed kern starts its own.
+    kern_isolation::abandon_id_mapped_userns_early();
     let Ok(self_exe) = std::env::current_exe() else {
         return;
     };
