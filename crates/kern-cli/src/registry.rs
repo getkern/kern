@@ -1919,6 +1919,50 @@ pub fn cpu_usec(pid: i32) -> Option<u64> {
         .ok()
 }
 
+/// One numeric value of a box's (dedicated) cgroup: the first field of `file`, or with `key` the
+/// `key <n>` line of a flat-keyed file (`memory.stat`). `None` for no cgroup, no such file or key,
+/// or `max` (no limit), which a caller shows as "no limit" rather than as a number.
+pub fn cgroup_value(pid: i32, file: &str, key: Option<&str>) -> Option<u64> {
+    let cg = box_cgroup(pid)?;
+    let text = fs::read_to_string(cg.join(file)).ok()?;
+    let v = match key {
+        Some(k) => text.lines().find_map(|l| {
+            let (name, n) = l.split_once(' ')?;
+            (name == k).then_some(n)
+        })?,
+        None => text.split_whitespace().next()?,
+    };
+    v.trim().parse().ok()
+}
+
+/// A box's network counters, per interface but `lo`, from its own network namespace
+/// (`/proc/<pid1>/net/dev`): `(name, rx_bytes, rx_packets, tx_bytes, tx_packets)`.
+pub fn net_counters(pid1: i32) -> Vec<(String, u64, u64, u64, u64)> {
+    fs::read_to_string(format!("/proc/{pid1}/net/dev"))
+        .unwrap_or_default()
+        .lines()
+        .skip(2)
+        .filter_map(|l| {
+            let (name, rest) = l.split_once(':')?;
+            let name = name.trim();
+            if name == "lo" {
+                return None;
+            }
+            let f: Vec<u64> = rest
+                .split_whitespace()
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            Some((
+                name.to_string(),
+                *f.first()?,
+                *f.get(1)?,
+                *f.get(8)?,
+                *f.get(9)?,
+            ))
+        })
+        .collect()
+}
+
 /// The number of tasks (processes/threads) in a box, from its (dedicated) cgroup `pids.current`.
 /// `None` if the box has no dedicated cgroup.
 pub fn tasks(pid: i32) -> Option<u64> {

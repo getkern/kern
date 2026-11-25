@@ -19,7 +19,8 @@ use crate::{Request, Response};
 /// One container event, as Docker's stream spells it.
 #[derive(Clone)]
 pub(crate) struct Event {
-    pub(crate) action: &'static str,
+    /// Docker's action: `start`, or `exec_start: <cmd>` (the filter matches the part before `:`).
+    pub(crate) action: String,
     pub(crate) name: String,
     pub(crate) image: String,
     pub(crate) labels: Vec<(String, String)>,
@@ -27,11 +28,54 @@ pub(crate) struct Event {
     pub(crate) exit: Option<i32>,
 }
 
+/// The image and labels each container's last event carried, so an exec event (which only knows
+/// the container's name) is described as Docker describes it.
+type Meta = std::collections::HashMap<String, (String, Vec<(String, String)>)>;
+static META: Mutex<Option<Meta>> = Mutex::new(None);
+
+/// `exec_create: <cmd>`, `exec_start: <cmd>`, `exec_die`: an exec's events, with its id
+/// (`execID`) and its container's image and labels, as Docker sends them.
+pub(crate) fn exec_event(kind: &str, name: &str, cmd: &[String], exec_id: &str, exit: Option<i32>) {
+    let (image, mut labels) = META
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(name).cloned()))
+        .unwrap_or_default();
+    labels.push(("execID".to_string(), exec_id.to_string()));
+    let action = if kind == "exec_die" {
+        kind.to_string()
+    } else {
+        format!("{kind}: {}", cmd.join(" "))
+    };
+    publish(&Event {
+        action,
+        name: name.to_string(),
+        image,
+        labels,
+        exit,
+    });
+}
+
+/// The container is removed: what its events carried goes with it.
+pub(crate) fn forget(name: &str) {
+    if let Ok(mut g) = META.lock() {
+        if let Some(m) = g.as_mut() {
+            m.remove(name);
+        }
+    }
+}
+
 /// The streams open now. A sender whose stream has gone is dropped at the next publish.
 static SUBSCRIBERS: Mutex<Vec<Sender<String>>> = Mutex::new(Vec::new());
 
 /// Send `e` to every open stream whose filters take it.
 pub(crate) fn publish(e: &Event) {
+    if !e.action.starts_with("exec_") {
+        if let Ok(mut g) = META.lock() {
+            let m = g.get_or_insert_with(Default::default);
+            m.insert(e.name.clone(), (e.image.clone(), e.labels.clone()));
+        }
+    }
     let line = to_json(e);
     let Ok(mut subs) = SUBSCRIBERS.lock() else {
         return;
@@ -65,7 +109,7 @@ fn to_json(e: &Event) -> String {
         attrs.join(","),
         since.as_secs(),
         since.as_nanos(),
-        a = json_str(e.action),
+        a = json_str(&e.action),
         id = json_str(&id),
         img = json_str(&e.image),
     )
@@ -122,7 +166,12 @@ impl Filters {
         };
         let (id, name) = (field("id"), attr("name").unwrap_or_default());
         (self.types.is_empty() || self.types.iter().any(|t| t == field("Type")))
-            && (self.events.is_empty() || self.events.iter().any(|a| a == field("Action")))
+            // Docker matches an event by its TYPE, the action before any `:` (`exec_start: sh`).
+            && (self.events.is_empty() || {
+                let action = field("Action");
+                let kind = action.split_once(':').map_or(action, |(k, _)| k);
+                self.events.iter().any(|a| a == kind || a == action)
+            })
             && (self.containers.is_empty()
                 || self
                     .containers
@@ -216,7 +265,7 @@ mod tests {
 
     fn start_of(name: &str, labels: &[(&str, &str)]) -> Value {
         let e = Event {
-            action: "start",
+            action: "start".into(),
             name: name.into(),
             image: "alpine:3.19".into(),
             labels: labels
@@ -274,6 +323,27 @@ mod tests {
         assert!(Filters::parse(&req(&[("filters", "{bad")])).is_err());
     }
 
+    /// `docker events --filter event=exec_start` matches `exec_start: true`: Docker matches an
+    /// event by its type, the action before the `:`. MEASURED before: kern sent no exec event at
+    /// all, so the filtered stream printed nothing where Docker printed `exec_start: true`.
+    #[test]
+    fn an_exec_event_names_its_command_and_matches_by_type() {
+        let e = Event {
+            action: "exec_start: true".into(),
+            name: "kd-x".into(),
+            image: "alpine:3.21".into(),
+            labels: vec![("execID".into(), "ab12".into())],
+            exit: None,
+        };
+        let ev = json::parse(&to_json(&e)).unwrap();
+        let f = |q: &str| Filters::parse(&req(&[("filters", q)])).unwrap();
+        assert!(f(r#"{"event":["exec_start"]}"#).keeps(&ev));
+        assert!(f(r#"{"event":["exec_start: true"]}"#).keeps(&ev));
+        assert!(!f(r#"{"event":["exec_die"]}"#).keeps(&ev));
+        let attrs = ev.get("Actor").and_then(|a| a.get("Attributes")).unwrap();
+        assert_eq!(attrs.get("execID").and_then(Value::as_str), Some("ab12"));
+    }
+
     /// A published event reaches an open stream, and a stream that went away is dropped.
     #[test]
     fn publish_reaches_subscribers_and_drops_the_closed() {
@@ -287,7 +357,7 @@ mod tests {
         }
         let before = SUBSCRIBERS.lock().unwrap().len();
         publish(&Event {
-            action: "create",
+            action: "create".into(),
             name: "kd-pub".into(),
             image: "alpine:3.19".into(),
             labels: Vec::new(),

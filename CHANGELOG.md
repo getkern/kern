@@ -104,6 +104,14 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**`docker stats`, exec events and terminal resizes through kern's socket.** `docker stats` answered
+501; it reads kern's figures now as Docker's (memory against the box's limit, CPU% from two
+readings, pids, network). `docker events` sends `exec_create`, `exec_start` and `exec_die`, and an
+`event=exec_start` filter matches them as Docker's does. A resize of `docker exec -it` or `docker run
+-it` reaches the program in the box as `SIGWINCH` with the new size; it was accepted and dropped.
+`kern stats --json` carries the memory and pids limits, the tasks, the page cache and the network
+counters it reads them from.
+
 **The Docker API server steps aside when kern is updated.** A server kept busy by a client
 (an IDE, a test suite) kept answering with the API of the binary it started from after a new kern
 was installed, for as long as it was busy (measured: 21 minutes). It now exits once it holds no

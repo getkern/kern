@@ -1165,13 +1165,34 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
     if json {
         // `null` (not 0) when the box has no dedicated cgroup to read - "unknown", not "zero".
         let num = json_num;
+        // `mem_limit`, `pids_limit`: `null` is no limit (`max`). The rest is what `docker stats`
+        // shows and the Docker API's `/containers/{id}/stats` answers from (`inactive_file` is the
+        // page cache Docker subtracts from the usage it prints).
         let out = kern_common::json_array(&boxes, |b| {
+            let cg = b.cgroup_pid();
+            let net = b
+                .live_pid1()
+                .map(registry::net_counters)
+                .unwrap_or_default()
+                .iter()
+                .map(|(n, rb, rp, tb, tp)| {
+                    format!(
+                        "{}:{{\"rx_bytes\":{rb},\"rx_packets\":{rp},\"tx_bytes\":{tb},\"tx_packets\":{tp}}}",
+                        json_str(n)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
-                "{{\"name\":{},\"pid\":{},\"mem_bytes\":{},\"cpu_usec\":{}}}",
+                "{{\"name\":{},\"pid\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"mem_limit\":{},\"inactive_file\":{},\"tasks\":{},\"pids_limit\":{},\"net\":{{{net}}}}}",
                 json_str(&b.name),
                 b.pid,
-                num(registry::mem_bytes(b.cgroup_pid())),
-                num(registry::cpu_usec(b.cgroup_pid()))
+                num(registry::mem_bytes(cg)),
+                num(registry::cpu_usec(cg)),
+                num(registry::cgroup_value(cg, "memory.max", None)),
+                num(registry::cgroup_value(cg, "memory.stat", Some("inactive_file"))),
+                num(registry::tasks(cg)),
+                num(registry::cgroup_value(cg, "pids.max", None)),
             )
         });
         println!("{out}");

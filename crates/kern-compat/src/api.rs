@@ -1407,6 +1407,200 @@ fn image_history(bin: &Path, name: &str) -> Response {
 }
 
 // ---------------------------------------------------------------------------------------------
+// containers/{id}/stats: `docker stats`, onto `kern stats --json`.
+
+/// One reading of a box (`kern stats --json --no-stream <name>`) and of the host's CPU clock at
+/// the same moment, which is what Docker's CPU percentage is computed from.
+struct Sample {
+    at: u64,
+    cpu_ns: u64,
+    mem: u64,
+    mem_limit: Option<u64>,
+    inactive_file: u64,
+    tasks: u64,
+    pids_limit: Option<u64>,
+    net: Vec<(String, u64, u64, u64, u64)>,
+    system_ns: u64,
+    cpus: u64,
+}
+
+/// The host's CPU time in nanoseconds (the `cpu` line of `/proc/stat`, in clock ticks) and its
+/// number of CPUs: Docker's `system_cpu_usage` and `online_cpus`.
+fn host_cpu() -> (u64, u64) {
+    let text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+    // SAFETY: sysconf has no preconditions.
+    let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+        .ok()
+        .filter(|&h| h > 0)
+        .unwrap_or(100);
+    let ticks: u64 = text
+        .lines()
+        .find(|l| l.starts_with("cpu "))
+        .map(|l| {
+            l.split_whitespace()
+                .skip(1)
+                .filter_map(|x| x.parse::<u64>().ok())
+                .sum()
+        })
+        .unwrap_or(0);
+    let cpus = text
+        .lines()
+        .filter(|l| l.starts_with("cpu") && l.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
+        .count() as u64;
+    (ticks.saturating_mul(1_000_000_000 / hz), cpus.max(1))
+}
+
+/// The host's memory, Docker's `limit` for a container with no memory limit.
+fn host_mem_total() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .map_or(0, |kb| kb * 1024)
+}
+
+fn sample(bin: &Path, name: &str) -> Option<Sample> {
+    let (code, out, _) = kern(bin, &["stats", "--json", "--no-stream", name]);
+    if code != 0 {
+        return None;
+    }
+    let (system_ns, cpus) = host_cpu();
+    let v = json::parse(out.trim()).ok()?;
+    let b = v.as_array()?.first()?.clone();
+    let n = |k: &str| {
+        b.get(k)
+            .and_then(Value::as_i64)
+            .and_then(|x| u64::try_from(x).ok())
+    };
+    let net = b
+        .get("net")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .map(|(iface, c)| {
+                    let f = |k: &str| {
+                        c.get(k)
+                            .and_then(Value::as_i64)
+                            .and_then(|x| u64::try_from(x).ok())
+                            .unwrap_or(0)
+                    };
+                    (
+                        iface.clone(),
+                        f("rx_bytes"),
+                        f("rx_packets"),
+                        f("tx_bytes"),
+                        f("tx_packets"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Sample {
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        cpu_ns: n("cpu_usec").unwrap_or(0).saturating_mul(1000),
+        mem: n("mem_bytes").unwrap_or(0),
+        mem_limit: n("mem_limit"),
+        inactive_file: n("inactive_file").unwrap_or(0),
+        tasks: n("tasks").unwrap_or(0),
+        pids_limit: n("pids_limit"),
+        net,
+        system_ns,
+        cpus,
+    })
+}
+
+fn cpu_json(s: Option<&Sample>) -> String {
+    let (total, system, cpus) = s.map_or((0, 0, 0), |s| (s.cpu_ns, s.system_ns, s.cpus));
+    format!(
+        "{{\"cpu_usage\":{{\"total_usage\":{total},\"usage_in_kernelmode\":0,\"usage_in_usermode\":0}},\"system_cpu_usage\":{system},\"online_cpus\":{cpus},\"throttling_data\":{{\"periods\":0,\"throttled_periods\":0,\"throttled_time\":0}}}}"
+    )
+}
+
+/// Docker's `StatsJSON` for `name` from a reading and the one before it (CPU% is their delta).
+fn stats_json(name: &str, cur: &Sample, pre: Option<&Sample>) -> String {
+    let networks: Vec<String> = cur
+        .net
+        .iter()
+        .map(|(n, rb, rp, tb, tp)| {
+            format!(
+                "{}:{{\"rx_bytes\":{rb},\"rx_packets\":{rp},\"rx_errors\":0,\"rx_dropped\":0,\"tx_bytes\":{tb},\"tx_packets\":{tp},\"tx_errors\":0,\"tx_dropped\":0}}",
+                json_str(n)
+            )
+        })
+        .collect();
+    let limit = cur.mem_limit.unwrap_or_else(host_mem_total);
+    let pids_limit = cur
+        .pids_limit
+        .map_or_else(|| "0".to_string(), |l| l.to_string());
+    let when =
+        |s: Option<&Sample>| json_str(&s.map_or_else(|| ZERO_TIME.to_string(), |s| rfc3339(s.at)));
+    format!(
+        "{{\"read\":{},\"preread\":{},\"pids_stats\":{{\"current\":{},\"limit\":{pids_limit}}},\"blkio_stats\":{{\"io_service_bytes_recursive\":null,\"io_serviced_recursive\":null,\"io_queue_recursive\":null,\"io_service_time_recursive\":null,\"io_wait_time_recursive\":null,\"io_merged_recursive\":null,\"io_time_recursive\":null,\"sectors_recursive\":null}},\"num_procs\":0,\"storage_stats\":{{}},\"cpu_stats\":{},\"precpu_stats\":{},\"memory_stats\":{{\"usage\":{},\"stats\":{{\"inactive_file\":{}}},\"limit\":{limit}}},\"name\":{},\"id\":{},\"networks\":{{{}}}}}",
+        when(Some(cur)),
+        when(pre),
+        cur.tasks,
+        cpu_json(Some(cur)),
+        cpu_json(pre),
+        cur.mem,
+        cur.inactive_file,
+        json_str(&format!("/{name}")),
+        json_str(&id_of(name)),
+        networks.join(",")
+    )
+}
+
+/// `GET /containers/{id}/stats`: `stream=false` answers one reading with the one a second before it
+/// as `precpu_stats` (none with `one-shot`), which is how Docker's daemon answers and what `docker
+/// stats --no-stream` computes its CPU% from; a stream sends one a second until the box ends or
+/// the client goes.
+fn container_stats(bin: &Path, req: &Request, id: &str) -> Response {
+    let Some(name) = resolve(bin, id) else {
+        return error(404, &format!("No such container: {id}"));
+    };
+    let stream = !matches!(req.param("stream"), Some("0" | "false" | "False"));
+    let one_shot = req.flag("one-shot");
+    let Some(first) = sample(bin, &name) else {
+        return error(409, &format!("Container {id} is not running"));
+    };
+    if !stream {
+        if one_shot {
+            return json_response(200, stats_json(&name, &first, None));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let Some(cur) = sample(bin, &name) else {
+            return json_response(200, stats_json(&name, &first, None));
+        };
+        return json_response(200, stats_json(&name, &cur, Some(&first)));
+    }
+    let bin = bin.to_path_buf();
+    Response::Stream {
+        status: 200,
+        content_type: "application/json",
+        upgrade: false,
+        extra: Vec::new(),
+        writer: Box::new(move |w: &mut crate::Out| {
+            let mut pre: Option<Sample> = None;
+            let mut cur = Some(first);
+            while let Some(s) = cur {
+                let line = format!("{}\n", stats_json(&name, &s, pre.as_ref()));
+                if w.write_all(line.as_bytes())
+                    .and_then(|()| w.flush())
+                    .is_err()
+                {
+                    return;
+                }
+                pre = Some(s);
+                std::thread::sleep(Duration::from_secs(1));
+                cur = sample(&bin, &name);
+            }
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // containers/{id}/archive: `docker cp`, onto `kern cp`.
 
 /// `KERN_CP_STAT=1 kern cp <name>:<path> -`: Docker's stat of the path, or kern's error.
@@ -2013,6 +2207,7 @@ fn session_ended(bin: &Path, req: &Request) -> Response {
 /// Remove `name` whatever its state: created, running (stopped at once) or ended.
 fn remove_container(bin: &Path, name: &str) {
     stage_forget(name);
+    crate::events::forget(name);
     if created_take(name).is_some() {
         drop(attached_take(name));
         return;
@@ -2427,7 +2622,12 @@ fn start_foreground(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Starte
     }
     let at = argv.len().min(2);
     argv.splice(at..at, extra);
-    let mut child = match Command::new(bin)
+    let mut command = Command::new(bin);
+    let size_file = c.tty.then(|| tty_prepare(name, None)).flatten();
+    if let Some(f) = &size_file {
+        command.env("KERN_TTY_SIZE_FILE", f);
+    }
+    let mut child = match command
         .args(&argv)
         .stdin(if c.stdin {
             Stdio::piped()
@@ -2444,6 +2644,9 @@ fn start_foreground(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Starte
             return error(500, &format!("cannot run kern box: {e}"));
         }
     };
+    if size_file.is_some() {
+        tty_register(name, child.id());
+    }
     let _ = to.send(Started::Foreground {
         stdin: child.stdin.take(),
         out: child.stdout.take(),
@@ -2456,6 +2659,7 @@ fn start_foreground(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Starte
         .name("kern-serve-run".into())
         .spawn(move || {
             let code = exit_code(&mut child);
+            tty_forget(&watched);
             crate::events::publish(&event_of("die", &watched, &created, Some(code)));
             run_end(&watched, code);
         });
@@ -2463,6 +2667,104 @@ fn start_foreground(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Starte
         run_end(name, -1);
     }
     no_content()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Terminal sizes: `docker exec -it` and `docker run -it` resizes, onto `KERN_TTY_SIZE_FILE`.
+
+/// The terminals this server's clients drive: an exec id or a container name, and the pid of the
+/// `kern` that sizes that terminal from its file on `SIGWINCH`.
+static TTYS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+/// The size file of terminal `key`: `$XDG_CACHE_HOME/kern/compat-tty/<key>` (an exec id is hex, a
+/// container name a valid name, so the key is one path component).
+fn tty_file(key: &str) -> Option<std::path::PathBuf> {
+    // Not `valid_name`: an exec id is 64 hex digits, one past a box name's 63.
+    let one_component = !key.is_empty()
+        && key.len() <= 128
+        && !key.starts_with('.')
+        && key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'.');
+    one_component.then_some(())?;
+    Some(
+        kern_common::xdg_cache_dir()?
+            .join("kern")
+            .join("compat-tty")
+            .join(key),
+    )
+}
+
+/// Write `COLSxROWS` to `key`'s size file, atomically (a `kern` reading it on `SIGWINCH` sees the
+/// old size or the new one, never half of one).
+fn tty_write(key: &str, cols: u16, rows: u16) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let f = tty_file(key)?;
+    let dir = f.parent()?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .ok()?;
+    let tmp = dir.join(format!(".{key}.new"));
+    std::fs::write(&tmp, format!("{cols}x{rows}")).ok()?;
+    std::fs::rename(&tmp, &f).ok()?;
+    Some(f)
+}
+
+/// A size file for a terminal about to start: `size` is Docker's `ConsoleSize` (`[rows, cols]`),
+/// 80x24 without one; the client sends its real size in a resize right after.
+fn tty_prepare(key: &str, size: Option<(u16, u16)>) -> Option<std::path::PathBuf> {
+    let (rows, cols) = size.unwrap_or((24, 80));
+    tty_write(key, cols, rows)
+}
+
+fn tty_register(key: &str, pid: u32) {
+    if let Ok(mut g) = TTYS.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(key.to_string(), pid);
+    }
+}
+
+fn tty_forget(key: &str) {
+    if let Ok(mut g) = TTYS.lock() {
+        if let Some(m) = g.as_mut() {
+            m.remove(key);
+        }
+    }
+    if let Some(f) = tty_file(key) {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+/// `POST /exec/{id}/resize` and `/containers/{id}/resize` (`h`, `w`): the new size in the file,
+/// then `SIGWINCH` to the `kern` that sizes the terminal, which pushes it to the pty, and the
+/// kernel signals the program in the box. A terminal this server is not driving (no `-t`, or a
+/// box started elsewhere) has nothing to resize, which Docker also answers with 200.
+fn tty_resize(key: &str, req: &Request) -> Response {
+    let dim = |k: &str| req.param(k).and_then(|v| v.parse::<u16>().ok());
+    let (Some(rows), Some(cols)) = (dim("h"), dim("w")) else {
+        return error(400, "resize needs h and w, the terminal's rows and columns");
+    };
+    let pid = TTYS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(key).copied()));
+    if let Some(pid) = pid {
+        if tty_write(key, cols, rows).is_some() {
+            if let Ok(p) = libc::pid_t::try_from(pid) {
+                // SAFETY: a signal to a pid this server started and still records; a reaped pid
+                // was removed from the table when its run or exec ended.
+                unsafe { libc::kill(p, libc::SIGWINCH) };
+            }
+        }
+    }
+    Response::Full {
+        status: 200,
+        content_type: "text/plain",
+        body: Vec::new(),
+        extra: Vec::new(),
+    }
 }
 
 /// How long a run's end is left to its attach's follow before `kern wait` waits for it.
@@ -2539,7 +2841,7 @@ fn start_again(bin: &Path, name: &str, running: Response) -> Response {
     // An attached run's record would answer a `wait` with the run before this one.
     run_forget(name);
     crate::events::publish(&crate::events::Event {
-        action: "start",
+        action: "start".into(),
         name: name.to_string(),
         image: v
             .get("image")
@@ -2553,14 +2855,9 @@ fn start_again(bin: &Path, name: &str, running: Response) -> Response {
 }
 
 /// The event of a container this server made.
-fn event_of(
-    action: &'static str,
-    name: &str,
-    c: &Created,
-    exit: Option<i32>,
-) -> crate::events::Event {
+fn event_of(action: &str, name: &str, c: &Created, exit: Option<i32>) -> crate::events::Event {
     crate::events::Event {
-        action,
+        action: action.to_string(),
         name: name.to_string(),
         image: c.image.clone(),
         labels: c.labels.clone(),
@@ -2596,22 +2893,29 @@ fn exec_get(id: &str) -> Option<Exec> {
 
 /// Claim an exec for a start: false when it was started already (Docker answers 409).
 fn exec_claim(id: &str) -> Option<Exec> {
-    let mut g = EXECS.lock().ok()?;
-    let e = g.as_mut()?.get_mut(id)?;
-    if e.started {
-        return None;
-    }
-    e.started = true;
-    e.running = true;
-    Some(e.clone())
+    let claimed = {
+        let mut g = EXECS.lock().ok()?;
+        let e = g.as_mut()?.get_mut(id)?;
+        if e.started {
+            return None;
+        }
+        e.started = true;
+        e.running = true;
+        e.clone()
+    };
+    crate::events::exec_event("exec_start", &claimed.name, &claimed.cmd, id, None);
+    Some(claimed)
 }
 
 fn exec_finish(id: &str, code: i32) {
-    if let Ok(mut g) = EXECS.lock() {
-        if let Some(e) = g.as_mut().and_then(|m| m.get_mut(id)) {
-            e.running = false;
-            e.exit = Some(code);
-        }
+    let ended = EXECS.lock().ok().and_then(|mut g| {
+        let e = g.as_mut()?.get_mut(id)?;
+        e.running = false;
+        e.exit = Some(code);
+        Some((e.name.clone(), e.cmd.clone()))
+    });
+    if let Some((name, cmd)) = ended {
+        crate::events::exec_event("exec_die", &name, &cmd, id, Some(code));
     }
 }
 
@@ -2669,7 +2973,7 @@ fn exec_create(name: &str, body: &Value) -> Response {
                 Exec {
                     name: name.to_string(),
                     argv,
-                    cmd,
+                    cmd: cmd.clone(),
                     tty,
                     stdin,
                     started: false,
@@ -2680,6 +2984,7 @@ fn exec_create(name: &str, body: &Value) -> Response {
         }
         Err(_) => return error(500, "the exec table is unusable"),
     }
+    crate::events::exec_event("exec_create", name, &cmd, &id, None);
     json_response(201, format!("{{\"Id\":{}}}", json_str(&id)))
 }
 
@@ -2733,6 +3038,22 @@ fn exec_start(bin: &Path, id: &str, req: &Request) -> Response {
         cmd.stdin(Stdio::piped());
     }
     let tty = e.tty;
+    // Docker's `ConsoleSize` (`[rows, cols]`): the terminal's size from its first byte.
+    let console = body
+        .get("ConsoleSize")
+        .and_then(Value::as_array)
+        .and_then(|a| {
+            let n = |i: usize| {
+                a.get(i)
+                    .and_then(Value::as_i64)
+                    .and_then(|x| u16::try_from(x).ok())
+            };
+            Some((n(0)?, n(1)?)).filter(|&(r, c)| r > 0 && c > 0)
+        });
+    let size_file = tty.then(|| tty_prepare(&id, console)).flatten();
+    if let Some(f) = &size_file {
+        cmd.env("KERN_TTY_SIZE_FILE", f);
+    }
     Response::Stream {
         status: 200,
         content_type: if tty {
@@ -2752,13 +3073,18 @@ fn exec_start(bin: &Path, id: &str, req: &Request) -> Response {
                     return;
                 }
             };
+            if size_file.is_some() {
+                tty_register(&id, child.id());
+            }
             let out = child.stdout.take();
             let err = child.stderr.take();
             let feeder = child.stdin.take().and_then(|sin| feed_stdin(w, sin));
             pump(w, out, err, tty);
             // The exit is recorded BEFORE the feeder ends: a client that has read the end of the
             // output asks for the code at once, and the feeder may wait for that client to go.
-            exec_finish(&id, exit_code(&mut child));
+            let code = exit_code(&mut child);
+            tty_forget(&id);
+            exec_finish(&id, code);
             end_feed(w, feeder);
         }),
     }
@@ -3046,6 +3372,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             Some(name) => inspect(bin, &name),
             None => error(404, &format!("No such container: {id}")),
         },
+        ("GET", ["containers", id, "stats"]) => container_stats(bin, req, id),
         ("GET" | "HEAD", ["containers", id, "archive"]) => {
             archive_get(bin, req, id, req.method == "HEAD")
         }
@@ -3117,6 +3444,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             };
             session_forget(&name);
             stage_forget(&name);
+            crate::events::forget(&name);
             if created_take(&name).is_some() {
                 // A pending attach ends with the container.
                 drop(attached_take(&name));
@@ -3169,7 +3497,16 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
         }
         ("POST", ["exec", id, "start"]) => exec_start(bin, id, req),
         ("GET", ["exec", id, "json"]) => exec_inspect(id),
-        ("POST", ["exec", _, "resize"]) => no_content(),
+        ("POST", ["exec", id, "resize"]) => {
+            if exec_get(id).is_none() {
+                return error(404, &format!("No such exec instance: {id}"));
+            }
+            tty_resize(id, req)
+        }
+        ("POST", ["containers", id, "resize"]) => match resolve(bin, id) {
+            Some(name) => tty_resize(&name, req),
+            None => error(404, &format!("No such container: {id}")),
+        },
         ("POST", [kind @ ("networks" | "volumes" | "images"), "prune"]) => {
             labelled_prune(kind, req)
         }
@@ -3852,6 +4189,66 @@ mod tests {
             panic!("a whole body");
         };
         assert_eq!(status, 501);
+    }
+
+    /// `docker stats` reads Docker's `StatsJSON`: the CPU delta against `precpu_stats`, the memory
+    /// usage and limit, the pids, the networks. MEASURED before: `/containers/{id}/stats` was a 501.
+    #[test]
+    fn stats_are_dockers_stats_json() {
+        let s = |cpu: u64, sys: u64| Sample {
+            at: 1_795_000_000,
+            cpu_ns: cpu,
+            mem: 3 << 20,
+            mem_limit: Some(100 << 20),
+            inactive_file: 1 << 20,
+            tasks: 2,
+            pids_limit: Some(512),
+            net: vec![("eth0".into(), 10, 1, 20, 2)],
+            system_ns: sys,
+            cpus: 8,
+        };
+        let pre = s(1_000, 10_000);
+        let cur = s(6_000, 20_000);
+        let v = json::parse(&stats_json("kd-s", &cur, Some(&pre))).unwrap();
+        let n = |path: &[&str]| {
+            let mut x = &v;
+            for p in path {
+                x = x.get(p).unwrap();
+            }
+            x.as_i64().unwrap()
+        };
+        assert_eq!(n(&["cpu_stats", "cpu_usage", "total_usage"]), 6_000);
+        assert_eq!(n(&["precpu_stats", "cpu_usage", "total_usage"]), 1_000);
+        assert_eq!(n(&["cpu_stats", "system_cpu_usage"]), 20_000);
+        assert_eq!(n(&["cpu_stats", "online_cpus"]), 8);
+        assert_eq!(n(&["memory_stats", "limit"]), 100 << 20);
+        assert_eq!(n(&["memory_stats", "stats", "inactive_file"]), 1 << 20);
+        assert_eq!(n(&["pids_stats", "current"]), 2);
+        assert_eq!(n(&["networks", "eth0", "tx_bytes"]), 20);
+        assert_eq!(v.get("name").and_then(Value::as_str), Some("/kd-s"));
+        let one = json::parse(&stats_json("kd-s", &cur, None)).unwrap();
+        assert_eq!(
+            one.get("precpu_stats")
+                .and_then(|p| p.get("system_cpu_usage"))
+                .and_then(Value::as_i64),
+            Some(0)
+        );
+        let (sys, cpus) = host_cpu();
+        assert!(
+            sys > 0 && cpus >= 1,
+            "the host's CPU clock reads: {sys} {cpus}"
+        );
+    }
+
+    /// An exec's terminal has a size file under its 64-hex id (one past a box name's 63), and a
+    /// key that could be a path is refused.
+    #[test]
+    fn a_terminal_size_file_takes_an_exec_id_and_refuses_a_path() {
+        let id = "a".repeat(64);
+        assert!(tty_file(&id).is_some_and(|p| p.ends_with(&id)));
+        for bad in ["", "..", ".x", "a/b", "a b"] {
+            assert!(tty_file(bad).is_none(), "{bad:?}");
+        }
     }
 
     /// `docker compose` through the socket stops at its first network call: the 501 says what runs
