@@ -9954,9 +9954,10 @@ fn remove_orphan_boxes(boxes: &[crate::compose::ComposeBox], pod: &str) -> Vec<S
 ///
 ///  * the source must be a NAME, never a host path - a `-v /srv/db:/data` names a directory the
 ///    project did not create and must not remove;
-///  * it must carry this project's prefix, which `scope_named_volumes` put there. A volume without
-///    it predates the scoping and may hold another stack's data (that sharing is the very defect
-///    the scoping fixed), so it is left alone;
+///  * it must carry this project's prefix, which `scope_named_volumes` put there, or be a name the
+///    file gives one of its own volumes (`name:`). A volume without either predates the scoping
+///    and may hold another stack's data (that sharing is the very defect the scoping fixed), so it
+///    is left alone;
 ///  * it must not be declared `external: true`. Docker never removes an external volume, because
 ///    the key means "this exists independently of me".
 ///
@@ -9994,13 +9995,17 @@ fn remove_project_volumes_matching(
             let Some((src, _)) = v.split_once(':') else {
                 continue;
             };
+            // The project's own: scoped by its prefix, or named by the file itself (`name:`), which
+            // Docker's `down -v` removes too.
+            let bare = src
+                .strip_prefix(&prefix)
+                .or_else(|| b.named_volumes.iter().any(|n| n == src).then_some(src));
             if !matches!(
                 crate::volume::classify(src),
                 crate::volume::SourceKind::Named
-            ) || !src.starts_with(&prefix)
-                || b.external_volumes.iter().any(|e| e == src)
+            ) || b.external_volumes.iter().any(|e| e == src)
                 || done.iter().any(|d| d == src)
-                || !src.strip_prefix(&prefix).is_some_and(&wanted)
+                || !bare.is_some_and(&wanted)
             {
                 continue;
             }

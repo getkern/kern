@@ -827,6 +827,8 @@ fn parse_document(
     mark_external_volumes(&mut boxes[..own_len], &external_volumes);
     let drivers = collect_volume_drivers(&root)?;
     apply_volume_drivers(&mut boxes[..own_len], &drivers);
+    let renamed = collect_renamed_volumes(&root)?;
+    mark_renamed_volumes(&mut boxes[..own_len], &renamed);
     // AND THE EXTERNAL NETWORKS EACH SERVICE IS ON, which is the intersection of two blocks that may
     // appear in either order: the top-level `networks:` says which are external, each service's own
     // `networks:` says which it joined. Done here, after every service exists, for the same reason
@@ -3538,6 +3540,73 @@ fn collect_external_volumes(
         out.insert(key, real);
     }
     Ok(out)
+}
+
+/// The top-level volumes that are not external and carry `name:`: key -> the name to mount.
+///
+/// IGNORED BEFORE, and MEASURED (Grok's round 17, case y06): `data: {name: app-explicit}` gave
+/// `<project>_data`, where Docker creates and mounts `app-explicit`.
+fn collect_renamed_volumes(
+    root: &Node,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(vols) = root.child("volumes") else {
+        return Ok(out);
+    };
+    for (key, def) in &vols.children {
+        if def
+            .child("external")
+            .is_some_and(|e| e.scalar.is_none() || scalar_is_true(e))
+        {
+            continue; // `collect_external_volumes` reads its `name:`
+        }
+        let Some(real) = def
+            .child("name")
+            .and_then(|n| n.scalar.as_deref())
+            .map(scalar_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        if !kern_common::valid_resource_name(&real) {
+            return Err(format!(
+                "volume '{key}' declares `name: {real}`, which is not a volume name (letters, \
+                 digits, `_`, `.` and `-` only, no leading `-` or `.`, at most 64 characters)"
+            ));
+        }
+        out.insert(key, real);
+    }
+    Ok(out)
+}
+
+/// Mount each renamed volume by its name, and say so on the box (see [`ComposeBox::named_volumes`]).
+fn mark_renamed_volumes(
+    boxes: &mut [ComposeBox],
+    renamed: &std::collections::HashMap<String, String>,
+) {
+    if renamed.is_empty() {
+        return;
+    }
+    for b in boxes.iter_mut() {
+        for v in &mut b.volumes {
+            let Some((src, rest)) = v.split_once(':') else {
+                continue;
+            };
+            let Some(real) = renamed.get(src) else {
+                continue;
+            };
+            b.named_volumes.push(real.clone());
+            *v = format!("{real}:{rest}");
+        }
+        for (key, _) in &mut b.volume_paths {
+            if let Some(real) = renamed.get(key.as_str()) {
+                *key = real.clone();
+            }
+        }
+        b.named_volumes.sort();
+        b.named_volumes.dedup();
+    }
 }
 
 /// What a top-level volume's `driver`/`driver_opts` ask for, read as Docker's `local` driver reads them.
@@ -9948,6 +10017,27 @@ mod tests {
         // is a refusal.
         let dflt = "services:\n  db:\n    image: alpine\n    environment:\n      - A=${KERN_T_UNSET:-fallback}\n";
         assert!(parse(dflt).is_ok(), "a defaulted variable is not required");
+    }
+
+    /// A volume the file names (`name:`, not external) is mounted by that name and is the project's
+    /// own; one without keeps the key (scoped later by the driver). Docker: `app-explicit`.
+    #[test]
+    fn a_named_volume_is_mounted_by_its_name() {
+        let y = "services:\n  s:\n    image: alpine\n    volumes: [\"data:/d\", \"plain:/p\"]\nvolumes:\n  data:\n    name: app-explicit\n  plain: {}\n";
+        let boxes = parse(y).unwrap();
+        assert!(
+            boxes[0].volumes.contains(&"app-explicit:/d".to_string()),
+            "{:?}",
+            boxes[0].volumes
+        );
+        assert!(boxes[0].volumes.contains(&"plain:/p".to_string()));
+        assert_eq!(boxes[0].named_volumes, ["app-explicit"]);
+        assert!(boxes[0].external_volumes.is_empty());
+        let bad = "services:\n  s:\n    image: alpine\n    volumes: [\"data:/d\"]\nvolumes:\n  data:\n    name: ../x\n";
+        assert!(
+            parse(bad).is_err(),
+            "a name that is not a volume name is refused"
+        );
     }
 
     #[test]

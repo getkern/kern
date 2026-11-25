@@ -1417,6 +1417,13 @@ fn scope_named_volumes(boxes: &mut [crate::compose::ComposeBox], project: &str) 
             if b.external_volumes.iter().any(|e| e == src) {
                 continue;
             }
+            // NAMED BY THE FILE (`name:`): the project's own, under that exact name.
+            if b.named_volumes.iter().any(|n| n == src) {
+                if !owned.iter().any(|o| o == src) {
+                    owned.push(src.to_string());
+                }
+                continue;
+            }
             let scoped = format!("{project}_{src}");
             if !owned.iter().any(|o| o == &scoped) {
                 owned.push(scoped.clone());
@@ -2163,7 +2170,12 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
     ) {
         for b in &boxes {
             for (key, dir) in &b.volume_paths {
-                crate::volume::ensure_at_path(&format!("{pod}_{key}"), dir)?;
+                let name = if b.named_volumes.contains(key) {
+                    key.clone()
+                } else {
+                    format!("{pod}_{key}")
+                };
+                crate::volume::ensure_at_path(&name, dir)?;
             }
         }
     }

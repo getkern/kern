@@ -467,6 +467,10 @@ pub struct ComposeBox {
     /// declaration carries one and the compose key otherwise - the same rewrite is applied to
     /// `volumes` so the existence check and the mount cannot be about two different volumes.
     pub external_volumes: Vec<String>,
+    /// Volumes the file names itself (a top-level `name:` on a volume that is not external): mounted
+    /// by that name, without the project's prefix, and still the project's own for `down -v`, as
+    /// Docker treats them. `volumes` already carries the name.
+    pub named_volumes: Vec<String>,
     /// Volumes the top-level block puts at a directory (`driver_opts: {type: none, o: bind, device:
     /// <dir>}`, Docker's local driver), as `(volume key, directory)`. The compose driver makes each
     /// one a kern volume at that directory (`kern volume create --path`) before the box starts; the
@@ -1685,6 +1689,7 @@ impl ComposeBox {
             expose,
             volumes,
             external_volumes,
+            named_volumes,
             volume_paths,
             env,
             env_file,
@@ -5029,6 +5034,11 @@ mod contract_tests {
                 "the compose driver makes each one a kern volume at its directory before the box \
                  starts (`kern volume create --path`); the mount itself is an ordinary named entry in \
                  `volumes`",
+            ),
+            (
+                "named_volumes",
+                "the compose driver leaves these names unscoped (`scope_named_volumes`) and `down \
+                 -v` removes them as the project's own; the mount is an ordinary entry in `volumes`",
             ),
             (
                 "external_volumes",
