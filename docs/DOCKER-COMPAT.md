@@ -103,7 +103,8 @@ set TESTCONTAINERS_RYUK_DISABLED=true
 | `containers/create`, `start` | `kern box <name> -d ...`, run at the start; the image, command, entrypoint, env, labels, workdir, user, hostname, published ports (`PortBindings`, `PublishAllPorts`), binds, memory, CPUs, `AutoRemove`, `NetworkMode` default, bridge, host or none |
 | `attach`, then `start` (`docker run` without `-d`) | `kern box` in the foreground: stdout and stderr come back apart, and the box's exit code is the run's |
 | `exec`, `exec/{id}/start`, `exec/{id}/json` | `kern exec`, stdout and stderr apart, the exit code, `-t`, `-u`, `-w`, env, detached |
-| `json` (list and inspect), `logs`, `wait`, `stop`, `kill`, `restart`, `DELETE` | `kern ps`, `inspect --json`, `logs`, `wait`, `stop`, `kill`, `restart`, `rm` |
+| `logs` (`stdout`, `stderr`, `follow`, `tail`, `since`, `timestamps`) | `kern logs`: stdout and stderr apart for a container made through the socket |
+| `json` (list and inspect), `wait`, `stop`, `kill`, `restart`, `DELETE` | `kern ps`, `inspect --json`, `wait`, `stop`, `kill`, `restart`, `rm` |
 | `images/create`, `images/{name}/json` | `kern pull`, `kern images --json` |
 | `_ping`, `version`, `info` | kern and kern's version |
 
@@ -120,8 +121,11 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
 - Testcontainers' reaper (Ryuk) is refused, as above; with `TESTCONTAINERS_RYUK_DISABLED=true` each
   test removes its own containers, as the `with` block does.
 - `--mount` (`HostConfig.Mounts`) is refused by name; a bind (`-v src:dst`) is translated.
-- `logs` of a box started with `-d` is one stream: kern keeps a box's stdout and stderr as one. The
-  attached `run` and `exec` keep them apart.
+- `logs` keeps stdout and stderr apart for the containers made through the socket: their box's log
+  records which stretch came from which stream. When the two are written within microseconds of each
+  other the order BETWEEN them can differ from the order they were written in, as with Docker's own
+  log driver; each stream keeps its own order. A box started with `kern box -d` outside the socket
+  keeps one stream, and its `logs` come back as stdout.
 - A container's id is derived from its box name, the same every time, and `docker ps` lists kern's
   boxes, not only those made through the socket.
 - A box run attached and ended without `--rm` is remembered by the server until `docker rm`; kern

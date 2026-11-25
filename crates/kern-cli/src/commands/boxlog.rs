@@ -147,6 +147,16 @@ pub(crate) struct CappedLog {
     /// ([`CappedLog::note_dropped`]): before this a full store lost lines and no reader could
     /// tell, `kern logs` included.
     pub(crate) dropped: u64,
+    /// `<path>.streams` (`--log-streams` only, else `-1`), the stream of the bytes being written now,
+    /// the last stream recorded (`0` = none yet, so the first write records one), and the sidecar's
+    /// size. See [`streams_path`].
+    streams_fd: i32,
+    pub(crate) cur_stream: u8,
+    last_stream: u8,
+    /// The offset the last record points at: records store the step from it.
+    last_stream_at: u64,
+    streams_len: u64,
+    split: bool,
 }
 
 /// The STARTING interval between time marks, and the finest resolution `logs -t` ever claims.
@@ -196,6 +206,11 @@ pub(crate) struct LogCap {
     pub(crate) files: u32,
     /// `false` for `--log-driver none`: the output goes to `/dev/null` and no log file is made.
     pub(crate) keep: bool,
+    /// `--log-streams`, written by the Docker API server for the boxes it creates: stdout and stderr
+    /// reach the pump on TWO pipes and `<log>.streams` records which stream each stretch of the log
+    /// came from, so `docker logs` can answer them apart. Off everywhere else, where the pump keeps
+    /// its single pipe exactly as before. See [`streams_path`].
+    pub(crate) streams: bool,
 }
 
 impl Default for LogCap {
@@ -207,6 +222,7 @@ impl Default for LogCap {
             max_bytes: BOX_LOG_MAX_BYTES,
             files: 2,
             keep: true,
+            streams: false,
         }
     }
 }
@@ -265,9 +281,40 @@ impl PartialCap {
             max_bytes: self.max_bytes.unwrap_or(base.max_bytes),
             files: self.files.unwrap_or(base.files),
             keep: self.keep,
+            streams: base.streams,
         }
     }
 }
+
+/// `<log>.streams`: which stream each stretch of a `--log-streams` log came from.
+///
+/// 🔴 A SIDECAR, FOR THE SAME REASON AS THE TIME INDEX: the pump moves bytes with `splice(2)` and
+/// never sees them, so the log stays byte for byte what the box wrote and `kern logs` reads it as it
+/// always did. One record is written only when the stream CHANGES: a box that writes only stdout
+/// leaves one record, an interleaved one a record per switch.
+///
+/// A RECORD IS 4 BYTES, little-endian: bit 31 is the stream (0 stdout, 1 stderr) and bits 0-30 how
+/// far the stretch starts after the previous record's (the first counts from 0). Compact because the
+/// count is what a chatty box spends: MEASURED with 16-byte `(offset, stream)` records capped like the
+/// time index, a box alternating 6-byte lines on the two streams filled the record within a quarter
+/// of its 1 MiB log and 17 711 line pieces were then filed as stdout. At 4 bytes, capped at half the
+/// log (see [`CappedLog::note_stream`]), lines of 8 bytes or more stay apart for the whole log.
+/// Bytes before the first record, and every byte of a log written without the flag, read as stdout.
+pub(crate) fn streams_path(log: &std::path::Path) -> std::path::PathBuf {
+    let mut p = log.to_path_buf().into_os_string();
+    p.push(".streams");
+    std::path::PathBuf::from(p)
+}
+
+/// Docker's stream numbers, as recorded in [`streams_path`] and framed by `kern logs --frames`.
+pub(crate) const STREAM_STDOUT: u8 = 1;
+pub(crate) const STREAM_STDERR: u8 = 2;
+
+/// The bytes of one stream record. See [`streams_path`].
+const STREAM_REC_LEN: usize = 4;
+/// The largest step one record can describe (31 bits); a longer stretch is bridged by records that
+/// repeat the stream.
+const STREAMS_MAX_STEP: u64 = 0x7FFF_FFFF;
 
 /// `<log>.idx`, beside the log rather than inside it. Same directory, same rotation, same lifetime.
 pub(crate) fn idx_path(log: &std::path::Path) -> std::path::PathBuf {
@@ -306,6 +353,18 @@ impl CappedLog {
             idx_len: 0,
             mark_every: MARK_EVERY,
             dropped: 0,
+            // Appended to, like the log: a log reopened for another run of the same box keeps its
+            // earlier records, whose offsets still describe the same file.
+            streams_fd: if cap.streams {
+                open_log(&streams_path(path), true)
+            } else {
+                -1
+            },
+            cur_stream: STREAM_STDOUT,
+            last_stream: 0,
+            last_stream_at: 0,
+            streams_len: 0,
+            split: cap.streams,
         })
     }
 
@@ -327,7 +386,10 @@ impl CappedLog {
         // SAFETY: a live buffer of the length passed, to a descriptor this struct owns.
         let n = unsafe { libc::write(self.fd, line.as_ptr().cast(), line.len()) };
         if n == line.len() as isize {
+            // kern's own line, so it is stderr whatever the box was writing around it.
+            let box_stream = std::mem::replace(&mut self.cur_stream, STREAM_STDERR);
             self.mark();
+            self.cur_stream = box_stream;
             self.written += line.len() as u64;
             self.dropped = 0;
         }
@@ -355,6 +417,81 @@ impl CappedLog {
         self.last_mark = 0;
         self.idx_len = 0;
         self.mark_every = MARK_EVERY;
+    }
+
+    /// Start the stream record over with the file it describes, for the reason [`reset_index`] gives:
+    /// after a rotation offset 0 is a different byte. A record closed early (stream `0`) is reopened,
+    /// because the new generation can be described again.
+    ///
+    /// [`reset_index`]: CappedLog::reset_index
+    fn reset_streams(&mut self) {
+        if !self.split {
+            return;
+        }
+        if self.streams_fd < 0 {
+            self.streams_fd = open_log(&streams_path(&self.path), true);
+        }
+        if self.streams_fd >= 0 {
+            // SAFETY: truncating a descriptor this struct owns; `O_APPEND` puts the next record at 0.
+            unsafe { libc::ftruncate(self.streams_fd, 0) };
+        }
+        self.last_stream = 0;
+        self.last_stream_at = 0;
+        self.streams_len = 0;
+    }
+
+    /// Record that the stream changes to `cur_stream` at `written`, when it differs from the last one
+    /// recorded. Called from [`CappedLog::mark`], so it runs at exactly the two sites that advance
+    /// `written`, immediately before the advance: the record points at the first byte of the stretch.
+    ///
+    /// BOUNDED at half the log's own cap: a box alternating streams on every write spends 4 bytes a
+    /// switch. At the bound the last record is a STDOUT one and the record stops: the rest of the
+    /// generation reads as stdout, separation degrades and the log itself loses nothing. A write
+    /// that fails stops it the same way, minus that last record.
+    fn note_stream(&mut self) {
+        if self.streams_fd < 0 || self.cur_stream == self.last_stream {
+            return;
+        }
+        let max = (self.max / 2).max(4096);
+        let bit = |stream: u8| {
+            if stream == STREAM_STDERR {
+                1u32 << 31
+            } else {
+                0
+            }
+        };
+        let mut step = self.written.saturating_sub(self.last_stream_at);
+        // Bridge a stretch longer than one record can step over, under the stream it already has.
+        while step > STREAMS_MAX_STEP {
+            if !self.put_stream_record(bit(self.last_stream) | STREAMS_MAX_STEP as u32, max) {
+                return;
+            }
+            self.last_stream_at += STREAMS_MAX_STEP;
+            step -= STREAMS_MAX_STEP;
+        }
+        let rec = bit(self.cur_stream) | step as u32;
+        if self.put_stream_record(rec, max) {
+            self.last_stream = self.cur_stream;
+            self.last_stream_at = self.written;
+        }
+    }
+
+    /// Append one record; when it is the last that fits under `max`, as stdout, and stop. `false`
+    /// once the record is closed.
+    fn put_stream_record(&mut self, rec: u32, max: u64) -> bool {
+        let full = self.streams_len + 2 * STREAM_REC_LEN as u64 > max;
+        let rec = if full { rec & 0x7FFF_FFFF } else { rec };
+        let bytes = rec.to_le_bytes();
+        // SAFETY: a live local buffer of exactly the length passed, to a descriptor this struct owns.
+        let n = unsafe { libc::write(self.streams_fd, bytes.as_ptr().cast(), bytes.len()) };
+        if n != bytes.len() as isize || full {
+            // SAFETY: closing a descriptor this struct owns, once; `-1` stops every later use.
+            unsafe { libc::close(self.streams_fd) };
+            self.streams_fd = -1;
+            return false;
+        }
+        self.streams_len += STREAM_REC_LEN as u64;
+        true
     }
 
     /// The index may not outgrow this. Beyond it the marks are thinned by half and the interval
@@ -414,6 +551,17 @@ impl CappedLog {
         self.idx_fd = -1;
     }
 
+    /// Close the two sidecars (time index, stream record). For `Drop`, beside the log's own fd.
+    pub(crate) fn close_sidecars(&mut self) {
+        for fd in [&mut self.idx_fd, &mut self.streams_fd] {
+            if *fd >= 0 {
+                // SAFETY: a descriptor this struct owns, closed once and then forgotten.
+                unsafe { libc::close(*fd) };
+                *fd = -1;
+            }
+        }
+    }
+
     fn rotate(&mut self) {
         // `files == 1` KEEPS NO GENERATION, which is Docker's `max-file: 1`. There is nothing to
         // rename to, so the active file is truncated in place: the fd stays valid and no reader ever
@@ -430,6 +578,7 @@ impl CappedLog {
             {
                 self.written = 0;
                 self.reset_index();
+                self.reset_streams();
             }
             return;
         }
@@ -455,6 +604,7 @@ impl CappedLog {
             self.fd = fd;
             self.written = 0;
             self.reset_index();
+            self.reset_streams();
         }
     }
 
@@ -476,6 +626,7 @@ impl CappedLog {
     /// the reader refuses a trailing partial record for the same reason, so the two agree without
     /// either of them having to trust the other.
     fn mark(&mut self) {
+        self.note_stream();
         if self.idx_fd < 0 {
             return;
         }
@@ -554,6 +705,64 @@ impl CappedLog {
 /// descriptor runs out and an `open` starts failing. A log is diagnostics; it may be lost, and it
 /// may never be the reason a workload dies.
 pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
+    pump_capped_streams(&mut [(rd, STREAM_STDOUT)], path, cap);
+}
+
+/// Which source the pump reads next: the only one, or, with two, one `poll` reports readable (or hung
+/// up: its EOF must be read too). When both are, the one NOT served last goes first, so a flooding
+/// stream cannot starve the other, and stdout goes first at the start. `None` when every source has
+/// reached EOF.
+///
+/// WHAT TWO PIPES CANNOT TELL: which of two writes that are both waiting came first. Docker's own
+/// log driver reads the two streams separately and has the same limit; a box whose writes are apart
+/// in time (a line, then the next) keeps its order.
+///
+/// ONE SOURCE NEVER POLLS. That is every box but the Docker API's, and its loop stays exactly the
+/// `splice` it was, without a syscall added per chunk.
+fn next_source(sources: &[(i32, u8)], last: Option<usize>) -> Option<usize> {
+    // At most two sources (stdout, stderr): fixed arrays, no allocation per chunk.
+    let mut open = [0usize; 2];
+    let mut fds = [libc::pollfd {
+        fd: -1,
+        events: libc::POLLIN,
+        revents: 0,
+    }; 2];
+    let mut count = 0usize;
+    for (i, &(fd, _)) in sources.iter().enumerate().take(2) {
+        if fd >= 0 {
+            open[count] = i;
+            fds[count].fd = fd;
+            count += 1;
+        }
+    }
+    match count {
+        0 => return None,
+        1 => return Some(open[0]),
+        _ => {}
+    }
+    loop {
+        // SAFETY: a live array of `count` (= 2) pollfd structs.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), count as libc::nfds_t, -1) };
+        if n > 0 {
+            break;
+        }
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            // poll itself failing is not a reason to stop draining: read the first, blocking.
+            return Some(open[0]);
+        }
+    }
+    let ready = |k: usize| fds[k].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+    let first = usize::from(last == Some(open[0]));
+    [first, 1 - first]
+        .into_iter()
+        .find(|&k| ready(k))
+        .map(|k| open[k])
+        .or(Some(open[0]))
+}
+
+/// [`pump_capped_log`] over one or more `(pipe, stream)` sources, until every one reaches EOF. With
+/// two (`--log-streams`) each stretch is recorded with its stream; see [`streams_path`].
+fn pump_capped_streams(sources: &mut [(i32, u8)], path: &std::path::Path, cap: LogCap) {
     let mut log = CappedLog::open(path, cap);
     // A /dev/null sink for the no-log case and disk-full overflow: the pipe must still be drained.
     let void = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
@@ -562,7 +771,13 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
                                         // Set when there is nowhere left to put the bytes. The pipe is still drained - see the note on
                                         // this function about what leaving instead costs the workload.
     let mut discard = false;
-    loop {
+    let mut last = None;
+    // Until every source is at EOF.
+    while let Some(at) = next_source(sources, last) {
+        last = Some(at);
+        let (rd, stream) = sources[at];
+        // EOF (or a read error) on THIS source ends this source; the loop ends with the last one.
+        let ended = |sources: &mut [(i32, u8)]| sources[at].0 = -1;
         if discard {
             // SAFETY: `scratch` is a live buffer this frame owns and `rd` is the pipe read end.
             let n = unsafe { libc::read(rd, scratch.as_mut_ptr().cast(), scratch.len()) };
@@ -570,9 +785,12 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
                 continue; // bytes read and dropped: the box keeps writing, and keeps living
             }
             if n == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                break; // EOF, or a read error on the pipe itself - there is no pipe left to serve
+                ended(sources); // EOF, or a read error on the pipe itself: nothing left to serve here
             }
             continue;
+        }
+        if let Some(l) = log.as_mut() {
+            l.cur_stream = stream;
         }
         // Choose this round's sink and how much may go to it. `to_log` distinguishes the real log (count
         // toward the cap) from the /dev/null shed (do not).
@@ -605,7 +823,7 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
         }
         if use_splice {
             match splice_once(rd, sink, want) {
-                Ok(0) => break, // EOF: every write end (workload + supervisor) is closed
+                Ok(0) => ended(sources), // EOF: every write end (workload + supervisor) is closed
                 Ok(n) => {
                     if let Some(l) = log.as_mut() {
                         if to_log {
@@ -640,9 +858,9 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
                     }
                 }
             } else if n == 0 {
-                break; // EOF: every write end (workload + supervisor) is closed
+                ended(sources); // EOF: every write end (workload + supervisor) is closed
             } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                break; // a real error on the pipe read end itself; EINTR falls through and retries
+                ended(sources); // a real error on the pipe read end itself; EINTR retries
             }
         }
     }
@@ -662,12 +880,21 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
 /// running Rust code in the child (no exec) is sound. The child sheds every inherited fd except the pipe
 /// read end - crucially the readiness-pipe write end, which held here would stop the launcher from ever
 /// seeing EOF and hang `kern box -d`.
-pub(crate) unsafe fn start_log_pump(path: &std::path::Path, cap: LogCap) -> Option<i32> {
+///
+/// RETURNS `(stdout, stderr)` write ends. They are the SAME descriptor unless `cap.streams` asks for
+/// the two apart, and then the pump reads two pipes (see [`streams_path`]); a second pipe that cannot
+/// be made leaves the box on one, which costs only the separation.
+pub(crate) unsafe fn start_log_pump(path: &std::path::Path, cap: LogCap) -> Option<(i32, i32)> {
     let mut fds = [0i32; 2];
     if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
         return None;
     }
     let (rd, wr) = (fds[0], fds[1]);
+    let mut efds = [-1i32; 2];
+    if cap.streams && libc::pipe2(efds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+        efds = [-1, -1];
+    }
+    let (erd, ewr) = (efds[0], efds[1]);
     // Enlarge the pipe buffer to `PUMP_SPLICE_CHUNK` (default is 64 KiB = 16 pages). `splice` moves at
     // most what the pipe holds, so a bigger buffer means one `splice` drains up to 1 MiB instead of
     // 64 KiB - ~16x fewer syscalls under a flood, and fewer `write` wake-ups for the box. Best-effort:
@@ -690,10 +917,17 @@ pub(crate) unsafe fn start_log_pump(path: &std::path::Path, cap: LogCap) -> Opti
     // are the ones already holding the descriptor - this box and the pump.
     libc::fchmod(wr, 0o666);
     libc::fcntl(rd, libc::F_SETPIPE_SZ, PUMP_SPLICE_CHUNK as libc::c_int);
+    if ewr >= 0 {
+        libc::fchmod(ewr, 0o666);
+        libc::fcntl(erd, libc::F_SETPIPE_SZ, PUMP_SPLICE_CHUNK as libc::c_int);
+    }
     let pid = libc::fork();
     if pid < 0 {
-        libc::close(rd);
-        libc::close(wr);
+        for fd in [rd, wr, erd, ewr] {
+            if fd >= 0 {
+                libc::close(fd);
+            }
+        }
         return None;
     }
     if pid == 0 {
@@ -712,14 +946,24 @@ pub(crate) unsafe fn start_log_pump(path: &std::path::Path, cap: LogCap) -> Opti
                 libc::close(devnull);
             }
         }
-        // Shed every OTHER inherited fd except the read end - most importantly the readiness-pipe write
-        // end, which held here would stop the launcher from ever seeing EOF and hang `kern box -d`.
-        kern_isolation::shed_inherited_fds(rd);
-        pump_capped_log(rd, path, cap);
+        // Shed every OTHER inherited fd except the read end(s) - most importantly the readiness-pipe
+        // write end, which held here would stop the launcher from ever seeing EOF and hang `kern box
+        // -d`. The write ends go too: a pump holding one would never see that stream's EOF.
+        if erd >= 0 {
+            kern_isolation::shed_inherited_fds_keeping(&[rd, erd]);
+            pump_capped_streams(&mut [(rd, STREAM_STDOUT), (erd, STREAM_STDERR)], path, cap);
+        } else {
+            kern_isolation::shed_inherited_fds(rd);
+            pump_capped_log(rd, path, cap);
+        }
         libc::_exit(0);
     }
-    libc::close(rd); // the parent keeps only the write end (dup2'd onto 1/2 by the caller, then closed)
-    Some(wr)
+    // The parent keeps only the write ends (dup2'd onto 1/2 by the caller, then closed).
+    libc::close(rd);
+    if erd >= 0 {
+        libc::close(erd);
+    }
+    Some((wr, if ewr >= 0 { ewr } else { wr }))
 }
 
 /// Open the box log for direct (uncapped) append - the fallback when the capped pump can't start.
@@ -740,18 +984,22 @@ pub(crate) fn detach_stdio(log: Option<&std::path::Path>, cap: LogCap) {
         }
         // `--log-driver none`: nothing is captured and no file is made, as Docker keeps nothing for
         // that driver.
-        let sink = log
+        let (out, err) = log
             .filter(|_| cap.keep)
-            .and_then(|p| start_log_pump(p, cap).or_else(|| open_log_direct(p)))
-            .unwrap_or(null);
-        if sink >= 0 {
-            libc::dup2(sink, 1);
-            libc::dup2(sink, 2);
+            .and_then(|p| start_log_pump(p, cap).or_else(|| open_log_direct(p).map(|fd| (fd, fd))))
+            .unwrap_or((null, null));
+        if out >= 0 {
+            libc::dup2(out, 1);
         }
-        // Close the source fd once it's duplicated onto 1/2 - unless it IS `null` (closed below) or a
-        // std stream.
-        if sink > 2 && sink != null {
-            libc::close(sink);
+        if err >= 0 {
+            libc::dup2(err, 2);
+        }
+        // Close the source fds once duplicated onto 1/2 - unless one IS `null` (closed below) or a std
+        // stream. `out == err` on every path but `--log-streams`: closed once.
+        for (i, fd) in [out, err].into_iter().enumerate() {
+            if fd > 2 && fd != null && !(i == 1 && fd == out) {
+                libc::close(fd);
+            }
         }
         if null > 2 {
             libc::close(null);
@@ -1466,6 +1714,7 @@ mod rotation_tests {
                     max_bytes: 16,
                     files,
                     keep: true,
+                    streams: false,
                 },
             )
             .expect("the log opens");
@@ -1536,6 +1785,7 @@ mod rotation_tests {
                 max_bytes: BOX_LOG_MAX_BYTES,
                 files: 2,
                 keep: true,
+                streams: false,
             }
         );
     }
@@ -1626,6 +1876,11 @@ pub(crate) struct Stamper {
     /// Print the time column. `false` when the window is the only reason this Stamper exists, which
     /// is `logs --since` without `-t`: Docker's `--since` does not imply `--timestamps` either.
     column_on: bool,
+    /// `logs --frames`: write Docker's multiplexed frames instead of plain bytes, each stretch under
+    /// the stream `<log>.streams` recorded for it (stdout where nothing was recorded).
+    frames: bool,
+    /// The stream record, `(offset, stream)`, read beside the time index. See [`read_streams`].
+    runs: Vec<(u64, u8)>,
 }
 
 impl Stamper {
@@ -1643,7 +1898,20 @@ impl Stamper {
             floor: None,
             window: (None, None),
             column_on: true,
+            frames: false,
+            runs: Vec::new(),
         }
+    }
+
+    /// Write Docker's multiplexed frames (`logs --frames`, the Docker API server's reader): every line
+    /// is cut at the stream boundaries `<log>.streams` recorded and each piece framed as stdout (1) or
+    /// stderr (2), the time column, when asked for, inside the line's first frame.
+    pub(crate) fn with_frames(mut self, on: bool) -> Self {
+        self.frames = on;
+        if on {
+            self.runs = read_streams(&self.log);
+        }
+        self
     }
 
     /// Restrict output to lines whose recorded time falls in `[since, until]`, and say whether the
@@ -1707,6 +1975,7 @@ impl Stamper {
     pub(crate) fn rebind(&mut self, ino: u64) {
         self.at = 0;
         self.marks.clear();
+        self.runs.clear();
         self.column = (None, Vec::new());
         self.bind_inode(ino);
     }
@@ -1725,6 +1994,9 @@ impl Stamper {
     ) -> std::io::Result<()> {
         if self.live {
             self.marks = read_marks(&self.log);
+            if self.frames {
+                self.runs = read_streams(&self.log);
+            }
             // The name may now be a DIFFERENT file than the one being read: see `bind_inode`.
             if self.ino != 0 && inode_of(&self.log).is_some_and(|i| i != self.ino) {
                 self.orphan = true;
@@ -1785,6 +2057,7 @@ impl Stamper {
         if let Some(n) = nanos {
             self.floor = Some(n);
         }
+        let line_at = self.at;
         // THE CURSOR ADVANCES WHETHER OR NOT THE LINE IS PRINTED. `at` is a file offset, and the
         // stamp of every later line is read from it: a filtered line that did not move it would
         // shift every remaining stamp backwards by its length.
@@ -1805,8 +2078,12 @@ impl Stamper {
                 let stamp = nanos.map(fmt_mark).unwrap_or_else(|| "-".to_string());
                 self.column = (nanos, format!("{stamp:<24} ").into_bytes());
             }
-            out.write_all(&self.column.1)?;
         }
+        let column: &[u8] = if self.column_on { &self.column.1 } else { &[] };
+        if self.frames {
+            return write_frames(out, &self.runs, line_at, column, line);
+        }
+        out.write_all(column)?;
         out.write_all(line)?;
         Ok(())
     }
@@ -1817,12 +2094,86 @@ impl Stamper {
             // Unstamped and therefore never filtered, for the same reason a `None` mark is kept
             // above: this line has no recorded time, so nothing is known to place it outside the
             // window.
-            out.write_all(&self.pending)?;
+            if self.frames {
+                write_frames(out, &self.runs, self.at, &[], &self.pending)?;
+            } else {
+                out.write_all(&self.pending)?;
+            }
             self.at += self.pending.len() as u64;
             self.pending.clear();
         }
         Ok(())
     }
+}
+
+/// The stream record of `log` as `(offset, stream)` in file order, or empty when there is none (a log
+/// written without `--log-streams`). A trailing partial record is ignored, as [`read_marks`] ignores
+/// one.
+pub(crate) fn read_streams(log: &std::path::Path) -> Vec<(u64, u8)> {
+    let Ok(data) = std::fs::read(streams_path(log)) else {
+        return Vec::new();
+    };
+    let mut at = 0u64;
+    let mut runs = Vec::with_capacity(data.len() / STREAM_REC_LEN);
+    for c in data.chunks_exact(STREAM_REC_LEN) {
+        let mut b = [0u8; STREAM_REC_LEN];
+        b.copy_from_slice(c);
+        let rec = u32::from_le_bytes(b);
+        at += u64::from(rec & 0x7FFF_FFFF);
+        let stream = if rec >> 31 == 1 {
+            STREAM_STDERR
+        } else {
+            STREAM_STDOUT
+        };
+        runs.push((at, stream));
+    }
+    runs
+}
+
+/// The stream of the byte at `offset`, and the offset where the next recorded stretch starts.
+/// Before the first record the answer is stdout.
+fn stream_at(runs: &[(u64, u8)], offset: u64) -> (u8, Option<u64>) {
+    let i = runs.partition_point(|r| r.0 <= offset);
+    let stream = match i.checked_sub(1).map(|k| runs[k].1) {
+        Some(STREAM_STDERR) => STREAM_STDERR,
+        _ => STREAM_STDOUT,
+    };
+    (stream, runs.get(i).map(|r| r.0))
+}
+
+/// Frame `bytes`, which start at file offset `at`, cutting at every recorded stream change; `prefix`
+/// (the time column, or nothing) leads the first frame. Docker's header: stream, three zero bytes,
+/// the payload length as a big-endian u32.
+fn write_frames(
+    out: &mut impl std::io::Write,
+    runs: &[(u64, u8)],
+    at: u64,
+    prefix: &[u8],
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut done = 0usize;
+    let mut prefix = prefix;
+    while done < bytes.len() {
+        let off = at + done as u64;
+        let (stream, next) = stream_at(runs, off);
+        // A frame's length is a u32, so no piece may be longer than that with its prefix.
+        let room = (u32::MAX as usize).saturating_sub(prefix.len()).max(1);
+        let take = next
+            .and_then(|n| usize::try_from(n.saturating_sub(off)).ok())
+            .filter(|&n| n > 0)
+            .map_or(bytes.len() - done, |n| n.min(bytes.len() - done))
+            .min(room);
+        let piece = &bytes[done..done + take];
+        let len = u32::try_from(prefix.len() + piece.len()).unwrap_or(u32::MAX);
+        let mut head = [stream, 0, 0, 0, 0, 0, 0, 0];
+        head[4..].copy_from_slice(&len.to_be_bytes());
+        out.write_all(&head)?;
+        out.write_all(prefix)?;
+        out.write_all(piece)?;
+        prefix = &[];
+        done += take;
+    }
+    Ok(())
 }
 
 /// The inode behind a path right now, or `None` if it cannot be stat'ed.
@@ -2017,6 +2368,7 @@ mod compaction_tests {
                 max_bytes: 1 << 20,
                 files: 2,
                 keep: true,
+                streams: false,
             },
         )
         .expect("the log opens");
@@ -2051,6 +2403,7 @@ mod compaction_tests {
                 max_bytes: 1 << 20,
                 files: 2,
                 keep: true,
+                streams: false,
             },
         )
         .expect("the log opens");
@@ -2149,6 +2502,7 @@ mod compaction_tests {
                 max_bytes: 65_536,
                 files: 2,
                 keep: true,
+                streams: false,
             },
         )
         .expect("the log opens");
@@ -2510,5 +2864,191 @@ mod log_cap_precedence_tests {
         let base = LogCap::default();
         let cap = LogCap::pick(Some(0), Some(0), Some(0), Some(0), true).with_base(base);
         assert_eq!(cap, base);
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kern-streams-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(std::fs::create_dir_all(&d).is_ok());
+        d
+    }
+
+    fn split_cap(max_bytes: u64) -> LogCap {
+        LogCap {
+            max_bytes,
+            files: 2,
+            keep: true,
+            streams: true,
+        }
+    }
+
+    /// `(stream, payload)` of every frame in `bytes`, and how many bytes were left over.
+    fn decode(bytes: &[u8]) -> (Vec<(u8, Vec<u8>)>, usize) {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 8 <= bytes.len() {
+            let mut len = [0u8; 4];
+            len.copy_from_slice(&bytes[i + 4..i + 8]);
+            let n = u32::from_be_bytes(len) as usize;
+            out.push((bytes[i], bytes[i + 8..i + 8 + n].to_vec()));
+            i += 8 + n;
+        }
+        (out, bytes.len() - i)
+    }
+
+    /// A switch is one record, a write in the same stream is none, and the record reads back as
+    /// the offsets where each stretch starts.
+    #[test]
+    fn switches_are_recorded_once_and_read_back_as_offsets() {
+        let d = dir("switch");
+        let path = d.join("b.log");
+        let Some(mut log) = CappedLog::open(&path, split_cap(1 << 20)) else {
+            panic!("the log opens");
+        };
+        for (stream, bytes) in [
+            (STREAM_STDOUT, &b"out\n"[..]),
+            (STREAM_STDERR, b"err\n"),
+            (STREAM_STDERR, b"err2\n"),
+            (STREAM_STDOUT, b"o\n"),
+        ] {
+            log.cur_stream = stream;
+            log.write(bytes);
+        }
+        drop(log);
+        assert_eq!(
+            read_streams(&path),
+            vec![(0, STREAM_STDOUT), (4, STREAM_STDERR), (13, STREAM_STDOUT)]
+        );
+        assert_eq!(
+            std::fs::metadata(streams_path(&path)).map(|m| m.len()).ok(),
+            Some(3 * STREAM_REC_LEN as u64)
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A stretch longer than a record's 31-bit step is bridged under the stream it has, and the
+    /// switch after it lands on the right offset.
+    #[test]
+    fn a_stretch_past_the_step_field_is_bridged() {
+        let d = dir("bridge");
+        let path = d.join("b.log");
+        let Some(mut log) = CappedLog::open(&path, split_cap(u64::MAX)) else {
+            panic!("the log opens");
+        };
+        log.cur_stream = STREAM_STDOUT;
+        log.note_stream();
+        let far = (1u64 << 32) + 5;
+        log.written = far;
+        log.cur_stream = STREAM_STDERR;
+        log.note_stream();
+        drop(log);
+        let runs = read_streams(&path);
+        assert_eq!(runs.first(), Some(&(0, STREAM_STDOUT)));
+        assert_eq!(runs.last(), Some(&(far, STREAM_STDERR)));
+        assert!(runs[1..runs.len() - 1]
+            .iter()
+            .all(|r| r.1 == STREAM_STDOUT && r.0 < far));
+        assert_eq!(stream_at(&runs, far - 1).0, STREAM_STDOUT);
+        assert_eq!(stream_at(&runs, far).0, STREAM_STDERR);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// At the cap the record ends on stdout and stops growing; the log goes on.
+    #[test]
+    fn the_record_is_capped_and_ends_on_stdout() {
+        let d = dir("cap");
+        let path = d.join("b.log");
+        let Some(mut log) = CappedLog::open(&path, split_cap(8192)) else {
+            panic!("the log opens");
+        };
+        for i in 0..3000u32 {
+            log.cur_stream = if i % 2 == 0 {
+                STREAM_STDOUT
+            } else {
+                STREAM_STDERR
+            };
+            log.write(b"x");
+        }
+        drop(log);
+        let len = std::fs::metadata(streams_path(&path))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(len <= 4096, "the record outgrew half the log: {len}");
+        let runs = read_streams(&path);
+        assert_eq!(runs.last().map(|r| r.1), Some(STREAM_STDOUT));
+        assert_eq!(stream_at(&runs, 2999).0, STREAM_STDOUT);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A line cut by a stream change becomes two frames, the time column inside the first.
+    #[test]
+    fn a_line_is_cut_at_the_stream_change_and_the_column_leads_it() {
+        let runs = [(0, STREAM_STDOUT), (4, STREAM_STDERR)];
+        let mut out = Vec::new();
+        assert!(write_frames(&mut out, &runs, 2, b"T ", b"abcd\n").is_ok());
+        assert_eq!(
+            decode(&out),
+            (
+                vec![
+                    (STREAM_STDOUT, b"T ab".to_vec()),
+                    (STREAM_STDERR, b"cd\n".to_vec())
+                ],
+                0
+            )
+        );
+        let mut plain = Vec::new();
+        assert!(write_frames(&mut plain, &[], 0, b"", b"no record\n").is_ok());
+        assert_eq!(
+            decode(&plain).0,
+            vec![(STREAM_STDOUT, b"no record\n".to_vec())]
+        );
+    }
+
+    /// The reader `logs --frames` uses: a log written on two streams comes back as frames of the
+    /// right stream, an unterminated last line included.
+    #[test]
+    fn the_stamper_writes_frames_by_stream() {
+        let d = dir("stamper");
+        let path = d.join("b.log");
+        let Some(mut log) = CappedLog::open(&path, split_cap(1 << 20)) else {
+            panic!("the log opens");
+        };
+        for (stream, bytes) in [
+            (STREAM_STDOUT, &b"one\n"[..]),
+            (STREAM_STDERR, b"two\n"),
+            (STREAM_STDOUT, b"thr"),
+            (STREAM_STDERR, b"ee\n"),
+            (STREAM_STDOUT, b"tail"),
+        ] {
+            log.cur_stream = stream;
+            log.write(bytes);
+        }
+        drop(log);
+        let content = std::fs::read(&path).unwrap_or_default();
+        let mut s = Stamper::new(&path, 0)
+            .with_window(None, None, false)
+            .with_frames(true);
+        let mut out = Vec::new();
+        assert!(s.push(&mut out, &content).is_ok());
+        assert!(s.flush(&mut out).is_ok());
+        assert_eq!(
+            decode(&out),
+            (
+                vec![
+                    (STREAM_STDOUT, b"one\n".to_vec()),
+                    (STREAM_STDERR, b"two\n".to_vec()),
+                    (STREAM_STDOUT, b"thr".to_vec()),
+                    (STREAM_STDERR, b"ee\n".to_vec()),
+                    (STREAM_STDOUT, b"tail".to_vec()),
+                ],
+                0
+            )
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

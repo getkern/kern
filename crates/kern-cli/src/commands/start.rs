@@ -3028,11 +3028,14 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The box's own flag first, then `[kern] log_max_size` / `log_max_file`, then kern's default:
     // Docker's order (`--log-opt` over `daemon.json` over the built-in). A `kern.toml` that does not
     // parse leaves the built-in in force rather than failing a box over its log.
-    let log_cap = crate::commands::boxlog::LogCap::resolve(
-        args.log_max_size,
-        args.log_max_file,
-        !args.log_none,
-    );
+    let log_cap = crate::commands::boxlog::LogCap {
+        streams: args.log_streams,
+        ..crate::commands::boxlog::LogCap::resolve(
+            args.log_max_size,
+            args.log_max_file,
+            !args.log_none,
+        )
+    };
     // THE RECORD IS WRITTEN HERE: past every argument-coherence refusal and immediately before the
     // box is launched.
     //

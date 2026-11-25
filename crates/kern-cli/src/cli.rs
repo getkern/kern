@@ -180,6 +180,9 @@ pub enum Command {
         log_max_file: Option<u32>,
         /// `--log-driver none`: the box's output is not kept (Docker's driver of that name).
         log_none: bool,
+        /// `--log-streams`: written by the Docker API server, never typed by hand. The log records
+        /// which of its bytes came from stderr, so `docker logs` answers the two apart.
+        log_streams: bool,
         /// `--memory-reservation <size>` → cgroup `memory.low`: a soft floor, never a cap.
         memory_reservation: Option<u64>,
         /// `--cpu-weight <n>` (1..=10000) → cgroup `cpu.weight`: relative CPU share under contention.
@@ -622,6 +625,9 @@ pub enum Command {
         /// `--since` / `--until` as unix nanoseconds: show only lines the index places inside the
         /// window. A line the index cannot place is KEPT (see `boxlog::Stamper::window`).
         window: (Option<u64>, Option<u64>),
+        /// `--frames`: written by the Docker API server, never typed by hand. Docker's multiplexed
+        /// frames, stdout and stderr apart for a box started with `--log-streams`.
+        frames: bool,
     },
     /// `logs --all`: every box's output in one stream, ordered by time. See `logview::print_all`.
     LogsAll {
@@ -1903,6 +1909,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("logs") => {
             let (mut lname, mut tail, mut follow) = (None, None, false);
             let mut timestamps = false;
+            let mut frames = false;
             let mut all = false;
             let (mut since, mut until) = (None, None);
             let now_nanos = log_clock_now();
@@ -1911,6 +1918,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 match rest[i] {
                     "-f" | "--follow" => follow = true,
                     "-t" | "--timestamps" => timestamps = true,
+                    // `--frames`: the Docker API server's reader, never typed by hand. See
+                    // `Command::Logs::frames`.
+                    "--frames" => frames = true,
                     // `--all`: every box's output in one stream, ordered by time (`kern top`'s
                     // Logs tab for a script). Docker has no CLI equivalent.
                     "-a" | "--all" => all = true,
@@ -1972,6 +1982,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                         "logs --all takes no box name: it is every box (`logs <name>` is one)",
                     ));
                 }
+                if frames {
+                    return Err(Error::Usage(
+                        "logs --frames reads one box's log (the Docker API's reader), not --all",
+                    ));
+                }
                 Command::LogsAll {
                     tail,
                     follow,
@@ -1986,6 +2001,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                         follow,
                         timestamps,
                         window: (since, until),
+                        frames,
                     },
                     None => {
                         return Err(Error::Usage(
@@ -3965,6 +3981,7 @@ const NO_VALUE_FLAGS: &[&str] = &[
     "--init",
     "--interactive",
     "--keep",
+    "--log-streams",
     "--no-uid-range",
     "--plan",
     "--privileged",
@@ -4108,6 +4125,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut log_max_size: Option<u64> = None;
     let mut log_max_file: Option<u32> = None;
     let mut log_none = false;
+    let mut log_streams = false;
     let mut memory_reservation: Option<u64> = None;
     let mut cpu_weight: Option<u64> = None;
     let mut secrets: Vec<String> = Vec::new();
@@ -5119,6 +5137,10 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // and `kern logs` then says so as `docker logs` does. Every other driver ships the
                 // output elsewhere (syslog, journald, fluentd, a cloud service), which kern does not
                 // do: refused by name rather than accepted and ignored.
+                // `--log-streams`: written by `kern compat docker` for the boxes it creates, never typed
+                // by hand. The pump reads stdout and stderr on two pipes and records which stream each
+                // stretch of the log came from (`<log>.streams`), which `kern logs --frames` reads.
+                "--log-streams" => log_streams = true,
                 "--log-driver" => {
                     i += 1;
                     match rest.get(i).map(|v| v.to_string()).as_deref() {
@@ -5473,6 +5495,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             log_max_size,
             log_max_file,
             log_none,
+            log_streams,
             memory_reservation,
             cpu_weight,
             secrets,
@@ -6636,6 +6659,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             log_max_size,
             log_max_file,
             log_none,
+            log_streams,
             memory_reservation,
             cpu_weight,
             secrets,
@@ -6790,6 +6814,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 log_max_size,
                 log_max_file,
                 log_none,
+                log_streams,
                 memory_reservation,
                 cpu_weight,
             })
@@ -7015,7 +7040,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             follow,
             timestamps,
             window,
-        } => commands::logs(&name, tail, follow, timestamps, window),
+            frames,
+        } => commands::logs(&name, tail, follow, timestamps, window, frames),
         Command::LogsAll {
             tail,
             follow,

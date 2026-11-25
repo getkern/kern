@@ -428,6 +428,8 @@ pub struct BoxRunArgs<'a> {
     pub log_max_file: Option<u32>,
     /// `--log-driver none`: keep no log of the box's output.
     pub log_none: bool,
+    /// `--log-streams` (internal, the Docker API server's): keep stdout and stderr apart in the log.
+    pub log_streams: bool,
     /// `--memory-reservation`: cgroup `memory.low`, a soft floor.
     pub memory_reservation: Option<u64>,
     /// `--cpu-weight`: cgroup `cpu.weight`, a relative share.
@@ -3011,6 +3013,7 @@ fn open_log(path: &std::path::Path, append: bool) -> i32 {
 
 impl Drop for CappedLog {
     fn drop(&mut self) {
+        self.close_sidecars();
         if self.fd >= 0 {
             unsafe { libc::close(self.fd) };
         }

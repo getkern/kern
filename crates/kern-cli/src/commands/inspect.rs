@@ -2277,6 +2277,7 @@ fn log_head<W: std::io::Write>(
     follow: bool,
     timestamps: bool,
     window: (Option<u64>, Option<u64>),
+    frames: bool,
     w: &mut W,
 ) -> Result<LogHead, Error> {
     use std::io::{Read, Seek, SeekFrom};
@@ -2332,9 +2333,10 @@ fn log_head<W: std::io::Write>(
     // filter on the recorded time, `-t` prints it, and Docker's `--since` does not imply
     // `--timestamps`. One Stamper serves both, told which of the two jobs it has.
     let windowed = window.0.is_some() || window.1.is_some();
-    let mut stamper = (timestamps || windowed).then(|| {
+    let mut stamper = (timestamps || windowed || frames).then(|| {
         crate::commands::boxlog::Stamper::new(&path, file_len.saturating_sub(shown.len() as u64))
             .with_window(window.0, window.1, timestamps)
+            .with_frames(frames)
     });
     {
         // BUFFERED BY [`logs`], BECAUSE `stdout()` IS A LineWriter. It flushes on every newline, and the stamped
@@ -2374,15 +2376,18 @@ pub(crate) fn logs_to<W: std::io::Write>(
     window: (Option<u64>, Option<u64>),
     w: &mut W,
 ) -> Result<(), Error> {
-    log_head(name, tail, false, timestamps, window, w).map(|_| ())
+    log_head(name, tail, false, timestamps, window, false, w).map(|_| ())
 }
 
+/// `frames` (`logs --frames`, internal): Docker's multiplexed frames, stdout and stderr apart where
+/// the box was started with `--log-streams`. The Docker API server's reader; see `boxlog::Stamper`.
 pub fn logs(
     name: &str,
     tail: Option<usize>,
     follow: bool,
     timestamps: bool,
     window: (Option<u64>, Option<u64>),
+    frames: bool,
 ) -> Result<(), Error> {
     use std::io::Write;
     let LogHead {
@@ -2393,7 +2398,7 @@ pub fn logs(
     } = {
         let out = std::io::stdout();
         let mut w = std::io::BufWriter::new(out.lock());
-        let head = log_head(name, tail, follow, timestamps, window, &mut w)?;
+        let head = log_head(name, tail, follow, timestamps, window, frames, &mut w)?;
         w.flush()
             .map_err(|e| Error::Sandbox(format!("writing log: {e}")))?;
         head

@@ -685,7 +685,13 @@ fn every_flag_box_parses_is_advertised_in_its_help() {
         //                    from, so a later `up` can tell whether the file still describes it.
         //  --overlay-lower   the build path hands a RUN step an already-resolved layer chain.
         //  --overlay-upper   the build path hands it the persistent upper for that step.
-        const INTERNAL: &[&str] = &["--def-hash", "--overlay-lower", "--overlay-upper"];
+        //  --log-streams     `kern compat docker` asks for stdout and stderr kept apart in the log.
+        const INTERNAL: &[&str] = &[
+            "--def-hash",
+            "--log-streams",
+            "--overlay-lower",
+            "--overlay-upper",
+        ];
         if INTERNAL.contains(&flag) {
             assert!(
                 !help.contains(flag),

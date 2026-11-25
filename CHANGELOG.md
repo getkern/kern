@@ -33,6 +33,14 @@ On Windows, `kern compat docker pipe` serves the same API on `\\.\pipe\kern-dock
 account only, with no TCP endpoint. Testcontainers' Redis and Postgres modules pass. See
 [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
 
+**`docker logs` through kern's socket keeps stdout and stderr apart.** A container made through
+the socket logs its two streams on two pipes and its log records which stretch came from which;
+`docker logs` and an `attach` after the start answer them as Docker does, with `--tail`, `-f`, `-t`,
+`--since` and `stdout=`/`stderr=`. The log file itself, and `kern logs`, are unchanged, and so is
+every other box. Measured: a detached start is the same with and without the record (-22.5 us, 95%
+interval -65.6 to +17.2), and a box alternating short lines on the two streams keeps them apart for
+its whole log.
+
 **`kern-docker`: the `docker` command line, translated into kern's.** A link to kern called
 `kern-docker` runs `docker run|exec|ps|logs|compose|...` against kern's boxes, flag by flag; a flag
 kern does not mean the same stops the command with exit 125, naming it. `kern compat docker -- CMD`

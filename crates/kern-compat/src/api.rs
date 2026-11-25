@@ -332,7 +332,14 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
             ));
         }
     }
-    let mut argv: Vec<String> = vec!["box".into(), name.into(), "-d".into()];
+    // `--log-streams`: the box's log keeps stdout and stderr apart, so `logs` and an `attach` after
+    // the start answer them as Docker does. Right after `-d`, which an attached start removes.
+    let mut argv: Vec<String> = vec![
+        "box".into(),
+        name.into(),
+        "-d".into(),
+        "--log-streams".into(),
+    ];
     let env = strings(body.get("Env"));
     for e in &env {
         argv.push("-e".into());
@@ -782,9 +789,58 @@ fn list(bin: &Path, req: &Request) -> Response {
     json_response(200, format!("[{}]", items.join(",")))
 }
 
-/// Docker's multiplexed log frame: stream 1 (stdout), the length, the bytes.
-fn frame(data: &[u8]) -> Vec<u8> {
-    frame_of(1, data)
+/// Forward the frames `kern logs --frames` writes, keeping those of the streams asked for
+/// (`(stdout, stderr)`), until `from` ends. A frame is passed on as it arrives: its header first,
+/// since it carries the full length, then the payload in whatever pieces the pipe gives, so a long
+/// line is never held whole. `false` when the client went away.
+fn copy_frames(mut from: impl Read, w: &mut impl Write, (out, err): (bool, bool)) -> bool {
+    let mut buf = [0u8; 16 * 1024];
+    let mut head = [0u8; 8];
+    let mut have = 0usize;
+    let mut left: u64 = 0;
+    let mut keep = false;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return true,
+        };
+        let mut i = 0;
+        while i < n {
+            if left == 0 && have < 8 {
+                let take = (8 - have).min(n - i);
+                head[have..have + take].copy_from_slice(&buf[i..i + take]);
+                have += take;
+                i += take;
+                if have < 8 {
+                    continue;
+                }
+                have = 0;
+                let mut len = [0u8; 4];
+                len.copy_from_slice(&head[4..]);
+                left = u64::from(u32::from_be_bytes(len));
+                keep = match head[0] {
+                    1 => out,
+                    2 => err,
+                    _ => false,
+                };
+                if keep && w.write_all(&head).is_err() {
+                    return false;
+                }
+                continue;
+            }
+            let take = usize::try_from(left).unwrap_or(usize::MAX).min(n - i);
+            if keep && w.write_all(&buf[i..i + take]).is_err() {
+                return false;
+            }
+            left -= take as u64;
+            i += take;
+        }
+        if w.flush().is_err() {
+            return false;
+        }
+    }
 }
 
 /// A frame of stream `kind` (1 stdout, 2 stderr).
@@ -796,10 +852,17 @@ fn frame_of(kind: u8, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `GET /containers/{id}/logs`: kern's log of the box, in Docker's multiplexed frames (kern keeps one
-/// stream, so every frame says stdout); `follow=1` streams until the box ends.
+/// `GET /containers/{id}/logs`: kern's log of the box, in Docker's multiplexed frames, which
+/// `kern logs --frames` writes itself: stdout and stderr apart for a box this server created (its
+/// `--log-streams`), all stdout for one started otherwise. `stdout=0`/`stderr=0` drop a stream;
+/// `follow=1` streams until the box ends.
 fn logs(bin: &Path, name: &str, req: &Request) -> Response {
-    let mut args: Vec<String> = vec!["logs".into()];
+    let wanted = (req.flag("stdout"), req.flag("stderr"));
+    if wanted == (false, false) {
+        // Docker's answer to the same request, word for word.
+        return error(400, "Bad parameters: you must choose at least one stream");
+    }
+    let mut args: Vec<String> = vec!["logs".into(), "--frames".into()];
     if req.flag("follow") {
         args.push("-f".into());
     }
@@ -828,21 +891,9 @@ fn logs(bin: &Path, name: &str, req: &Request) -> Response {
                 .stderr(Stdio::null())
                 .spawn();
             let Ok(mut child) = child else { return };
-            if let Some(mut out) = child.stdout.take() {
-                let mut buf = [0u8; 16 * 1024];
-                loop {
-                    match out.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if w.write_all(&frame(&buf[..n]))
-                                .and_then(|()| w.flush())
-                                .is_err()
-                            {
-                                let _ = child.kill();
-                                break;
-                            }
-                        }
-                    }
+            if let Some(out) = child.stdout.take() {
+                if !copy_frames(out, w, wanted) {
+                    let _ = child.kill();
                 }
             }
             let _ = child.wait();
@@ -1399,7 +1450,18 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
             }),
         };
     }
-    let mut args: Vec<String> = vec!["logs".into(), "-f".into(), name.to_string()];
+    // Both streams unless the client named its own: an attach that asks for neither is how the
+    // CLI's older clients spoke, and it always meant both.
+    let wanted = match (req.flag("stdout"), req.flag("stderr")) {
+        (false, false) => (true, true),
+        named => named,
+    };
+    let mut args: Vec<String> = vec![
+        "logs".into(),
+        "--frames".into(),
+        "-f".into(),
+        name.to_string(),
+    ];
     if !req.flag("logs") {
         args.push("--tail".into());
         args.push("0".into());
@@ -1415,8 +1477,9 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
         upgrade: req.upgrade,
         writer: Box::new(move |w: &mut UnixStream| {
             let Ok(mut child) = cmd.spawn() else { return };
-            let out = child.stdout.take();
-            pump(w, out, None, false);
+            if let Some(out) = child.stdout.take() {
+                let _ = copy_frames(out, w, wanted);
+            }
             let _ = child.kill();
             let _ = child.wait();
         }),
@@ -1962,6 +2025,7 @@ mod tests {
                 "box",
                 "kd-1",
                 "-d",
+                "--log-streams",
                 "-e",
                 "A=1",
                 "-l",
@@ -2015,7 +2079,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             a,
-            "box n -d -p 0.0.0.0::6379/tcp -v /data:/d:ro --cpus 0.500 --rm --network host --entrypoint /bin/sh --image x -- -c echo hi"
+            "box n -d --log-streams -p 0.0.0.0::6379/tcp -v /data:/d:ro --cpus 0.500 --rm --network host --entrypoint /bin/sh --image x -- -c echo hi"
         );
         let b = body(r#"{"Image":"x","HostConfig":{"NetworkMode":"mynet"}}"#);
         assert!(create_argv("n", &b).is_err());
@@ -2056,8 +2120,58 @@ mod tests {
     #[test]
     fn a_log_frame_is_docker_s_eight_byte_header() {
         assert_eq!(
-            frame(b"hi\n"),
+            frame_of(1, b"hi\n"),
             vec![1, 0, 0, 0, 0, 0, 0, 3, b'h', b'i', b'\n']
         );
+    }
+
+    /// A reader that hands out `step` bytes at a time, so headers and payloads arrive cut anywhere.
+    struct Trickle<'a> {
+        data: &'a [u8],
+        step: usize,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(self.data.len()).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// The frames `kern logs --frames` writes pass through whole, and only the streams asked for:
+    /// cut into 3-byte reads, with an empty frame among them, the output is the same frames.
+    #[test]
+    fn framed_logs_pass_through_and_a_stream_not_asked_for_is_dropped() {
+        let mut input = Vec::new();
+        input.extend(frame_of(1, b"out one\n"));
+        input.extend(frame_of(2, b"err one\n"));
+        input.extend(frame_of(1, b""));
+        input.extend(frame_of(2, b"err two, longer than a read\n"));
+        input.extend(frame_of(1, b"out two\n"));
+        let run = |wanted: (bool, bool)| {
+            let mut out = Vec::new();
+            let ok = copy_frames(
+                Trickle {
+                    data: &input,
+                    step: 3,
+                },
+                &mut out,
+                wanted,
+            );
+            assert!(ok);
+            out
+        };
+        assert_eq!(run((true, true)), input);
+        let mut only_out = Vec::new();
+        only_out.extend(frame_of(1, b"out one\n"));
+        only_out.extend(frame_of(1, b""));
+        only_out.extend(frame_of(1, b"out two\n"));
+        assert_eq!(run((true, false)), only_out);
+        let mut only_err = Vec::new();
+        only_err.extend(frame_of(2, b"err one\n"));
+        only_err.extend(frame_of(2, b"err two, longer than a read\n"));
+        assert_eq!(run((false, true)), only_err);
     }
 }
