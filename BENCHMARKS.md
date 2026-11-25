@@ -12,6 +12,25 @@ musl), measured on 2026-09-20: Intel i7-14700KF, Linux 7.0.0, `powersave` govern
 | podman `run --rm` | 288 ms | 43.6 s | forks `conmon` and the full OCI stack every run |
 | docker `run --rm` | 294 ms | 16.6 s | client, daemon round trip, containerd, runc |
 
+## On your machine: `kern bench`
+
+The numbers here are one machine's. `kern bench` measures the same start on yours, with the
+discipline used for this page:
+
+```sh
+kern bench --image alpine:3.19                    # 20 runs, image in the cache first
+kern bench --image alpine:3.19 --compare podman   # paired with podman, run by run
+kern bench --image alpine:3.19 --json             # one JSON object
+```
+
+It prints the median with p10 and p90, the floor (what spawning `/bin/true` costs there, below which
+no difference is real), and an A/A interval: the same start in two interleaved series, so the noise of
+the machine at that moment is a number and not a guess. A comparison runs only when asked, and it is
+reported as the median of the per-pair differences with a 95% interval, never as a ratio. Each run is
+saved under `~/.local/share/kern/bench/`. Measured on 2026-11-20 on the machine above, load 1.4:
+kern 4.48 ms median (p10 4.00, p90 4.76), floor 0.31 ms, A/A [-0.25, +0.35] ms, podman 283.5 ms more
+per pair [+278.9, +289.9].
+
 **THE FIGURE IS THE BEST OF THE DAY, AND THIS PARAGRAPH IS WHERE THAT IS ADMITTED.** The `--image`
 row is 3.6 ms, which is the fastest replica measured on 2026-09-20 on an otherwise idle machine
 (CPU read at 1.0% from `/proc/stat`). Across 34 replicas taken the same day it is the ONLY one at or

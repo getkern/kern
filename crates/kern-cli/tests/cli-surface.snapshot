@@ -96,7 +96,7 @@ COMMANDS:
     doctor [--apparmor-profile]                                    Preflight: will boxes run here?
     probe                                                          Host resources you can put in kern.toml
     info                                                           Runtime + host snapshot
-    bench (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N]    Time box start→exit latency
+    bench (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N] [--compare docker|podman] [--json]  Time box start→exit latency
     completions <bash|zsh|fish>                                    Print a shell-completion script
 
 

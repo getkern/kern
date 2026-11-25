@@ -258,6 +258,7 @@ pub(crate) fn global_env(name: &str) -> Option<std::ffi::OsString> {
 }
 
 mod auth;
+mod bench;
 mod boxcp;
 mod builds;
 mod caps;

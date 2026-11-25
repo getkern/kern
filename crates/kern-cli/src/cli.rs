@@ -663,6 +663,11 @@ pub enum Command {
         /// silently measures something other than what was asked is worse than one that refuses.
         bind_rootfs: bool,
         count: u32,
+        /// `--compare docker|podman`: the same image and command with that runtime, paired run by
+        /// run. Only when asked: kern never starts another runtime on its own.
+        compare: Option<String>,
+        /// `--json`: the report as one JSON object (also saved under the data directory).
+        json: bool,
     },
     /// `kern recover`: clean up stale registry entries / orphaned scratch of dead boxes.
     Recover,
@@ -2080,17 +2085,35 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             reject_unknown_flags(
                 "bench",
                 &rest,
-                &["--rootfs", "--image", "--bind-rootfs", "-n", "--count"],
+                &[
+                    "--rootfs",
+                    "--image",
+                    "--bind-rootfs",
+                    "-n",
+                    "--count",
+                    "--compare",
+                    "--json",
+                ],
             )?;
+            let compare = flag_value(&rest, "--compare");
+            if compare
+                .as_deref()
+                .is_some_and(|t| t != "docker" && t != "podman")
+            {
+                return Err(Error::Usage("bench --compare docker|podman"));
+            }
             Command::Bench {
                 rootfs: flag_value(&rest, "--rootfs"),
                 image: flag_value(&rest, "--image"),
                 bind_rootfs: rest.contains(&"--bind-rootfs"),
+                // At least 5: the A/A interval and the percentiles mean nothing on fewer.
                 count: flag_value(&rest, "-n")
                     .or_else(|| flag_value(&rest, "--count"))
                     .and_then(|v| v.parse().ok())
-                    .filter(|n| *n >= 1)
+                    .filter(|n| *n >= 5)
                     .unwrap_or(20),
+                compare,
+                json: rest.contains(&"--json"),
             }
         }
         Some("recover") => {
@@ -7012,7 +7035,16 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             image,
             bind_rootfs,
             count,
-        } => commands::bench(rootfs.as_deref(), image.as_deref(), bind_rootfs, count),
+            compare,
+            json,
+        } => commands::bench(
+            rootfs.as_deref(),
+            image.as_deref(),
+            bind_rootfs,
+            count,
+            compare.as_deref(),
+            json,
+        ),
         Command::Recover => commands::recover(),
         Command::Start { names, attach } => commands::start_kept(&names, attach),
         Command::Restart { names, grace } => commands::restart(&names, grace),
@@ -10251,8 +10283,23 @@ mod tests {
                 image: None,
                 bind_rootfs: true,
                 count: 20,
+                compare: None,
+                json: false,
             }
         );
+        // A comparison is asked by name, docker or podman, and nothing else.
+        assert!(matches!(
+            parse(&["bench".into(), "--image".into(), "alpine".into(), "--compare".into(), "docker".into()]),
+            Ok((_, Command::Bench { compare: Some(ref t), .. })) if t == "docker"
+        ));
+        assert!(parse(&[
+            "bench".into(),
+            "--image".into(),
+            "alpine".into(),
+            "--compare".into(),
+            "lxc".into()
+        ])
+        .is_err());
 
         // Absent means absent: the default must not quietly become the bind path either.
         let cmd = parse(&["bench".into(), "--rootfs".into(), "/x".into()])

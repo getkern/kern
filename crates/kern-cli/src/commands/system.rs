@@ -273,7 +273,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}doctor{z} [--apparmor-profile]                                    Preflight: will boxes run here?
     {c}probe{z}                                                          Host resources you can put in kern.toml
     {c}info{z}                                                           Runtime + host snapshot
-    {c}bench{z} (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N]    Time box start→exit latency
+    {c}bench{z} (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N] [--compare docker|podman] [--json]  Time box start→exit latency
+                                                                     with the floor and an A/A noise interval; a comparison paired run by run
     {c}completions{z} <bash|zsh|fish>                                    Print a shell-completion script
 
 {b}OPTIONS for box:{z}
@@ -850,6 +851,8 @@ pub fn bench(
     image: Option<&str>,
     bind_rootfs: bool,
     count: u32,
+    compare: Option<&str>,
+    json: bool,
 ) -> Result<(), Error> {
     // `--image` resolves through the SAME cache path `kern box --image` uses, so benching an image
     // measures the box a user would actually run, and a second copy of the pull logic never appears
@@ -883,73 +886,16 @@ pub fn bench(
             ))
         }
     };
-    let self_exe =
-        std::env::current_exe().map_err(|e| Error::Sandbox(format!("locating kern: {e}")))?;
-    let one = |name: &str| -> Option<std::time::Duration> {
-        let t0 = std::time::Instant::now();
-        let mut cmd = std::process::Command::new(&self_exe);
-        cmd.args(["box", name, flag, value]);
-        // Passed through to the box rather than resolved here, for the same reason `--rootfs` and
-        // `--image` are: bench must spawn the command it quotes, or it stops describing it.
-        if bind_rootfs {
-            cmd.arg("--bind-rootfs");
-        }
-        let ok = cmd
-            .args(["--", "/bin/true"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        ok.then(|| t0.elapsed())
-    };
-    // Warm-up (image/overlay caches, first scope) - discarded.
-    let pid = std::process::id();
-    if one(&format!("bench-{pid}-warm")).is_none() {
-        return Err(Error::Sandbox(
-            "bench box failed to run - does the rootfs have /bin/true? (try a busybox/distro rootfs)"
-                .into(),
-        ));
-    }
-    let mut times: Vec<std::time::Duration> = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        if let Some(d) = one(&format!("bench-{pid}-{i}")) {
-            times.push(d);
-        }
-    }
-    if times.is_empty() {
-        return Err(Error::Sandbox("no bench runs succeeded".into()));
-    }
-    times.sort();
-    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-    let sum: f64 = times.iter().map(|d| ms(*d)).sum();
-    let avg = sum / times.len() as f64;
-    let p = crate::ui::Palette::detect();
-    // The header names the exact box that was timed, `--bind-rootfs` included: on a host where the
-    // overlay mount IS the cost, the two paths differ by more than the rest of box start put
-    // together, so a header that omits it leaves two very different numbers looking identical.
-    println!(
-        "{b}kern bench{z}  {} runs, {} {value}{}",
-        times.len(),
+    // THE MEASUREMENT IS `crate::bench`'s: the floor, an A/A interval, and a comparison only when
+    // asked and paired run by run, around the same box this verb always timed.
+    crate::bench::run(&crate::bench::BenchArgs {
         flag,
-        if bind_rootfs { " --bind-rootfs" } else { "" },
-        b = p.b,
-        z = p.z
-    );
-    println!(
-        "  min {:.1} ms · median {:.1} ms · avg {:.1} ms · max {:.1} ms",
-        ms(times[0]),
-        ms(times[times.len() / 2]),
-        avg,
-        ms(times[times.len() - 1])
-    );
-    println!(
-        "  {g}{:.0} boxes/sec{z} (serial)",
-        1000.0 / avg,
-        g = p.g,
-        z = p.z
-    );
-    Ok(())
+        value,
+        bind_rootfs,
+        runs: count as usize,
+        compare,
+        json,
+    })
 }
 
 /// `kern update <box> [--memory M] [--cpus N] [--pids-limit P]` - change a RUNNING box's cgroup v2
