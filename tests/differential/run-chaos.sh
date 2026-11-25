@@ -71,6 +71,10 @@ if [ ${#list[@]} -eq 0 ]; then
 fi
 
 docker_before=$(docker ps -aq | sort)
+# The exited rows kern already lists, by name and pid: only the ones a case adds are its leftovers,
+# as for Docker's containers above. Counting every row counted boxes of earlier runs on the host.
+kern_rows() { kern ps -a 2>/dev/null | awk '/ exit [0-9]/ {print $1" "$2}' | sort; }
+kern_rows_before=$(kern_rows)
 same=0 expect=0 unexpected=0
 report="$WORK/report.txt"
 : > "$report"
@@ -138,7 +142,7 @@ done
 
 # What a run left behind: kern boxes and exited rows, and Docker containers created during the run.
 left_kern=$(kern ps -q 2>/dev/null | grep -c . || true)
-left_rows=$(kern ps -a 2>/dev/null | grep -cE ' exit ' || true)
+left_rows=$(comm -13 <(echo "$kern_rows_before") <(kern_rows) | grep -c . || true)
 # Docker's legacy builder leaves one exited container per failed RUN step (set1/case3 builds a
 # broken Dockerfile on purpose): no compose label, created during this run. Removed and counted apart.
 build_leftovers=0
