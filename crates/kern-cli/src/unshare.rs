@@ -8,6 +8,10 @@
 //! `podman unshare` does for podman: `kern unshare -- rm -rf ./old-rootfs`,
 //! `kern unshare -- chown -R 0:0 ./data`, `kern unshare -- ls -ln ./data`.
 //!
+//! AS ROOT a bind mount is idmapped (Docker's view), so the files a box writes there carry the host's
+//! own ids and root needs no namespace for them; inside this one they are out of reach, since those
+//! host ids are not in its map. Root uses it for the files that do carry the range: layers, uppers.
+//!
 //! WITHOUT A RANGE (no `newuidmap`/`newgidmap`, or no `/etc/subuid` line) the namespace maps only the
 //! caller's own id: the command still runs as uid 0, but a box's other users are not in the map and
 //! their files stay out of reach. That is said before the command starts, not left to show up as

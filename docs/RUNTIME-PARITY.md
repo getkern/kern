@@ -677,6 +677,12 @@ is kern's. Where there is no subordinate id range (no `newuidmap`/`newgidmap`, o
 line), the command still runs as uid 0, with only your own id mapped, and kern says so before it
 starts: the files of a box's other users stay out of reach there.
 
+As root a bind mount is idmapped, Docker's view: the box's 1000 writes host uid 1000 into it, and
+root changes or removes that tree without `kern unshare` (measured on Ubuntu 24.04: a box's
+`chown 999` on a bind read 999 on the host). Inside `kern unshare` such a file is out of reach,
+because host uid 999 is not in the namespace's map. What root needs `kern unshare` for is the rest of
+a box's files, which do carry the subordinate range: an image's layers, a kept box's upper.
+
 ## 39. After a reboot
 
 Docker restarts a container with `restart: always` or `unless-stopped` at boot, because the daemon
