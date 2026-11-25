@@ -105,6 +105,21 @@ made through kern's socket) starts at once: the launcher held its layer, so the 
 failed and ran a second later, and `docker run -d --restart always` took 1.4 s with a restart counted
 that never happened (now about 190 ms and 0).
 
+**A `--restart` box is one box from run to run, as a Docker container is.** Under `always` and
+`unless-stopped` each run started from the image again, so a file the box wrote was gone at the
+next run, and a box with no `--name` took a new name (`box-<pid>`) every time, listed beside the
+name of its unit. The box is now kept: its name and its files carry over, `kern stop` then `kern
+start` (or `kern restart`) brings it back with its policy, which `docker inspect` reports while
+it is stopped, and `kern rm -f` removes the box, its files and its unit. Between two runs it is
+up, as `docker ps` lists a `Restarting (1)` container: `restarting (1)` in `kern ps` without `-a`,
+in `kern top` (with no pid, `null` in `--json`) and through kern's socket, where it was missing,
+or `exited` for an instant. `kern rename` takes the box's earlier runs with it, records and logs.
+
+**`docker inspect` reports a container's image id.** `Image` in `inspect` and `ImageID` in the list
+are the image's id, the `Id` `docker images` gives it; its name is `Config.Image` and the list's
+`Image`. Both said the name. `docker inspect` of a name that does not exist ends with Docker's `no
+such object`.
+
 **`ptrace` works in a box.** `strace`, `gdb` and profilers failed with `Operation not permitted`
 where Docker's and Podman's default profiles permit `ptrace`; a box permits it now, and the sandbox
 SDKs, the MCP server and `--security-profile untrusted` still deny it (with the kill).

@@ -29,7 +29,7 @@ never renamed or retyped; a field may be added, so a reader ignores keys it does
 | `runs` | `kern limit` invocations: `total`, `per_sec`, `peak_per_sec`, `avg_setup_us` |
 | `box_starts` | box starts: `total`, `per_sec`, `peak_per_sec` |
 | `services` | `docker_api` and `https`: the Docker API socket and HTTPS, in `kern info`'s words |
-| `boxes` | one object per running box: `name`, `pid`, `uptime_s`, `mem_bytes`, `cpu_pct`, `tasks`, `paused`, `orphaned`, `health`, `ports`, `pod`, `isolation` (`net:host`, `net:nat`, `root-mapped`, `caps:+`, `gpu:0,1`), `confinement` (`egress`, `landlock`), `oom_kills` and `oom_killed` (processes the OOM killer ended while the box runs on), `restarts` (Docker's `RestartCount`), `network` (`nat`, `pod`, `host`, `none`, or empty when the box's init could not be read) |
+| `boxes` | one object per running box, and per `--restart` box between two runs: `name`, `pid` (`null` between two runs, when no process runs), `restarting` (`true` for that row), `uptime_s`, `mem_bytes`, `cpu_pct`, `tasks`, `paused`, `orphaned`, `health`, `ports`, `pod`, `isolation` (`net:host`, `net:nat`, `root-mapped`, `caps:+`, `gpu:0,1`), `confinement` (`egress`, `landlock`), `oom_kills` and `oom_killed` (processes the OOM killer ended while the box runs on), `restarts` (Docker's `RestartCount`), `network` (`nat`, `pod`, `host`, `none`, or empty when the box's init could not be read) |
 | `counts` | how many `boxes`, `images`, `builds`, `profiles`, `volumes`, `sandboxes` there are |
 
 Rates and CPU% are deltas against the previous frame; the first frame is taken 120 ms after a
