@@ -1414,6 +1414,79 @@ fn labels_of(v: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A container's `Mounts`, as Docker's summary and inspect carry them, from the argv the box was made
+/// with: `-v name:dst` and `--mount type=volume` a named volume, `-v /path:dst` and `type=bind` a bind,
+/// `type=tmpfs` a tmpfs. `docker compose` reads them to decide whether a container still has the
+/// volumes its service declares (`checkExpectedVolumes`). MEASURED before (Grok's round 6+1, case 2):
+/// the field was `[]`, so compose recreated every service with a named volume at each `up`, where
+/// Docker starts the stopped container again.
+fn mounts_json(argv: &[String]) -> String {
+    let mut out = Vec::new();
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        let spec = match a.as_str() {
+            "-v" | "--volume" | "--mount" => it.next(),
+            _ => continue,
+        };
+        let Some(spec) = spec else { break };
+        let (kind, src, dst, ro) = if a == "--mount" {
+            let mut kind = "volume";
+            let (mut src, mut dst, mut ro) = ("", "", false);
+            for kv in spec.split(',') {
+                match kv.split_once('=') {
+                    Some(("type", v)) => {
+                        kind = match v {
+                            "bind" => "bind",
+                            "tmpfs" => "tmpfs",
+                            _ => "volume",
+                        }
+                    }
+                    Some(("src" | "source", v)) => src = v,
+                    Some(("dst" | "destination" | "target", v)) => dst = v,
+                    Some(("readonly" | "ro", v)) => ro = v != "false" && v != "0",
+                    None if kv == "ro" || kv == "readonly" => ro = true,
+                    _ => {}
+                }
+            }
+            (kind, src, dst, ro)
+        } else {
+            let mut f = spec.splitn(3, ':');
+            let src = f.next().unwrap_or_default();
+            let Some(dst) = f.next() else { continue };
+            let ro = f.next().is_some_and(|o| o.split(',').any(|x| x == "ro"));
+            let kind = if src.starts_with('/') || src.starts_with('.') {
+                "bind"
+            } else {
+                "volume"
+            };
+            (kind, src, dst, ro)
+        };
+        if dst.is_empty() {
+            continue;
+        }
+        out.push(match kind {
+            "volume" => format!(
+                "{{\"Type\":\"volume\",\"Name\":{},\"Source\":\"\",\"Destination\":{},\"Driver\":\"local\",\"Mode\":\"z\",\"RW\":{},\"Propagation\":\"\"}}",
+                json_str(src),
+                json_str(dst),
+                !ro
+            ),
+            "bind" => format!(
+                "{{\"Type\":\"bind\",\"Source\":{},\"Destination\":{},\"Mode\":\"\",\"RW\":{},\"Propagation\":\"rprivate\"}}",
+                json_str(src),
+                json_str(dst),
+                !ro
+            ),
+            _ => format!(
+                "{{\"Type\":\"tmpfs\",\"Source\":\"\",\"Destination\":{},\"Mode\":\"\",\"RW\":{},\"Propagation\":\"\"}}",
+                json_str(dst),
+                !ro
+            ),
+        });
+    }
+    format!("[{}]", out.join(","))
+}
+
 /// `GET /containers/{id}/json`.
 fn inspect(bin: &Path, name: &str) -> Response {
     let id = id_of(name);
@@ -1422,10 +1495,11 @@ fn inspect(bin: &Path, name: &str) -> Response {
         let nets = crate::netvol::container_networks_json(name, net.as_deref(), &aliases);
         let policy = restart_policy_json(&c.argv);
         let privileged = c.argv.iter().any(|a| a == "--privileged");
+        let mounts = mounts_json(&c.argv);
         return json_response(
             200,
             format!(
-                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"RestartCount\":0,\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"Privileged\":{privileged},\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
+                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"RestartCount\":0,\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"Privileged\":{privileged},\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":{mounts}}}",
                 json_str(&id),
                 json_str(&rfc3339(c.created)),
                 json_str(&format!("/{name}")),
@@ -1509,7 +1583,9 @@ fn inspect(bin: &Path, name: &str) -> Response {
     // Docker's `HostConfig.RestartPolicy`, from the argv the box was kept with, or the systemd unit
     // a standalone `always`/`unless-stopped` box runs under (its argv carries no `--restart`: systemd
     // does the restarting). MEASURED before: empty for every container.
-    let privileged = kept_argv(name).iter().any(|a| a == "--privileged");
+    let kept = kept_argv(name);
+    let privileged = kept.iter().any(|a| a == "--privileged");
+    let mounts = mounts_json(&kept);
     let policy = match unit_restart_policy(name) {
         Some(p) => format!("{{\"Name\":{},\"MaximumRetryCount\":0}}", json_str(&p)),
         None => restart_policy_json(&kept_argv(name)),
@@ -1517,7 +1593,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{},\"Paused\":{paused},\"Restarting\":{restarting},\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"Privileged\":{privileged},\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{},\"Paused\":{paused},\"Restarting\":{restarting},\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"Privileged\":{privileged},\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":{mounts}}}",
             json_str(&id),
             json_str(&created),
             json_str(&format!("/{name}")),
@@ -1704,7 +1780,7 @@ fn list(bin: &Path, req: &Request) -> Response {
             // compose's second `up` reads the networks from THIS list to decide whether a container
             // must be recreated. MEASURED before: the field was absent and the docker compose v5
             // client crashed with a nil pointer (`checkExpectedNetworks`).
-            "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":\"\",\"Command\":{},\"Created\":{},\"State\":{},\"Status\":{},\"Ports\":[{}],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":\"\",\"Command\":{},\"Created\":{},\"State\":{},\"Status\":{},\"Ports\":[{}],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":{}}}",
             json_str(&id_of(&name)),
             json_str(&format!("/{name}")),
             json_str(v.get("image").and_then(Value::as_str).unwrap_or_default()),
@@ -1731,7 +1807,8 @@ fn list(bin: &Path, req: &Request) -> Response {
             ports.join(","),
             labels_json(&labels),
             json_str(if pod.is_empty() { "default" } else { pod }),
-            crate::netvol::container_networks_json(&name, Some(pod), &net_aliases(&name))
+            crate::netvol::container_networks_json(&name, Some(pod), &net_aliases(&name)),
+            mounts_json(&kept_argv(&name))
         ));
     }
     if all {
@@ -1744,7 +1821,7 @@ fn list(bin: &Path, req: &Request) -> Response {
             }
             let (net, aliases) = crate::netvol::created_network(&c.argv);
             items.push(format!(
-                "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":\"\",\"Command\":{},\"Created\":{},\"State\":\"created\",\"Status\":\"Created\",\"Ports\":[],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":[]}}",
+                "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":\"\",\"Command\":{},\"Created\":{},\"State\":\"created\",\"Status\":\"Created\",\"Ports\":[],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":{}}}",
                 json_str(&id_of(name)),
                 json_str(&format!("/{name}")),
                 json_str(&c.image),
@@ -1752,7 +1829,8 @@ fn list(bin: &Path, req: &Request) -> Response {
                 c.created,
                 labels_json(&c.labels),
                 json_str(net.as_deref().unwrap_or("default")),
-                crate::netvol::container_networks_json(name, net.as_deref(), &aliases)
+                crate::netvol::container_networks_json(name, net.as_deref(), &aliases),
+                mounts_json(&c.argv)
             ));
         }
     }
@@ -6885,6 +6963,57 @@ mod tests {
     }
 
     /// `GET /networks` lists Docker's three builtins whatever kern has, as Docker's daemon does.
+    /// A container's mounts read as Docker's: what compose's second `up` checks a service's named
+    /// volumes against. A named volume by `-v` and by `--mount`, a read-only bind, a tmpfs; an argv
+    /// with none is `[]`.
+    #[test]
+    fn a_containers_mounts_read_as_dockers() {
+        let argv: Vec<String> = [
+            "box",
+            "x",
+            "-v",
+            "proj_data:/var/lib/data",
+            "-v",
+            "/srv/conf:/etc/app:ro",
+            "--mount",
+            "type=volume,src=proj_cache,dst=/cache",
+            "--mount",
+            "type=tmpfs,dst=/run/t",
+            "--image",
+            "alpine",
+        ]
+        .map(String::from)
+        .to_vec();
+        let m = body(&mounts_json(&argv));
+        let arr = m.as_array().unwrap_or_default();
+        assert_eq!(arr.len(), 4, "{}", mounts_json(&argv));
+        let get = |i: usize, k: &str| {
+            arr[i]
+                .get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            (get(0, "Type"), get(0, "Name"), get(0, "Destination")),
+            ("volume".into(), "proj_data".into(), "/var/lib/data".into())
+        );
+        assert_eq!(
+            (get(1, "Type"), get(1, "Source")),
+            ("bind".into(), "/srv/conf".into())
+        );
+        assert_eq!(arr[1].get("RW").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            (get(2, "Type"), get(2, "Name")),
+            ("volume".into(), "proj_cache".into())
+        );
+        assert_eq!(
+            (get(3, "Type"), get(3, "Destination")),
+            ("tmpfs".into(), "/run/t".into())
+        );
+        assert_eq!(mounts_json(&["box".to_string()]), "[]");
+    }
+
     #[test]
     fn the_network_list_has_dockers_builtins() {
         let req = Request {
