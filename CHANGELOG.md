@@ -155,6 +155,10 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern cp` of a stopped box, twice in a row, on WSL.** The second copy waited 20 s and failed "in
   use by another box": the box kern starts on the layer for a copy was not removed in kern's WSL
   distro. Five copies in a row now take 16-21 ms each there, and a copy is about 3 ms faster here.
+- **`kern stop` of a box that is already stopped** prints its name and exits 0, as `docker stop` does;
+  it answered "no running box". A name that is no box at all is still an error.
+- **`kern doctor` says when kern is not where the AppArmor profile looks**, and to copy it to
+  `~/.local/bin/kern` first; it said "if that path is not in its attachment line".
 - **`kern top` names the `kern limit` tab "Limits".** It was "Runs", from when that verb was
   `kern run`; every box, `run` or `box`, is on the Boxes tab. `--tab runs` still works, and the JSON
   key `runs` is unchanged.
