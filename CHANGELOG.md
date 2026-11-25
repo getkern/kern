@@ -81,6 +81,18 @@ the connections queued, and runs with its soft file limit raised to the hard one
 does; the boxes it starts keep the limit they had (soft 1024, as a Docker container's). Measured: 200
 at once, three times, 200 of 200 in about one second, the same server, no box left.
 
+**`kern run -d` prints the box's name, and `kern rm` only the names it removed.** `kern run` may pick
+the name itself, and it was in a sentence on stderr only: `id=$(kern run -d nginx)` was empty where
+`docker run -d` gives an id. The name is alone on stdout now, the narration on stderr; `kern box -d`
+keeps stdout empty. `kern rm -f web` printed `stopped 'web' (pid N)` before `web`, a restarting box no
+name, a kept box `removed kept box 'web'`: each is the name alone, as `docker rm` prints it.
+
+**`kern top` shows what the new defaults change.** A box row says `oom:N` when the OOM killer ended a
+process in a box that runs on, and `restarts:N` for a `--restart` box; the Overview counts how the
+running boxes reach out (`3 nat · 1 none`) and names the Docker API socket and HTTPS; `--json` carries
+`oom_kills`, `oom_killed`, `restarts` and `network` per box and a `services` object
+([TOP-JSON.md](docs/TOP-JSON.md)). `kern info` said "on on port 8443" once HTTPS was trusted.
+
 **A `--restart always` box can be created when its command exits at once, and removed.** `kern run
 -d --restart always alpine false` (and `docker run` through kern's socket) failed with "the box unit
 was installed but didn't start": systemd holds such a unit in `activating` between runs, which the

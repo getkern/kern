@@ -28,7 +28,8 @@ never renamed or retyped; a field may be added, so a reader ignores keys it does
 | `gpus` | one object per NVIDIA card: `index`, `name`, `bus`, `mem_used_mib`, `mem_total_mib`, `util_pct`, `temp_c`, `power_w` (`null` when the driver does not say) |
 | `runs` | `kern limit` invocations: `total`, `per_sec`, `peak_per_sec`, `avg_setup_us` |
 | `box_starts` | box starts: `total`, `per_sec`, `peak_per_sec` |
-| `boxes` | one object per running box: `name`, `pid`, `uptime_s`, `mem_bytes`, `cpu_pct`, `tasks`, `paused`, `orphaned`, `health`, `ports`, `pod`, `isolation` (how it is less confined than the default), `confinement` (`egress`, `landlock`) |
+| `services` | `docker_api` and `https`: the Docker API socket and HTTPS, in `kern info`'s words |
+| `boxes` | one object per running box: `name`, `pid`, `uptime_s`, `mem_bytes`, `cpu_pct`, `tasks`, `paused`, `orphaned`, `health`, `ports`, `pod`, `isolation` (`net:host`, `net:nat`, `root-mapped`, `caps:+`, `gpu:0,1`), `confinement` (`egress`, `landlock`), `oom_kills` and `oom_killed` (processes the OOM killer ended while the box runs on), `restarts` (Docker's `RestartCount`), `network` (`nat`, `pod`, `host`, `none`, or empty when the box's init could not be read) |
 | `counts` | how many `boxes`, `images`, `builds`, `profiles`, `volumes`, `sandboxes` there are |
 
 Rates and CPU% are deltas against the previous frame; the first frame is taken 120 ms after a
@@ -37,7 +38,9 @@ baseline, so it carries real numbers.
 What a frame costs, measured on a host with 2 GPUs, 557 volumes and 8951 finished sandboxes: about
 2 ms of kern's CPU. The GPUs are read from ONE `nvidia-smi` that kern starts and keeps running for
 the whole stream (about 3 ms of CPU a reading, against about 44 ms for a fresh one); a single frame
-takes about 150 ms, 120 of them the baseline its CPU% and rates are deltas against.
+takes about 150 ms, 120 of them the baseline its CPU% and rates are deltas against. `services` and
+a `--restart always` box's `restarts` come from `systemctl` (about 4 ms a call), read again every
+5 s while streaming.
 
 ## The tabs' records
 
