@@ -132,6 +132,18 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 --format json` prints Docker's line per box (it printed the word `json`), and `--format` says
 `restarting` / `Restarting (1) ...` for a box between two runs.
 
+**`kern cp` and `docker cp` reach a kept box that is not running, and a kept box keeps its image.**
+A box that is stopped, never started, or between two runs of its `--restart` policy was refused as
+"not running", where `docker cp` copies into and out of a stopped container. kern now starts a box
+on its layer for the copy, with no network, a PID 1 that runs nothing, and the box's own volumes,
+so a path under an image `VOLUME` reaches the box's data. It takes about 15 ms. Its layer is held
+meanwhile, so a run of the box cannot mount it at the same time. A kept box now runs the image it
+was created from, as a Docker container does: when its tag is rebuilt or pulled again, its runs
+and `cp` still use the old content. That content is kept as a pin, made with hard links (no data
+copied) once per image and off the box's start path; the image list does not show it, and it goes
+with the last box created from it. When that content is gone (`kern gc --images`), the box is
+refused by name instead of putting its layer on another base.
+
 **A container keeps the image id it was started from.** The id is recorded when the box starts,
 so a rebuild of its tag no longer moves the id `docker inspect` and `kern inspect` report for a
 box that still runs the old image, as Docker keeps it.
