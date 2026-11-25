@@ -5887,12 +5887,15 @@ mod tests {
     /// ID into a name); it was refused outright before kern had the flag.
     #[test]
     fn volumes_from_becomes_the_flag() {
-        let body = json::parse(
-            r#"{"Image":"alpine","HostConfig":{"VolumesFrom":["data","logs:ro"]}}"#,
-        )
-        .expect("json");
+        let body =
+            json::parse(r#"{"Image":"alpine","HostConfig":{"VolumesFrom":["data","logs:ro"]}}"#)
+                .expect("json");
         let c = create_argv("web", &body).expect("accepted");
-        let pairs: Vec<&[String]> = c.argv.windows(2).filter(|w| w[0] == "--volumes-from").collect();
+        let pairs: Vec<&[String]> = c
+            .argv
+            .windows(2)
+            .filter(|w| w[0] == "--volumes-from")
+            .collect();
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0][1], "data");
         assert_eq!(pairs[1][1], "logs:ro");
