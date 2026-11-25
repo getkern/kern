@@ -152,6 +152,16 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **A deeply nested compose value is refused.** A flow collection nested past 64 levels
   (`labels: [[[[...]]]]`) made `kern compose` allocate until it aborted, past 4 GiB in under a
   second. It is now refused by name, with its line.
+- **`kern cp` of a stopped box, twice in a row, on WSL.** The second copy waited 20 s and failed "in
+  use by another box": the box kern starts on the layer for a copy was not removed in kern's WSL
+  distro. Five copies in a row now take 16-21 ms each there, and a copy is about 3 ms faster here.
+- **`kern top` names the `kern limit` tab "Limits".** It was "Runs", from when that verb was
+  `kern run`; every box, `run` or `box`, is on the Boxes tab. `--tab runs` still works, and the JSON
+  key `runs` is unchanged.
+- **`kern doctor` and the box panel say the network a box has.** The pasta row said a plain box is
+  loopback-only, and `--verbose` showed "isolated (loopback-only)" for a box with a NAT; both now
+  follow the default, as `kern info` already did. The config `kern config setup` writes shows
+  `kern limit vcpu:heavy -- ./train.sh` and `kern run vcpu:heavy <image>`.
 - **A failed archive entry is named.** `kern cp -` and `docker cp` into a box name the archive entry
   that failed. The API answered 404 "Could not find the file" for a destination that exists; 404 is
   now only for a missing destination.

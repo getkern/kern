@@ -55,5 +55,5 @@ reads them only for the tab on view:
 | `storage` | `volumes`: `name`, `size_bytes`, `quota_bytes`; a size is a walk of the volume, so a stream measures them at most every 30 s and a volume made since then reads `null` |
 | `sandboxes` | `sandboxes`: the newest 512 finished SDK and MCP sandboxes, in the shape of `kern sandbox history --json`; `counts.sandboxes` is the total |
 
-`overview`, `boxes` and `runs` add nothing: their data is in every frame. `--tab logs` is refused:
+`overview`, `boxes` and `limits` add nothing: their data is in every frame (`limits` is the screen's tab for `kern limit`, whose figures are the `runs` key; `--tab runs`, its name before, is still taken). `--tab logs` is refused:
 `kern logs --all -f` is that stream already, one line a box output line.
