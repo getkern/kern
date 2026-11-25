@@ -171,6 +171,13 @@ code" (6 times in 6 on a kept box), and `docker wait` beside a `docker stop` thr
 answered -1 where Docker answers 137. The record is written first, and a waiter that sees the
 supervisor go while a stop is under way waits for that stop's code.
 
+**`docker events` through kern's socket follows a container to its end.** A container started
+detached made no `die` at all, not at its exit, a `stop` or an `rm -f`; `rm` made no `destroy`, and
+`stop`, `kill` and `restart` made no event. Each is published now in Docker's order (`kill`, `die`
+with the exit code, then `stop`, or `start` and `restart`, and `destroy` last), watched through a
+pidfd on the box's supervisor, so no process stays resident per container. A `docker rm` refused
+with 409 no longer forgets the running container's id and network on the way.
+
 **`depends_on: condition: service_healthy` through kern's socket.** A container's `Healthcheck`
 was not read, so the box had no check and the `docker compose` client refused the stack ("has no
 healthcheck configured"); it is the box's `--health-*` now, durations rounded up to whole seconds.

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kern_common::json::{self, Value};
 use kern_common::json_str;
@@ -2721,8 +2721,7 @@ fn reaper(bin: &Path) {
             })
             .unwrap_or_default();
         for name in ended {
-            remove_container(bin, &name);
-            session_forget(&name);
+            remove_container(bin, &name, true);
         }
     }
 }
@@ -2746,25 +2745,40 @@ fn session_ended(bin: &Path, req: &Request) -> Response {
         })
         .unwrap_or_default();
     for name in names {
-        remove_container(bin, &name);
-        session_forget(&name);
+        remove_container(bin, &name, true);
     }
     no_content()
 }
 
-/// Remove `name` whatever its state: created, running (stopped at once) or ended.
-fn remove_container(bin: &Path, name: &str) {
+/// Remove `name` whatever its state: created, running (stopped at once, when `running`) or ended;
+/// then Docker's `destroy`.
+fn remove_container(bin: &Path, name: &str, running: bool) {
+    session_forget(name);
     stage_forget(name);
-    crate::events::forget(name);
     net_forget(name);
     id_forget(name);
     if created_take(name).is_some() {
+        // A pending attach ends with the container.
         drop(attached_take(name));
-        return;
+        // A start that failed may have left kern a box under this name (a kept layer, an exit
+        // record): removed with the container, or `ps -a` keeps showing it.
+        let _ = kern(bin, &["rm", "-f", name]);
+    } else {
+        if running {
+            if die_pending(name) {
+                crate::events::publish_named("kill", name, None);
+            }
+            let _ = kern(bin, &["stop", "-t", "0", name]);
+            // The reaper of a box this server started publishes its `die` once the box is down.
+            run_ended_within(name, DIE_FIRST);
+            die_within(name, DIE_FIRST);
+        }
+        // An attached run that ended: forgotten here, and its kept layer, if it has one, is
+        // removed like any other container's.
+        run_forget(name);
+        let _ = kern(bin, &["rm", "-f", name]);
     }
-    run_forget(name);
-    let _ = kern(bin, &["stop", "-t", "0", name]);
-    let _ = kern(bin, &["rm", "-f", name]);
+    crate::events::destroyed(name);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2902,6 +2916,28 @@ fn run_forget(name: &str) {
     if let Ok(mut g) = RUNS.lock() {
         if let Some(m) = g.as_mut() {
             m.remove(name);
+        }
+    }
+}
+
+/// Wait up to `limit` for the end of `name`, if this server started it; at once otherwise.
+fn run_ended_within(name: &str, limit: Duration) {
+    let Ok(mut g) = RUNS.lock() else {
+        return;
+    };
+    let deadline = Instant::now() + limit;
+    while g
+        .as_ref()
+        .and_then(|m| m.get(name))
+        .is_some_and(|r| r.exit.is_none())
+    {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match RUN_ENDED.wait_timeout(g, left) {
+            Ok((next, _)) => g = next,
+            Err(_) => return,
         }
     }
 }
@@ -3321,7 +3357,8 @@ fn tty_resize(key: &str, req: &Request) -> Response {
 const FOLLOW_FIRST: Duration = Duration::from_secs(60);
 
 /// `kern box -d` of a created container, which returns once the box has started, and its `start`
-/// event. The `Err` is the answer to give.
+/// event. The `Err` is the answer to give. Its `die` is the caller's: an attach's reaper publishes
+/// it, and a detached start arms [`watch_die`].
 fn start_detached(bin: &Path, name: &str, c: &Created, argv: &[&str]) -> Result<(), Response> {
     let (code, _, err) = kern(bin, argv);
     if code != 0 {
@@ -3329,6 +3366,117 @@ fn start_detached(bin: &Path, name: &str, c: &Created, argv: &[&str]) -> Result<
     }
     crate::events::publish(&event_of("start", name, c, None));
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// `die` of the boxes started detached: nothing of this server waits on them otherwise.
+
+/// The detached boxes whose `die` is not published yet. A removal or a restart waits for it, so
+/// the events follow in Docker's order (`die` before `destroy`, before the next `start`).
+static DIE_PENDING: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+static DIE_PUBLISHED: Condvar = Condvar::new();
+
+/// How long a removal or a restart waits for the `die` of the box it stopped.
+const DIE_FIRST: Duration = Duration::from_secs(3);
+
+/// A thread pinned by a pidfd to the box's supervisor, which exits with the box and leaves its exit
+/// record: woken at the exit, it reads the code and publishes `die`. No `kern wait` stays resident
+/// for the box's life. MEASURED before: `docker events` on kern's socket printed no `die` for a
+/// `docker run -d`, not at its exit, not at a `stop`, not at an `rm -f`.
+fn watch_die(bin: &Path, name: &str, auto_remove: bool) {
+    if let Ok(mut g) = DIE_PENDING.lock() {
+        g.get_or_insert_with(Default::default)
+            .insert(name.to_string());
+    }
+    let (bin, watched) = (bin.to_path_buf(), name.to_string());
+    let spawned = std::thread::Builder::new()
+        .name("kern-serve-die".into())
+        .stack_size(256 << 10)
+        .spawn(move || {
+            let supervisor = kern_boxes(&bin)
+                .into_iter()
+                .find(|(n, v)| *n == watched && box_running(v))
+                .and_then(|(_, v)| v.get("pid").and_then(Value::as_i64))
+                .and_then(|p| libc::pid_t::try_from(p).ok());
+            // A box already down has its record; without a pidfd (a kernel before 5.3, or the
+            // supervisor gone) `kern wait` below is the wait.
+            if let Some(fd) = supervisor.and_then(pidfd_open) {
+                wait_readable(&fd);
+            }
+            let code = if auto_remove {
+                kern_wait_code_with(&bin, "__wait-removed", &watched)
+            } else {
+                kern_wait_code(&bin, &watched)
+            };
+            crate::events::publish_named("die", &watched, Some(code));
+            die_settled(&watched);
+        });
+    if spawned.is_err() {
+        die_settled(name);
+    }
+}
+
+fn die_pending(name: &str) -> bool {
+    DIE_PENDING
+        .lock()
+        .ok()
+        .is_some_and(|g| g.as_ref().is_some_and(|s| s.contains(name)))
+}
+
+fn die_settled(name: &str) {
+    if let Ok(mut g) = DIE_PENDING.lock() {
+        if let Some(s) = g.as_mut() {
+            s.remove(name);
+        }
+    }
+    DIE_PUBLISHED.notify_all();
+}
+
+/// Wait up to `limit` for the `die` of `name`, if one is pending.
+fn die_within(name: &str, limit: Duration) {
+    let Ok(mut g) = DIE_PENDING.lock() else {
+        return;
+    };
+    let deadline = Instant::now() + limit;
+    while g.as_ref().is_some_and(|s| s.contains(name)) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match DIE_PUBLISHED.wait_timeout(g, left) {
+            Ok((next, _)) => g = next,
+            Err(_) => return,
+        }
+    }
+}
+
+fn pidfd_open(pid: libc::pid_t) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    if pid <= 0 {
+        return None;
+    }
+    // SAFETY: `pidfd_open(pid, 0)` takes two integers and returns a new descriptor or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = std::os::fd::RawFd::try_from(fd).ok().filter(|f| *f >= 0)?;
+    // SAFETY: a descriptor the kernel just returned to this process, owned by nothing else.
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Block until `fd` is readable (a pidfd: its process exited), across signals.
+fn wait_readable(fd: &std::os::fd::OwnedFd) {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one pollfd owned here, count 1, no timeout.
+        let n = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if n >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
+        }
+    }
 }
 
 /// A `kern box` argv without the valueless flags `drop`, which stand among the flags (before the
@@ -3401,6 +3549,7 @@ fn start_again(bin: &Path, name: &str, running: Response) -> Response {
         labels: labels_of(&v),
         exit: None,
     });
+    watch_die(bin, name, false);
     no_content()
 }
 
@@ -3915,7 +4064,10 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 None => {
                     let argv: Vec<&str> = c.argv.iter().map(String::as_str).collect();
                     match start_detached(bin, &name, &c, &argv) {
-                        Ok(()) => no_content(),
+                        Ok(()) => {
+                            watch_die(bin, &name, c.auto_remove);
+                            no_content()
+                        }
                         Err(e) => e,
                     }
                 }
@@ -4040,8 +4192,24 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 "restart" => vec!["restart", "-t", &t, &name],
                 _ => vec!["stop", "-t", &t, &name],
             };
+            // Docker's order: `kill` (before the signal, so before the `die` it causes), the box's
+            // `die`, then `stop`, or `start` and `restart`. Only for a box whose `die` is watched,
+            // which is a running one: a kill that finds none makes no event.
+            if die_pending(&name) {
+                crate::events::publish_named("kill", &name, None);
+            }
             let (code, _, err) = kern(bin, &args);
             if code == 0 {
+                if *verb != "kill" {
+                    die_within(&name, DIE_FIRST);
+                    if *verb == "restart" {
+                        crate::events::publish_named("start", &name, None);
+                        crate::events::publish_named("restart", &name, None);
+                        watch_die(bin, &name, false);
+                    } else {
+                        crate::events::publish_named("stop", &name, None);
+                    }
+                }
                 no_content()
             } else if *verb == "kill" && err.contains("no running box") {
                 // Docker's answer to a kill of a container that does not run: 409, not 304.
@@ -4061,33 +4229,16 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             let Some(name) = resolve(bin, id) else {
                 return error(404, &format!("No such container: {id}"));
             };
-            session_forget(&name);
-            stage_forget(&name);
-            crate::events::forget(&name);
-            net_forget(&name);
-            id_forget(&name);
-            if created_take(&name).is_some() {
-                // A pending attach ends with the container.
-                drop(attached_take(&name));
-                // A start that failed may have left kern a box under this name (a kept layer, an
-                // exit record): removed with the container, or `ps -a` keeps showing it.
-                let _ = kern(bin, &["rm", "-f", &name]);
-                return no_content();
-            }
-            // An attached run that ended: forgotten here, and its kept layer, if it has one, is
-            // removed below like any other container's.
-            run_forget(&name);
-            let force = req.flag("force");
-            let running = kern_boxes(bin)
-                .into_iter()
-                .any(|(n, v)| n == name && box_running(&v));
-            if running && !force {
+            // Refused before anything is forgotten: a container a 409 leaves running keeps its id,
+            // its network and its events' labels.
+            let running = created_get(&name).is_none()
+                && kern_boxes(bin)
+                    .into_iter()
+                    .any(|(n, v)| n == name && box_running(&v));
+            if running && !req.flag("force") {
                 return error(409, &format!("You cannot remove a running container {name}. Stop the container before attempting removal or force remove"));
             }
-            if running {
-                let _ = kern(bin, &["stop", "-t", "0", &name]);
-            }
-            let _ = kern(bin, &["rm", "-f", &name]);
+            remove_container(bin, &name, running);
             no_content()
         }
         ("POST", ["images", "create"]) => pull(bin, req),
@@ -4908,6 +5059,33 @@ mod tests {
     /// The rest of `HostConfig` reaches the box: limits, mounts, names, resolvers, signals; a field
     /// kern has no flag for is a warning. MEASURED before: only Memory and NanoCpus were read, and
     /// `--pids-limit 32` through the socket let 100 forks through.
+    /// A removal or a restart waits for the pending `die`, so it is published first; with none
+    /// pending it does not wait.
+    #[test]
+    fn die_within_waits_for_the_pending_die_and_only_for_it() {
+        let t = Instant::now();
+        die_within("kd-no-die-pending", Duration::from_secs(2));
+        assert!(t.elapsed() < Duration::from_millis(100));
+        if let Ok(mut g) = DIE_PENDING.lock() {
+            g.get_or_insert_with(Default::default)
+                .insert("kd-die-pending".to_string());
+        }
+        assert!(die_pending("kd-die-pending"));
+        let settler = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            die_settled("kd-die-pending");
+        });
+        let t = Instant::now();
+        die_within("kd-die-pending", Duration::from_secs(2));
+        let waited = t.elapsed();
+        assert!(
+            waited >= Duration::from_millis(140) && waited < Duration::from_secs(1),
+            "{waited:?}"
+        );
+        assert!(!die_pending("kd-die-pending"));
+        settler.join().unwrap();
+    }
+
     #[test]
     fn host_config_limits_and_settings_reach_the_box() {
         let b = body(

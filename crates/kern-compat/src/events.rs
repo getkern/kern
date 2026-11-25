@@ -56,12 +56,40 @@ pub(crate) fn exec_event(kind: &str, name: &str, cmd: &[String], exec_id: &str, 
     });
 }
 
-/// The container is removed: what its events carried goes with it.
-pub(crate) fn forget(name: &str) {
-    if let Ok(mut g) = META.lock() {
-        if let Some(m) = g.as_mut() {
-            m.remove(name);
-        }
+/// Docker's `action` for `name` (`die` with its `exit`, `kill`, `stop`, `restart`), described by
+/// the image and labels its last event carried. A container this server made no event for makes
+/// none here either.
+pub(crate) fn publish_named(action: &str, name: &str, exit: Option<i32>) {
+    let meta = META
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(name).cloned()));
+    if let Some((image, labels)) = meta {
+        publish(&Event {
+            action: action.to_string(),
+            name: name.to_string(),
+            image,
+            labels,
+            exit,
+        });
+    }
+}
+
+/// The container is removed: Docker's `destroy`, with the image and labels its events carried,
+/// which go with it. A container this server made no event for makes none here either.
+pub(crate) fn destroyed(name: &str) {
+    let meta = META
+        .lock()
+        .ok()
+        .and_then(|mut g| g.as_mut().and_then(|m| m.remove(name)));
+    if let Some((image, labels)) = meta {
+        publish(&Event {
+            action: "destroy".into(),
+            name: name.to_string(),
+            image,
+            labels,
+            exit: None,
+        });
     }
 }
 
@@ -70,7 +98,7 @@ static SUBSCRIBERS: Mutex<Vec<Sender<String>>> = Mutex::new(Vec::new());
 
 /// Send `e` to every open stream whose filters take it.
 pub(crate) fn publish(e: &Event) {
-    if !e.action.starts_with("exec_") {
+    if !e.action.starts_with("exec_") && e.action != "destroy" {
         if let Ok(mut g) = META.lock() {
             let m = g.get_or_insert_with(Default::default);
             m.insert(e.name.clone(), (e.image.clone(), e.labels.clone()));
@@ -248,6 +276,9 @@ fn client_gone(w: &crate::Out) -> bool {
 mod tests {
     use super::*;
 
+    /// The tests that subscribe share `SUBSCRIBERS`, and count it: one at a time.
+    static SUBSCRIBING: Mutex<()> = Mutex::new(());
+
     fn req(query: &[(&str, &str)]) -> Request {
         Request {
             method: "GET".into(),
@@ -344,9 +375,64 @@ mod tests {
         assert_eq!(attrs.get("execID").and_then(Value::as_str), Some("ab12"));
     }
 
+    /// `rm` publishes `destroy` with what the container's events carried, once; a container this
+    /// server made no event for makes none. MEASURED before: `docker events` on kern's socket
+    /// printed `create start die` for a `run` then `rm`, where Docker's printed `destroy` too.
+    #[test]
+    fn removal_publishes_destroy_with_the_containers_labels_once() {
+        let _one = SUBSCRIBING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (tx, rx) = mpsc::channel();
+        SUBSCRIBERS.lock().unwrap().push(tx);
+        publish(&Event {
+            action: "create".into(),
+            name: "kd-destroy".into(),
+            image: "alpine:3.20".into(),
+            labels: vec![("com.example".into(), "1".into())],
+            exit: None,
+        });
+        destroyed("kd-destroy");
+        destroyed("kd-destroy");
+        destroyed("kd-never-seen");
+        let mine: Vec<Value> =
+            std::iter::from_fn(|| rx.recv_timeout(Duration::from_millis(200)).ok())
+                .filter_map(|l| json::parse(&l).ok())
+                .filter(|v| {
+                    v.get("Actor")
+                        .and_then(|a| a.get("Attributes"))
+                        .and_then(|a| a.get("name"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.starts_with("kd-destroy") || n == "kd-never-seen")
+                })
+                .collect();
+        let actions: Vec<&str> = mine
+            .iter()
+            .filter_map(|v| v.get("Action").and_then(Value::as_str))
+            .collect();
+        assert_eq!(actions, ["create", "destroy"]);
+        let attrs = mine[1]
+            .get("Actor")
+            .and_then(|a| a.get("Attributes"))
+            .unwrap();
+        assert_eq!(attrs.get("com.example").and_then(Value::as_str), Some("1"));
+        assert_eq!(
+            mine[1].get("from").and_then(Value::as_str),
+            Some("alpine:3.20")
+        );
+        assert!(META
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|m| !m.contains_key("kd-destroy")));
+    }
+
     /// A published event reaches an open stream, and a stream that went away is dropped.
     #[test]
     fn publish_reaches_subscribers_and_drops_the_closed() {
+        let _one = SUBSCRIBING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = mpsc::channel();
         let (gone_tx, gone_rx) = mpsc::channel::<String>();
         drop(gone_rx);
