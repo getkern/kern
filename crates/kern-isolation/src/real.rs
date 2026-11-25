@@ -6017,19 +6017,23 @@ fn spawn_idmap(
     own: u32,
     sub: u32,
     count: u32,
+    quiet: bool,
 ) -> Option<std::process::Child> {
-    std::process::Command::new(bin)
-        .args([
-            pid.to_string(),
-            "0".to_string(),
-            own.to_string(),
-            "1".to_string(),
-            "1".to_string(),
-            sub.to_string(),
-            count.to_string(),
-        ])
-        .spawn()
-        .ok()
+    let mut cmd = std::process::Command::new(bin);
+    if quiet {
+        cmd.stderr(std::process::Stdio::null());
+    }
+    cmd.args([
+        pid.to_string(),
+        "0".to_string(),
+        own.to_string(),
+        "1".to_string(),
+        "1".to_string(),
+        sub.to_string(),
+        count.to_string(),
+    ])
+    .spawn()
+    .ok()
 }
 
 // A CONCURRENT USER NAMESPACE THAT MEASURED WORSE, recorded so the next person does not rebuild it.
@@ -6103,9 +6107,9 @@ fn spawn_idmap(
 ///
 /// BOTH are waited even when the first fails: a spawned child that is never reaped becomes a zombie
 /// held by the supervisor for as long as the box lives.
-fn run_both_idmaps(r: &IdRange, pid: i32, euid: u32, egid: u32) -> bool {
-    let a = spawn_idmap(&r.newuidmap, pid, euid, r.sub_uid, r.uid_count);
-    let b = spawn_idmap(&r.newgidmap, pid, egid, r.sub_gid, r.gid_count);
+fn run_both_idmaps(r: &IdRange, pid: i32, euid: u32, egid: u32, quiet: bool) -> bool {
+    let a = spawn_idmap(&r.newuidmap, pid, euid, r.sub_uid, r.uid_count, quiet);
+    let b = spawn_idmap(&r.newgidmap, pid, egid, r.sub_gid, r.gid_count, quiet);
     let wait = |c: Option<std::process::Child>| {
         c.map(|mut c| c.wait().map(|s| s.success()).unwrap_or(false))
             .unwrap_or(false)
@@ -6185,7 +6189,7 @@ fn apply_userns_range(
         let ppid = unsafe { libc::getppid() };
         let mut b = [0u8; 1];
         let _ = unsafe { libc::read(p2h[0], b.as_mut_ptr() as *mut libc::c_void, 1) };
-        let ok = run_both_idmaps(r, ppid, euid, egid);
+        let ok = run_both_idmaps(r, ppid, euid, egid, false);
         // The parent's namespace is mapped and this process is still the host's root: make the
         // idmapped mounts against it and send them, BEFORE the verdict, so they are queued when the
         // parent reads it.
@@ -6512,7 +6516,11 @@ fn early_userns_helper(
     } else {
         -1
     };
-    let mapped = ns >= 0 && run_both_idmaps(range, carrier, euid, egid);
+    // QUIET: this map is made ahead, for a box that may never start (a refused `--keep` image,
+    // a usage error found after this began), and a failure here only means the box maps later,
+    // where a failure is reported. MEASURED: a refused start printed `newuidmap: Could not open proc
+    // directory for target <pid>` and the same for `newgidmap` after kern's own error.
+    let mapped = ns >= 0 && run_both_idmaps(range, carrier, euid, egid, true);
     // Release the carrier BEFORE telling kern, so its exit overlaps kern's `setns` instead of
     // following it; the namespace stays alive through `ns`.
     unsafe { libc::close(release[1]) };

@@ -7898,6 +7898,29 @@ mod twin_tests {
     }
 }
 
+/// A `kern run` (or `kern container run`) command line as the `kern box` one it is
+/// (`cli::run_to_box`, the parser's own translation), and any other as it was. A kept box records
+/// the `box` form: `kern start` replays only that, and the image a later `--keep` run is checked
+/// against is read from it. MEASURED before (0.57.0's `kern run`): `kern run --keep --name rk2
+/// alpine:3.21 ...` could not be started again ("its record does not begin `box rk2`"), and `kern run
+/// --keep --name rk2 debian:12` ran on the alpine layer, the check seeing no image in the record.
+fn as_box_argv(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let words: Option<Vec<&str>> = argv.iter().map(|a| a.to_str()).collect();
+    let Some(mut words) = words else {
+        return argv;
+    };
+    if words.first() == Some(&"container") && words.get(1) == Some(&"run") {
+        words.remove(0);
+    }
+    if words.first() != Some(&"run") {
+        return argv;
+    }
+    match crate::cli::run_to_box(&words) {
+        Ok(boxed) => boxed.into_iter().map(std::ffi::OsString::from).collect(),
+        Err(_) => argv,
+    }
+}
+
 /// The command line a kept box records, as `box <name> <options...>`: `kern start` replays only a
 /// record that begins that way (see `start_one_kept`), and `--name <name>` is Docker's spelling of
 /// the same thing. MEASURED: `kern box --name web --image nginx:alpine -d --keep` recorded `box
@@ -7905,6 +7928,7 @@ mod twin_tests {
 /// from", so a box kept that way could never start again. The name moves to position 1; everything
 /// after the workload's `--` is the workload's and is left as it is.
 fn kept_argv(argv: Vec<std::ffi::OsString>, name: &str) -> Vec<std::ffi::OsString> {
+    let argv = as_box_argv(argv);
     if argv
         .get(1)
         .is_some_and(|a| a.as_os_str() == std::ffi::OsStr::new(name))
@@ -8315,4 +8339,59 @@ pub(crate) fn stack_network_join(
     // internet. A network the file marks `internal: true` gets none, as its services got none.
     let nat = !chosen.internal;
     Ok((Some(stack), pod_bridges, add_hosts, nat))
+}
+
+#[cfg(test)]
+mod kept_record_tests {
+    use super::{as_box_argv, kept_argv};
+
+    fn os(v: &[&str]) -> Vec<std::ffi::OsString> {
+        v.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    /// A kept box's record is the `box <name>` command line whatever verb made it: `kern run` and
+    /// `kern container run` are translated (the image named, so a later `--keep` run is checked
+    /// against it, and `kern start` can replay it), and `kern box` is left as it was.
+    #[test]
+    fn a_kept_run_records_the_box_it_is() {
+        let run = kept_argv(
+            os(&[
+                "run",
+                "--keep",
+                "--name",
+                "rk",
+                "-l",
+                "a=b",
+                "alpine:3.21",
+                "sh",
+                "-c",
+                "x",
+            ]),
+            "rk",
+        );
+        assert_eq!(
+            run,
+            os(&[
+                "box",
+                "rk",
+                "--keep",
+                "-l",
+                "a=b",
+                "--image",
+                "alpine:3.21",
+                "--",
+                "sh",
+                "-c",
+                "x"
+            ])
+        );
+        assert_eq!(crate::keepbox::image_of(&run), "alpine:3.21");
+        assert_eq!(crate::keepbox::workload_of(&run), "sh -c x");
+        assert_eq!(
+            as_box_argv(os(&["container", "run", "--keep", "alpine"])),
+            os(&["box", "--keep", "--image", "alpine"])
+        );
+        let boxed = os(&["box", "rk", "--image", "alpine", "--keep", "--", "true"]);
+        assert_eq!(as_box_argv(boxed.clone()), boxed);
+    }
 }

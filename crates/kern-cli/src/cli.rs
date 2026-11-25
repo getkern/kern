@@ -5705,7 +5705,8 @@ pub(crate) fn run_bare_image() -> Option<(&'static str, &'static str)> {
     RUN_BARE_IMAGE.get().map(|(w, c)| (w.as_str(), c.as_str()))
 }
 
-/// `kern run [OPTIONS] IMAGE [COMMAND [ARG...]]`: `docker run`'s shape, onto `kern box`.
+/// `kern run [OPTIONS] IMAGE [COMMAND [ARG...]]`, as the `kern box` command line it is: `docker
+/// run`'s shape onto `kern box`. The one translation, for the parser and for a kept box's record.
 ///
 /// ONE PARSER, NOT TWO. The options are `box`'s own, read by `parse_box`, so a flag means here
 /// exactly what it means there, and a Docker-named flag is one `box` already gives Docker's
@@ -5717,7 +5718,7 @@ pub(crate) fn run_bare_image() -> Option<(&'static str, &'static str)> {
 /// `kern run` capped a HOST process before 0.57.0; that is `kern limit` now. Its old forms are
 /// answered with the new verb: `kern run [opts] -- CMD` (an option list then `--`, no image) and
 /// an image that is a path.
-fn parse_run(rest: &[&str]) -> Result<Command, Error> {
+pub(crate) fn run_to_box(rest: &[&str]) -> Result<Vec<String>, Error> {
     let split = split_equals_flags(rest, VALUE_FLAGS, NO_VALUE_FLAGS)?;
     let rest: &[&str] = &split;
     let mut argv: Vec<&str> = vec!["box"];
@@ -5788,7 +5789,14 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
         argv.push("--");
         argv.extend_from_slice(command);
     }
-    parse_box(&argv)
+    Ok(argv.iter().map(|a| (*a).to_string()).collect())
+}
+
+/// [`run_to_box`], parsed as the `box` it is.
+fn parse_run(rest: &[&str]) -> Result<Command, Error> {
+    let argv = run_to_box(rest)?;
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    parse_box(&refs)
 }
 
 /// `words` as one command line a reader can paste into a shell: a word with anything but plain
