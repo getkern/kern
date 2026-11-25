@@ -31,6 +31,8 @@
 //!
 //! Both are inert under a pasta that has the fixes: its RST carries the ACK, so rule 2 never matches,
 //! and it ignores a repeated SYN, so rule 1 only spares it a packet. That is why no version is read.
+//! MEASURED with passt's own build of 2026-10-02 ahead in `PATH`, the rules installed: a closed port
+//! refused in 13 ms, a dropped first SYN 1009-1060 ms.
 //!
 //! WITH THE RULES, same host, same servers: the closed port is refused in 1081-1088 ms (one SYN
 //! retry; Docker's 311 ms is a RST the box's socket takes at once, which this namespace cannot
