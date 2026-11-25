@@ -257,8 +257,84 @@ pub(crate) enum Response {
         content_type: &'static str,
         /// Answer `101` and hand the connection over, as Docker does when the client asked for it.
         upgrade: bool,
-        writer: Box<dyn FnOnce(&mut UnixStream) + Send>,
+        writer: Box<dyn FnOnce(&mut Out) + Send>,
     },
+}
+
+/// Where a stream response's body goes: the connection itself after a `101`, and otherwise in
+/// HTTP/1.1 chunks, which is how Docker answers a stream (`logs`, `pull`, `wait`, an attach the client
+/// did not upgrade).
+///
+/// CHUNKED BECAUSE A CLIENT REQUIRES IT. The body used to run unframed to the connection's close,
+/// which HTTP/1.1 allows and the `docker` CLI and docker-py read. Docker.DotNet (Testcontainers for
+/// .NET) does not: MEASURED on Windows through the named pipe, its `GetLogsAsync` failed with
+/// `Invalid chunk header encountered: 'out-a'`, reading the first log frame as a chunk size.
+///
+/// ONE WRITE IS ONE CHUNK, written whole: two threads that share the connection under one lock (the
+/// attach pump, one per stream) then cannot interleave inside a chunk any more than inside a frame.
+pub(crate) struct Out {
+    stream: UnixStream,
+    chunked: bool,
+}
+
+impl Out {
+    /// A second handle on the same connection, framing the same way.
+    pub(crate) fn try_clone(&self) -> std::io::Result<Out> {
+        Ok(Out {
+            stream: self.stream.try_clone()?,
+            chunked: self.chunked,
+        })
+    }
+
+    /// The connection, for a handler that watches it (a client hanging up) rather than writes.
+    pub(crate) fn socket(&self) -> &UnixStream {
+        &self.stream
+    }
+
+    /// End the body: the empty chunk, when chunked.
+    fn finish(&mut self) -> std::io::Result<()> {
+        if self.chunked {
+            self.stream.write_all(b"0\r\n\r\n")?;
+        }
+        self.stream.flush()
+    }
+}
+
+/// `n` in lowercase hex, into `buf`, and the bytes written: a chunk size without an allocation.
+fn hex_len(mut n: usize, buf: &mut [u8; 16]) -> &[u8] {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = DIGITS[n & 0xf];
+        n >>= 4;
+        if n == 0 || i == 0 {
+            break;
+        }
+    }
+    &buf[i..]
+}
+
+impl Write for Out {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.is_empty() {
+            // An empty chunk is the end of the body: never written for an empty write.
+            return Ok(0);
+        }
+        if !self.chunked {
+            return self.stream.write(data);
+        }
+        let mut digits = [0u8; 16];
+        self.stream.write_all(hex_len(data.len(), &mut digits))?;
+        self.stream.write_all(b"\r\n")?;
+        self.stream.write_all(data)?;
+        self.stream.write_all(b"\r\n")?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 fn reason(status: u16) -> &'static str {
@@ -322,14 +398,22 @@ fn write_response(w: &mut UnixStream, resp: Response, head_only: bool) -> bool {
                 )
             } else {
                 format!(
-                "HTTP/1.1 {status} {}\r\nServer: kern/{}\r\nApi-Version: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} {}\r\nServer: kern/{}\r\nApi-Version: {}\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
                 reason(status),
                 kern_common::VERSION,
                 api::API_VERSION
             )
             };
+            let Ok(stream) = w.try_clone() else {
+                return false;
+            };
+            let mut out = Out {
+                stream,
+                chunked: !upgrade,
+            };
             if w.write_all(head.as_bytes()).is_ok() {
-                writer(w);
+                writer(&mut out);
+                let _ = out.finish();
             }
             false
         }
@@ -556,6 +640,48 @@ fn inherited(fd: RawFd) -> Result<UnixListener, String> {
 
 #[cfg(test)]
 mod tests {
+    /// A stream body in HTTP/1.1 chunks: one write, one chunk; an empty write writes nothing (an
+    /// empty chunk would END the body); `finish` writes the terminator. After a `101` the bytes go
+    /// as they are.
+    #[test]
+    fn a_stream_body_is_chunked_unless_the_connection_was_upgraded() {
+        use std::io::{Read, Write};
+        for (chunked, want) in [
+            (
+                true,
+                &b"5\r\nhello\r\n1a\r\nabcdefghijklmnopqrstuvwxyz\r\n0\r\n\r\n"[..],
+            ),
+            (false, &b"helloabcdefghijklmnopqrstuvwxyz"[..]),
+        ] {
+            let Ok((a, mut b)) = UnixStream::pair() else {
+                panic!("socketpair");
+            };
+            let mut out = Out { stream: a, chunked };
+            assert!(out.write_all(b"hello").is_ok());
+            assert!(matches!(out.write(b""), Ok(0)));
+            let Ok(mut second) = out.try_clone() else {
+                panic!("clone");
+            };
+            assert!(second.write_all(b"abcdefghijklmnopqrstuvwxyz").is_ok());
+            drop(second);
+            assert!(out.finish().is_ok());
+            drop(out);
+            let mut got = Vec::new();
+            assert!(b.read_to_end(&mut got).is_ok());
+            assert_eq!(
+                got,
+                want,
+                "chunked={chunked}: {:?}",
+                String::from_utf8_lossy(&got)
+            );
+        }
+        let mut buf = [0u8; 16];
+        assert_eq!(hex_len(0, &mut buf), b"0");
+        assert_eq!(hex_len(255, &mut buf), b"ff");
+        assert_eq!(hex_len(1 << 20, &mut buf), b"100000");
+        assert_eq!(hex_len(usize::MAX, &mut buf), b"ffffffffffffffff");
+    }
+
     use super::*;
 
     /// The parser takes what any client of this user sends: mutated real requests, from the shapes

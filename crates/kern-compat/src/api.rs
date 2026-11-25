@@ -883,7 +883,7 @@ fn logs(bin: &Path, name: &str, req: &Request) -> Response {
         status: 200,
         content_type: "application/vnd.docker.multiplexed-stream",
         upgrade: false,
-        writer: Box::new(move |w: &mut UnixStream| {
+        writer: Box::new(move |w: &mut crate::Out| {
             let child = Command::new(&bin)
                 .args(&args)
                 .stdin(Stdio::null())
@@ -923,7 +923,7 @@ fn pull(bin: &Path, req: &Request) -> Response {
         status: 200,
         content_type: "application/json",
         upgrade: false,
-        writer: Box::new(move |w: &mut UnixStream| {
+        writer: Box::new(move |w: &mut crate::Out| {
             let _ = writeln!(
                 w,
                 "{{\"status\":{}}}",
@@ -1190,7 +1190,7 @@ fn remove_container(bin: &Path, name: &str) {
 /// Copy `out` and `err` to `w` until both end, as Docker's frames (stream 1 and 2), or as the raw
 /// bytes for a tty. ONE LOCK PER WHOLE FRAME: two readers share the connection, and a frame of one
 /// stream must never be cut by a frame of the other.
-fn pump(w: &UnixStream, out: Option<ChildStdout>, err: Option<ChildStderr>, raw: bool) {
+fn pump(w: &crate::Out, out: Option<ChildStdout>, err: Option<ChildStderr>, raw: bool) {
     let Ok(sink) = w.try_clone() else { return };
     let sink = Arc::new(Mutex::new(sink));
     let pipes: [(u8, Option<Box<dyn Read + Send>>); 2] = [
@@ -1398,7 +1398,7 @@ fn wait(bin: &Path, name: String) -> Response {
         status: 200,
         content_type: "application/json",
         upgrade: false,
-        writer: Box::new(move |w: &mut UnixStream| {
+        writer: Box::new(move |w: &mut crate::Out| {
             wait_until_started(&name);
             let body = match run_exit(&name) {
                 Some(status) => format!("{{\"StatusCode\":{status},\"Error\":null}}"),
@@ -1406,7 +1406,8 @@ fn wait(bin: &Path, name: String) -> Response {
                     // A client that gave up (`docker run -d` drops its wait once the box started)
                     // ends this wait too: it would hold a `kern wait` and keep the server awake for
                     // as long as the box runs.
-                    let Some((code, out, err)) = kern_wait_while_connected(&bin, &name, w) else {
+                    let Some((code, out, err)) = kern_wait_while_connected(&bin, &name, w.socket())
+                    else {
                         return;
                     };
                     match out.trim().parse::<i64>() {
@@ -1442,7 +1443,7 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
             status: 200,
             content_type: "application/vnd.docker.multiplexed-stream",
             upgrade: req.upgrade,
-            writer: Box::new(move |w: &mut UnixStream| {
+            writer: Box::new(move |w: &mut crate::Out| {
                 // Ends without a word when the container is removed instead of started.
                 if let Ok((out, err)) = from.recv() {
                     pump(w, out, err, false);
@@ -1475,7 +1476,7 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
         status: 200,
         content_type: "application/vnd.docker.multiplexed-stream",
         upgrade: req.upgrade,
-        writer: Box::new(move |w: &mut UnixStream| {
+        writer: Box::new(move |w: &mut crate::Out| {
             let Ok(mut child) = cmd.spawn() else { return };
             if let Some(out) = child.stdout.take() {
                 let _ = copy_frames(out, w, wanted);
@@ -1679,7 +1680,7 @@ fn exec_start(bin: &Path, id: &str, req: &Request) -> Response {
             "application/vnd.docker.multiplexed-stream"
         },
         upgrade: req.upgrade,
-        writer: Box::new(move |w: &mut UnixStream| {
+        writer: Box::new(move |w: &mut crate::Out| {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(err) => {
