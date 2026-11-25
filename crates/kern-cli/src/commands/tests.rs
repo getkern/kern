@@ -9475,6 +9475,7 @@ fn a_kept_row_between_runs_formats_as_restarting() {
             last_exit: None,
             image: "alpine:3.21".into(),
             cwd: String::new(),
+            image_id: String::new(),
         },
         command: "sh -c exit 1".into(),
         labels: Vec::new(),

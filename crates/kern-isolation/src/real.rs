@@ -313,6 +313,11 @@ pub struct SandboxSpec {
     /// exits with its status. Off by default (PID 1 execs the command directly), so the common path is
     /// byte-for-byte unchanged.
     pub init: bool,
+    /// PID 1 runs NOTHING: once the box is set up it waits for SIGTERM (or SIGINT), then exits 0.
+    /// For a box kern starts on another box's layer to reach its files (`kern cp` into or out of a
+    /// kept box that is not running): the image's own binaries, which may be none at all (a
+    /// distroless image has no `sleep`), are never needed. Off for every user box.
+    pub idle: bool,
     /// `--tmpfs PATH[:opts]`: extra fresh tmpfs mounts inside the box. Blocked over hardened mounts.
     pub tmpfs: Vec<TmpfsMount>,
     /// `--user UID[:GID]`: drop to this uid/gid just before exec (after all privileged setup). `None`
@@ -2345,12 +2350,45 @@ fn child_setup_and_exec(
     // that size with no marker is the largest thing in this file nobody can attribute, and the fd shed
     // walks `/proc/self/fd`, so it is the first candidate the residue has to be split against.
     t.mark("shed-fds");
-    if spec.init {
+    if spec.idle {
+        // An idle PID 1 (`SandboxSpec::idle`): nothing is executed. Never returns.
+        run_idle(ready_fd, gate)
+    } else if spec.init {
         // `--init`: this PID-1 process forks the workload and becomes a reaping init. Never returns.
         run_init(spec, argv, ready_fd, gate)
     } else {
         // Default: PID 1 IS the workload - exec directly, byte-for-byte the original path.
         Err(exec(argv, ready_fd, gate))
+    }
+}
+
+/// An idle PID 1 ([`SandboxSpec::idle`]): the box is up once the readiness pipe reads EOF, which
+/// closing its write end gives the launcher exactly as a successful `execvp` (close-on-exec) does;
+/// then it waits, and SIGTERM or SIGINT ends it with status 0. Raw libc only: the handler calls
+/// `_exit`, which is async-signal-safe, and nothing here allocates or unwinds. A gate (`--no-pod`
+/// stacks) is never set for such a box and is closed if it is.
+fn run_idle(ready_fd: Option<libc::c_int>, gate: Option<libc::c_int>) -> ! {
+    extern "C" fn leave(_sig: libc::c_int) {
+        // SAFETY: `_exit` is on the async-signal-safe list.
+        unsafe { libc::_exit(0) }
+    }
+    // SAFETY: a zeroed `sigaction` with a handler, an empty mask and no flags is a valid argument;
+    // the handler only calls `_exit`.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = leave as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        if let Some(g) = gate {
+            libc::close(g);
+        }
+        if let Some(fd) = ready_fd {
+            libc::close(fd);
+        }
+        loop {
+            libc::pause();
+        }
     }
 }
 

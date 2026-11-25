@@ -2131,8 +2131,18 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--keep`: the layer is TAKEN here and the record is WRITTEN further down, just before the box
     // is launched. See the note at the write for why the two are at different points.
     let mut keep_record: Option<(std::path::PathBuf, Vec<std::ffi::OsString>, u64)> = None;
-    if args.keep {
-        if let Some(dir) = crate::keepbox::dir_of(name.as_str()) {
+    // The image a kept box was CREATED from, from its record: what its runs mount (see `Meta`).
+    let mut recorded_image_id: Option<String> = None;
+    // `--layer-of <owner>` is a box on ANOTHER box's kept layer (`kern cp` of a kept box that is
+    // not running): the layer, its lock and its record are the owner's; nothing is written.
+    if args.layer_of.is_some() && !args.idle {
+        return Err(Error::Usage(
+            "--layer-of is internal to `kern cp` and runs only with --idle",
+        ));
+    }
+    let layer_owner: &str = args.layer_of.unwrap_or(name.as_str());
+    if args.keep || args.layer_of.is_some() {
+        if let Some(dir) = crate::keepbox::dir_of(layer_owner) {
             // THE LAYER IS TAKEN BEFORE ANYTHING IS WRITTEN TO IT, because the name claim above does
             // not cover it: the registry and the layer live in different places, and two boxes
             // mounting one overlay upperdir is undefined behaviour by the kernel's own message. See
@@ -2180,15 +2190,26 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     )));
                 }
             }
-            keep_record = Some((
-                dir,
-                argv,
-                previous
-                    .as_ref()
-                    .map(|(_, m)| m.created)
-                    .filter(|c| *c > 0)
-                    .unwrap_or_else(registry::now_unix),
-            ));
+            recorded_image_id = previous
+                .as_ref()
+                .map(|(_, m)| m.image_id.clone())
+                .filter(|id| !id.is_empty());
+            if args.layer_of.is_some() && previous.is_none() {
+                return Err(Error::NotRunning(format!(
+                    "no kept box '{layer_owner}' to run on"
+                )));
+            }
+            keep_record = args.keep.then(|| {
+                (
+                    dir,
+                    argv,
+                    previous
+                        .as_ref()
+                        .map(|(_, m)| m.created)
+                        .filter(|c| *c > 0)
+                        .unwrap_or_else(registry::now_unix),
+                )
+            });
         }
     }
 
@@ -2240,6 +2261,21 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     for layer in args.overlay_lower {
         crate::secret::guard_host_path(layer, "--overlay-lower")?;
     }
+    // The pin a kept box runs from: when its record names the content it was created from, the pin
+    // of that content is in the cache, and the tag names other content now (or is not cached at
+    // all, which a `start` must not pull: Docker's never does).
+    let pinned_root: Option<String> = match (&recorded_image_id, args.image, args.rootfs) {
+        (Some(id), Some(img), None) => {
+            let pin = crate::commands::imagecache::pin_ref(id);
+            let cache = crate::commands::imagecache::cache_dir();
+            let pin_there = crate::commands::imagecache::image_present(
+                &cache,
+                &crate::commands::imagecache::sanitize_ref(&pin),
+            );
+            (pin_there && image_id_now(Some(img)) != *id).then_some(pin)
+        }
+        _ => None,
+    };
     // The lower/base rootfs: an explicit --rootfs, or pull --image into a local cache. An --image
     // also yields its OCI runtime config (Entrypoint/Cmd/Env/WorkingDir/User) - the defaults below.
     // `lower` is the root's layers, TOP first, one path each - a list up to the mount, never a
@@ -2253,9 +2289,53 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // `--pull` policy rides all the way down to the one site that hits the network
             // (`pull_to_cache`); `scratch` and locally-built images short-circuit before that, so
             // `never` naturally passes them.
-            (_, None, Some(img)) => resolve_image_depth(img, 0, args.pull)?,
+            // A KEPT BOX whose tag now names other content runs the content it was created from,
+            // from its pin, as Docker's container keeps its image; never pulled (a pin is local).
+            (_, None, Some(img)) => match &pinned_root {
+                Some(pin) => resolve_image_depth(pin, 0, PullPolicy::Never)?,
+                None => resolve_image_depth(img, 0, args.pull)?,
+            },
             (_, None, None) => return Err(Error::Sandbox("need --rootfs or --image".to_string())),
         };
+    // THE ID OF THE ROOT THIS BOX STARTS FROM, read once here and kept for the record the
+    // supervisor writes (a fork of this process): computed again from the NAME there, it said the
+    // tag's new content for a box running its pin.
+    let root_ref: Option<&str> = pinned_root.as_deref().or(args.image);
+    let root_image_id = image_id_now(root_ref);
+    if pinned_root.is_none() && (keep_record.is_some() || args.layer_of.is_some()) {
+        if let Some(created_from) = &recorded_image_id {
+            // THE LAYER IS A DELTA OF THE CONTENT IT WAS WRITTEN ON, and that content is gone (a
+            // `kern gc --images`, or a cache from before pins): mounting it on what the tag names
+            // now is the hybrid root the name check above refuses for a different image.
+            if !root_image_id.is_empty() && root_image_id != *created_from {
+                return Err(Error::Sandbox(format!(
+                    "kept box '{}' was created from image {} ('{}'), which this cache no longer \
+                     holds, and '{}' now names {}: the box's layer is a delta of the first and is \
+                     not valid on the second. `kern rm {}` and run it again on the image as it is \
+                     now",
+                    name.as_str(),
+                    short_image_id(created_from),
+                    args.image.unwrap_or(""),
+                    args.image.unwrap_or(""),
+                    short_image_id(&root_image_id),
+                    name.as_str()
+                )));
+            }
+        }
+    }
+    let _ = ROOT_IMAGE_ID.set(root_image_id.clone());
+    // A kept box records the content it runs; its pin is made once per content, OFF this path.
+    let kept_image_id = if keep_record.is_some() {
+        let id = root_ref
+            .and_then(crate::commands::imagecache::kept_image_id)
+            .unwrap_or_else(|| root_image_id.clone());
+        if let Some(r) = root_ref {
+            crate::commands::imagecache::pin_in_background(r, &id);
+        }
+        id
+    } else {
+        String::new()
+    };
     // AN EMPTY NAMED VOLUME IS SEEDED FROM THE IMAGE, WHICH IS WHAT DOCKER DOES.
     //
     // Docker copies the image's content at the mount point into a named volume the first time that
@@ -2365,7 +2445,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             if covered.iter().any(|c| c == dest) {
                 continue;
             }
-            let name = crate::volume::anon_name(args.name, dest);
+            // The OWNER's, for a box on another's layer: its VOLUME paths are that box's data.
+            let name = crate::volume::anon_name(args.layer_of.unwrap_or(args.name), dest);
             let source = crate::volume::resolve_named(&name)?;
             volumes.push(Volume {
                 source,
@@ -3007,8 +3088,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // mount, the work-dir clearing, the registry record - sees one mechanism and cannot disagree
         // about where a box's writes go. An explicit `--overlay-upper` wins: a build step passes it.
         overlay_upper: args.overlay_upper.map(str::to_string).or_else(|| {
-            args.keep
-                .then(|| crate::keepbox::dir_of(name.as_str()))
+            (args.keep || args.layer_of.is_some())
+                .then(|| crate::keepbox::dir_of(layer_owner))
                 .flatten()
                 .map(|d| d.to_string_lossy().into_owned())
         }),
@@ -3046,6 +3127,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         hostname,
         tun: args.tun,
         init: args.init,
+        idle: args.idle,
         tmpfs,
         run_as,
         extra_gids,
@@ -3223,6 +3305,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             cwd: std::env::current_dir()
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            image_id: kept_image_id.clone(),
         };
         // A record that cannot be written is a `kern start` that would not work, so it is the box's
         // problem and not a note: the operator asked for a box they can start again.
@@ -8200,9 +8283,31 @@ fn as_box_argv(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
 /// report it: the cache entry's content, read now, so a later rebuild of the tag does not move it.
 /// Empty for a `--rootfs` box and for an image not in the cache (a box cannot start from one).
 fn started_image_id(image: Option<&str>) -> String {
+    if let Some(id) = ROOT_IMAGE_ID.get() {
+        return id.clone();
+    }
+    image_id_now(image)
+}
+
+/// The id the root a box mounts, set once by `box_run` when it resolves it (see there); a fork of
+/// this process, the detached supervisor, reads it rather than asking the cache by name again.
+static ROOT_IMAGE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// `sha256:` and the first 12 hex digits, as `docker images` prints an id.
+fn short_image_id(id: &str) -> &str {
+    let hex = id.strip_prefix("sha256:").unwrap_or(id);
+    hex.get(..12).unwrap_or(hex)
+}
+
+/// The id of the cached image `image` as the cache holds it NOW; empty for none. A pin answers
+/// the id of the image it keeps (`imagecache::pin_id_of`).
+fn image_id_now(image: Option<&str>) -> String {
     let Some(r) = image.filter(|r| !r.is_empty()) else {
         return String::new();
     };
+    if let Some(id) = crate::commands::imagecache::pin_id_of(r) {
+        return id;
+    }
     let cache = crate::commands::imagecache::cache_dir();
     let stem = crate::commands::imagecache::cache_entry_for(&cache, r);
     if !crate::commands::imagecache::image_present(&cache, &stem) {

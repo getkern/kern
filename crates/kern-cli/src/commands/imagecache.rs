@@ -2718,6 +2718,341 @@ pub(crate) fn chain_dir_mode(chain: &[String], rel: &str) -> Option<u32> {
         .find_map(|d| kern_oci::dir_mode(&std::path::Path::new(d).join(rel)))
 }
 
+/// The repository a kept box's image is pinned under: `kern-pin/<hex of its id>`.
+///
+/// WHY A KEPT BOX PINS ITS IMAGE. Docker's container runs the image it was created from until it is
+/// removed, whatever its tag names later; kern's cache is keyed by NAME, and a rebuild or a pull of
+/// the tag replaced the entry, so the next run of a kept box mounted its layer (a DELTA of the old
+/// content) on the new one. A pin is a second name for the same content, made with hard links (no
+/// data is copied: measured 6 ms for `alpine:3.21`, 10 ms for `nginx:alpine` and `docker:28-dind`,
+/// once per distinct content, not per box), so it outlives the tag's next content.
+pub(crate) const PIN_REPO: &str = "kern-pin/";
+
+/// The pin reference of the image whose id is `image_id` (`sha256:<hex>` or the bare hex).
+pub(crate) fn pin_ref(image_id: &str) -> String {
+    format!(
+        "{PIN_REPO}{}",
+        image_id.strip_prefix("sha256:").unwrap_or(image_id)
+    )
+}
+
+/// Whether a reference, as an image listing shows it, is a pin: kern's own, never a user's image.
+pub(crate) fn is_pin_ref(reference: &str) -> bool {
+    reference.starts_with(PIN_REPO)
+}
+
+/// The id a pin stands for, from its NAME (`kern-pin/<hex>[:tag]` gives `sha256:<hex>`), `None`
+/// for any other reference. NOT the pin's own content: a built image's pin has its base line
+/// rewritten to the base's pin, so its bytes, and an id hashed from them, differ from the image it
+/// keeps. MEASURED before: a kept box replayed from such a pin recorded that other id, and the pin
+/// its record should have released stayed in the cache after `kern rm`.
+pub(crate) fn pin_id_of(reference: &str) -> Option<String> {
+    let r = kern_oci::normalize_ref(reference);
+    let hex = r.strip_prefix(PIN_REPO)?;
+    let hex = hex.split(':').next().unwrap_or(hex);
+    (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("sha256:{hex}"))
+}
+
+/// The id (`sha256:<hex>`) of the cached image `image` as a kept box records it, without making the
+/// pin: one `stat` and a hash of its config, for the box's start path. A pin's id is the one in its
+/// name. `None` when the image is not in the cache.
+pub(crate) fn kept_image_id(image: &str) -> Option<String> {
+    if let Some(id) = pin_id_of(image) {
+        return Some(id);
+    }
+    let cache = cache_dir();
+    let stem = cache_entry_for(&cache, image);
+    image_present(&cache, &stem).then(|| kern_compat::image_id_for_entry(&cache, &stem, image))
+}
+
+/// Make the pin of `image` (whose id is `id`) in a process of its own, so a box does not wait for
+/// it. MEASURED on the start path: the first kept box of `nginx:alpine` took 13 to 24 ms more than
+/// the next one (2127 entries linked), every container kern's Docker API makes being a kept one.
+/// The pin is made only if the tag still names `id` when that process runs (`pin_image_if`), so a
+/// rebuild in between cannot pin other content; until it exists, a run with the tag unchanged mounts
+/// the tag, which IS that content.
+///
+/// ⛔ A DOUBLE FORK, AND NO THREAD AND NO EXEC. A thread to reap a spawned child made this process
+/// multi-threaded, and the box's `unshare(CLONE_NEWUSER)` then failed with EINVAL: MEASURED, every
+/// first kept box of an image refused to start. The middle child exits at once and is reaped here
+/// (well under a millisecond); the grandchild, reparented to the init, closes every descriptor it
+/// inherited (a pipe a client reads to EOF must not wait for it) and makes the pin.
+pub(crate) fn pin_in_background(image: &str, id: &str) {
+    if id.is_empty() || pin_id_of(image).is_some() {
+        return;
+    }
+    let cache = cache_dir();
+    if image_present(&cache, &sanitize_ref(&pin_ref(id))) {
+        return;
+    }
+    // SAFETY: `fork` in the box's launcher, which is single-threaded (the box's own `unshare` needs
+    // it to be). The children run this crate's code and `_exit`; they never return into the caller.
+    let middle = unsafe { libc::fork() };
+    match middle {
+        -1 => {}
+        0 => {
+            // SAFETY: as above; the middle child forks once more and leaves.
+            if unsafe { libc::fork() } == 0 {
+                detach_from_the_caller();
+                pin_image_if(image, id);
+            }
+            // SAFETY: `_exit` skips the caller's atexit handlers and buffered output, which belong
+            // to the launcher, not to this child.
+            unsafe { libc::_exit(0) };
+        }
+        pid => {
+            let mut status = 0;
+            // SAFETY: waiting for the child this function just forked.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+        }
+    }
+}
+
+/// The grandchild's stdio on `/dev/null` and every other inherited descriptor closed.
+fn detach_from_the_caller() {
+    // SAFETY: plain syscalls on descriptors this process owns; a failure leaves the default.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+        if null >= 0 {
+            for fd in 0..3 {
+                libc::dup2(null, fd);
+            }
+        }
+        libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+        libc::setsid();
+    }
+}
+
+/// Pin `image` if the tag still names `id`. Silent: no one reads its output.
+pub(crate) fn pin_image_if(image: &str, id: &str) {
+    if kept_image_id(image).as_deref() == Some(id) {
+        let _ = pin_image(image);
+    }
+}
+
+/// Pin the cached image `image` for a kept box, and return its id (`sha256:<hex>`), or `None` when
+/// the image is not in the cache. BEST EFFORT on the pin itself: a pin that cannot be made (a
+/// directory the owner cannot read, a full disk) leaves the id returned anyway, so the box records
+/// what it was created from and a later run REFUSES a changed tag instead of mounting the layer on
+/// it. A built image's BASE is pinned too and its manifest points at the base's pin, so a re-pull of
+/// the base does not move it either.
+pub(crate) fn pin_image(image: &str) -> Option<String> {
+    pin_image_depth(&cache_dir(), image, 0)
+}
+
+fn pin_image_depth(cache: &std::path::Path, image: &str, depth: u32) -> Option<String> {
+    let stem = cache_entry_for(cache, image);
+    if !image_present(cache, &stem) {
+        return None;
+    }
+    if let Some(id) = pin_id_of(image) {
+        return Some(id); // already a pin: nothing to make, and the id it stands for
+    }
+    let id = kern_compat::image_id_for_entry(cache, &stem, image);
+    let pin = pin_ref(&id);
+    let pin_stem = sanitize_ref(&pin);
+    if image_present(cache, &pin_stem) {
+        return Some(id);
+    }
+    // A partial pin from an interrupted attempt has no `.ok` and is not an image: clear it first.
+    drop_image_artifacts(cache, &pin_stem);
+    if let Err(e) = link_entry(cache, &stem, &pin_stem, &pin, depth) {
+        drop_image_artifacts(cache, &pin_stem);
+        eprintln!(
+            "kern: note: could not keep a copy of {image} for this box ({e}); it runs as it is, and \
+             a later run refuses if the tag then names other content"
+        );
+    }
+    Some(id)
+}
+
+/// A second cache entry `dst` (reference `dst_ref`) for the entry `src`: the same files by hard link
+/// (a flat or single-diff image), or the same manifest with its base pinned (a layered build, whose
+/// `L/` layers are already shared by key). The `.ok` sentinel is written LAST, so an interrupted
+/// copy is not an image.
+fn link_entry(
+    cache: &std::path::Path,
+    src: &str,
+    dst: &str,
+    dst_ref: &str,
+    depth: u32,
+) -> Result<(), Error> {
+    if depth > 128 {
+        return Err(Error::Oci("image base chain too deep to pin".into()));
+    }
+    let cp = |suffix: &str| -> Result<(), Error> {
+        let from = cache.join(format!("{src}{suffix}"));
+        if from.exists() {
+            std::fs::copy(&from, cache.join(format!("{dst}{suffix}")))
+                .map_err(|e| Error::Oci(format!("pin {suffix}: {e}")))?;
+        }
+        Ok(())
+    };
+    cp(".image")?;
+    cp(".platforms")?;
+    cp(".setuid")?;
+    let flat = cache.join(src);
+    let diff = cache.join(format!("{src}.diff"));
+    let layers = cache.join(format!("{src}.layers"));
+    if flat.is_dir() {
+        link_tree(&flat, &cache.join(dst))?;
+    } else if layers.exists() {
+        let body = std::fs::read_to_string(&layers)
+            .map_err(|e| Error::Oci(format!("pin: read layers: {e}")))?;
+        let rebased = rebase_on_pin(cache, &body, depth)?;
+        std::fs::write(cache.join(format!("{dst}.layers")), rebased)
+            .map_err(|e| Error::Oci(format!("pin .layers: {e}")))?;
+        cp(".base")?;
+    } else if diff.is_dir() {
+        link_tree(&diff, &cache.join(format!("{dst}.diff")))?;
+        let base = std::fs::read_to_string(cache.join(format!("{src}.base"))).unwrap_or_default();
+        let rebased = rebase_on_pin(cache, &base, depth)?;
+        std::fs::write(cache.join(format!("{dst}.base")), rebased)
+            .map_err(|e| Error::Oci(format!("pin .base: {e}")))?;
+    } else {
+        return Err(Error::Oci("the image has no rootfs form".into()));
+    }
+    seal_entry(cache, dst, dst_ref, Owners::CopyOf(src), false)
+        .map_err(|e| Error::Oci(format!("pin marker: {e}")))
+}
+
+/// A manifest whose first line names the base (`<ref>` or `<ref> <os>/<arch>`), with that base
+/// pinned and named by its pin; the rest of the text unchanged. A base that cannot be pinned keeps
+/// its name.
+fn rebase_on_pin(cache: &std::path::Path, body: &str, depth: u32) -> Result<String, Error> {
+    let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
+    let first = first.trim();
+    if first.is_empty() || first == "scratch" {
+        return Ok(body.to_string());
+    }
+    let (base_ref, platform) = match first.split_once(' ') {
+        Some((r, p)) => (r.trim(), Some(p.trim())),
+        None => (first, None),
+    };
+    let parsed = match platform {
+        Some(p) => Some(
+            kern_oci::Platform::parse(p)
+                .map_err(|e| Error::Oci(format!("pin: corrupt base platform: {e}")))?,
+        ),
+        None => None,
+    };
+    let base_id = with_image_platform(parsed, || pin_image_depth(cache, base_ref, depth + 1));
+    let Some(base_id) = base_id.filter(|id| image_present(cache, &sanitize_ref(&pin_ref(id))))
+    else {
+        return Ok(body.to_string());
+    };
+    let line = match platform {
+        Some(p) => format!("{} {p}", pin_ref(&base_id)),
+        None => pin_ref(&base_id),
+    };
+    Ok(if body.contains('\n') {
+        format!("{line}\n{rest}")
+    } else {
+        line
+    })
+}
+
+/// `src` recreated at `dst` with every file a hard link to the original (no data copied), every
+/// symlink re-made, every directory made with its mode once its entries are in (an image directory
+/// may have no owner write bit, `dr-xr-xr-x` is ordinary). Not through a symlink: the walk reads
+/// links as links.
+fn link_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    let err = |what: &str, p: &std::path::Path, e: std::io::Error| {
+        Error::Oci(format!("pin: {what} {}: {e}", p.display()))
+    };
+    let meta = std::fs::symlink_metadata(src).map_err(|e| err("stat", src, e))?;
+    std::fs::create_dir(dst).map_err(|e| err("mkdir", dst, e))?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| err("chmod", dst, e))?;
+    for entry in std::fs::read_dir(src).map_err(|e| err("read", src, e))? {
+        let entry = entry.map_err(|e| err("read", src, e))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type().map_err(|e| err("stat", &from, e))?;
+        if ft.is_dir() {
+            link_tree(&from, &to)?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(&from).map_err(|e| err("readlink", &from, e))?;
+            std::os::unix::fs::symlink(target, &to).map_err(|e| err("symlink", &to, e))?;
+        } else {
+            std::fs::hard_link(&from, &to).map_err(|e| err("link", &from, e))?;
+        }
+    }
+    std::fs::set_permissions(
+        dst,
+        std::fs::Permissions::from_mode(meta.permissions().mode()),
+    )
+    .map_err(|e| err("chmod", dst, e))
+}
+
+/// Drop the pin of `image_id` when no kept box records that id and no other pin builds on it, then
+/// the pins of its own base chain by the same rule. Called when a kept box is removed.
+pub(crate) fn release_pin(image_id: &str) {
+    if image_id.is_empty() {
+        return;
+    }
+    let cache = cache_dir();
+    let mut next = Some(pin_ref(image_id));
+    let mut hops = 0u32;
+    while let Some(pin) = next.take() {
+        hops += 1;
+        if hops > 128 {
+            return;
+        }
+        let id = format!("sha256:{}", pin.trim_start_matches(PIN_REPO));
+        let used_by_a_box = crate::keepbox::list_matching(|_| true)
+            .iter()
+            .any(|k| k.meta.image_id == id);
+        let stem = sanitize_ref(&pin);
+        if used_by_a_box || pin_is_a_base(&cache, &stem, &pin) {
+            return;
+        }
+        // Its base, read before the entry goes: the next pin to consider.
+        let base_line = std::fs::read_to_string(cache.join(format!("{stem}.layers")))
+            .or_else(|_| std::fs::read_to_string(cache.join(format!("{stem}.base"))))
+            .unwrap_or_default();
+        drop_image_artifacts(&cache, &stem);
+        next = base_line
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().next())
+            .filter(|r| is_pin_ref(r))
+            .map(str::to_string);
+    }
+}
+
+/// Whether another pin's manifest names `pin` as its base.
+fn pin_is_a_base(cache: &std::path::Path, stem: &str, pin: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(cache) else {
+        return false;
+    };
+    // `sanitize_ref` writes the `/` of `kern-pin/` as `_`: every pin's stem starts so.
+    let prefix = "kern-pin_";
+    rd.flatten().any(|e| {
+        let name = e.file_name();
+        let Some(n) = name.to_str() else {
+            return false;
+        };
+        let Some(other) = n
+            .strip_suffix(".layers")
+            .or_else(|| n.strip_suffix(".base"))
+        else {
+            return false;
+        };
+        other != stem
+            && other.starts_with(prefix)
+            && std::fs::read_to_string(e.path())
+                .ok()
+                .and_then(|b| {
+                    b.lines()
+                        .next()
+                        .map(|l| l.split_whitespace().next() == Some(pin))
+                })
+                .unwrap_or(false)
+    })
+}
+
 /// A filesystem-safe directory name for an image reference.
 pub(crate) fn sanitize_ref(image: &str) -> String {
     // The reference gets its implied tag FIRST, so `alpine` and `alpine:latest` are one key and not
@@ -2963,5 +3298,128 @@ mod built_here_tests {
         record_setuid_kept(&dir, "img");
         assert_eq!(stripped_privileges(&dir, "img"), None, "the current mark");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// A pin stands for the id in its NAME, whatever its own bytes hash to; nothing else is a pin.
+    #[test]
+    fn a_pin_names_the_id_it_keeps() {
+        let hex = "0b9b40070c39aa00000000000000000000000000000000000000000000000000";
+        assert_eq!(
+            pin_id_of(&pin_ref(&format!("sha256:{hex}"))),
+            Some(format!("sha256:{hex}"))
+        );
+        assert_eq!(
+            pin_id_of(&format!("kern-pin/{hex}:latest")),
+            Some(format!("sha256:{hex}"))
+        );
+        assert_eq!(pin_id_of("alpine:3.21"), None);
+        assert_eq!(pin_id_of("kern-pin/not-hex"), None);
+        assert!(is_pin_ref(&kern_oci::normalize_ref(&pin_ref(hex))));
+    }
+
+    /// A kept box's image is pinned by hard links (the same inodes, no data copied), a built image's
+    /// base with it, the pin outlives the tag's entry, no listing shows it, and it goes with the
+    /// last box that uses it.
+    #[test]
+    fn a_pin_shares_the_bytes_survives_the_tag_and_is_released() {
+        let _g = crate::env_guard();
+        let home = std::env::temp_dir().join(format!("kern-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        struct Restore(
+            Vec<(&'static str, Option<std::ffi::OsString>)>,
+            std::path::PathBuf,
+        );
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => crate::set_global_env(k, v),
+                        None => crate::unset_global_env(k),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let keys = ["XDG_CACHE_HOME", "XDG_DATA_HOME"];
+        let _restore = Restore(
+            keys.iter().map(|k| (*k, crate::global_env(k))).collect(),
+            home.clone(),
+        );
+        for k in keys {
+            let d = home.join(k);
+            assert!(std::fs::create_dir_all(d.join("kern")).is_ok());
+            crate::set_global_env(k, &d);
+        }
+        let cache = cache_dir();
+        assert!(std::fs::create_dir_all(&cache).is_ok());
+        // A flat image `base:1` with a file and a read-only directory, and a build `app:1` on it.
+        let base = sanitize_ref("base:1");
+        let root = cache.join(&base);
+        assert!(std::fs::create_dir_all(root.join("ro")).is_ok());
+        assert!(std::fs::write(root.join("ro/f"), "one").is_ok());
+        assert!(std::fs::set_permissions(
+            root.join("ro"),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o555)
+        )
+        .is_ok());
+        assert!(std::fs::write(cache.join(format!("{base}.image")), "{\"config\":{}}").is_ok());
+        assert!(std::fs::write(cache.join(format!("{base}.ok")), "base:1").is_ok());
+        let app = sanitize_ref("app:1");
+        assert!(std::fs::write(cache.join(format!("{app}.layers")), "base:1\n").is_ok());
+        assert!(std::fs::write(
+            cache.join(format!("{app}.image")),
+            "{\"config\":{\"Cmd\":[\"x\"]}}"
+        )
+        .is_ok());
+        assert!(std::fs::write(cache.join(format!("{app}.ok")), "app:1").is_ok());
+
+        let Some(app_id) = pin_image("app:1") else {
+            panic!("a cached image is pinned");
+        };
+        let app_pin = sanitize_ref(&pin_ref(&app_id));
+        assert!(image_present(&cache, &app_pin), "the pin is an image");
+        let first =
+            std::fs::read_to_string(cache.join(format!("{app_pin}.layers"))).unwrap_or_default();
+        let base_ref = first.lines().next().unwrap_or_default().to_string();
+        assert!(
+            is_pin_ref(&base_ref),
+            "the base is named by its pin: {first:?}"
+        );
+        let base_pin = sanitize_ref(&base_ref);
+        let ino = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.ino()).unwrap_or(0);
+        assert_eq!(
+            ino(&root.join("ro/f")),
+            ino(&cache.join(&base_pin).join("ro/f")),
+            "the base's file is the same inode, not a copy"
+        );
+        // The pins are not listed; the user's two images are.
+        let (listing, _) = crate::commands::image_entries_in(&cache, crate::listing::Detail::Read);
+        let names: Vec<&str> = listing.records.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.iter().all(|n| !is_pin_ref(n)), "{names:?}");
+        assert_eq!(names.len(), 2, "{names:?}");
+        // The tag's entry goes (a re-pull replaces it); the pin keeps the bytes.
+        assert!(drop_image_artifacts(&cache, &base));
+        assert_eq!(
+            std::fs::read_to_string(cache.join(&base_pin).join("ro/f"))
+                .ok()
+                .as_deref(),
+            Some("one")
+        );
+        // No kept box records the id: the pin and its base pin are released.
+        release_pin(&app_id);
+        assert!(
+            !image_present(&cache, &app_pin),
+            "the pin went with its last user"
+        );
+        assert!(
+            !cache.join(&base_pin).exists(),
+            "and the base's pin, which only it used"
+        );
     }
 }

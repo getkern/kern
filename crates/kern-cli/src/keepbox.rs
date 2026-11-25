@@ -96,6 +96,11 @@ pub struct Meta {
     /// The directory the `kern box` command was given in. A relative `-v ./data:/data` means nothing
     /// without it, and `kern start` run from elsewhere would resolve it against the wrong tree.
     pub cwd: String,
+    /// The ID (`sha256:<hex>`) of the image the box was CREATED from, as Docker's container keeps
+    /// the image it was created from: every later run mounts that content, from its pin
+    /// (`imagecache::pin_ref`) once the tag names another. The layer is a delta of that content and
+    /// means nothing on another. Empty for a `--rootfs` box and a record from before the key.
+    pub image_id: String,
 }
 
 /// Create `dir` 0700: a box's layer holds whatever the workload wrote, and the argv can name a
@@ -187,10 +192,11 @@ pub fn write(dir: &Path, argv: &[std::ffi::OsString], meta: &Meta) -> io::Result
     // the separator cannot occur inside it and the split below cannot land in the middle of a
     // value; everything after it is raw and may hold any byte, including a newline.
     let mut body = format!(
-        "created={}\nlast_exit={}\ncwd={}\n\n",
+        "created={}\nlast_exit={}\ncwd={}\nimage_id={}\n\n",
         meta.created,
         meta.last_exit.map_or(String::new(), |c| c.to_string()),
         one_line(&meta.cwd),
+        one_line(&meta.image_id),
     )
     .into_bytes();
     body.extend_from_slice(&bytes);
@@ -427,6 +433,7 @@ pub fn read(dir: &Path) -> Option<(Vec<std::ffi::OsString>, Meta)> {
             "created" => meta.created = v.parse().unwrap_or(0),
             "last_exit" => meta.last_exit = v.parse().ok(),
             "cwd" => meta.cwd = v.to_string(),
+            "image_id" => meta.image_id = v.to_string(),
             // `image=` was a header field until it was measured that a hand-written record could
             // make `ps -a` show one image and run another. It is derived below and ignored here.
             _ => {}
@@ -606,6 +613,9 @@ pub fn remove(name: &str) -> Result<(), crate::error::Error> {
         }
         Ok(_) => {}
     }
+    // The content it was created from, read before the record goes: its pin is released below once
+    // no other kept box was created from it.
+    let image_id = read(&dir).map(|(_, m)| m.image_id).unwrap_or_default();
     crate::commands::remove_build_tree(&dir);
     if dir.exists() {
         return Err(crate::error::Error::Sandbox(format!(
@@ -613,6 +623,7 @@ pub fn remove(name: &str) -> Result<(), crate::error::Error> {
             dir.display()
         )));
     }
+    crate::commands::release_pin(&image_id);
     Ok(())
 }
 
@@ -691,9 +702,14 @@ mod tests {
                 last_exit: None,
                 image: "alpine:3.19".into(),
                 cwd: "/home/x/p".into(),
+                image_id: "sha256:ab12".into(),
             };
             write(&dir, &argv, &meta).expect("write");
             let (back, m) = read(&dir).expect("read");
+            assert_eq!(
+                m.image_id, "sha256:ab12",
+                "the image the box was created from"
+            );
             assert_eq!(back, argv, "the argv came back changed");
             assert_eq!(m.created, 1_700_000_000);
             assert_eq!(m.last_exit, None);

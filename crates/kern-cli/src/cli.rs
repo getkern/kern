@@ -174,6 +174,9 @@ pub enum Command {
         /// INTERNAL (used by `kern build`): a PERSISTENT overlay upper dir (the build layer) instead
         /// of the ephemeral scratch upper - so a build's writes accumulate across RUN steps.
         overlay_upper: Option<String>,
+        /// INTERNAL `--layer-of <box>`: run on that KEPT box's layer, its anonymous volumes and the
+        /// image it was created from, writing no record (see `commands::BoxRunArgs::layer_of`).
+        layer_of: Option<String>,
         /// `--keep`: the box's writable layer survives its exit, and `kern start <name>` runs it
         /// again. See [`crate::keepbox`]. Without it a box leaves nothing behind, which stays the
         /// default.
@@ -257,6 +260,9 @@ pub enum Command {
         gpus: Option<String>,
         /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
         init: bool,
+        /// INTERNAL `--idle`: PID 1 runs nothing and waits for SIGTERM (`SandboxSpec::idle`). Written
+        /// by `kern cp` for the box it starts on a stopped kept box's layer; not for users.
+        idle: bool,
         /// `--pids-limit N`: cap the box's process/thread count (`pids.max`) - fork-bomb containment.
         pids_limit: Option<u64>,
         /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
@@ -549,6 +555,7 @@ pub enum Command {
     WaitRemoved {
         name: String,
     },
+
     /// `compat docker ...`: run a command with `docker` answered by kern, or manage the `docker`
     /// links kern made (`crate::dockershim`).
     Compat {
@@ -1415,6 +1422,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             },
             _ => return Err(Error::Usage("__wait-removed <name>")),
         },
+
         Some("proxy") => Command::Proxy {
             action: match (rest.get(1).copied(), rest.len()) {
                 (Some("trust"), 2) => ProxyAction::Trust,
@@ -4197,6 +4205,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--nice",
     "--overlay-lower",
     "--overlay-upper",
+    "--layer-of",
     "--pids-limit",
     "--network-alias",
     "--net-alias",
@@ -4235,6 +4244,7 @@ const NO_VALUE_FLAGS: &[&str] = &[
     "--allow-uncapped",
     "--bind-rootfs",
     "--detach",
+    "--idle",
     "--init",
     "--interactive",
     "--keep",
@@ -4362,6 +4372,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut security_profile: Option<commands::SecurityProfile> = None;
     let mut overlay_lower: Vec<String> = Vec::new();
     let mut overlay_upper: Option<String> = None;
+    let mut layer_of: Option<String> = None;
     let mut keep = false;
     let mut tty = false;
     let mut restart = commands::RestartPolicy::No;
@@ -4404,6 +4415,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut no_new_privs = false;
     let mut tun = false;
     let mut init = false;
+    let mut idle = false;
     let mut pids_limit: Option<u64> = None;
     let mut tmpfs: Vec<String> = Vec::new();
     let mut shm_size: Option<u64> = None;
@@ -4676,6 +4688,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     build_ssh_agents.push((src.to_string(), format!("/{dst}")));
                 }
                 "--init" => init = true,
+                "--idle" => idle = true,
                 // `--keep`: see `crate::keepbox`. One flag, no value: where the layer lives is kern's
                 // to choose, under `$XDG_DATA_HOME/kern/boxes/<name>`, so two boxes of the same name
                 // cannot be handed the same directory by accident and `kern rm <name>` knows where to
@@ -4929,6 +4942,14 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     overlay_upper = Some(
                         rest.get(i)
                             .ok_or(Error::Usage("--overlay-upper <dir>"))?
+                            .to_string(),
+                    );
+                }
+                "--layer-of" => {
+                    i += 1;
+                    layer_of = Some(
+                        rest.get(i)
+                            .ok_or(Error::Usage("--layer-of <box>"))?
                             .to_string(),
                     );
                 }
@@ -5861,6 +5882,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             security_profile,
             overlay_lower,
             overlay_upper,
+            layer_of,
             keep,
             memory,
             memory_swap_max,
@@ -5891,6 +5913,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             build_ssh_agents,
             no_new_privs,
             init,
+            idle,
             pids_limit,
             tmpfs,
             shm_size,
@@ -7327,6 +7350,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             security_profile,
             overlay_lower,
             overlay_upper,
+            layer_of,
             keep,
             memory,
             memory_swap_max,
@@ -7357,6 +7381,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             build_ssh_agents,
             no_new_privs,
             init,
+            idle,
             pids_limit,
             tmpfs,
             shm_size,
@@ -7477,6 +7502,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     security_profile,
                     overlay_lower: &overlay_lower,
                     overlay_upper: overlay_upper.as_deref(),
+                    layer_of: layer_of.as_deref(),
                     keep,
                     memory,
                     memory_swap_max,
@@ -7500,6 +7526,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     build_ssh_agents: &build_ssh_agents,
                     no_new_privs,
                     init,
+                    idle,
                     pids_limit,
                     tmpfs: &tmpfs,
                     shm_size,
@@ -7729,6 +7756,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::RouterPort => std::process::exit(crate::localrouter::port_verb()),
         Command::LocalCa => std::process::exit(crate::localtls::print_authority()),
         Command::WaitRemoved { name } => commands::wait_removed(&name),
+
         Command::Proxy { action } => match action {
             ProxyAction::Trust => crate::localtls::trust(),
             ProxyAction::Untrust => crate::localtls::untrust(),

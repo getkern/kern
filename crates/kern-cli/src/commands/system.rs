@@ -193,7 +193,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      --platform picks an image's entry for that platform
     {c}port{z} <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
     {c}attach{z} <name>                                                  Stream a box's output live (Ctrl-C detaches)
-    {c}cp{z} [-L] <box>:<src> <dst> | [-L] <src> <box>:<dst>               Copy files or directories host<->box (- = a tar on stdout/stdin; -L follows a symlink SRC)
+    {c}cp{z} [-L] <box>:<src> <dst> | [-L] <src> <box>:<dst>               Copy files or directories host<->box, running or kept (stopped, or between two runs) (- = a tar on stdout/stdin; -L follows a symlink SRC)
     {c}pause{z} <name>... | --all                                        Freeze box(es) (cgroup freezer)
     {c}unpause{z} <name>... | --all                                      Thaw frozen box(es)
     {c}kill{z} [-s SIGNAL] <name>... | killall                           Kill box(es) at once (SIGKILL), or send SIGNAL to the init

@@ -860,10 +860,12 @@ pub fn ps(
                 None => ("kept", restarts),
             };
             items.push(format!(
-                "{{\"name\":{},\"command\":{},\"image\":{},\"created\":{}{exit},\"restart_count\":{restarts},\"oom_killed\":{oom},\"labels\":{},\"health\":{},\"status\":{}}}",
+                "{{\"name\":{},\"command\":{},\"image\":{},\"image_id\":{},\"created\":{}{exit},\"restart_count\":{restarts},\"oom_killed\":{oom},\"labels\":{},\"health\":{},\"status\":{}}}",
                 json_str(&k.name),
                 json_str(&crate::ui::scrub(&k.command)),
                 json_str(&crate::ui::scrub(&k.meta.image)),
+                // The image it was CREATED from, which its runs mount (its pin once the tag moves).
+                json_str(&k.meta.image_id),
                 k.meta.created,
                 labels_object(k.labels.iter().cloned()),
                 json_str(status),
@@ -1935,6 +1937,7 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
             "Image" => b
                 .as_ref()
                 .map(|i| i.image_id.clone())
+                .or_else(|| kept.as_ref().map(|(k, _)| k.meta.image_id.clone()))
                 .or_else(|| exited.as_ref().map(|e| e.image_id.clone()))
                 .filter(|id| !id.is_empty())
                 .or_else(|| image_ref.as_deref().and_then(image_id)),
@@ -3860,6 +3863,8 @@ pub fn create(name: &str, image: &str, argv: &[String]) -> Result<(), Error> {
     let Some(dir) = crate::keepbox::dir_of(name) else {
         return Err(Error::Sandbox(format!("'{name}' is not a box name")));
     };
+    // CREATED FROM THIS CONTENT, as `docker create` fixes the image of the container it makes: the
+    // first `start` mounts it even if the tag has moved by then.
     let meta = crate::keepbox::Meta {
         created: registry::now_unix(),
         last_exit: None,
@@ -3867,6 +3872,11 @@ pub fn create(name: &str, image: &str, argv: &[String]) -> Result<(), Error> {
         cwd: std::env::current_dir()
             .map(|d| d.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        image_id: {
+            let id = crate::commands::imagecache::kept_image_id(image).unwrap_or_default();
+            crate::commands::imagecache::pin_in_background(image, &id);
+            id
+        },
     };
     let os: Vec<std::ffi::OsString> = argv.iter().map(std::ffi::OsString::from).collect();
     crate::keepbox::write(&dir, &os, &meta)

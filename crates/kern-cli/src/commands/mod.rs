@@ -290,6 +290,12 @@ pub struct BoxRunArgs<'a> {
     pub overlay_lower: &'a [String],
     /// INTERNAL (build): a persistent overlay upper (the build layer) instead of ephemeral scratch.
     pub overlay_upper: Option<&'a str>,
+    /// INTERNAL `--layer-of <box>`: run on that KEPT box's layer, as `kern cp` does to reach a kept box
+    /// that is not running. The layer is HELD for the run (no run of the owner can mount it
+    /// meanwhile), the image VOLUMEs mount the owner's anonymous volumes, the root is the image the
+    /// owner was created from (its pin when the tag has moved), and no record is written for either
+    /// name. Only with `--idle`.
+    pub layer_of: Option<&'a str>,
     /// `--keep`: this box's writable layer is the kept one for its name, and its command line is
     /// recorded so `kern start` can run it again. See [`crate::keepbox`]. The layer's path is not a
     /// field: it is `keepbox::dir_of(name)`, so nothing can point two boxes of one name at two
@@ -352,6 +358,8 @@ pub struct BoxRunArgs<'a> {
     pub no_new_privs: bool,
     /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
     pub init: bool,
+    /// INTERNAL `--idle`; see `cli::Command::BoxRun::idle`.
+    pub idle: bool,
     /// `--pids-limit N`: cap the box's task count (`pids.max`) - fork-bomb containment.
     pub pids_limit: Option<u64>,
     /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
@@ -1442,6 +1450,7 @@ struct BuildSpec<'a> {
     hostname: Option<String>,
     tun: bool,
     init: bool,
+    idle: bool,
     tmpfs: Vec<kern_isolation::TmpfsMount>,
     run_as: Option<(u32, u32)>,
     /// The supplementary groups the image puts that user in. See
@@ -1814,6 +1823,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         ssh: b.ssh,
         tun: b.tun,
         init: b.init,
+        idle: b.idle,
         tmpfs: b.tmpfs,
         run_as: b.run_as,
         extra_gids: b.extra_gids,
@@ -4632,6 +4642,15 @@ pub(crate) fn image_entries_in(
             if !crate::commands::imagecache::is_safe_stem(&stem) {
                 continue;
             }
+            // A KEPT BOX'S PIN IS NOT AN IMAGE OF THE USER'S: kern made it so the box keeps the
+            // content it was created from (`imagecache::pin_image`), and it goes with the last box
+            // that uses it. Every pin's stem starts so (`/` is written `_`); the sentinel says which.
+            if stem.starts_with("kern-pin_")
+                && std::fs::read_to_string(&path)
+                    .is_ok_and(|r| crate::commands::imagecache::is_pin_ref(r.trim()))
+            {
+                continue;
+            }
             total += 1;
             if detail == crate::listing::Detail::Skip {
                 continue;
@@ -6212,6 +6231,7 @@ pub(crate) fn unit_only_box(name: &str) -> Option<crate::keepbox::KeptBox> {
             last_exit: last.as_ref().map(|e| e.code),
             image,
             cwd: String::new(),
+            image_id: String::new(),
         },
         command,
         labels: Vec::new(),

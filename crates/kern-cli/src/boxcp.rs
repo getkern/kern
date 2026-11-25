@@ -39,6 +39,9 @@ use std::os::unix::ffi::OsStrExt;
 enum Side {
     /// `<name>:<path>` naming a box that is running: its pid 1 and the in-box path.
     Boxed(i32, String),
+    /// `<name>:<path>` naming a KEPT box that is not running (stopped, never started, or between two
+    /// runs of its `--restart` policy): reached through a box kern starts on its layer.
+    Kept(String, String),
     /// `<name>:<path>`-shaped, naming no running box. Carries the name so the error can say it.
     NoSuchBox(String),
     /// `-`: a tar archive on stdin or stdout.
@@ -74,6 +77,15 @@ fn classify(spec: &str) -> Side {
         return Side::Host;
     }
     let Some(inst) = crate::registry::find_ref(name) else {
+        // A KEPT BOX IS A CONTAINER THAT IS NOT RUNNING, and `docker cp` copies into and out of a
+        // stopped container. MEASURED before: kern answered "no box named 'x' is running" for a
+        // `--restart always` box between two runs, where Docker copied the file.
+        if crate::keepbox::dir_of(name)
+            .and_then(|d| crate::keepbox::read(&d))
+            .is_some()
+        {
+            return Side::Kept(name.to_string(), path.to_string());
+        }
         return Side::NoSuchBox(name.to_string());
     };
     let pid1 = match inst.live_pid1() {
@@ -97,15 +109,59 @@ const STAT_ENV: &str = "KERN_CP_STAT";
 
 /// `kern cp [-L] <src> <dst>` - exactly one of `src`/`dst` must be `<box>:<path>`.
 pub fn cp(src: &str, dst: &str, follow: bool) -> Result<(), Error> {
-    match (classify(src), classify(dst)) {
+    let (src_side, dst_side) = (classify(src), classify(dst));
+    // Refused before a box is started for either side: two boxes are never a copy kern makes.
+    if matches!(
+        (&src_side, &dst_side),
+        (
+            Side::Boxed(..) | Side::Kept(..),
+            Side::Boxed(..) | Side::Kept(..)
+        )
+    ) {
+        return Err(Error::Sandbox(
+            "box-to-box copy isn't supported - copy via the host in two steps".into(),
+        ));
+    }
+    // A kept box that is not running is reached through a box on its layer, which lives as long as
+    // this copy (`LayerBox` removes it on every way out).
+    let mut held: Option<LayerBox> = None;
+    let mut reach = |side: Side| -> Result<Side, Error> {
+        match side {
+            Side::Kept(owner, path) => {
+                let (lb, pid1) = LayerBox::start(&owner)?;
+                held = Some(lb);
+                Ok(Side::Boxed(pid1, path))
+            }
+            other => Ok(other),
+        }
+    };
+    let src_side = reach(src_side)?;
+    let dst_side = reach(dst_side)?;
+    let done = dispatch(src_side, dst_side, src, dst, follow);
+    drop(held);
+    done
+}
+
+fn dispatch(
+    src_side: Side,
+    dst_side: Side,
+    src: &str,
+    dst: &str,
+    follow: bool,
+) -> Result<(), Error> {
+    match (src_side, dst_side) {
         // Checked first: a missing box is a definite answer, and reporting it as anything else
         // (bad syntax, or "needs a box") describes a problem the caller does not have.
         (Side::NoSuchBox(name), _) | (_, Side::NoSuchBox(name)) => Err(Error::NotRunning(format!(
             "no box named '{name}' is running"
         ))),
-        (Side::Boxed(..), Side::Boxed(..)) => Err(Error::Sandbox(
+        (Side::Boxed(..) | Side::Kept(..), Side::Boxed(..) | Side::Kept(..)) => Err(Error::Sandbox(
             "box-to-box copy isn't supported - copy via the host in two steps".into(),
         )),
+        // `cp` resolves a kept side to a running one before it gets here.
+        (Side::Kept(name, _), _) | (_, Side::Kept(name, _)) => Err(Error::NotRunning(format!(
+            "kept box '{name}' could not be reached"
+        ))),
         (Side::Boxed(pid1, box_src), Side::Stdio) => {
             if crate::global_env(STAT_ENV).is_some() {
                 print_stat(pid1, &box_src, follow)
@@ -120,6 +176,165 @@ pub fn cp(src: &str, dst: &str, follow: bool) -> Result<(), Error> {
             "kern cp needs a box: one side must be <box>:<path> (e.g. kern cp web:/etc/app.conf ./ )"
                 .into(),
         )),
+    }
+}
+
+/// A box kern starts on a kept box's layer so `kern cp` can reach its files while it is not
+/// running, as `docker cp` reaches a stopped container's.
+///
+/// IT IS A BOX, NOT A SECOND READER OF LAYERS. The copy goes through the same `/proc/<pid1>/root`,
+/// user namespace and mounts a running box gives, so whiteouts, opaque directories, the uid map and
+/// the box's volumes are the kernel's and the box runtime's, not a reimplementation of them. Its
+/// PID 1 runs nothing (`--idle`, so an image with no binaries works), it has no network, it pulls
+/// nothing, and `--layer-of` gives it the owner's layer (held for its life, so no run of the owner
+/// mounts it meanwhile), the owner's anonymous volumes and the image the owner was created from.
+/// The owner's own volumes (`-v`, `--mount`) are mounted as they were recorded, from the directory
+/// it was created in, so a path inside one reaches the volume, as it does under Docker.
+struct LayerBox {
+    name: String,
+}
+
+impl LayerBox {
+    fn start(owner: &str) -> Result<(LayerBox, i32), Error> {
+        let Some(dir) = crate::keepbox::dir_of(owner) else {
+            return Err(Error::NotRunning(format!("no kept box '{owner}'")));
+        };
+        let Some((argv, meta)) = crate::keepbox::read(&dir) else {
+            return Err(Error::NotRunning(format!("no kept box '{owner}'")));
+        };
+        let words: Option<Vec<String>> = argv
+            .iter()
+            .map(|a| a.to_str().map(str::to_string))
+            .collect();
+        let Some(words) = words else {
+            return Err(Error::Sandbox(format!(
+                "kept box '{owner}': its command line is not UTF-8, so kern cannot read which \
+                 image and volumes it has"
+            )));
+        };
+        let Ok((
+            _,
+            crate::cli::Command::BoxRun {
+                image,
+                rootfs,
+                platform,
+                volumes,
+                mounts,
+                uid_range,
+                no_uid_range,
+                ..
+            },
+        )) = crate::cli::parse(&words)
+        else {
+            return Err(Error::Sandbox(format!(
+                "kept box '{owner}': its record is not a box command kern can read"
+            )));
+        };
+        let me = std::env::current_exe()
+            .map_err(|e| Error::Sandbox(format!("cannot locate the kern binary: {e}")))?;
+        let name = Self::name_for(owner);
+        let mut args: Vec<String> = vec![
+            "box".into(),
+            name.clone(),
+            "-d".into(),
+            "--rm".into(),
+            "--idle".into(),
+            "--net".into(),
+            "none".into(),
+            "--pull".into(),
+            "never".into(),
+            "--layer-of".into(),
+            owner.to_string(),
+        ];
+        match (image, rootfs) {
+            (Some(i), _) => args.extend(["--image".into(), i]),
+            (None, Some(r)) => args.extend(["--rootfs".into(), r]),
+            (None, None) => {
+                return Err(Error::Sandbox(format!(
+                    "kept box '{owner}': its record names no image and no rootfs"
+                )))
+            }
+        }
+        if let Some(p) = platform {
+            args.extend(["--platform".into(), format!("{}/{}", p.os, p.arch)]);
+        }
+        if uid_range {
+            args.push("--uid-range".into());
+        }
+        if no_uid_range {
+            args.push("--no-uid-range".into());
+        }
+        for v in volumes {
+            args.extend(["-v".into(), v]);
+        }
+        for (src, dst, ro) in mounts {
+            args.extend([
+                "-v".into(),
+                if ro {
+                    format!("{src}:{dst}:ro")
+                } else {
+                    format!("{src}:{dst}")
+                },
+            ]);
+        }
+        args.extend(["--".into(), "/kern-idle".into()]);
+        let mut cmd = std::process::Command::new(&me);
+        cmd.args(&args)
+            .env_remove("KERN_MANAGED")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        if !meta.cwd.is_empty() && std::path::Path::new(&meta.cwd).is_dir() {
+            cmd.current_dir(&meta.cwd);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| Error::Sandbox(format!("kept box '{owner}': cannot run kern: {e}")))?;
+        // From here the box may exist: the guard removes it on every way out, the errors included.
+        let lb = LayerBox { name };
+        if !out.status.success() {
+            let why = String::from_utf8_lossy(&out.stderr);
+            let why = why.trim().trim_start_matches("error: ");
+            return Err(Error::Sandbox(format!(
+                "kept box '{owner}' is not running and kern could not open its layer to copy: {why}"
+            )));
+        }
+        let pid1 = crate::registry::find(&lb.name).and_then(|i| {
+            i.live_pid1()
+                .or_else(|| crate::registry::box_init_under(i.pid))
+        });
+        match pid1 {
+            Some(p) => Ok((lb, p)),
+            None => Err(Error::Sandbox(format!(
+                "kept box '{owner}': the box kern started on its layer is not up"
+            ))),
+        }
+    }
+
+    /// `<owner>-cp<pid>`, a valid box name that no user box shares; a short fallback when the
+    /// owner's name is near the limit.
+    fn name_for(owner: &str) -> String {
+        let pid = std::process::id();
+        let full = format!("{owner}-cp{pid}");
+        if kern_common::BoxName::parse(&full).is_ok() {
+            full
+        } else {
+            format!("kern-cp{pid}")
+        }
+    }
+}
+
+impl Drop for LayerBox {
+    /// Removed as `kern rm -f` removes a box: its PID 1 ends on the SIGTERM, `--rm` leaves no record.
+    fn drop(&mut self) {
+        if let Ok(me) = std::env::current_exe() {
+            let _ = std::process::Command::new(me)
+                .args(["rm", "-f", &self.name])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
 }
 
