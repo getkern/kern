@@ -19,6 +19,7 @@
 //! runtime root, which no box may mount; kern refuses to replace a path that is not a socket.
 
 mod api;
+pub use api::image_id_for_entry;
 mod events;
 mod netvol;
 mod projnet;

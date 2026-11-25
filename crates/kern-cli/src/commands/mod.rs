@@ -125,7 +125,7 @@ impl RestartPolicy {
     }
 
     /// Human name (matches the CLI value + Docker's).
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::No => "no",
             Self::OnFailure => "on-failure",
@@ -2759,6 +2759,233 @@ pub(crate) fn has_managed_unit(name: &str) -> bool {
     managed_unit_path(name).is_some_and(|p| is_kern_managed_unit(&p))
 }
 
+/// The arguments of a unit's `ExecStart=` value as written, each with its quotes: what
+/// [`systemd_quote`] produced, or a bare word. A backslash escapes the next character inside quotes.
+/// PURE.
+fn exec_tokens(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in value.chars() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => {
+                cur.push(c);
+                escaped = true;
+            }
+            '"' => {
+                cur.push(c);
+                quoted = !quoted;
+            }
+            ' ' if !quoted => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The unit kern wrote for the box `old`, rewritten for the same box named `new`: its
+/// description, its marker, and the name in its `ExecStart` (`--name <old>`, `--name=<old>`, or
+/// the name `kern box` takes after the verb). Every other line, the policy and the caps included,
+/// is kept as written. `None` when the text is not a unit kern wrote for `old`. PURE.
+fn unit_text_renamed(text: &str, old: &str, new: &str) -> Option<String> {
+    if !text.lines().any(|l| {
+        l.strip_prefix(MANAGED_MARKER)
+            .and_then(|r| r.strip_prefix('='))
+            == Some(old)
+    }) {
+        return None;
+    }
+    let (q_old, q_new) = (systemd_quote(old), systemd_quote(new));
+    let (q_eq_old, q_eq_new) = (
+        systemd_quote(&format!("--name={old}")),
+        systemd_quote(&format!("--name={new}")),
+    );
+    let mut out = String::with_capacity(text.len() + new.len() * 3);
+    for line in text.lines() {
+        if line == format!("Description=kern box {old}") {
+            out.push_str(&format!("Description=kern box {new}"));
+        } else if line == format!("{MANAGED_MARKER}={old}") {
+            out.push_str(&format!("{MANAGED_MARKER}={new}"));
+        } else if let Some(value) = line.strip_prefix("ExecStart=") {
+            let mut toks = exec_tokens(value);
+            for i in 0..toks.len() {
+                let after_name = i > 0 && toks[i - 1] == systemd_quote("--name");
+                // `box <name>`: the verb is the binary's next word, or the one after `container`, and
+                // the name follows it, or the `--keep` a unit pins right after the verb.
+                let box_at = |j: usize| (1..=3).contains(&j) && toks[j] == systemd_quote("box");
+                let after_box = i > 0
+                    && (box_at(i - 1)
+                        || (i > 1 && toks[i - 1] == systemd_quote("--keep") && box_at(i - 2)));
+                if (after_name || after_box) && toks[i] == q_old {
+                    toks[i] = q_new.clone();
+                } else if toks[i] == q_eq_old {
+                    toks[i] = q_eq_new.clone();
+                }
+            }
+            out.push_str("ExecStart=");
+            out.push_str(&toks.join(" "));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// The unit that takes over from a running box's unit when the box is renamed: systemd runs it
+/// in place of the old one at the box's next exit (the policy restarts it, a crash included), and
+/// it removes itself and starts the box's unit under the new name. Not a kern box's unit (no
+/// marker, another description), so no list shows it. `systemctl` is named by its path, since a
+/// user manager's `PATH` is not the caller's. PURE.
+fn unit_text_handover(old_path: &str, new_unit: &str, systemctl: &str) -> String {
+    let sh = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let script = format!(
+        "rm -f -- {path}; {sc} --user daemon-reload; exec {sc} --user --no-block start {unit}",
+        path = sh(old_path),
+        sc = sh(systemctl),
+        unit = sh(new_unit),
+    );
+    format!(
+        "[Unit]\nDescription=kern: hand a renamed box over to {new_unit}\nStartLimitIntervalSec=0\n\n\
+         [Service]\nType=simple\nExecStart=/bin/sh -c {}\nRestart=always\nRestartSec=1\n\
+         KillMode=mixed\nTimeoutStopSec=10\n",
+        systemd_quote(&script)
+    )
+}
+
+/// `systemctl`'s path for a unit's command line: the first on `PATH`, else where distributions put
+/// it.
+fn systemctl_path() -> String {
+    crate::global_env("PATH")
+        .and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("systemctl"))
+                .find(|c| c.is_file())
+        })
+        .map_or_else(
+            || "/usr/bin/systemctl".to_string(),
+            |c| c.to_string_lossy().into_owned(),
+        )
+}
+
+/// `kern rename` of a box a `--restart` unit runs: the unit follows the name, as Docker's renamed
+/// container keeps its policy. MEASURED before: the layer took the new name and the unit went on
+/// running the old one, so `ps -a` had two rows (`<old> Restarting`, `<new> Exited`) and the box
+/// under the old name started again from an empty layer.
+///
+/// BETWEEN TWO RUNS (`live` false) the old unit is stopped and removed before the caller moves the
+/// layer, and [`start_renamed_unit`] starts the new one after: no process is cut short, there is
+/// none. A RUNNING box is not stopped, as Docker does not stop it: the new unit is written and
+/// enabled but not started, and the old unit's file becomes [`unit_text_handover`], which systemd
+/// runs instead when the box next exits. MEASURED on this desktop: a unit whose file is gone is not
+/// restarted when its process exits, so the old name cannot come back. Returns the new unit's
+/// text for [`start_renamed_unit`], `None` when `old` has no unit kern wrote.
+pub(crate) fn rename_managed_unit(
+    old: &str,
+    new: &str,
+    live: bool,
+) -> Result<Option<String>, Error> {
+    let Some(old_path) = managed_unit_path(old) else {
+        return Ok(None);
+    };
+    if !is_kern_managed_unit(&old_path) {
+        return Ok(None);
+    }
+    let Some(new_path) = managed_unit_path(new) else {
+        return Ok(None);
+    };
+    if new_path.exists() {
+        return Err(Error::AlreadyRunning(format!(
+            "a unit for a box named '{new}' exists already ({})",
+            new_path.display()
+        )));
+    }
+    let text = std::fs::read_to_string(&old_path)
+        .map_err(|e| Error::Sandbox(format!("rename: cannot read {}: {e}", old_path.display())))?;
+    let Some(renamed) = unit_text_renamed(&text, old, new) else {
+        return Ok(None);
+    };
+    let (old_unit, new_unit) = (unit_file_name(old), unit_file_name(new));
+    if live {
+        std::fs::write(&new_path, &renamed).map_err(|e| {
+            Error::Sandbox(format!("rename: cannot write {}: {e}", new_path.display()))
+        })?;
+        let handover =
+            unit_text_handover(&old_path.to_string_lossy(), &new_unit, &systemctl_path());
+        // The boot link goes first, so a reboot before the box exits starts the new name.
+        systemctl_user(&["disable", &old_unit]);
+        std::fs::write(&old_path, handover).map_err(|e| {
+            Error::Sandbox(format!("rename: cannot write {}: {e}", old_path.display()))
+        })?;
+        systemctl_user(&["daemon-reload"]);
+        systemctl_user(&["enable", &new_unit]);
+        return Ok(Some(renamed));
+    }
+    systemctl_user(&["disable", "--now", &old_unit]);
+    systemctl_user(&["reset-failed", &old_unit]);
+    let _ = std::fs::remove_file(&old_path);
+    systemctl_user(&["daemon-reload"]);
+    Ok(Some(renamed))
+}
+
+/// The second half of [`rename_managed_unit`] for a box between two runs: the new unit is written
+/// and started once the caller has moved the box's layer and records to the new name.
+pub(crate) fn start_renamed_unit(new: &str, text: &str) -> Result<(), Error> {
+    let Some(path) = managed_unit_path(new) else {
+        return Err(Error::Sandbox(format!("rename: '{new}' is not a box name")));
+    };
+    std::fs::write(&path, text)
+        .map_err(|e| Error::Sandbox(format!("rename: cannot write {}: {e}", path.display())))?;
+    systemctl_user(&["daemon-reload"]);
+    if systemctl_user(&["enable", "--now", &unit_file_name(new)]) {
+        Ok(())
+    } else {
+        Err(Error::Sandbox(format!(
+            "rename: the unit {} did not start; `systemctl --user status {}` says why",
+            unit_file_name(new),
+            unit_file_name(new)
+        )))
+    }
+}
+
+/// The restart policy a kept box's RECORDED command line asks for: `--restart <p>[:N]`,
+/// `--restart=<p>`, a bare `--restart` (`on-failure`), and `no` when it asks for none, which the
+/// record can say because it is the whole command line `kern start` replays. Among kern's flags
+/// only, before the `--` of the workload. PURE.
+pub(crate) fn recorded_policy(argv: &[std::ffi::OsString]) -> RestartPolicy {
+    let words: Vec<&str> = argv
+        .iter()
+        .map(|a| a.to_str().unwrap_or_default())
+        .take_while(|a| *a != "--")
+        .collect();
+    let policy_of = |v: &str| RestartPolicy::parse(v.split(':').next().unwrap_or_default());
+    for (i, w) in words.iter().enumerate() {
+        if let Some(v) = w.strip_prefix("--restart=") {
+            return policy_of(v).unwrap_or(RestartPolicy::OnFailure);
+        }
+        if *w == "--restart" {
+            return words
+                .get(i + 1)
+                .and_then(|v| policy_of(v))
+                .unwrap_or(RestartPolicy::OnFailure);
+        }
+    }
+    RestartPolicy::No
+}
+
 /// The policy of the unit kern wrote for `name` (its `X-KernRestart=`), `always` for a unit
 /// written before the key existed; `None` without a kern unit. The same reading kern's Docker API
 /// makes for `HostConfig.RestartPolicy`.
@@ -2874,6 +3101,9 @@ fn wait_unit_came_up(unit: &str) -> (bool, String) {
 /// Quote one argv element for a systemd `ExecStart=` line: wrap in double quotes and escape the
 /// characters systemd would otherwise act on - `"`/`\` (C-escapes), `$` (env expansion → `$$`), and
 /// `%` (specifier → `%%`). Keeps arbitrary box names/commands/paths intact when systemd re-runs us.
+/// A NEWLINE or a carriage return is the C escape `\n` / `\r`, which systemd decodes inside quotes:
+/// a raw one would end the line and start a directive. MEASURED before: a `--restart always` box
+/// whose command was a two-line `python -c` was refused, where Docker runs it.
 fn systemd_quote(arg: &str) -> String {
     let mut out = String::with_capacity(arg.len() + 2);
     out.push('"');
@@ -2883,12 +3113,46 @@ fn systemd_quote(arg: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
             '$' => out.push_str("$$"),
             '%' => out.push_str("%%"),
             _ => out.push(c),
         }
     }
     out.push('"');
+    out
+}
+
+/// One `ExecStart=` argument as [`systemd_quote`] wrote it, back to the argument: the inverse, for
+/// a reader of a unit kern wrote. A bare word is returned as it is. PURE.
+fn systemd_unquote(tok: &str) -> String {
+    let Some(inner) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
+        return tok.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut it = inner.chars().peekable();
+    while let Some(c) = it.next() {
+        match (c, it.peek().copied()) {
+            ('\\', Some('n')) => {
+                it.next();
+                out.push('\n');
+            }
+            ('\\', Some('r')) => {
+                it.next();
+                out.push('\r');
+            }
+            ('\\', Some(n)) => {
+                it.next();
+                out.push(n);
+            }
+            ('$', Some('$')) | ('%', Some('%')) => {
+                it.next();
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
     out
 }
 
@@ -3592,7 +3856,13 @@ impl PsRow for crate::keepbox::KeptBox {
             human_duration(now.saturating_sub(self.meta.created))
         )
     }
+    /// `restarting` between two runs of its `--restart` policy, as the table, `--json` and kern's
+    /// Docker API say. MEASURED before: `--format '{{.State}}'` said `exited` for that row while the
+    /// table beside it said `restarting (1)`.
     fn ps_state(&self) -> String {
+        if self.unit.is_some_and(|u| u.restarting) {
+            return "restarting".to_string();
+        }
         match self.meta.last_exit {
             Some(_) => "exited",
             None => "created",
@@ -3600,29 +3870,32 @@ impl PsRow for crate::keepbox::KeptBox {
         .to_string()
     }
     /// A kept box that has run is a stopped container (`Exited (0) 2 minutes ago`), one never
-    /// started is `Created`. The time is the record's: it is rewritten when a run ends, and also by
-    /// `update`, so after an `update` it is the time of the update.
+    /// started is `Created`, one between two runs of its policy `Restarting (1) ...` as Docker
+    /// writes it. The time is the record's: it is rewritten when a run ends, and also by `update`,
+    /// so after an `update` it is the time of the update.
     fn ps_status(&self, now: u64) -> String {
-        match self.meta.last_exit {
-            Some(c) => {
-                let written = crate::keepbox::dir_of(&self.name)
-                    .and_then(|d| std::fs::metadata(d.join("box.rec")).ok())
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(self.meta.created, |d| d.as_secs());
-                format!(
-                    "Exited ({c}) {} ago",
-                    human_duration(now.saturating_sub(written))
-                )
-            }
-            None => "Created".to_string(),
+        let code = kept_last_exit(self, self.unit.as_ref());
+        let restarting = self.unit.is_some_and(|u| u.restarting);
+        let ago = || {
+            let written = crate::keepbox::dir_of(&self.name)
+                .and_then(|d| std::fs::metadata(d.join("box.rec")).ok())
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(self.meta.created, |d| d.as_secs());
+            human_duration(now.saturating_sub(written))
+        };
+        match (restarting, code) {
+            (true, Some(c)) => format!("Restarting ({c}) {} ago", ago()),
+            (true, None) => "Restarting".to_string(),
+            (false, Some(c)) => format!("Exited ({c}) {} ago", ago()),
+            (false, None) => "Created".to_string(),
         }
     }
     fn ps_health(&self) -> String {
         String::new()
     }
     fn ps_exit_code(&self) -> i32 {
-        self.meta.last_exit.unwrap_or(0)
+        kept_last_exit(self, self.unit.as_ref()).unwrap_or(0)
     }
 }
 
@@ -3865,6 +4138,50 @@ fn docker_ports_cell(ports: &str) -> String {
 }
 
 /// [`render_ps_format`] with a [`PsCtx`].
+/// One row as `docker ps --format json` writes it: an object per line with Docker's keys, each
+/// value the string `--format '{{.Key}}'` renders for the same row, so the two cannot disagree.
+/// Only the keys kern has a true value for; `Size`, `Mounts`, `Networks` and `LocalVolumes` are
+/// left out rather than invented (a script reading one fails loudly instead of reading a blank).
+fn render_ps_docker_json<R: PsRow>(b: &R, ctx: &PsCtx<'_>) -> Result<String, Error> {
+    const KEYS: [&str; 9] = [
+        "Command",
+        "ID",
+        "Image",
+        "Labels",
+        "Names",
+        "Ports",
+        "RunningFor",
+        "State",
+        "Status",
+    ];
+    let mut out = String::from("{");
+    for (i, key) in KEYS.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let value = render_ps_format_ctx(&format!("{{{{.{key}}}}}"), b, ctx)?;
+        out.push_str(&json_str(key));
+        out.push(':');
+        out.push_str(&json_str(&value));
+    }
+    out.push('}');
+    Ok(out)
+}
+
+/// A `kern ps --format` row: the template, or Docker's JSON line for `--format json`.
+fn render_ps_row<R: PsRow>(
+    docker_json: bool,
+    tmpl: &str,
+    b: &R,
+    ctx: &PsCtx<'_>,
+) -> Result<String, Error> {
+    if docker_json {
+        render_ps_docker_json(b, ctx)
+    } else {
+        render_ps_format_ctx(tmpl, b, ctx)
+    }
+}
+
 fn render_ps_format_ctx<R: PsRow>(tmpl: &str, b: &R, ctx: &PsCtx<'_>) -> Result<String, Error> {
     let now = ctx.now;
     let mut out = String::with_capacity(tmpl.len());
@@ -5859,11 +6176,9 @@ pub(crate) fn unit_only_box(name: &str) -> Option<crate::keepbox::KeptBox> {
     }
     let text = std::fs::read_to_string(&path).ok()?;
     let exec = text.lines().find_map(|l| l.strip_prefix("ExecStart="))?;
-    let argv: Vec<String> = exec
-        .split('"')
-        .enumerate()
-        .filter(|(i, _)| i % 2 == 1)
-        .map(|(_, a)| a.replace("\\\\", "\\"))
+    let argv: Vec<String> = exec_tokens(exec)
+        .iter()
+        .map(|t| systemd_unquote(t))
         .collect();
     // THE CLI'S OWN PARSER splits the image from the workload, as it did when the unit ran: a
     // count of flags here would be a second parser of `kern run`. MEASURED before: the COMMAND
@@ -5901,6 +6216,7 @@ pub(crate) fn unit_only_box(name: &str) -> Option<crate::keepbox::KeptBox> {
         command,
         labels: Vec::new(),
         exited_ago: last.map(|e| e.exited_ago),
+        unit: None,
     })
 }
 

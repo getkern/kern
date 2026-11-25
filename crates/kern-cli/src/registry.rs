@@ -138,6 +138,12 @@ pub struct Instance {
     /// writes the box's line in the sandbox history without having started it: the detached box's
     /// supervisor and `kern stop`. An older record lacks the key and reads as empty.
     pub image: String,
+    /// The ID of that image AS THE BOX STARTED IT (`sha256:<hex>`, `imageid=`), the one `docker
+    /// inspect` reports for the container: a tag rebuilt while the box runs names another image
+    /// from then on, and the box still runs this one. MEASURED before: after a rebuild of its tag a
+    /// running container reported the NEW image's id, where Docker keeps the one it was created
+    /// from. Empty for a `--rootfs` box and for a record from before the key.
+    pub image_id: String,
     /// The `--gpus` selection, empty for none (`gpus=`), for the same line.
     pub gpus: String,
     /// `--timeout` in seconds, 0 for none (`timeout=`): what tells kern's own watchdog SIGKILL from
@@ -1078,11 +1084,12 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance, oom: bool
         // container killed for its memory cap read `OOMKilled: false` through kern's socket, where
         // Docker says true.
         let body = format!(
-            "{code}\n{}\n{}\n{}\nimage\t{}\nlabels\t{}\nrestarts\t{restarts}\noom\t{}",
+            "{code}\n{}\n{}\n{}\nimage\t{}\nimageid\t{}\nlabels\t{}\nrestarts\t{restarts}\noom\t{}",
             b.name,
             b.pod,
             one_line(&b.command, 512),
             one_line(&b.image, 1024),
+            one_line(&b.image_id, 80),
             one_line(&b.labels, 8192),
             u8::from(oom),
         );
@@ -1199,6 +1206,38 @@ pub fn rename_exited(old: &str, new: &str) {
                 let _ = fs::rename(from, l.join(format!("{new}-{pid}.log{suffix}")));
             }
         }
+    }
+    // AND THE LOG OF EVERY RUN THAT ENDED, with a record or without: the runs a `--restart` unit
+    // drives are in the foreground and leave none. MEASURED before: after `rename` of such a box
+    // `kern logs <new>` showed the runs after the rename and not the ones before, where
+    // `docker logs` shows them all. A key is this box's when what follows `<old>-` is a pid alone
+    // (a box called `<old>-1` has keys `<old>-1-<pid>`); a live run's log moved with its entry.
+    let Some(l) = logs else {
+        return;
+    };
+    let live_pids: std::collections::HashSet<i32> = registered.iter().map(|(p, _)| *p).collect();
+    let Ok(rd) = fs::read_dir(&l) else {
+        return;
+    };
+    let prefix = format!("{old}-");
+    for e in rd.flatten() {
+        let fname = e.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        let Some((key, suffix)) = split_log_file(fname) else {
+            continue;
+        };
+        let Some(pid) = key
+            .strip_prefix(&prefix)
+            .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        if pid.parse::<i32>().is_ok_and(|p| live_pids.contains(&p)) {
+            continue;
+        }
+        let _ = fs::rename(e.path(), l.join(format!("{new}-{pid}.log{suffix}")));
     }
 }
 
@@ -1436,6 +1475,8 @@ pub struct ExitedBox {
     pub command: String,
     /// The image it ran, empty for a `--rootfs` box or a record from before it was kept.
     pub image: String,
+    /// That image's ID as the box started it (see [`Instance::image_id`]); empty when not recorded.
+    pub image_id: String,
     /// Its `--label` pairs, comma-joined as [`Instance::labels`]; empty when none or not recorded.
     pub labels: String,
     /// How many times it was restarted (Docker's `RestartCount`); 0 when not recorded.
@@ -1538,6 +1579,7 @@ pub fn list_exited_among(boxes: &[Instance]) -> Vec<ExitedBox> {
             pod: crate::ui::scrub(pod),
             command: command.to_string(),
             image: crate::ui::scrub(&keyed("image")),
+            image_id: crate::ui::scrub(&keyed("imageid")),
             labels: crate::ui::scrub(&keyed("labels")),
             restarts: keyed("restarts").trim().parse().unwrap_or(0),
             oom: keyed("oom").trim() == "1",
@@ -2131,7 +2173,7 @@ pub fn forget_stop_record(name: &str, pid: i32) {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\ngpus={}\ntimeout={}\nbridges={}\nlogdriver={}\nrm={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\nimageid={}\ngpus={}\ntimeout={}\nbridges={}\nlogdriver={}\nrm={}\n",
         inst.name,
         inst.pid,
         inst.pid1_recorded,
@@ -2173,6 +2215,7 @@ fn encode(inst: &Instance) -> String {
         u8::from(inst.no_new_privs),
         u8::from(inst.keep_groups),
         one_line(&inst.image),
+        one_line(&inst.image_id),
         one_line(&inst.gpus),
         inst.timeout_s,
         one_line(&inst.bridges),
@@ -3660,6 +3703,7 @@ fn parse(body: &str) -> Option<Instance> {
     let mut no_new_privs = true;
     let mut keep_groups = false;
     let mut image = String::new();
+    let mut image_id = String::new();
     let mut gpus = String::new();
     let mut timeout_s = 0u64;
     let mut posture_corrupt = false;
@@ -3758,6 +3802,7 @@ fn parse(body: &str) -> Option<Instance> {
             "nnp" => no_new_privs = v != "0",
             "keepgroups" => keep_groups = v == "1",
             "image" => image = v.to_string(),
+            "imageid" => image_id = v.to_string(),
             "gpus" => gpus = v.to_string(),
             "timeout" => timeout_s = v.parse().unwrap_or(0),
             "seccompmode" => {
@@ -3826,6 +3871,7 @@ fn parse(body: &str) -> Option<Instance> {
         no_new_privs,
         keep_groups,
         image,
+        image_id,
         gpus,
         timeout_s,
         apparmor,
@@ -4772,6 +4818,7 @@ mod tests {
             no_new_privs: true,
             keep_groups: false,
             image: String::new(),
+            image_id: String::new(),
             gpus: String::new(),
             timeout_s: 0,
             apparmor: String::new(),
@@ -5050,6 +5097,7 @@ mod tests {
             no_new_privs: true,
             keep_groups: false,
             image: String::new(),
+            image_id: String::new(),
             gpus: String::new(),
             timeout_s: 0,
             apparmor: String::new(),
@@ -5099,6 +5147,7 @@ mod tests {
             no_new_privs: true,
             keep_groups: false,
             image: String::new(),
+            image_id: String::new(),
             gpus: String::new(),
             timeout_s: 0,
             apparmor: String::new(),
@@ -5187,6 +5236,24 @@ mod tests {
         assert!(!parse(older).expect("an older entry loads").auto_remove);
         let off = parse(&wire.replace("\nrm=1\n", "\nrm=0\n")).expect("parse");
         assert!(!off.auto_remove);
+    }
+
+    /// The image's ID as the box started it survives the record, live and exited: what kern's
+    /// Docker API reports for the container after a rebuild of its tag. An older record reads empty.
+    #[test]
+    fn image_id_roundtrips_and_an_older_entry_has_none() {
+        let id = "sha256:3d64c51230e1b10fd74aee461bb85f0da9581e1bc432fa70abe43a1e92a664a9";
+        let body = format!(
+            "name=r\npid=7\npid1=8\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\nimage=a:1\nimageid={id}\n"
+        );
+        let got = parse(&body).expect("parse");
+        assert_eq!(got.image_id, id);
+        assert_eq!(
+            parse(&encode(&got)).map(|i| i.image_id),
+            Some(id.to_string())
+        );
+        let older = "name=o\npid=3\npid1=0\nrootfs=/r\ncommand=sh\nstarted=1\nstarttime=2\n";
+        assert_eq!(parse(older).map(|i| i.image_id), Some(String::new()));
     }
 
     #[test]
@@ -5476,6 +5543,7 @@ mod tests {
                 no_new_privs: true,
                 keep_groups: false,
                 image: String::new(),
+                image_id: String::new(),
                 gpus: String::new(),
                 timeout_s: 0,
                 apparmor: String::new(),
@@ -5561,6 +5629,7 @@ mod tests {
             no_new_privs: true,
             keep_groups: false,
             image: String::new(),
+            image_id: String::new(),
             gpus: String::new(),
             timeout_s: 0,
             apparmor: String::new(),
@@ -5649,6 +5718,7 @@ mod tests {
             no_new_privs: true,
             keep_groups: false,
             image: String::new(),
+            image_id: String::new(),
             gpus: String::new(),
             timeout_s: 0,
             apparmor: String::new(),
@@ -6110,7 +6180,7 @@ mod removed_record_tests {
             pid - 1,
             st,
             3,
-            &parse("name=kept\npid=1\ncommand=true\nimage=alpine:3.21\nlabels=a=b\n")
+            &parse("name=kept\npid=1\ncommand=true\nimage=alpine:3.21\nimageid=sha256:ab\nlabels=a=b\n")
                 .expect("an instance record"),
             true,
         );
@@ -6119,6 +6189,10 @@ mod removed_record_tests {
             kept.as_ref()
                 .is_some_and(|e| e.image == "alpine:3.21" && e.labels == "a=b"),
             "an exit record keeps the image and the labels"
+        );
+        assert!(
+            kept.as_ref().is_some_and(|e| e.image_id == "sha256:ab"),
+            "and the image's id as the box started it"
         );
         assert!(
             kept.as_ref().is_some_and(|e| e.oom),
@@ -6173,6 +6247,9 @@ mod removed_record_tests {
         };
         fs::write(logs.join(format!("renold-{pid}.log")), "line").expect("a log");
         fs::write(logs.join(format!("renold-{pid}.log.1")), "older").expect("a rotated log");
+        // A run with NO exit record (a unit's foreground run), and a box named `renold-1`.
+        fs::write(logs.join("renold-424242.log"), "unit run").expect("a log without a record");
+        fs::write(logs.join("renold-1-424243.log"), "another box").expect("a neighbour's log");
 
         rename_exited("renold", "rennew");
 
@@ -6196,6 +6273,14 @@ mod removed_record_tests {
                 && logs.join(format!("rennew-{pid}.log.1")).exists()
                 && !logs.join(format!("renold-{pid}.log")).exists(),
             "the run's log files did not follow the name"
+        );
+        assert!(
+            logs.join("rennew-424242.log").exists() && !logs.join("renold-424242.log").exists(),
+            "the log of a run with no record did not follow the name"
+        );
+        assert!(
+            logs.join("renold-1-424243.log").exists(),
+            "the log of the box `renold-1` was taken"
         );
         assert_eq!(
             clear_exited_named("rennew", None),

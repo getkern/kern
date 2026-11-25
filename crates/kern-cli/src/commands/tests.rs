@@ -889,6 +889,7 @@ mod ps_exited_tests {
             pod: pod.to_string(),
             command: "python app.py".to_string(),
             image: String::new(),
+            image_id: String::new(),
             labels: String::new(),
             exited_ago: 5,
         }
@@ -1843,6 +1844,7 @@ mod net_resource_tests {
             no_new_privs: true,
             keep_groups: false,
             image: String::new(),
+            image_id: String::new(),
             gpus: String::new(),
             timeout_s: 0,
             apparmor: String::new(),
@@ -2417,6 +2419,23 @@ mod net_resource_tests {
         assert_eq!(systemd_quote("echo $(date +%s)"), "\"echo $$(date +%%s)\"");
         // Embedded quotes/backslashes are C-escaped so the ExecStart line stays parseable.
         assert_eq!(systemd_quote(r#"a"b\c"#), r#""a\"b\\c""#);
+        // A newline or CR is its C escape: raw, it would end the `ExecStart=` line.
+        assert_eq!(systemd_quote("a\nb\rc"), "\"a\\nb\\rc\"");
+        // And a reader of the unit gets every argument back as it was given.
+        for arg in [
+            "alpine",
+            "echo $(date +%s)",
+            r#"a"b\c"#,
+            "two\nlines\r",
+            "100%$",
+            "",
+        ] {
+            assert_eq!(
+                crate::commands::systemd_unquote(&systemd_quote(arg)),
+                arg,
+                "{arg:?}"
+            );
+        }
     }
 
     /// `WORKDIR /app` + `COPY . .` is the shape most application Dockerfiles have, and joining the
@@ -4815,6 +4834,7 @@ mod label_filter_tests {
             no_new_privs: true,
             keep_groups: false,
             image: String::new(),
+            image_id: String::new(),
             gpus: String::new(),
             timeout_s: 0,
             apparmor: String::new(),
@@ -4951,6 +4971,7 @@ mod drift_tests {
             no_new_privs: true,
             keep_groups: false,
             image: String::new(),
+            image_id: String::new(),
             gpus: String::new(),
             timeout_s: 0,
             apparmor: String::new(),
@@ -9342,4 +9363,143 @@ fn unit_runs_read_the_gap_and_only_an_exit_code() {
         None,
         "a running process has no code yet"
     );
+}
+
+/// `kern rename` of a box a unit runs rewrites the unit for the new name: the description, the
+/// marker and the name in `ExecStart` (`--name`, `--name=`, or `kern box`'s positional), and
+/// nothing else, not the workload's own `--name` nor a word equal to the name in its command.
+#[test]
+fn a_unit_is_rewritten_for_the_new_name_and_only_the_name() {
+    let unit = "[Unit]\nDescription=kern box web\nX-KernManagedBox=web\nX-KernRestart=always\n\n\
+                [Service]\nType=simple\nExecStart=\"/k\" \"run\" \"--keep\" \"--name\" \"web\" \
+                \"-e\" \"A=a b\" \"alpine:3.21\" \"sh\" \"-c\" \"echo \\\"web\\\" --name web\"\n\
+                MemoryMax=1024\n";
+    let Some(out) = super::unit_text_renamed(unit, "web", "api") else {
+        panic!("a unit kern wrote for 'web' is renamed");
+    };
+    assert!(out.contains("Description=kern box api\n"), "{out}");
+    assert!(out.contains("X-KernManagedBox=api\n"), "{out}");
+    assert!(
+        out.contains("X-KernRestart=always\n") && out.contains("MemoryMax=1024\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "ExecStart=\"/k\" \"run\" \"--keep\" \"--name\" \"api\" \"-e\" \"A=a b\" \
+             \"alpine:3.21\" \"sh\" \"-c\" \"echo \\\"web\\\" --name web\"\n"
+        ),
+        "only kern's --name moves, the workload's text stays: {out}"
+    );
+    let boxed = "X-KernManagedBox=b\nExecStart=\"/k\" \"box\" \"--keep\" \"b\" \"--image\" \"b\"\n";
+    assert_eq!(
+        super::unit_text_renamed(boxed, "b", "c").as_deref(),
+        Some("X-KernManagedBox=c\nExecStart=\"/k\" \"box\" \"--keep\" \"c\" \"--image\" \"b\"\n"),
+        "the positional name moves, an image called like the box does not"
+    );
+    let eq = "X-KernManagedBox=w\nExecStart=\"/k\" \"run\" \"--name=w\" \"img\"\n";
+    assert!(super::unit_text_renamed(eq, "w", "z").is_some_and(|t| t.contains("\"--name=z\"")));
+    assert_eq!(
+        super::unit_text_renamed(unit, "other", "x"),
+        None,
+        "a unit of another box is not rewritten"
+    );
+    // The tokenizer keeps a quoted argument with spaces and escapes whole.
+    assert_eq!(
+        super::exec_tokens("\"a b\" \"c\\\"d\" bare"),
+        vec!["\"a b\"", "\"c\\\"d\"", "bare"]
+    );
+}
+
+/// The unit that hands a running box over to its new name is not a kern box's unit (no list shows
+/// it), and its script quotes the paths it is given.
+#[test]
+fn the_handover_unit_is_not_a_box_and_quotes_its_paths() {
+    let text = super::unit_text_handover(
+        "/h/o'k/kern-a.service",
+        "kern-b.service",
+        "/usr/bin/systemctl",
+    );
+    assert!(!text.contains(super::MANAGED_MARKER), "{text}");
+    assert!(
+        !text.lines().any(|l| l.starts_with("Description=kern box ")),
+        "{text}"
+    );
+    assert!(
+        text.contains("Restart=always"),
+        "it runs at the box's next exit: {text}"
+    );
+    assert!(
+        text.contains("'/h/o'\\\\''k/kern-a.service'"),
+        "a quote in the path is closed: {text}"
+    );
+    assert!(text.contains("start 'kern-b.service'"), "{text}");
+}
+
+/// The policy a kept box's record asks for, in each spelling, and `no` for a record without one.
+#[test]
+fn a_recorded_policy_reads_every_spelling() {
+    use super::RestartPolicy as P;
+    let os = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+    let p = |a: &[&str]| super::recorded_policy(&os(a));
+    assert_eq!(
+        p(&["box", "w", "--restart", "always", "--image", "a"]),
+        P::Always
+    );
+    assert_eq!(
+        p(&["box", "w", "--restart=unless-stopped"]),
+        P::UnlessStopped
+    );
+    assert_eq!(p(&["box", "w", "--restart", "on-failure:3"]), P::OnFailure);
+    assert_eq!(
+        p(&["box", "w", "--restart", "--image", "a"]),
+        P::OnFailure,
+        "a bare one"
+    );
+    assert_eq!(p(&["box", "w", "--image", "a"]), P::No);
+    assert_eq!(
+        p(&["box", "w", "--", "app", "--restart", "always"]),
+        P::No,
+        "the workload's"
+    );
+}
+
+/// A kept row between two runs of its policy is `restarting` in `--format` and in Docker's JSON
+/// line, as the table and `--json` say; stopped it is `exited`.
+#[test]
+fn a_kept_row_between_runs_formats_as_restarting() {
+    let _g = crate::env_guard();
+    let mut k = crate::keepbox::KeptBox {
+        name: "loop".into(),
+        meta: crate::keepbox::Meta {
+            created: 100,
+            last_exit: None,
+            image: "alpine:3.21".into(),
+            cwd: String::new(),
+        },
+        command: "sh -c exit 1".into(),
+        labels: Vec::new(),
+        exited_ago: None,
+        unit: Some(super::UnitRuns {
+            restarting: true,
+            restarts: 2,
+            last_code: Some(1),
+        }),
+    };
+    let ctx = super::PsCtx {
+        now: 160,
+        service: None,
+        image: None,
+        docker_command: None,
+    };
+    let f = |t: &str, k: &crate::keepbox::KeptBox| super::render_ps_format_ctx(t, k, &ctx).ok();
+    assert_eq!(f("{{.State}}", &k).as_deref(), Some("restarting"));
+    assert!(f("{{.Status}}", &k).is_some_and(|s| s.starts_with("Restarting (1) ")));
+    let line = super::render_ps_docker_json(&k, &ctx).unwrap_or_default();
+    assert!(
+        line.contains("\"State\":\"restarting\"") && line.contains("\"Names\":\"loop\""),
+        "{line}"
+    );
+    k.unit = None;
+    k.meta.last_exit = Some(3);
+    assert_eq!(f("{{.State}}", &k).as_deref(), Some("exited"));
 }

@@ -505,7 +505,6 @@ pub fn ps(
         crate::keepbox::list_matching(|n| name_want.is_none_or(|w| n.contains(w)))
             .into_iter()
             .filter(|k| !live_names.contains(&k.name))
-            .filter(|k| kept_matches(k, filters) && named(&k.name))
             .chain(
                 // A `--restart always|unless-stopped` box made WITHOUT `--keep` has a unit and no
                 // kept record: between two runs it was in no list, so `ps -a`, kern's Docker API
@@ -517,6 +516,10 @@ pub fn ps(
                     .filter(|n| !live_names.contains(n))
                     .filter_map(|n| crate::commands::unit_only_box(&n)),
             )
+            .map(|mut k| {
+                k.unit = crate::commands::managed_unit_runs(&k.name);
+                k
+            })
             .filter(|k| kept_matches(k, filters) && named(&k.name))
             .fold(Vec::new(), |mut v: Vec<crate::keepbox::KeptBox>, k| {
                 if !v.iter().any(|x| x.name == k.name) {
@@ -539,12 +542,14 @@ pub fn ps(
             .into_iter()
             .filter(|n| name_want.is_none_or(|w| n.contains(w)) && named(n))
             .filter(|n| !live_names.contains(n))
-            .filter(|n| crate::commands::managed_unit_runs(n).is_some_and(|u| u.restarting))
             .filter_map(|n| {
-                crate::keepbox::list_matching(|k| k == n)
+                let u = crate::commands::managed_unit_runs(&n).filter(|u| u.restarting)?;
+                let mut k = crate::keepbox::list_matching(|k| k == n)
                     .into_iter()
                     .next()
-                    .or_else(|| crate::commands::unit_only_box(&n))
+                    .or_else(|| crate::commands::unit_only_box(&n))?;
+                k.unit = Some(u);
+                Some(k)
             })
             .filter(|k| kept_matches(k, filters))
             .collect()
@@ -707,15 +712,19 @@ pub fn ps(
             image: Some(&image_of),
             docker_command: Some(!view.no_trunc),
         };
+        // `--format json` IS DOCKER'S `docker ps --format json`, one object per line. MEASURED
+        // before: `kern ps --format json` printed the word `json` once per box. (`compose ps`
+        // maps the same word to its own shape before it gets here.)
+        let docker_json = !table && tmpl.eq_ignore_ascii_case("json");
         let mut rows: Vec<(String, String)> = Vec::new();
         for b in &boxes {
-            rows.push((b.name.clone(), render_ps_format_ctx(tmpl, b, &ctx)?));
+            rows.push((b.name.clone(), render_ps_row(docker_json, tmpl, b, &ctx)?));
         }
         for e in &exited {
-            rows.push((e.name.clone(), render_ps_format_ctx(tmpl, e, &ctx)?));
+            rows.push((e.name.clone(), render_ps_row(docker_json, tmpl, e, &ctx)?));
         }
         for k in &kept {
-            rows.push((k.name.clone(), render_ps_format_ctx(tmpl, k, &ctx)?));
+            rows.push((k.name.clone(), render_ps_row(docker_json, tmpl, k, &ctx)?));
         }
         if view.compose {
             rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -756,13 +765,15 @@ pub fn ps(
                 // has to re-split a string is doing the parsing this document exists to avoid.
                 let oom = box_oom_killed(b);
                 format!(
-                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"started\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"status\":{},\"oom_killed\":{oom}}}",
+                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"image\":{},\"image_id\":{},\"command\":{},\"started\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"status\":{},\"oom_killed\":{oom}}}",
                     json_str(&b.name),
                     b.pid,
                     json_str(&b.pod),
                     json_str(&b.rootfs),
                     // The image it runs, as its exited and kept rows say it; empty for `--rootfs`.
                     json_str(&b.image),
+                    // And its ID as the box started it, which a rebuild of the tag does not move.
+                    json_str(&b.image_id),
                     json_str(&b.command),
                     b.started,
                     json_str(&b.ports),
@@ -788,12 +799,13 @@ pub fn ps(
                 // read ONE key across live and exited rows instead of knowing that a dead box spells
                 // its state in the health field. `health` keeps saying `exited` because something may
                 // already read it.
-                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"image\":{},\"labels\":{},\"exit_code\":{},\"exited_ago\":{}{started},\"restart_count\":{},\"health\":{},\"status\":{},\"oom_killed\":{}}}",
+                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"image\":{},\"image_id\":{},\"labels\":{},\"exit_code\":{},\"exited_ago\":{}{started},\"restart_count\":{},\"health\":{},\"status\":{},\"oom_killed\":{}}}",
                 json_str(&e.name),
                 e.pid,
                 json_str(&e.pod),
                 json_str(&e.command),
                 json_str(&e.image),
+                json_str(&e.image_id),
                 labels_object(e.labels.split(',').filter(|l| !l.is_empty()).map(str::to_string)),
                 e.code,
                 e.exited_ago,
@@ -819,7 +831,7 @@ pub fn ps(
             // by them. `exited_ago` once a run has ended, as on an exited row.
             // A `--restart always` box between two runs is `restarting`, and its count is the
             // unit's: systemd runs it again with a new supervisor each time, which counts nothing.
-            let unit = crate::commands::managed_unit_runs(&k.name);
+            let unit = k.unit;
             let exit = match (
                 crate::commands::kept_last_exit(k, unit.as_ref()),
                 k.exited_ago,
@@ -1168,7 +1180,7 @@ pub fn ps(
                 // `restarting (code)` between two runs of a `--restart always` box, the word `ps
                 // --json` and kern's Docker API use (Docker: `Restarting (3) ...`). MEASURED
                 // before: the JSON said `restarting` and this cell `exit 3`.
-                let unit = crate::commands::managed_unit_runs(&k.name);
+                let unit = k.unit;
                 let restarting = unit.is_some_and(|u| u.restarting);
                 let last_exit = crate::commands::kept_last_exit(k, unit.as_ref());
                 let status = match (restarting, last_exit) {
@@ -1203,9 +1215,7 @@ fn kept_matches(k: &crate::keepbox::KeptBox, filters: &[(String, String)]) -> bo
             "exited" => k.meta.last_exit.is_some(),
             // Between two runs systemd makes of a `--restart always` box: the state `ps --json`
             // and kern's Docker API report, from the same function.
-            "restarting" => {
-                crate::commands::managed_unit_runs(&k.name).is_some_and(|u| u.restarting)
-            }
+            "restarting" => k.unit.is_some_and(|u| u.restarting),
             // NOT `created`: the usage message for this flag says kern has no created state, and a
             // mapping here would have made that sentence false for one row kind only. A kept box
             // that has never run is `status=kept` with no `exit_code` in `--json`, which answers the
@@ -1595,14 +1605,18 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
         // A KEPT BOX IS A THIRD SUBJECT WITH THAT NAME, and saying "nothing named 'x'" about a
         // layer sitting in the store is the same defect as the one the note above records for
         // images: `kern ps -a` listed it while `kern inspect` denied it existed.
+        // AND IT IS REPORTED, as `docker inspect` reports a stopped container: what its record
+        // holds, in the words `kern ps -a` uses for the same row. MEASURED before: a refusal, so a
+        // `--restart always` box between two runs could not be inspected at all.
         if let Some(dir) = crate::keepbox::dir_of(name) {
-            if crate::keepbox::read(&dir).is_some() {
-                return Err(Error::NotRunning(format!(
-                    "'{name}' is a kept box that is not running: its layer and its command line are \
-                     in {}, and `kern start {name}` runs it. `kern inspect` reports a box while it \
-                     runs, so start it first, and `kern ps -a` shows what the last run exited with",
-                    dir.display()
-                )));
+            if let Some((argv, _)) = crate::keepbox::read(&dir) {
+                if let Some(mut k) = crate::keepbox::list_matching(|n| n == name)
+                    .into_iter()
+                    .next()
+                {
+                    k.unit = crate::commands::managed_unit_runs(name);
+                    return inspect_kept(&k, &argv, &dir, json);
+                }
             }
         }
         // NEITHER EXISTS, so name both subjects: a reader told only about boxes goes looking for
@@ -1714,6 +1728,62 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
     Ok(())
 }
 
+/// `kern inspect` of a kept box that is not running: stopped, never started, or between two runs
+/// of its `--restart` policy. Only what its record and its unit hold; nothing of a process, which
+/// it does not have.
+fn inspect_kept(
+    k: &crate::keepbox::KeptBox,
+    argv: &[std::ffi::OsString],
+    dir: &std::path::Path,
+    json: bool,
+) -> Result<(), Error> {
+    let restarting = k.unit.is_some_and(|u| u.restarting);
+    let code = crate::commands::kept_last_exit(k, k.unit.as_ref());
+    let policy = crate::commands::managed_unit_policy(&k.name)
+        .unwrap_or_else(|| crate::commands::recorded_policy(argv).as_str());
+    let restarts = k.unit.map_or(0, |u| u.restarts);
+    if json {
+        let exit = code.map_or_else(String::new, |c| format!(",\"exit_code\":{c}"));
+        println!(
+            "{{\"name\":{},\"status\":{},\"image\":{},\"command\":{},\"created\":{}{exit},\"restart_policy\":{},\"restart_count\":{restarts},\"layer\":{}}}",
+            json_str(&k.name),
+            json_str(if restarting { "restarting" } else { "kept" }),
+            json_str(&crate::ui::scrub(&k.meta.image)),
+            json_str(&crate::ui::scrub(&k.command)),
+            k.meta.created,
+            json_str(policy),
+            json_str(&dir.to_string_lossy()),
+        );
+        return Ok(());
+    }
+    let status = match (restarting, code) {
+        (true, Some(c)) => format!("restarting ({c})"),
+        (true, None) => "restarting".to_string(),
+        (false, Some(c)) => format!("exit {c}"),
+        (false, None) => "never ran".to_string(),
+    };
+    let age = registry::now_unix().saturating_sub(k.meta.created);
+    println!("{}", k.name);
+    let row = |key: &str, val: &str| println!("{key:<8} {val}");
+    row("status", &status);
+    row("image", &crate::ui::scrub(&k.meta.image));
+    row("command", &crate::ui::scrub(&k.command));
+    row("created", &format!("{} ago", fmt_uptime(age)));
+    row(
+        "restart",
+        &if restarts > 0 {
+            format!(
+                "{policy} ({restarts} restart{})",
+                if restarts == 1 { "" } else { "s" }
+            )
+        } else {
+            policy.to_string()
+        },
+    );
+    row("layer", &dir.to_string_lossy());
+    Ok(())
+}
+
 /// `inspect` with Docker's `--format`, for the field set kern can answer TRUTHFULLY.
 ///
 /// WHY THE FIELDS ARE ENUMERATED AND NOT MAPPED FROM A STRUCT. Docker's inspect document has
@@ -1752,7 +1822,27 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
     } else {
         registry::list_exited().into_iter().find(|e| e.name == name)
     };
-    if !running && exited.is_none() {
+    // A KEPT BOX is answered too, stopped or between two runs of its `--restart` policy, as
+    // `docker inspect` answers any container until it is removed: its record is durable, where an
+    // exit record lasts an hour. MEASURED before: `kern inspect -f` refused a kept box that was
+    // not running, and so refused every `--restart always` box between two runs.
+    let kept: Option<(crate::keepbox::KeptBox, Vec<std::ffi::OsString>)> = if running {
+        None
+    } else {
+        crate::keepbox::dir_of(name)
+            .and_then(|d| crate::keepbox::read(&d))
+            .and_then(|(argv, _)| {
+                let mut k = crate::keepbox::list_matching(|n| n == name)
+                    .into_iter()
+                    .next()?;
+                k.unit = crate::commands::managed_unit_runs(name);
+                Some((k, argv))
+            })
+    };
+    let restarting = kept
+        .as_ref()
+        .is_some_and(|(k, _)| k.unit.is_some_and(|u| u.restarting));
+    if !running && exited.is_none() && kept.is_none() {
         return Err(Error::NotRunning(format!(
             "no box '{name}': it is not running, and kern holds no recent exit record for it \
              (`kern ps -a` lists what exited within the last hour). Refusing rather than reporting \
@@ -1762,13 +1852,45 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
     // Docker's `.State.Status` vocabulary, from the ONE function that reads the freezer and the
     // orphan flag. It used to be decided here by `health == "paused"`, a word `health_of` never
     // returns, so a frozen box reported `running` while `kern ps` reported `paused`.
-    let status = match &b {
-        None => "exited",
-        Some(i) => box_lifecycle_status(i),
+    let status = match (&b, &kept) {
+        (Some(i), _) => box_lifecycle_status(i),
+        (None, Some(_)) if restarting => "restarting",
+        (None, Some((k, _))) if k.meta.last_exit.is_none() && exited.is_none() => "created",
+        (None, _) => "exited",
     };
+    // The image the box runs, as `docker inspect` names it in `Config.Image`: the reference, not
+    // the scratch path the registry's `rootfs` holds. MEASURED before: `{{.Config.Image}}` of a
+    // running `alpine:3.21` box printed `/run/user/1000/kern/scratch/<box>/merged`. A `--rootfs`
+    // box has no reference, and its directory is the honest answer.
+    let image_ref = match (&b, &kept, &exited) {
+        (Some(i), _, _) if !i.image.is_empty() => Some(i.image.clone()),
+        (Some(i), _, _) => Some(i.rootfs.clone()),
+        (None, Some((k, _)), _) if !k.meta.image.is_empty() => Some(k.meta.image.clone()),
+        (None, _, Some(e)) if !e.image.is_empty() => Some(e.image.clone()),
+        _ => None,
+    };
+    // `.Image` is the image's ID, the one `docker images -q --no-trunc` and kern's Docker API give;
+    // none for a `--rootfs` box, which has no image.
+    let image_id = |r: &str| -> Option<String> {
+        let cache = crate::commands::imagecache::cache_dir();
+        let stem = crate::commands::imagecache::cache_entry_for(&cache, r);
+        crate::commands::imagecache::image_present(&cache, &stem)
+            .then(|| kern_compat::image_id_for_entry(&cache, &stem, r))
+    };
+    // The policy, where kern holds it: the unit of a `--restart always|unless-stopped` box, or a
+    // kept box's recorded command line. A running box with neither did not record one, and the
+    // field is refused for it rather than answered `no`.
+    let policy = crate::commands::managed_unit_policy(name)
+        .map(str::to_string)
+        .or_else(|| {
+            kept.as_ref()
+                .map(|(_, argv)| crate::commands::recorded_policy(argv).as_str().to_string())
+        });
     let field = |f: &str| -> Option<String> {
         match f {
-            "State.Running" => Some(running.to_string()),
+            // Docker counts a container between two runs of its policy as running.
+            "State.Running" => Some((running || restarting).to_string()),
+            "State.Restarting" => Some(restarting.to_string()),
             "State.Status" => Some(status.to_string()),
             "State.Paused" => Some((status == "paused").to_string()),
             // Docker prints `healthy`/`unhealthy`/`starting`, and an empty string for a container
@@ -1779,7 +1901,17 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
             // is exactly what the two sources here hold. It is the other half of the wait loop:
             // having learnt that a one-shot service is `exited`, the next question is whether it
             // exited WELL, and `kern ps -a` is a table rather than a value a script can test.
-            "State.ExitCode" => Some(exited.as_ref().map_or(0, |e| e.code).to_string()),
+            "State.ExitCode" => Some(
+                exited
+                    .as_ref()
+                    .map(|e| e.code)
+                    .or_else(|| {
+                        kept.as_ref()
+                            .and_then(|(k, _)| crate::commands::kept_last_exit(k, k.unit.as_ref()))
+                    })
+                    .unwrap_or(0)
+                    .to_string(),
+            ),
             "Name" => Some(format!("/{name}")),
             // The memory cap the box runs under, in bytes, 0 for none, as Docker prints it. Only
             // while it runs: the exit record does not keep it, so an exited box is refused below
@@ -1791,9 +1923,22 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
                     .map_or(0, registry::Attempt::restarts)
                     .to_string(),
                 (None, Some(e)) => e.restarts.to_string(),
-                (None, None) => "0".to_string(),
+                (None, None) => kept
+                    .as_ref()
+                    .and_then(|(k, _)| k.unit)
+                    .map_or(0, |u| u.restarts)
+                    .to_string(),
             }),
-            "Config.Image" | "Image" => b.as_ref().map(|i| i.rootfs.clone()),
+            "Config.Image" => image_ref.clone(),
+            // The ID the box STARTED from, as recorded; a record from before the key, and a kept
+            // box (whose next run resolves its image by name), from the cache entry now.
+            "Image" => b
+                .as_ref()
+                .map(|i| i.image_id.clone())
+                .or_else(|| exited.as_ref().map(|e| e.image_id.clone()))
+                .filter(|id| !id.is_empty())
+                .or_else(|| image_ref.as_deref().and_then(image_id)),
+            "HostConfig.RestartPolicy.Name" => policy.clone(),
             // Every label as a JSON object, which is the shape `{{json .Config.Labels}}` asks for
             // and the only shape a caller can feed to a parser. A box past its exit has none: the
             // instance record that held them is pruned, so `{}` here is the honest empty and not a
@@ -1973,7 +2118,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&gpu)
         };
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"created\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{},\"restart_count\":{},\"oom_killed\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"image\":{},\"image_id\":{},\"command\":{},\"created\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{},\"restart_count\":{},\"oom_killed\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
@@ -1986,6 +2131,14 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
                 "null".to_string()
             } else {
                 json_str(&b.image)
+            },
+            // Its ID as the box started it, `null` for none: a rebuild of the tag does not move it,
+            // as Docker keeps the id a container was created from. MEASURED before: kern's Docker
+            // API, which inspects a running box through this, reported the rebuilt image's id.
+            if b.image_id.is_empty() {
+                "null".to_string()
+            } else {
+                json_str(&b.image_id)
             },
             json_str(&b.command),
             // When the box was MADE: a kept box's record says, across its restarts (`started` is
@@ -2131,9 +2284,16 @@ pub fn rename(old: &str, new: &str) -> Result<(), Error> {
     }
     let Some(inst) = registry::find_ref(old) else {
         // A KEPT BOX THAT IS NOT RUNNING is renamed too, as Docker renames a stopped or created
-        // container: only its layer and its record carry the name.
-        if crate::keepbox::rename(old, new)? {
+        // container: its layer and its record carry the name, and its `--restart` unit when it is
+        // between two runs (see `rename_managed_unit`: the old unit stops BEFORE the layer moves,
+        // so no run of the old name can take the layer meanwhile).
+        let unit = crate::commands::rename_managed_unit(old, new, false)?;
+        let kept = crate::keepbox::rename(old, new)?;
+        if kept || unit.is_some() {
             registry::rename_exited(old, new);
+            if let Some(text) = unit {
+                crate::commands::start_renamed_unit(new, &text)?;
+            }
             println!("{}renamed{} {old} → {new}", p.g, p.z);
             return Ok(());
         }
@@ -2158,6 +2318,8 @@ pub fn rename(old: &str, new: &str) -> Result<(), Error> {
     }
     // The runs that ended before this one are this box too: their records follow the name.
     registry::rename_exited(&inst.name, new);
+    // And its `--restart` unit, handed over at the box's next exit: a running box is not stopped.
+    crate::commands::rename_managed_unit(&inst.name, new, true)?;
     println!("{}renamed{} {} → {new}", p.g, p.z, inst.name);
     Ok(())
 }
@@ -2211,6 +2373,19 @@ fn wait_for(names: &[String], removed_too: bool) -> Result<(), Error> {
                 println!("{code}");
                 continue;
             }
+            // A KEPT BOX keeps the code of its last run in its record, past the hour an exit
+            // record lasts: a stopped `--keep` box, and a `--restart` box between two runs (its
+            // runs are in the foreground of a unit, which leave no exit record). Docker answers
+            // `docker wait` on a stopped or restarting container with that code at once. MEASURED
+            // before: `kern wait` refused here and kern's Docker API answered -1, where Docker
+            // answered the last run's 1.
+            if let Some(code) = crate::keepbox::dir_of(name)
+                .and_then(|d| crate::keepbox::read(&d))
+                .and_then(|(_, meta)| meta.last_exit)
+            {
+                println!("{code}");
+                continue;
+            }
             return Err(Error::NotRunning(format!(
                 "no running box named '{name}' and no exit record for one (kern keeps no stopped boxes; the record is dropped by `prune`/`gc`, and an hour after the box exited)"
             )));
@@ -2251,6 +2426,30 @@ fn wait_for(names: &[String], removed_too: bool) -> Result<(), Error> {
             }
             waiter.wait(WAIT_FLOOR_MS);
         };
+        // A KEPT BOX's run in the foreground (a `--restart` unit runs every box so) leaves no exit
+        // record; it writes its code to the kept record as it ends. That write is THIS run's when
+        // the record changed after the run started, and it lands just after the box leaves the
+        // registry, so it is waited for within the same bound as a stopper's write.
+        let code = code.or_else(|| {
+            crate::keepbox::dir_of(&inst.name).filter(|d| d.is_dir())?;
+            let since = std::time::Instant::now();
+            loop {
+                let run_ended = crate::keepbox::list_matching(|n| n == inst.name)
+                    .into_iter()
+                    .next()
+                    .and_then(|k| {
+                        let ago = k.exited_ago?;
+                        let ended_at = registry::now_unix().saturating_sub(ago);
+                        (ended_at >= inst.started)
+                            .then_some(k.meta.last_exit)
+                            .flatten()
+                    });
+                if run_ended.is_some() || since.elapsed() >= STOPPER_RECORDS_WITHIN {
+                    break run_ended;
+                }
+                waiter.wait(WAIT_FLOOR_MS);
+            }
+        });
         match code {
             Some(code) => println!("{code}"),
             None => {

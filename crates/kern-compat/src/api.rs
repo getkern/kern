@@ -1581,7 +1581,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
     // box and for a box that has exited, whose record no longer holds it).
     let image_name = v.get("image").and_then(Value::as_str).unwrap_or_default();
     let image = json_str(image_name);
-    let image_id = json_str(&container_image_id(&kern_images(bin, false), image_name));
+    let image_id = json_str(&recorded_or_current_image_id(bin, &v, image_name));
     // Docker's `HostConfig.RestartPolicy`, from the argv the box was kept with, or the systemd unit
     // a standalone `always`/`unless-stopped` box runs under (its argv carries no `--restart`: systemd
     // does the restarting). MEASURED before: empty for every container.
@@ -1787,10 +1787,18 @@ fn list(bin: &Path, req: &Request) -> Response {
             json_str(&id_of(&name)),
             json_str(&format!("/{name}")),
             json_str(v.get("image").and_then(Value::as_str).unwrap_or_default()),
-            json_str(&container_image_id(
-                &images,
-                v.get("image").and_then(Value::as_str).unwrap_or_default()
-            )),
+            json_str(
+                &v.get("image_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map_or_else(
+                        || container_image_id(
+                            &images,
+                            v.get("image").and_then(Value::as_str).unwrap_or_default()
+                        ),
+                        str::to_string
+                    )
+            ),
             json_str(v.get("command").and_then(Value::as_str).unwrap_or_default()),
             // The same `Created` `inspect` says: when the box was made.
             v.get("created")
@@ -2190,6 +2198,20 @@ fn image_by_id_prefix<'a>(images: &'a [Value], r: &str) -> Option<&'a Value> {
     hits.next().is_none().then_some(one)
 }
 
+/// A box's image id for `inspect`: the one kern recorded when the box started (`image_id` in
+/// `kern ps --json`), which a rebuild of the tag does not move, as Docker keeps the id a container
+/// was created from; for a record without one, the id its image's name has now.
+fn recorded_or_current_image_id(bin: &Path, v: &Value, image: &str) -> String {
+    match v
+        .get("image_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => id.to_string(),
+        None => container_image_id(&kern_images(bin, false), image),
+    }
+}
+
 /// The image id of a container that runs `image`, as Docker reports it: `Image` in `inspect` and
 /// `ImageID` in the list are the id (`sha256:<hex>`), the name is `Config.Image` and the list's
 /// `Image`. MEASURED before: both said the name, where a client that compares a container's image
@@ -2234,6 +2256,17 @@ fn content_id(stem: &str) -> Option<String> {
     content_id_in(
         &kern_common::xdg_cache_dir()?.join("kern").join("images"),
         stem,
+    )
+}
+
+/// The id (`sha256:<hex>`) of the cached image whose entry is `stem` in the image cache `dir`,
+/// named `name`: its content, as the socket's `images/json` and `inspect` report it, or the id
+/// derived from the name for an entry with no config to read. For `kern inspect`, so the CLI and
+/// kern's Docker API give one image one id.
+pub fn image_id_for_entry(dir: &std::path::Path, stem: &str, name: &str) -> String {
+    format!(
+        "sha256:{}",
+        content_id_in(dir, stem).unwrap_or_else(|| id_of(name))
     )
 }
 

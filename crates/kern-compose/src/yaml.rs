@@ -163,6 +163,14 @@ fn parse_no_pod(text: &str) -> Result<Vec<ComposeBox>, String> {
     )
 }
 
+thread_local! {
+    /// How many services the last profile decision ON THIS THREAD skipped: what a caller that wires
+    /// a stack needs besides the services it runs now, because a later `up --profile` adds them to
+    /// the SAME stack. Per thread, so the parse and its reader (one `compose` command) see one
+    /// decision, and parses on other threads (tests run in parallel) cannot change it.
+    pub(crate) static PROFILE_SKIPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Split a stack into the services that run and the ones an inactive profile keeps out.
 ///
 /// Docker profiles: a service with a non-empty profile list is INACTIVE unless one of its profiles is
@@ -205,6 +213,7 @@ pub(crate) fn split_inactive_profiles(
         }
         kept.push(b);
     }
+    PROFILE_SKIPPED.with(|c| c.set(skipped.len()));
     (kept, skipped, inactive)
 }
 
@@ -10236,7 +10245,8 @@ mod tests {
         let _ = parse(text);
         let w = take_warnings();
         assert!(
-            w.iter().any(|m| m.contains("G13_NEVER_SET_K7") && m.contains("not set")),
+            w.iter()
+                .any(|m| m.contains("G13_NEVER_SET_K7") && m.contains("not set")),
             "no warning for the unset variable: {w:?}"
         );
     }

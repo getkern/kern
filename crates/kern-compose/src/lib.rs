@@ -1218,6 +1218,15 @@ pub fn config_document(
     yaml::document_val(text, dotenv, dir, interpolate)
 }
 
+/// How many services of the file the last parse on this thread left out because their profiles
+/// are not active. A stack is wired for the file, not for the services one `up` runs: MEASURED, a
+/// file with one plain service and one under a profile was given a pod without a bridge by `up`,
+/// and `up --profile <p>` then failed to attach the second service to it, where Docker adds it to
+/// the project's network. One stack per `compose` command, so "the last parse" is that stack's.
+pub fn services_skipped_by_profile() -> usize {
+    yaml::PROFILE_SKIPPED.with(std::cell::Cell::get)
+}
+
 pub fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     parse_with_env(text, &DotEnv::default(), StackNet::Pod)
 }
@@ -4683,6 +4692,23 @@ mod dotenv_tests {
             "the gated service stays out, the other runs"
         );
         validate_runnable(&merged).expect("what remains is runnable, as docker says it is");
+    }
+
+    /// The parse says how many services a profile kept out, so a stack is wired for its whole
+    /// file: the count follows each parse on this thread, a file with none answers 0.
+    #[test]
+    fn the_parse_counts_the_services_a_profile_kept_out() {
+        let file = concat!(
+            "services:\n",
+            "  core:\n    image: img\n",
+            "  extra:\n    image: img\n    profiles: [kern-test-never-active]\n",
+            "  more:\n    image: img\n    profiles: [kern-test-never-active-2]\n",
+        );
+        let boxes = parse(file).expect("parses");
+        assert_eq!(boxes.len(), 1, "one service runs");
+        assert_eq!(services_skipped_by_profile(), 2, "two are kept out");
+        parse("services:\n  a:\n    image: img\n").expect("parses");
+        assert_eq!(services_skipped_by_profile(), 0, "the next parse resets it");
     }
 
     #[test]

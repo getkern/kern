@@ -447,6 +447,10 @@ pub struct KeptBox {
     /// Seconds since its last run ended, from the record's mtime (rewritten by [`set_exit`] at
     /// that moment), `None` while it has never finished one.
     pub exited_ago: Option<u64>,
+    /// What systemd says of its `--restart` unit, read ONCE by the listing that shows the row
+    /// (`kern ps`), so the filter, the table, `--json` and `--format` answer from one reading.
+    /// `None` for a box with no unit, and until a listing reads it.
+    pub unit: Option<crate::commands::UnitRuns>,
 }
 
 /// Every kept box whose NAME passes `name_ok`, which is asked before the record is opened. Order is
@@ -486,6 +490,7 @@ pub fn list_matching(name_ok: impl Fn(&str) -> bool) -> Vec<KeptBox> {
             exited_ago,
             name,
             meta,
+            unit: None,
         });
     }
     out

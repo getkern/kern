@@ -2448,8 +2448,12 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
     // traffic a file put behind a VPN container went out directly. A box now JOINS the named
     // service's network namespace in every wiring (`--network container:`), which is Docker's
     // arrangement exactly, so the stack takes the wiring its other properties call for.
+    // TWO SERVICES OF THE FILE, not of this `up`: a service under a profile that is not active now
+    // joins this stack when an `up --profile` names it, and a pod made without a bridge cannot take
+    // it then (see `kern_compose::services_skipped_by_profile`).
+    let services_in_file = boxes.len() + kern_compose::services_skipped_by_profile();
     let auto_bridge =
-        !no_pod && !force_pod && (segregates || collides || hosts_collide || boxes.len() >= 2);
+        !no_pod && !force_pod && (segregates || collides || hosts_collide || services_in_file >= 2);
     let want_bridge = want_bridge || auto_bridge;
     // THE DEFAULT ARM SPEAKS FOR ITSELF, and does not borrow the sentence below.
     //

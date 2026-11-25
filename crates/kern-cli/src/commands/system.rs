@@ -144,6 +144,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      a `--restart` box between two runs is UP and listed without -a, as `restarting (code)`; status=restarting selects those
                                                                      --last N is about boxes that RAN, so it does not list the kept ones (they outlive the boot and share no clock with a run)
                                                                      --format fields: .Names .ID .Image .Command .Ports .URL .Pod .Service .Status .State .Health .ExitCode .RunningFor .Labels .Label \"k\"
+                                                                     --format json prints Docker's line per box (`docker ps --format json`)
                                                                      .Status is Docker's (Up 4 seconds (healthy), Exited (3) 4 seconds ago, Created), .State the word (running, exited); `table ...` prints headers
     {c}logs{z} <name>|--all [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
                                                                      --all: every box's, one stream ordered by time, each line `box  | `; --tail is per box
@@ -187,8 +188,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}sandbox{z} ls [--json] | history [-n N] [--failed] [--all] [--json] | stats [--all] [--json]  The SDK and MCP sandboxes: running now, finished, outcomes
     {c}sandbox show{z} [<box>] [-n N] [--json]                         The code SDK sandboxes ran and their output (kept with the history)
     {c}sandbox{z} keep|clear [memory|disk|off]                             Where the finished ones are kept (default memory: until reboot), or remove them
-    {c}inspect{z} <name> [--json] [-f|--format T] [--platform P]         Full detail for one box; -f renders a Go-style template
-                                                                     (`-f '{{{{.State.Status}}}}'`, the common field paths);
+    {c}inspect{z} <name> [--json] [-f|--format T] [--platform P]         Full detail for one box, running or kept (stopped, or between two runs); -f renders a Go-style template
+                                                                     (`-f '{{{{.State.Status}}}}'`, the common field paths; .Image is the image's id, .Config.Image its name);
                                                                      --platform picks an image's entry for that platform
     {c}port{z} <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
     {c}attach{z} <name>                                                  Stream a box's output live (Ctrl-C detaches)

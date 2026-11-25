@@ -3350,6 +3350,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             no_new_privs: spec.effective_no_new_privs(),
             keep_groups: spec.keep_groups,
             image: args.image.unwrap_or("").to_string(),
+            image_id: started_image_id(args.image),
             gpus: args.gpus.unwrap_or("").to_string(),
             timeout_s: args.timeout,
             apparmor: spec.apparmor.clone().unwrap_or_default(),
@@ -6489,6 +6490,7 @@ fn run_detached(
         no_new_privs: spec.effective_no_new_privs(),
         keep_groups: spec.keep_groups,
         image: image.to_string(),
+        image_id: started_image_id(Some(image)),
         gpus: gpus.to_string(),
         timeout_s: timeout,
         apparmor: spec.apparmor.clone().unwrap_or_default(),
@@ -6558,15 +6560,14 @@ fn run_detached(
 
 /// The `ExecStart=` argv of a `--restart` unit, each element quoted for systemd: this binary, then
 /// the DECIDED `invocation` without kern's `-d`/`--restart`, with `--keep` and `--name <name>`
-/// pinned when the command line did not give them (see the notes inside). PURE but for the
-/// refusal of a newline, which would break out of the quoted line.
+/// pinned when the command line did not give them (see the notes inside). PURE.
 fn unit_exec_argv(
     self_exe: &str,
     invocation: Vec<String>,
     name: &str,
     name_given: bool,
     keep: bool,
-) -> Result<Vec<String>, Error> {
+) -> Vec<String> {
     let mut exec = vec![systemd_quote(self_exe)];
     let mut it = invocation.into_iter().peekable();
     let mut past_sep = false;
@@ -6589,16 +6590,7 @@ fn unit_exec_argv(
                 _ => {}
             }
         }
-        // A newline/CR would break out of the quoted `ExecStart` line and could inject a systemd
-        // directive. It can't come from a normal shell, so reject it rather than emit a corrupt unit
-        // (defence in depth - don't rely on systemd itself rejecting the malformed unit).
-        if a.contains(['\n', '\r']) {
-            return Err(Error::Sandbox(
-                "a newline in the command isn't allowed with --restart always \
-                 (it would corrupt the systemd unit)"
-                    .to_string(),
-            ));
-        }
+        // A newline/CR is quoted as its C escape by `systemd_quote`, so it cannot end the line.
         exec.push(systemd_quote(&a));
     }
     // THE BOX KEEPS ITS FILESYSTEM FROM ONE RUN TO THE NEXT, as a container with a restart policy
@@ -6630,7 +6622,7 @@ fn unit_exec_argv(
         }
         exec.splice(at + 1..at + 1, pinned);
     }
-    Ok(exec)
+    exec
 }
 
 /// `--restart always|unless-stopped` + `-d`: write and enable a systemd **user** unit that supervises
@@ -6660,7 +6652,7 @@ fn install_persistent_box(
         name.as_str(),
         name_given,
         keep,
-    )?;
+    );
     // [Service] body. `Restart=always` + `RestartSec=1` for both persistent policies (the
     // stop-survival nuance between `always`/`unless-stopped` is handled by `kern stop` removing the
     // unit). Resource caps go here so systemd's service cgroup enforces them for the managed run.
@@ -8204,6 +8196,21 @@ fn as_box_argv(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
 /// --name web ...`, and `kern start web` refused it as "not a command line this box can be started
 /// from", so a box kept that way could never start again. The name moves to position 1; everything
 /// after the workload's `--` is the workload's and is left as it is.
+/// The ID of the image a box starts from (`sha256:<hex>`), as kern's Docker API and `kern inspect`
+/// report it: the cache entry's content, read now, so a later rebuild of the tag does not move it.
+/// Empty for a `--rootfs` box and for an image not in the cache (a box cannot start from one).
+fn started_image_id(image: Option<&str>) -> String {
+    let Some(r) = image.filter(|r| !r.is_empty()) else {
+        return String::new();
+    };
+    let cache = crate::commands::imagecache::cache_dir();
+    let stem = crate::commands::imagecache::cache_entry_for(&cache, r);
+    if !crate::commands::imagecache::image_present(&cache, &stem) {
+        return String::new();
+    }
+    kern_compat::image_id_for_entry(&cache, &stem, r)
+}
+
 /// Whether a recorded `box <name> ...` argv asks for a restart policy, among kern's flags (before
 /// the `--` of the workload). PURE.
 fn recorded_restart(argv: &[std::ffi::OsString]) -> bool {
@@ -8838,8 +8845,8 @@ mod restart_unit_tests {
             false,
         );
         assert_eq!(
-            unnamed.ok(),
-            Some(q(&[
+            unnamed,
+            q(&[
                 "/k",
                 "run",
                 "--keep",
@@ -8849,7 +8856,7 @@ mod restart_unit_tests {
                 "sh",
                 "-c",
                 "run"
-            ]))
+            ])
         );
         let named = unit_exec_argv(
             "/k",
@@ -8868,8 +8875,8 @@ mod restart_unit_tests {
             true,
         );
         assert_eq!(
-            named.ok(),
-            Some(q(&["/k", "run", "--keep", "--name", "web", "nginx"])),
+            named,
+            q(&["/k", "run", "--keep", "--name", "web", "nginx"]),
             "given flags are not pinned twice"
         );
         let boxed = unit_exec_argv(
@@ -8880,15 +8887,18 @@ mod restart_unit_tests {
             false,
         );
         assert_eq!(
-            boxed.ok(),
-            Some(q(&[
-                "/k", "box", "--keep", "b1", "--image", "alpine", "--", "sh", "-d"
-            ])),
+            boxed,
+            q(&["/k", "box", "--keep", "b1", "--image", "alpine", "--", "sh", "-d"]),
             "a `-d` of the workload stays"
         );
-        assert!(
-            unit_exec_argv("/k", v(&["run", "alpine", "echo", "a\nb"]), "x", true, true).is_err(),
-            "a newline would break out of the ExecStart line"
+        assert_eq!(
+            unit_exec_argv("/k", v(&["run", "alpine", "echo", "a\nb"]), "x", true, true),
+            [
+                q(&["/k", "run", "alpine", "echo"]),
+                vec!["\"a\\nb\"".to_string()]
+            ]
+            .concat(),
+            "a newline is its C escape, so it cannot end the ExecStart line"
         );
     }
 
