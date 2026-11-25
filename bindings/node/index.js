@@ -5248,7 +5248,8 @@ class Sandbox {
    */
   async destroy() {
     if (!this.name) return;
-    await runCapture([this._kern, "stop", this._residentName()], 60000);
+    // `rm -f`: stopped AND removed, so no `ps -a` row outlives a destroyed sandbox.
+    await runCapture([this._kern, "rm", "-f", this._residentName()], 60000);
     this._resident = null;
   }
 
@@ -6274,7 +6275,9 @@ class Sandbox {
     // SIGKILL of kern's parent: (1) `kern stop` (cgroup-kill); (2) SIGKILL the whole process group;
     // (3) SIGKILL the child. kern's own --timeout backstop guarantees the box is gone shortly.
     try {
-      spawnSync(this._kern, ["stop", name], { env: childEnv, timeout: 5000, stdio: "ignore" });
+      // `rm -f`, not `stop`: the same teardown, and no `Exited (137)` row left in `kern ps -a` for an
+      // hour after every timed-out call.
+      spawnSync(this._kern, ["rm", "-f", name], { env: childEnv, timeout: 5000, stdio: "ignore" });
     } catch {
       /* ignore */
     }
@@ -8321,7 +8324,7 @@ class Kernel {
     const child = this._child;
     if (!child) return;
     try {
-      spawnSync(this._sbx._kern, ["stop", this._name], { env: this._childEnv, timeout: 5000, stdio: "ignore" });
+      spawnSync(this._sbx._kern, ["rm", "-f", this._name], { env: this._childEnv, timeout: 5000, stdio: "ignore" });
     } catch {
       /* ignore */
     }

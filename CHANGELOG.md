@@ -124,6 +124,11 @@ as it does under Docker. A block of zeros is a hole now, so it takes the 1 MiB, 
 under Docker.** They answered `ENOSYS`. They are still denied, and never kill under any verdict, as
 software probes them at start; `clone3` keeps `ENOSYS`, which glibc needs to fall back to `clone`.
 
+**A sandbox call that times out leaves no row in `kern ps -a`.** The Python and Node SDKs ended a
+timed-out cell, a destroyed persistent sandbox and a killed kernel cell with `kern stop`, whose exit
+record listed it as `Exited (137)` for an hour; a cell that ended by itself left nothing. They use
+`kern rm -f`, the same teardown with the record removed.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

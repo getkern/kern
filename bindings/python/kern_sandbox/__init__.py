@@ -5714,8 +5714,9 @@ class Sandbox:
         if not self.name:
             return
         try:
+            # `rm -f`: stopped AND removed, so no `ps -a` row outlives a destroyed sandbox.
             subprocess.run(  # noqa: S603 - argv list, no shell
-                [self._kern, "stop", self._resident_name()],
+                [self._kern, "rm", "-f", self._resident_name()],
                 capture_output=True, text=True, timeout=60,
             )
         except (OSError, subprocess.SubprocessError):
@@ -7015,9 +7016,12 @@ class Sandbox:
         teardown (cgroup-kill); (2) SIGKILL the whole process group; (3) SIGKILL the parent. kern's own
         --timeout backstop guarantees the box is gone shortly regardless. We never block here."""
 
+        # `rm -f`, not `stop`: it stops the box the same way, and takes away the exit record a stop
+        # writes, which `kern ps -a` listed for an hour after every timed-out call (MEASURED: a
+        # `pysbx-...  Exited (137)` row per timeout, where a call that ended by itself leaves none).
         try:
             subprocess.run(
-                [self._kern, "stop", name], env=child_env, capture_output=True, timeout=5
+                [self._kern, "rm", "-f", name], env=child_env, capture_output=True, timeout=5
             )
         except (OSError, subprocess.SubprocessError):
             pass
@@ -9347,7 +9351,7 @@ class Kernel:
             if self._name:
                 try:
                     subprocess.run(  # noqa: S603 - argv list, no shell
-                        [self._sbx._kern, "stop", self._name],
+                        [self._sbx._kern, "rm", "-f", self._name],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         timeout=5,
