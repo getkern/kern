@@ -1533,8 +1533,13 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
             // disagreed about what kern knows, and `Labels` appeared in neither. An image's labels
             // are where `org.opencontainers.image.*` lives - source commit, version, licence - so a
             // consumer asking kern for them was told the image has none.
-            "[{{\"RepoTags\":[{}],\"Os\":\"linux\",\"Architecture\":{},\"Size\":{},\"Config\":{{\"Entrypoint\":{},\"Cmd\":{},\"Env\":{},\"WorkingDir\":{},\"User\":{},\"ExposedPorts\":{{{}}},\"StopSignal\":{},\"Labels\":{},\"Healthcheck\":{}}}}}]",
+            "[{{\"RepoTags\":[{}],\"RepoDigests\":[{}],\"Os\":\"linux\",\"Architecture\":{},\"Size\":{},\"Config\":{{\"Entrypoint\":{},\"Cmd\":{},\"Env\":{},\"WorkingDir\":{},\"User\":{},\"ExposedPorts\":{{{}}},\"StopSignal\":{},\"Labels\":{},\"Healthcheck\":{}}}}}]",
             json_str(name),
+            // The repository digest the pull recorded, as Docker lists it (`repo@sha256:...`);
+            // empty for a build, a commit, a load, or an image pulled before it was recorded.
+            cfg.repo_digest.as_deref().map_or_else(String::new, |d| {
+                json_str(&kern_common::repo_digest_ref(name, d))
+            }),
             // DOCKER'S SPELLING FOR THIS FIELD, which is the Go one: `docker image inspect` says
             // `amd64` where `docker info` says `x86_64`, and a consumer compares against a fixed
             // string. Same table as the shim's `--format` renderer, for the same reason.
@@ -1564,6 +1569,7 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
         }
     };
     row("size", &human_bytes(size));
+    row("digest", cfg.repo_digest.as_deref().unwrap_or_default());
     row("entrypoint", &cfg.entrypoint.join(" "));
     row("command", &cfg.cmd.join(" "));
     row("workdir", cfg.workdir.as_deref().unwrap_or(""));

@@ -114,6 +114,11 @@ pub struct ImageConfig {
     /// Set only when the blob was verified against it. `--pull always` compares it with the
     /// registry's before downloading anything (see [`remote_config_digest`]).
     pub digest: Option<String>,
+    /// The repository digest the image was pulled by (`sha256:...` of the manifest the registry
+    /// answered for the reference, an index for a multi-arch image): Docker's `RepoDigests`, and
+    /// what `name@<it>` pulls the very same image again by. `None` for a build, or an entry pulled
+    /// before it was recorded.
+    pub repo_digest: Option<String>,
     /// The config's `architecture` (`amd64`, `arm64`, ...). Read from what was pulled, carried by a
     /// build from its base, stamped by a `--platform` build: what a push writes and what a build for
     /// another platform checks before it reuses an image.
@@ -228,11 +233,23 @@ impl ImageHealthcheck {
 /// `announce` prints the resolving line. `pull` wants it; a `config` that is answering a question
 /// about a file does not, and printing it would put registry traffic in the middle of a dry run's
 /// output with no explanation.
+/// A reference resolved to this platform's manifest: where it is, the manifest, the credentials, and
+/// the REPOSITORY digest, that of the manifest the registry answered for the reference itself (an
+/// index for a multi-arch image), which is what Docker records as `RepoDigests` and what
+/// `name@sha256:...` pulls the same image again by. `None` only when it could not be computed.
+struct Resolved {
+    registry: String,
+    repo: String,
+    manifest: String,
+    auth: Auth,
+    repo_digest: Option<String>,
+}
+
 fn resolve_manifest(
     image: &str,
     platform: Option<&Platform>,
     announce: bool,
-) -> Result<(String, String, String, Auth), OciError> {
+) -> Result<Resolved, OciError> {
     let host = Platform::host();
     let want = platform.unwrap_or(&host);
     if announce {
@@ -245,9 +262,14 @@ fn resolve_manifest(
     // A digest PIN is a content-address: verify the bytes hash to it, so a compromised registry cannot
     // serve a DIFFERENT manifest under a pinned reference (TLS protects the transport, not a malicious
     // or backdoored registry). Only sha256 references reach here as digests; a tag skips this.
-    if reference.starts_with("sha256:") {
+    // That digest is also the repository digest; asked by tag, it is the hash of what the registry
+    // answered, taken before descending into the platform's manifest.
+    let repo_digest = if reference.starts_with("sha256:") {
         verify_digest_bytes(manifest.as_bytes(), &reference)?;
-    }
+        Some(reference.clone())
+    } else {
+        sha256_of(manifest.as_bytes())
+    };
     let manifest = if is_manifest_list(&manifest) {
         // Select the requested arch EXACTLY - no wrong-arch fallback. Under an explicit `--platform`
         // that would silently pull the wrong image; even by default it's safer to error with the list
@@ -272,7 +294,13 @@ fn resolve_manifest(
     } else {
         manifest
     };
-    Ok((registry, repo, manifest, auth))
+    Ok(Resolved {
+        registry,
+        repo,
+        manifest,
+        auth,
+        repo_digest,
+    })
 }
 
 /// An image's runtime CONFIG, fetched WITHOUT downloading a layer.
@@ -296,9 +324,11 @@ pub fn fetch_image_config(
     scratch: &Path,
     platform: Option<&Platform>,
 ) -> Result<ImageConfig, OciError> {
-    let (registry, repo, manifest, auth) = resolve_manifest(image, platform, false)?;
+    let r = resolve_manifest(image, platform, false)?;
     std::fs::create_dir_all(scratch).map_err(|e| OciError::Extract(e.to_string()))?;
-    Ok(fetch_config(&registry, &repo, &manifest, &auth, scratch))
+    let mut config = fetch_config(&r.registry, &r.repo, &r.manifest, &r.auth, scratch);
+    config.repo_digest = r.repo_digest;
+    Ok(config)
 }
 
 /// The config digest the registry names for `image` now, reading the manifest only: no blob, no
@@ -318,10 +348,29 @@ pub fn remote_config_digest_for(
     image: &str,
     platform: Option<&Platform>,
 ) -> Result<String, OciError> {
-    let (registry, repo, manifest, _) = resolve_manifest(image, platform, false)?;
-    object_after(&manifest, "config")
+    remote_digests_for(image, platform).map(|d| d.config)
+}
+
+/// What the registry names for a reference now, from the manifests alone: the config digest (the
+/// image's identity) and the repository digest (see [`ImageConfig::repo_digest`]).
+pub struct RemoteDigests {
+    pub config: String,
+    pub repo: Option<String>,
+}
+
+/// [`RemoteDigests`] of `image` for one platform (`None`: this host's). No blob, no layer.
+pub fn remote_digests_for(
+    image: &str,
+    platform: Option<&Platform>,
+) -> Result<RemoteDigests, OciError> {
+    let r = resolve_manifest(image, platform, false)?;
+    let config = object_after(&r.manifest, "config")
         .and_then(|d| first_str(d, "digest"))
-        .ok_or_else(|| manifest_error(&manifest, &registry, &repo))
+        .ok_or_else(|| manifest_error(&r.manifest, &r.registry, &r.repo))?;
+    Ok(RemoteDigests {
+        config,
+        repo: r.repo_digest,
+    })
 }
 
 /// What an extraction does with an image file's setuid/setgid bit.
@@ -348,7 +397,13 @@ pub fn pull(
     platform: Option<&Platform>,
     setuid: SetuidBits,
 ) -> Result<ImageConfig, OciError> {
-    let (registry, repo, manifest, auth) = resolve_manifest(image, platform, true)?;
+    let Resolved {
+        registry,
+        repo,
+        manifest,
+        auth,
+        repo_digest,
+    } = resolve_manifest(image, platform, true)?;
 
     let layers = layer_digests(&manifest);
     if layers.is_empty() {
@@ -389,7 +444,8 @@ pub fn pull(
     download_large_layers_ranged(&registry, &repo, &manifest, &layers, &auth, dest);
     // The image's runtime config (entrypoint/env/…) - now usually already fetched above; `fetch_config`
     // reuses the pre-downloaded tmp when present. Best-effort: a missing/odd config yields defaults.
-    let config = fetch_config(&registry, &repo, &manifest, &auth, dest);
+    let mut config = fetch_config(&registry, &repo, &manifest, &auth, dest);
+    config.repo_digest = repo_digest;
     // PREFETCH: download layer K+1 concurrently while layer K is verified + extracted + merged. The
     // per-layer download command is UNCHANGED (same TLS pin, auth, timeouts) - only the SCHEDULING
     // overlaps the next layer's network with the current layer's CPU (decompress/extract). Extract +
@@ -559,6 +615,8 @@ fn parse_image_config(blob: &str) -> ImageConfig {
         healthcheck: healthcheck_after(cfg),
         // Set by the caller, which holds the digest the blob was verified against.
         digest: None,
+        // Set by the pull, which holds the manifest the reference resolved to.
+        repo_digest: None,
         architecture: first_str(blob, "architecture").and_then(nonempty),
     }
 }
@@ -2440,6 +2498,27 @@ fn hash_and_compare(file: &Path, digest: &str) -> Result<FileIdentity, OciError>
 /// but WITHOUT a temp file - a manifest is already in memory and small. Refuses a non-sha256 algorithm
 /// (no free pass for an unverified algorithm). sha256sum reads the bytes on stdin and emits its hash
 /// only after EOF, so a blocking `write_all` of a small manifest cannot deadlock on the stdout pipe.
+/// sha256 of `bytes` as `sha256:<hex>`, via `sha256sum` like every digest kern-oci computes; `None`
+/// when it cannot be had, never a made-up value.
+pub(crate) fn sha256_of(bytes: &[u8]) -> Option<String> {
+    use std::io::Write;
+    let mut child = Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Written and closed before the wait, so `sha256sum` sees its end of input.
+    let wrote = child.stdin.take().map(|mut si| si.write_all(bytes));
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() || !matches!(wrote, Some(Ok(()))) {
+        return None;
+    }
+    let hex = String::from_utf8_lossy(&out.stdout);
+    let h = hex.split_whitespace().next()?;
+    (h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("sha256:{h}"))
+}
+
 fn verify_digest_bytes(bytes: &[u8], digest: &str) -> Result<(), OciError> {
     let Some(expected) = digest.strip_prefix("sha256:") else {
         return Err(OciError::Registry(format!(
@@ -4611,6 +4690,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The repository digest is the sha256 of the bytes the registry answered, the known vector.
+    #[test]
+    fn sha256_of_is_the_digest_of_the_bytes() {
+        if std::process::Command::new("sha256sum")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skip: no sha256sum here");
+            return;
+        }
+        assert_eq!(
+            sha256_of(b"abc").as_deref(),
+            Some("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
     }
 
     #[test]

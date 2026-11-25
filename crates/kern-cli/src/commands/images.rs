@@ -20,7 +20,7 @@ use super::*;
 /// follows carries no `/`: `localhost:5000/app` is a host and a path, not a repository and a tag,
 /// and splitting it there would name a repository that does not exist. A reference with no tag
 /// renders `latest`, which is the tag it resolves to.
-fn render_image_format(tmpl: &str, e: &ImageEntry) -> Result<String, Error> {
+fn render_image_format(tmpl: &str, e: &ImageEntry, digest: Option<&str>) -> Result<String, Error> {
     let (repo, tag) = match e.name.rsplit_once(':') {
         Some((r, t)) if !t.contains('/') => (r, t),
         _ => (e.name.as_str(), "latest"),
@@ -45,10 +45,12 @@ fn render_image_format(tmpl: &str, e: &ImageEntry) -> Result<String, Error> {
             ".Reference" | ".ID" | ".Id" => out.push_str(&crate::ui::scrub(&e.name)),
             ".Size" => out.push_str(&kern_common::fmt_bytes(e.size)),
             ".Dangling" => out.push_str(&e.dangling.to_string()),
+            // The repository digest recorded at the pull, `<none>` as Docker prints a missing one.
+            ".Digest" => out.push_str(digest.unwrap_or("<none>")),
             _ => {
                 return Err(Error::Usage(
                     "images --format: unsupported token (supported: {{.Repository}} {{.Tag}} \
-                     {{.Reference}} {{.Size}} {{.Dangling}}; {{.ID}} is accepted and renders the \
+                     {{.Reference}} {{.Size}} {{.Dangling}} {{.Digest}}; {{.ID}} is accepted and renders the \
                      REFERENCE, not a content digest, so two tags of one image differ there. kern \
                      keeps no creation date, only when this machine pulled it - use --json)",
                 ))
@@ -250,7 +252,18 @@ fn unclaimed_cache_note(cache: &std::path::Path) -> String {
     )
 }
 
-pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) -> Result<(), Error> {
+/// The repository digest recorded at the pull of cached image `name`, `None` when it has none (a
+/// build, a commit, a load, or a pull from before it was recorded).
+pub(crate) fn repo_digest_of(name: &str) -> Option<String> {
+    read_image_config(&cache_dir().join(format!("{}.image", sanitize_ref(name)))).repo_digest
+}
+
+pub fn images(
+    json: bool,
+    digests: bool,
+    filters: &[(String, String)],
+    format: Option<&str>,
+) -> Result<(), Error> {
     // FILTERED ONCE, BEFORE EITHER RENDERER, so the human table and `--json` describe the same set
     // by construction - the property a script comparing the two would otherwise take on trust.
     let (listing, cache_bytes) = image_entries_in(&cache_dir(), crate::listing::Detail::Read);
@@ -285,16 +298,37 @@ pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) ->
     // caller's own shape. An empty result prints NOTHING here rather than the table's "no images"
     // sentence: a caller piping this into a loop must get zero lines, not one line of prose it
     // would then try to parse as an image name.
+    // THE DIGEST IS READ ONLY WHEN IT IS ASKED FOR: it lives in each image's sidecar, and a sidecar
+    // read per image is what the listing must not pay for output that does not show it (see the
+    // `label=` filter below). MEASURED: 0.44 ms more per `images --json` over 85 images, which
+    // every caller of the JSON paid, kern's Docker API on each image inspect included. `--digests`
+    // asks for it (the column, and `repo_digest` in `--json`), and so does a template naming it.
+    let want_digest = digests || format.is_some_and(|t| t.contains(".Digest"));
+    let digest_of: Vec<Option<String>> = rows
+        .iter()
+        .map(|e| want_digest.then(|| repo_digest_of(&e.name)).flatten())
+        .collect();
     if let Some(tmpl) = format {
-        for e in &rows {
-            println!("{}", render_image_format(tmpl, e)?);
+        for (e, d) in rows.iter().zip(&digest_of) {
+            println!("{}", render_image_format(tmpl, e, d.as_deref())?);
         }
         return Ok(());
     }
     if json {
-        let out = kern_common::json_array(&rows, |e| {
+        let rows_d: Vec<(&ImageEntry, &Option<String>)> = rows.iter().zip(&digest_of).collect();
+        let out = kern_common::json_array(&rows_d, |(e, d)| {
+            // `repo_digest` with `--digests` only, `null` where none was recorded: absent, it was
+            // not read, which is not the same as there being none.
+            let digest = if digests {
+                format!(
+                    ",\"repo_digest\":{}",
+                    d.as_deref().map_or_else(|| "null".to_string(), json_str)
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{{\"image\":{},\"size_bytes\":{},\"pulled\":{},\"dangling\":{}}}",
+                "{{\"image\":{},\"size_bytes\":{},\"pulled\":{},\"dangling\":{}{digest}}}",
                 json_str(&e.name),
                 e.size,
                 e.pulled,
@@ -336,8 +370,14 @@ pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) ->
         }
     } else {
         let p = crate::ui::Palette::detect();
+        // `--digests` adds Docker's DIGEST column, `<none>` where none was recorded.
+        let digest_head = if digests {
+            format!("{:<71} ", "DIGEST")
+        } else {
+            String::new()
+        };
         println!(
-            "{d}{:<30} {:>9}  PULLED{z}",
+            "{d}{:<30} {digest_head}{:>9}  PULLED{z}",
             "REPOSITORY",
             "SIZE",
             d = p.d,
@@ -345,9 +385,14 @@ pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) ->
         );
         let now = registry::now_unix();
         let mut dangling = 0usize;
-        for e in &rows {
+        for (e, d) in rows.iter().zip(&digest_of) {
             // `truncate` also strips escapes - the `.ok` sentinel content is untrusted.
             let repo = format!("{}{}{:<30}{}", p.b, p.c, truncate(&e.name, 30), p.z);
+            let digest = if digests {
+                format!("{:<71} ", d.as_deref().unwrap_or("<none>"))
+            } else {
+                String::new()
+            };
             // A dangling image shows an explicit `dangling` (yellow), never a `0 B` that reads as "empty".
             let size = if e.dangling {
                 dangling += 1;
@@ -355,7 +400,10 @@ pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) ->
             } else {
                 format!("{:>9}", human_bytes(e.size))
             };
-            println!("{repo} {size}  {}", fmt_age(now.saturating_sub(e.pulled)));
+            println!(
+                "{repo} {digest}{size}  {}",
+                fmt_age(now.saturating_sub(e.pulled))
+            );
         }
         if dangling > 0 {
             // `kern rmi <image>` and nothing else. This line used to offer `kern gc` as an
@@ -610,6 +658,47 @@ pub fn pull(
 /// transfers). Re-fetching bytes already on disk is the wrong default for a tool whose argument is
 /// that it does not waste anything, and "make sure it is cached" is what a pull is for. A deliberate
 /// refresh is `kern box --image <ref> --pull always`, which the message points at.
+/// An image cached before its repository digest was recorded gets it at an explicit `kern pull`:
+/// the manifest alone is read (no layer), and when the config digest it names is the one the cache
+/// holds, it is the same image and its digest is written beside it. A tag that has moved names
+/// another image, whose digest would be a lie about this one, so nothing is written and the note
+/// says how to fetch the new one. Offline, or for an image the registry no longer has, the entry is
+/// left as it is; a pull of a cached image never fails for this.
+fn record_repo_digest(image: &str, key: &str, held: &kern_oci::ImageConfig, quiet: bool) {
+    let Some(local) = held.digest.as_deref() else {
+        return; // a build or a commit: no registry names it
+    };
+    let remote = match kern_oci::remote_digests_for(
+        image,
+        super::imagecache::image_platform().as_ref(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            if !quiet {
+                eprintln!("kern: note: '{image}' has no recorded repository digest, and the registry could not be asked for it ({e})");
+            }
+            return;
+        }
+    };
+    match remote.repo {
+        Some(repo) if remote.config == local => {
+            let mut cfg = held.clone();
+            cfg.repo_digest = Some(repo);
+            let cache = cache_dir();
+            let cfgfile = cache.join(format!("{key}.image"));
+            super::imagecache::replace_image_config(&cache, key, &cfgfile, &cfg);
+        }
+        _ if remote.config != local && !quiet => {
+            eprintln!(
+                "kern: note: '{image}' now names another image at the registry, so the cached \
+                     one keeps no repository digest; `kern box <name> --image {image} --pull \
+                     always` fetches the new one"
+            );
+        }
+        _ => {}
+    }
+}
+
 fn pull_into_cache(image: &str, quiet: bool) -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
     // Was it already there? Asked BEFORE the fetch, so the message can distinguish "downloaded" from
@@ -621,7 +710,10 @@ fn pull_into_cache(image: &str, quiet: bool) -> Result<(), Error> {
     // "Already cached" must mean RUNNABLE, not "a sentinel file exists". Asked with the same predicate
     // the pull itself uses, so the message cannot claim a hit the resolver treated as a miss.
     let had = cache_entry_complete(&cache_dir(), &key);
-    let (layers, _cfg) = resolve_image_depth(image, 0, PullPolicy::Missing)?;
+    let (layers, cfg) = resolve_image_depth(image, 0, PullPolicy::Missing)?;
+    if had && cfg.repo_digest.is_none() {
+        record_repo_digest(image, &key, &cfg, quiet);
+    }
     // Where the image lives: its own directory, which is the TOP layer. A locally built image rests
     // on base layers too, and this used to print them all joined by `:`, the same text that could
     // not be told apart from a `:` inside a path.
@@ -1111,6 +1203,8 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         healthcheck: None,
         // A local snapshot: no registry names it, so `--pull always` has nothing to compare.
         digest: None,
+        // Nor a repository digest: `docker commit` leaves `RepoDigests` empty too.
+        repo_digest: None,
         // The box ran on this machine, so its filesystem is this machine's architecture.
         architecture: Some(kern_oci::Platform::host().as_oci_arch().to_string()),
     };
@@ -1205,7 +1299,7 @@ mod glob_tests {
             pulled: 0,
             dangling: false,
         };
-        let r = |name: &str, t: &str| render_image_format(t, &row(name)).unwrap();
+        let r = |name: &str, t: &str| render_image_format(t, &row(name), None).unwrap();
         assert_eq!(r("alpine:3.19", "{{.Repository}}:{{.Tag}}"), "alpine:3.19");
         // NO TAG resolves to `latest`, which is the tag it actually resolves to.
         assert_eq!(r("alpine", "{{.Repository}}:{{.Tag}}"), "alpine:latest");
@@ -1225,8 +1319,14 @@ mod glob_tests {
         assert!(r("alpine:3.19", "{{.Size}}").contains('M'));
         // An unknown token is REFUSED, not rendered empty: blank columns read as "this image has
         // no tag" to whatever parses the line.
-        assert!(render_image_format("{{.CreatedSince}}", &row("alpine")).is_err());
-        assert!(render_image_format("{{.Repository}", &row("alpine")).is_err());
+        assert!(render_image_format("{{.CreatedSince}}", &row("alpine"), None).is_err());
+        assert!(render_image_format("{{.Repository}", &row("alpine"), None).is_err());
+        // The repository digest the pull recorded, `<none>` as Docker prints a missing one.
+        assert_eq!(
+            render_image_format("{{.Digest}}", &row("alpine"), Some("sha256:ab")).ok(),
+            Some("sha256:ab".to_string())
+        );
+        assert_eq!(r("alpine", "{{.Digest}}"), "<none>");
     }
 
     /// The census behind "N entries that no image claims", driven against a synthetic wreck rather

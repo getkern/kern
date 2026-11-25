@@ -327,6 +327,19 @@ pub fn json_array<T>(items: &[T], mut render: impl FnMut(&T) -> String) -> Strin
     out
 }
 
+/// Docker's `RepoDigests` entry for image `name` pulled by `digest`: the repository without its tag,
+/// `@`, the digest (`alpine:3.19` + `sha256:ab` -> `alpine@sha256:ab`). A `localhost:5000/app` keeps
+/// its port, and a reference already `repo@sha256:...` keeps its repository. One rule for the CLI
+/// (`kern inspect`) and the Docker API, so the two cannot spell the same image differently.
+pub fn repo_digest_ref(name: &str, digest: &str) -> String {
+    let repo = name.split('@').next().unwrap_or(name);
+    let repo = match repo.rsplit_once(':') {
+        Some((r, t)) if !t.contains('/') => r,
+        _ => repo,
+    };
+    format!("{repo}@{digest}")
+}
+
 /// Escape `s` as a JSON string literal, quotes included.
 ///
 /// Lives here and not next to one emitter because FIVE verbs print JSON (`ps`, `images`, `stats`,
@@ -631,6 +644,29 @@ macro_rules! progress {
 
 #[cfg(test)]
 mod tests {
+
+    /// Docker's `RepoDigests` shape: the repository, its registry port kept, without the tag.
+    #[test]
+    fn repo_digest_ref_drops_the_tag_and_keeps_a_port() {
+        assert_eq!(
+            repo_digest_ref("alpine:3.19", "sha256:ab"),
+            "alpine@sha256:ab"
+        );
+        assert_eq!(repo_digest_ref("alpine", "sha256:ab"), "alpine@sha256:ab");
+        assert_eq!(
+            repo_digest_ref("localhost:5000/app:1", "sha256:ab"),
+            "localhost:5000/app@sha256:ab"
+        );
+        assert_eq!(
+            repo_digest_ref("localhost:5000/app", "sha256:ab"),
+            "localhost:5000/app@sha256:ab"
+        );
+        assert_eq!(
+            repo_digest_ref("ghcr.io/o/a@sha256:ab", "sha256:ab"),
+            "ghcr.io/o/a@sha256:ab"
+        );
+    }
+
     use super::*;
 
     /// THE GATE ANSWERS FOR THE STREAM THE USER READS, once someone has said what it is.

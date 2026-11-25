@@ -302,6 +302,12 @@ pub(crate) fn write_image_config(
     if let Some(d) = &c.digest {
         line("digest", d);
     }
+    // ADDITIVE, no format bump: an entry written before it has no line and reads as `None` (an
+    // unknown repository digest, `<none>` as Docker prints it); a bump would send every old entry
+    // down the repair path for a field nothing depends on.
+    if let Some(d) = &c.repo_digest {
+        line("repodigest", d);
+    }
     if let Some(a) = &c.architecture {
         line("arch", a);
     }
@@ -359,6 +365,7 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
             }
             "stopsignal" => c.stop_signal = Some(v.to_string()),
             "digest" => c.digest = Some(v.to_string()),
+            "repodigest" => c.repo_digest = Some(v.to_string()),
             "arch" => c.architecture = Some(v.to_string()),
             "hctest" => c
                 .healthcheck
@@ -435,8 +442,19 @@ fn refresh_image_config(
             read_image_config(cfgfile)
         }
     };
+    replace_image_config(cache, safe, cfgfile, &config);
+}
+
+/// Replace an image's config sidecar in one `rename`, so a box starting meanwhile reads the old file
+/// or the new one, never half of one. Best effort: on failure the old file stays.
+pub(crate) fn replace_image_config(
+    cache: &std::path::Path,
+    safe: &str,
+    cfgfile: &std::path::Path,
+    config: &kern_oci::ImageConfig,
+) {
     let tmp = cache.join(format!("{safe}.image-{}", std::process::id()));
-    if write_image_config(&tmp, &config).is_err() || std::fs::rename(&tmp, cfgfile).is_err() {
+    if write_image_config(&tmp, config).is_err() || std::fs::rename(&tmp, cfgfile).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -1900,14 +1918,21 @@ pub(crate) fn pull_to_cache(
         // `kern_oci::remote_config_digest` for the measurement. An entry recorded before the digest
         // was kept, or a registry that cannot answer, takes the full re-pull below, as before.
         if cache_entry_complete(&cache, &safe) {
-            let held = read_image_config(&cfgfile);
+            let mut held = read_image_config(&cfgfile);
             if let (Some(local), Ok(remote)) = (
-                held.digest.as_deref(),
-                kern_oci::remote_config_digest_for(image, platform.as_ref()),
+                held.digest.clone(),
+                kern_oci::remote_digests_for(image, platform.as_ref()),
             ) {
                 // An entry an older kern extracted without setuid bits is NOT up to date, whatever
                 // its digest: re-extracting is the only way to get them back (see `SetuidBits`).
-                if local == remote && setuid_kept(&cache, &safe) {
+                if local == remote.config && setuid_kept(&cache, &safe) {
+                    // The same image, and the manifest just read names its repository digest:
+                    // recorded when it is new (an entry from before it was kept, or a tag whose
+                    // index moved while this platform's image stayed the same).
+                    if remote.repo.is_some() && remote.repo != held.repo_digest {
+                        held.repo_digest = remote.repo;
+                        replace_image_config(&cache, &safe, &cfgfile, &held);
+                    }
                     kern_common::progress!("✓ image '{image}' is up to date (--pull always)");
                     return Ok((dir.to_string_lossy().into_owned(), held));
                 }

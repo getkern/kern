@@ -37,6 +37,15 @@ image and execs into it: `--mount`, `exec -i`, and `docker events` for the conta
 container keeps its filesystem until `docker rm` (a kept box), so the `docker start` of a reopen
 runs it again on the same files; `--rm` containers and a Testcontainers run's stay in memory.
 
+**A pull records the image's repository digest, and `kern images --digests` shows it.** It is the
+digest of the manifest the registry answered for the reference (the index of a multi-arch image),
+what Docker lists as `RepoDigests` and what `name@sha256:...` pulls the same image again by:
+`images --digests` adds the DIGEST column, `--format {{.Digest}}` and `--json --digests` give it,
+`kern inspect --json` of an image lists `RepoDigests`, and so does kern's Docker API. A build, a
+commit and a load have none, as with Docker. An image cached before gets it at the next
+`kern pull` of it, from the manifest alone, when the registry still names the same image. Measured
+against Docker Hub's `Docker-Content-Digest`: `alpine:3.21` and `alpine:3.19` match.
+
 **A port published through kern's Docker API with no address is on every address.** `HostIp` left
 empty became `0.0.0.0`, IPv4 alone, where Docker binds `0.0.0.0` and `::`; a Windows client asking
 for `localhost` (.NET, PowerShell) tries `::1` first and waited 2068 ms for its refusal on every new

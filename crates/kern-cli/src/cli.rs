@@ -552,6 +552,8 @@ pub enum Command {
     /// `kern images [--json]`: list pulled (cached) images.
     Images {
         json: bool,
+        /// `--digests`: a DIGEST column, each image's repository digest (Docker's flag).
+        digests: bool,
         /// `--filter reference=<pattern>` / `--filter dangling=<bool>`, repeatable and ANDed. The
         /// two keys kern's cache can answer; any other is refused at parse time by name. A
         /// positional `images <repo>` lands here too, as `reference=<repo>`.
@@ -1462,7 +1464,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `images`: list pulled (cached) images.
         Some("images") => {
-            reject_unknown_flags("images", &rest, &["--json", "--filter", "--format"])?;
+            reject_unknown_flags(
+                "images",
+                &rest,
+                &["--json", "--digests", "--filter", "--format"],
+            )?;
             // `--filter` with the two keys a cache actually has an answer for. Docker's other keys
             // (`before=`, `since=`, `label=`) need per-image metadata kern's cache does not keep, so
             // they are refused BY NAME rather than accepted and ignored: a filter that silently
@@ -1535,6 +1541,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
             Command::Images {
                 json: rest.contains(&"--json"),
+                digests: rest.contains(&"--digests"),
                 filters,
                 format: flag_value(&rest, "--format"),
             }
@@ -7005,9 +7012,10 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Search { query, json } => commands::search(&query, json),
         Command::Images {
             json,
+            digests,
             filters,
             format,
-        } => commands::images(json, &filters, format.as_deref()),
+        } => commands::images(json, digests, &filters, format.as_deref()),
         Command::Rmi { images, force } => commands::image_rm_with(&images, force),
         Command::Save { image, out } => commands::save(&image, out.as_deref()),
         Command::Load { input } => commands::load(input.as_deref()),

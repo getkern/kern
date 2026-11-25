@@ -1190,9 +1190,15 @@ fn pull(bin: &Path, req: &Request) -> Response {
     }
 }
 
-/// The local image cache, as `kern images --json` lists it.
-fn kern_images(bin: &Path) -> Vec<Value> {
-    let (_, out, _) = kern(bin, &["images", "--json"]);
+/// The local image cache, as `kern images --json` lists it; with `digests`, each image's
+/// repository digest too (`repo_digest`), which costs a read per image and only the list shows.
+fn kern_images(bin: &Path, digests: bool) -> Vec<Value> {
+    let args: &[&str] = if digests {
+        &["images", "--json", "--digests"]
+    } else {
+        &["images", "--json"]
+    };
+    let (_, out, _) = kern(bin, args);
     json::parse(out.trim())
         .ok()
         .and_then(|v| v.as_array().map(<[Value]>::to_vec))
@@ -1257,7 +1263,7 @@ fn image_list(bin: &Path, req: &Request) -> Response {
     let dangling = filter_values(&filters, "dangling");
     let dangling = dangling.first().map(|d| d == "true" || d == "1");
     let mut items = Vec::new();
-    for i in kern_images(bin) {
+    for i in kern_images(bin, true) {
         let Some(n) = i.get("image").and_then(Value::as_str) else {
             continue;
         };
@@ -1273,8 +1279,15 @@ fn image_list(bin: &Path, req: &Request) -> Response {
             json_str(n)
         };
         let size = i.get("size_bytes").and_then(Value::as_i64).unwrap_or(0);
+        // `repo@sha256:...`, as Docker lists the digest a pull recorded; none for a build.
+        let digests = i
+            .get("repo_digest")
+            .and_then(Value::as_str)
+            .map_or_else(String::new, |d| {
+                json_str(&kern_common::repo_digest_ref(n, d))
+            });
         items.push(format!(
-            "{{\"Id\":{},\"ParentId\":\"\",\"RepoTags\":[{tags}],\"RepoDigests\":[],\"Created\":{},\"Size\":{size},\"SharedSize\":-1,\"VirtualSize\":{size},\"Labels\":{{}},\"Containers\":-1}}",
+            "{{\"Id\":{},\"ParentId\":\"\",\"RepoTags\":[{tags}],\"RepoDigests\":[{digests}],\"Created\":{},\"Size\":{size},\"SharedSize\":-1,\"VirtualSize\":{size},\"Labels\":{{}},\"Containers\":-1}}",
             json_str(&format!("sha256:{}", id_of(n))),
             i.get("pulled").and_then(Value::as_i64).unwrap_or(0).max(0),
         ));
@@ -1289,7 +1302,7 @@ fn image_inspect(bin: &Path, name: &str) -> Response {
     } else {
         format!("{name}:latest")
     };
-    let found = kern_images(bin).into_iter().find(|i| {
+    let found = kern_images(bin, false).into_iter().find(|i| {
         i.get("image")
             .and_then(Value::as_str)
             .is_some_and(|n| n == name || n == want_latest || n.split('@').next() == Some(name))
@@ -1307,7 +1320,8 @@ fn image_inspect(bin: &Path, name: &str) -> Response {
         Some(members) if code == 0 => json_response(
             200,
             format!(
-                "{{\"Id\":{},\"RepoDigests\":[],\"Created\":{},{members}}}",
+                // `RepoDigests` is in kern's own object, with the tags.
+                "{{\"Id\":{},\"Created\":{},{members}}}",
                 json_str(&format!("sha256:{}", id_of(n))),
                 json_str(&rfc3339(
                     i.get("pulled").and_then(Value::as_i64).unwrap_or(0).max(0) as u64

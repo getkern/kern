@@ -1304,6 +1304,9 @@ fn build_run(
     }
     let (base_lower, base_cfg) = resolve_image(base_ref)?;
     let mut config = base_cfg;
+    // The base's repository digest names the base's manifest, not this image: a build has none,
+    // as Docker's `RepoDigests` of a built image is empty until it is pushed.
+    config.repo_digest = None;
 
     // Choose the build strategy: layered (overlay, no base copy) unless the user forces a flat build
     // (`KERN_BUILD_FLAT=1`, an escape hatch for a misbehaving overlay) or the probe says overlay

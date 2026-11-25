@@ -2555,6 +2555,9 @@ mod net_resource_tests {
             digest: Some(
                 "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
             ),
+            repo_digest: Some(
+                "sha256:4bc453b53cb3d914b45f4b250294236adba2c0e09ff6f03793949e7e39fd4cc1".into(),
+            ),
             architecture: Some("arm64".into()),
         };
         let path =
@@ -2971,6 +2974,9 @@ mod net_resource_tests {
             }),
             digest: Some(
                 "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+            ),
+            repo_digest: Some(
+                "sha256:4bc453b53cb3d914b45f4b250294236adba2c0e09ff6f03793949e7e39fd4cc1".into(),
             ),
             architecture: Some("arm64".into()),
         };

@@ -159,29 +159,11 @@ pub(crate) fn tar_rootfs_root_owned(rootfs: &Path, out: &Path) -> Result<(), Oci
     Ok(())
 }
 
-/// sha256 of an in-memory byte slice → `sha256:<hex>`, via `sha256sum` (coreutils).
+/// sha256 of an in-memory byte slice → `sha256:<hex>`, via `sha256sum` (coreutils); all zeros when
+/// it cannot be had, which this module's callers compare against and never record.
 fn sha256_bytes(bytes: &[u8]) -> String {
-    use std::io::Write;
     const ZERO: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-    let Ok(mut child) = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-    else {
-        return ZERO.into(); // shouldn't happen - sha256sum is a coreutils staple used across kern-oci
-    };
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(bytes);
-    }
-    if let Ok(out) = child.wait_with_output() {
-        let hex = String::from_utf8_lossy(&out.stdout);
-        if let Some(h) = hex.split_whitespace().next() {
-            if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return format!("sha256:{h}");
-            }
-        }
-    }
-    ZERO.into()
+    crate::pull::sha256_of(bytes).unwrap_or_else(|| ZERO.into())
 }
 
 // ── load ────────────────────────────────────────────────────────────────────────────────────────
@@ -394,6 +376,8 @@ fn parse_image_config(json: &str) -> ImageConfig {
         healthcheck: crate::pull::healthcheck_after(cfg),
         // Nothing to compare a registry against: a loaded archive has no tag to re-pull.
         digest: None,
+        // A loaded archive came from no registry, as Docker leaves its `RepoDigests` empty.
+        repo_digest: None,
         architecture: str_field(json, "architecture").filter(|s| !s.is_empty()),
     }
 }
