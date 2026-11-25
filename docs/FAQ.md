@@ -56,6 +56,13 @@ on the Mac that runs it there ([docs/INSTALL.md](INSTALL.md#macos)). Any other L
 **Which guest you pick changes how much of kern you get**, and the gap is bigger than it looks. Both
 options below have been observed rather than assumed, and they are not equivalent.
 
+**The VM the installer creates runs the whole runtime.** Measured on an Apple Silicon Mac (macOS 27,
+Lima 2.3.0) from nothing: the install line downloads Ubuntu 24.04 LTS minimal (200 MiB) and has kern
+ready in about two and a half minutes. A box starts, nginx and redis (images that switch to a service
+user) start, a box given `--memory 64m` is OOM-killed when it reaches 100 MB, and `--net` reaches the
+internet. The installer puts kern's AppArmor profile and `uidmap` in that VM, which are the two
+things a stock Ubuntu guest lacks.
+
 **A Fedora guest gives the whole runtime.** A user on Apple Silicon running Lima with Fedora 43
 (`6.17.1-300.fc43.aarch64`) posted their `kern doctor` in
 [issue #5](https://github.com/getkern/kern/issues/5): 16 ok and one warning. Unprivileged user
@@ -65,9 +72,9 @@ lingering on, unprivileged overlayfs, `newuidmap`, `pasta`, and Landlock ABI v7.
 was a missing `sshfs`. Nothing switched off. Their host, their output, reported rather than measured
 here, which is why it is attributed: Lima's own template list is the place to get a Fedora guest.
 
-**An Ubuntu guest works, with two things switched off.** Verified directly, on a MacBook with Apple
-Silicon and an Ubuntu 24.04 guest (colima 0.10.3): kern installs, a box from an OCI image starts,
-and the Python SDK drives it. What you give up on that guest:
+**A colima Ubuntu guest works, with two things switched off.** Verified directly, on a MacBook with
+Apple Silicon and an Ubuntu 24.04 guest of colima 0.10.3 (not the VM the installer creates): kern
+installs, a box from an OCI image starts, and the Python SDK drives it. What you give up there:
 
 - **The first box fails on AppArmor**, because Ubuntu 23.10 and newer restrict unprivileged user
   namespaces. `kern doctor` names it first and prints the fix
@@ -79,11 +86,11 @@ and the Python SDK drives it. What you give up on that guest:
   there without being asked. The isolation itself (namespaces,
   pivoted root, seccomp, Landlock) is unaffected.
 
-Neither of those applies to the Fedora guest above, which is the whole reason both are documented
-instead of one.
+Neither of those applies to the installer's VM or to the Fedora guest above, which is the whole
+reason they are documented separately.
 
-Whichever guest you pick, **no GPU and no GPIO** are reachable from a Linux VM on a Mac. Apple
-exposes neither, which is why Docker Desktop has no GPU for containers either.
+Whichever guest you pick, **no GPU** is reachable from a Linux VM on a Mac: Apple does not expose one
+to it.
 
 [docs/INSTALL.md](INSTALL.md) has the detail and the way back to enforced caps.
 

@@ -69,8 +69,8 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-On macOS kern runs in a small Lima VM, created automatically, with no Docker inside; `kern` on the
-Mac runs it there, in the current directory. Kern Sandbox goes in the VM, with the code that calls
+On macOS kern runs in a small Lima VM, created automatically (Ubuntu 24.04 minimal, about 200 MB to
+download, once), with no Docker inside; `kern` on the Mac runs it there, in the current directory. Kern Sandbox goes in the VM, with the code that calls
 it: `limactl shell kern`, then `pip install kern-sandbox` there.
 
 Then `kern doctor` checks the host and says what to fix. Ubuntu 23.10 and newer need one root step
