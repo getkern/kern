@@ -1005,6 +1005,22 @@ mod tests {
             ),
             "install.ps1"
         );
+        // kern.exe checks its own update with the same two, and with nothing else: the code before
+        // its tests carries exactly these two public keys.
+        let win = std::fs::read_to_string(root.join("windows/kern-win/src/selfupdate.rs"))
+            .unwrap_or_default();
+        let code = win.split("#[cfg(test)]").next().unwrap_or_default();
+        for (id, key) in RELEASE_KEYS {
+            assert!(
+                code.contains(&format!("\"{id}\"")) && code.contains(&format!("\"{key}\"")),
+                "kern.exe lacks key {id}"
+            );
+        }
+        assert_eq!(
+            code.matches("\"RW").count(),
+            2,
+            "kern.exe carries a key kern does not"
+        );
         // And docs/INSTALL.md, which shows the reader how to check a file by hand with them.
         let doc = std::fs::read_to_string(root.join("docs/INSTALL.md")).unwrap_or_default();
         for (id, key) in RELEASE_KEYS {

@@ -195,7 +195,13 @@ kern self-update --rollback   # put back the binary the last update replaced
 ```
 
 A kern that pip, npm, cargo or a package manager installed is updated by that tool, and
-`self-update` says which command to run. On Windows, run `install.ps1` again.
+`self-update` says which command to run.
+
+On Windows, `kern self-update` typed in Windows updates both halves: the kern in the distro first,
+then `kern.exe`, to the `kern-windows-x86_64.exe` of the release the distro now runs. `kern.exe`
+checks that file's signature itself, with the same two keys, before it replaces anything; the one it
+replaced stays as `kern.exe.previous` for `--rollback`. `install.ps1` run again does the same with a
+fresh distro.
 
 ## Uninstall
 

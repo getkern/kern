@@ -1,5 +1,5 @@
 # kern.exe - the Windows→WSL2 bridge. kern is one Linux binary; on Windows the edge is a thin shim
-# that forwards to kern running inside a WSL2 distro. Zero dependencies (std only), like kern itself.
+# that forwards to kern running inside a WSL2 distro. One dependency: minisign's verifier (see below).
 #
 # This crate is OUTSIDE the main workspace (see the root Cargo.toml `exclude`) so the normal Linux
 # `cargo build`/`clippy`/`test` never tries to build a Windows target. The release CI cross-compiles it:
@@ -16,7 +16,11 @@ license = "Apache-2.0"
 name = "kern"          # ships as kern.exe on Windows
 path = "src/main.rs"
 
-[dependencies]           # zero - std only, like kern itself
+[dependencies]
+# ONE, for one job: checking the signature of its own update (`kern self-update`). minisign's own
+# verifier, by minisign's author, with no dependencies of its own, pinned exactly as `kern` pins it:
+# a signature check is not code to take new versions of without reading them.
+minisign-verify = "=0.3.0"
 
 [profile.release]
 opt-level = "z"
