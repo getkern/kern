@@ -651,6 +651,23 @@ pub fn serve(listen: Listen, kern: PathBuf, idle: Option<Duration>) -> Result<()
     eprintln!("kern: the Docker API, answered by kern, on {shown}");
     LAST_END.store(monotonic_secs(), Ordering::Release);
     loop {
+        // A SERVER WHOSE BINARY WAS REPLACED STEPS ASIDE as soon as it holds nothing: the next
+        // connection waits in the socket's backlog for the new binary, which systemd (or the
+        // bridge) starts. MEASURED before: after a new kern was installed, a server kept alive by a
+        // client answering every few seconds served the OLD API for 21 minutes (`/proc/<pid>/exe`
+        // read "(deleted)"), so `docker cp` still answered 501 with the fix installed. The commands
+        // it runs were already the new binary's; only its own answers were stale.
+        if idle.is_some()
+            && binary_replaced()
+            && ACTIVE.load(Ordering::Acquire) == 0
+            && !api::sessions_open()
+            && !api::runs_alive()
+        {
+            eprintln!(
+                "kern: this server's binary was replaced; the next connection starts the new one"
+            );
+            return Ok(());
+        }
         if let Some(idle) = idle {
             let mut pfd = libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -693,6 +710,13 @@ pub fn serve(listen: Listen, kern: PathBuf, idle: Option<Duration>) -> Result<()
             ACTIVE.fetch_sub(1, Ordering::AcqRel);
         }
     }
+}
+
+/// Was the file this process runs replaced (renamed over, or removed) since it started?
+fn binary_replaced() -> bool {
+    std::fs::read_link("/proc/self/exe")
+        .map(|p| p.as_os_str().as_encoded_bytes().ends_with(b" (deleted)"))
+        .unwrap_or(false)
 }
 
 /// A Windows process key as `kern.exe` writes it: `<pid>-<creation time>`, both decimal.

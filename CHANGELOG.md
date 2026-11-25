@@ -104,6 +104,12 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**The Docker API server steps aside when kern is updated.** A server kept busy by a client
+(an IDE, a test suite) kept answering with the API of the binary it started from after a new kern
+was installed, for as long as it was busy (measured: 21 minutes). It now exits once it holds no
+connection, test session or attached run, and the next connection starts the new binary (measured:
+20 ms for that request).
+
 **`kern cp` copies directories, as `docker cp` does, and `docker cp` works through kern's socket.**
 `kern cp` copied single files only. It copies a whole tree now, keeps a symlink as a symlink (`-L`
 follows the one SRC names) and a hardlink as a hardlink, takes Docker's destination rules (into an
