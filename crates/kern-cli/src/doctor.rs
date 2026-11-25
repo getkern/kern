@@ -2416,17 +2416,16 @@ fn check_tools() -> Vec<R> {
         },
         tool_opt(
             "pasta",
-            // NOT "pod / box": a plain box is loopback-only whatever pasta does, and outbound there
-            // comes from `--net` (the host's own stack), not from this tool. Measured: a default box
-            // reaches neither an IP nor DNS with pasta installed; the same command in a pod reaches
-            // the internet. `doctor` is what a reader runs to learn what will work, so it may not
-            // name a capability the next command will not have. That distinction is the NOTE, which
-            // is why it is not welded into the capability name.
-            "pod outbound networking (NAT + DNS)",
-            "a plain box is loopback-only whatever pasta does; `--net` gives it the host's stack",
-            "install passt (apt install passt / dnf install passt / apk add passt / zypper install passt); without it a pod is loopback-only \
-             - peers reach each other but nothing reaches the network (no apk add / pip install). kern \
-             uses pasta if present, it does not ship it",
+            // A BOX AND A POD: since a box reaches the internet by default, as a Docker container
+            // does, its outbound IS this tool. MEASURED with pasta off the PATH: `kern run alpine
+            // wget example.com` warned "no outbound - pasta (passt) is not installed" and could not
+            // resolve the name; with it, the same box reaches the internet. The row said a plain box
+            // was loopback-only whatever pasta does, which was the default before.
+            "outbound networking for boxes and pods (NAT + DNS)",
+            "`--net none` keeps a box on its own loopback; `--net host` gives it the host's stack",
+            "install passt (apt install passt / dnf install passt / apk add passt / zypper install passt); without it a box or a pod \
+             starts with its own loopback only (kern warns) - nothing reaches the network (no apk add / \
+             pip install). kern uses pasta if present, it does not ship it",
         ),
         landlock(),
     ]
@@ -2472,7 +2471,7 @@ fn tool_req(bin: &str, what: &str, hint: &str) -> R {
 /// sentences: "found (`what`)" and "not found - `what` unavailable". A `what` carrying a clause
 /// reads correctly in the first and is broken English in the second, which is what pasta's did:
 /// "not found - pod outbound networking (NAT + DNS); a plain box is loopback-only, `--net` gives it
-/// the host's unavailable". Any qualification goes in `note`, which is a line of its own, and the
+/// the host's unavailable" (the wording of that time). Any qualification goes in `note`, which is a line of its own, and the
 /// not-found branch does not need it because `hint` is already that line there.
 fn tool_opt(bin: &str, what: &str, note: &str, hint: &str) -> R {
     if which(bin) {
@@ -3918,8 +3917,8 @@ mod tests {
         ));
         all.push(tool_opt(
             "definitely-not-here",
-            "pod outbound networking (NAT + DNS)",
-            "a plain box is loopback-only whatever pasta does; `--net` gives it the host's stack",
+            "outbound networking for boxes and pods (NAT + DNS)",
+            "`--net none` keeps a box on its own loopback; `--net host` gives it the host's stack",
             "install passt",
         ));
         for r in &all {

@@ -2700,7 +2700,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                         {
                             tabs.push(crate::tui::json_tab(t).ok_or_else(|| {
                                 Error::Cli(format!(
-                                    "top --tab {t}: not a tab (overview, boxes, runs, images, builds, profiles, storage, sandboxes, logs)"
+                                    "top --tab {t}: not a tab (overview, boxes, limits, images, builds, profiles, storage, sandboxes, logs)"
                                 ))
                             })?);
                         }

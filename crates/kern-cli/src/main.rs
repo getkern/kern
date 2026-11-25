@@ -394,7 +394,7 @@ fn main() -> ExitCode {
     // (see `wslentry`). One failed `stat` everywhere else.
     wslentry::enter_as_user_if_kern_distro();
     // Stamp process entry as early as possible: `kern limit` measures entry→exec against it to record its
-    // own per-run setup latency (the honest "~1 ms" shown in `kern top`'s Runs tab). Cheap and harmless
+    // own per-run setup latency (the honest "~1 ms" shown in `kern top`'s Limits tab). Cheap and harmless
     // on every other subcommand.
     runstats::mark_start();
     // Scope-readiness signal: if we are the kern re-exec'd INSIDE a transient systemd scope, reaching

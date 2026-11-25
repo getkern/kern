@@ -142,12 +142,28 @@ pub struct BoxStatus<'a> {
     pub cmd: &'a str,
     pub read_only: bool,
     pub bind_rootfs: bool,
-    pub share_net: bool,
+    /// What network the box has; the panel's `net` row and its warning read it.
+    pub net: Net,
     pub memory: Option<u64>,
     pub cpus: Option<f64>,
     pub volumes: usize,
     pub tty: bool,
     pub seccomp_syscalls: usize,
+}
+
+/// The network a box runs with, as the launch decided it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Net {
+    /// `--net host`: the host's own stack, no network isolation.
+    Host,
+    /// A NAT of its own and the host's resolvers: the default, as a Docker container's.
+    Nat,
+    /// `--egress-allow`/`--egress-secret`: out only through kern's filtering proxy.
+    Egress,
+    /// Another's network namespace: a pod, `--network container:BOX`, a stack's network.
+    Joined,
+    /// `--net none`: its own loopback only.
+    Loopback,
 }
 
 /// Human-readable byte size (`512M`, `1.5G`, `256K`, `0 B`) - the shared [`kern_common::fmt_bytes`]
@@ -164,7 +180,7 @@ pub fn box_line(s: &BoxStatus, p: &Palette, gl: &Glyphs) -> String {
     let (b, c, d, g, y, z) = (p.b, p.c, p.d, p.g, p.y, p.z);
     let name = scrub(s.name);
     let source = scrub(s.source);
-    let posture = if s.share_net {
+    let posture = if s.net == Net::Host {
         format!("{y}{} host network - not isolated{z}", gl.warn)
     } else if s.bind_rootfs {
         format!("{y}{} shared rootfs - writes persist{z}", gl.warn)
@@ -252,23 +268,33 @@ pub fn box_banner(s: &BoxStatus, p: &Palette, gl: &Glyphs, width: usize) -> Stri
     }
 
     // network.
-    if s.share_net {
-        row(
-            &mut out,
-            "net",
+    // THE NETWORK THE BOX HAS, not "isolated" for every box that is not `--net host`: since a box
+    // reaches the internet by default, as a Docker container does, that row described the old
+    // default and told the reader a NAT box was loopback-only.
+    let (glyph, colour, text) = match s.net {
+        Net::Host => (
             gl.warn,
             y,
             format!("host {d}(shared - no network isolation){z}"),
-        );
-    } else {
-        row(
-            &mut out,
-            "net",
+        ),
+        Net::Nat => (
             gl.ok,
             g,
-            format!("isolated {d}(loopback-only){z}"),
-        );
-    }
+            format!("isolated NAT {d}(own network, as Docker's){z}"),
+        ),
+        Net::Egress => (
+            gl.ok,
+            g,
+            format!("egress allowlist {d}(out only through kern's proxy, to the listed hosts){z}"),
+        ),
+        Net::Joined => (
+            gl.ok,
+            g,
+            format!("shared {d}(the network of the pod, stack or box it joined){z}"),
+        ),
+        Net::Loopback => (gl.ok, g, format!("isolated {d}(loopback only){z}")),
+    };
+    row(&mut out, "net", glyph, colour, text);
 
     // guard line: seccomp + caps + userns, the always-on baseline.
     row(
@@ -330,10 +356,10 @@ pub fn box_banner(s: &BoxStatus, p: &Palette, gl: &Glyphs, width: usize) -> Stri
     // Warning block: the deliberately-open choices, each with a one-line fix. Dedup of the status
     // rows above - the warning *expands* the yellow row, it doesn't repeat it.
     let mut warns: Vec<(String, String)> = Vec::new();
-    if s.share_net {
+    if s.net == Net::Host {
         warns.push((
             "--net shares the host network - the box has no network isolation".into(),
-            "drop --net for an isolated, loopback-only box".into(),
+            "drop --net host for a NAT of its own, or use --net none for loopback only".into(),
         ));
     }
     if s.bind_rootfs {
@@ -579,7 +605,7 @@ mod tests {
             cmd: "/bin/sh",
             read_only: false,
             bind_rootfs: false,
-            share_net: false,
+            net: Net::Nat,
             memory: None,
             cpus: None,
             volumes: 0,
@@ -623,11 +649,31 @@ mod tests {
     #[test]
     fn banner_net_emits_actionable_warning() {
         let mut s = base();
-        s.share_net = true;
+        s.net = Net::Host;
         let out = box_banner(&s, &plain(), &ascii_glyphs(), 80);
         assert!(out.contains("host (shared"));
         assert!(out.contains("--net shares the host network"));
-        assert!(out.contains("drop --net"));
+        assert!(out.contains("drop --net host"));
+    }
+
+    /// The `net` row says the network the box HAS: a default box has a NAT of its own, and only
+    /// `--net none` is loopback only.
+    #[test]
+    fn banner_net_row_names_the_network_the_box_has() {
+        let row = |net: Net| {
+            let mut s = base();
+            s.net = net;
+            box_banner(&s, &plain(), &ascii_glyphs(), 100)
+                .lines()
+                .find(|l| l.contains("net "))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(row(Net::Nat).contains("NAT"), "{}", row(Net::Nat));
+        assert!(!row(Net::Nat).contains("loopback"), "{}", row(Net::Nat));
+        assert!(row(Net::Loopback).contains("loopback only"));
+        assert!(row(Net::Egress).contains("egress allowlist"));
+        assert!(row(Net::Joined).contains("joined"));
     }
 
     #[test]
@@ -703,10 +749,10 @@ mod tests {
     #[test]
     fn line_surfaces_open_boundaries_inline() {
         let mut s = base();
-        s.share_net = true;
+        s.net = Net::Host;
         let out = box_line(&s, &plain(), &ascii_glyphs());
         assert!(out.contains("not isolated"));
-        s.share_net = false;
+        s.net = Net::Nat;
         s.bind_rootfs = true;
         let out = box_line(&s, &plain(), &ascii_glyphs());
         assert!(out.contains("writes persist"));

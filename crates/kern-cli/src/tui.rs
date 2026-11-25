@@ -31,7 +31,10 @@ use std::time::Instant;
 const TABS: [&str; 9] = [
     "Overview",
     "Boxes",
-    "Runs",
+    // `kern limit`'s, named after the verb. It was "Runs" while that verb was `kern run`; since
+    // `kern run` starts a box, as `docker run` does, a "Runs" tab beside "Boxes" read as a second
+    // kind of box. Every box, `run` or `box`, is on the Boxes tab.
+    "Limits",
     "Images",
     "Builds",
     "Profiles",
@@ -512,7 +515,7 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut prev: HashMap<i32, (u64, Instant)> = HashMap::new();
     let mut prev_cpu: Option<(u64, u64)> = None;
     let mut prev_runs: Option<(u64, std::time::Instant)> = None;
-    let mut runs_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the Runs tab
+    let mut runs_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the Limits tab
     let mut prev_box: Option<(u64, std::time::Instant)> = None;
     let mut box_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the box-start rate
                                              // Cleared by the first poll that times out; see the comment at that poll for why.
@@ -2220,7 +2223,11 @@ const LIST_CAP: usize = 512;
 const VOLUME_SIZES_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A tab named as the tab bar names it, any case: its index. `None` for any other word.
+/// `runs` is the tab's name before `kern limit` had that name, kept for a script written then.
 pub(crate) fn json_tab(name: &str) -> Option<usize> {
+    if name.eq_ignore_ascii_case("runs") {
+        return Some(TAB_RUNS);
+    }
     TABS.iter().position(|t| t.eq_ignore_ascii_case(name))
 }
 
@@ -3839,19 +3846,27 @@ fn render(
             _ => label(i, true, false),
         }
     };
-    let bar_w = |step: usize| {
+    // TIGHT: two spaces between two tabs instead of three, tried at each step BEFORE that step's
+    // counts give way, so nine columns of spacing go before a number does. MEASURED: renaming the
+    // third tab from "Runs" to "Limits" took a 100-column bar with `Images (1k)` and `Builds (12k)`
+    // from 100 columns to 102, and both counts went for two letters.
+    let bar_w = |step: usize, tight: bool| {
         1 + (0..TABS.len())
-            .map(|i| shown(i, step).chars().count() + 3)
+            .map(|i| shown(i, step).chars().count() + if tight { 2 } else { 3 })
             .sum::<usize>()
     };
-    let step = (0..3).find(|st| bar_w(*st) <= width).unwrap_or(3);
+    let (step, tight) = (0..3)
+        .flat_map(|st| [(st, false), (st, true)])
+        .find(|(st, t)| bar_w(*st, *t) <= width)
+        .unwrap_or((3, false));
+    let sep = if tight { "" } else { " " };
     s.push(' ');
     for i in 0..TABS.len() {
         let l = shown(i, step);
         if i == tab {
-            s.push_str(&format!("{b}\x1b[7m {l} \x1b[27m{z} "));
+            s.push_str(&format!("{b}\x1b[7m {l} \x1b[27m{z}{sep}"));
         } else {
-            s.push_str(&format!("{d} {l} {z} "));
+            s.push_str(&format!("{d} {l} {z}{sep}"));
         }
     }
     s.push('\n');
@@ -3942,10 +3957,11 @@ fn help_text() -> String {
      \n\
      TABS - what each one shows\n\
        1 Overview   host CPU / RAM / load and the box totals\n\
-       2 Boxes      every running box (pods grouped): MEM, CPU%, PIDS, HEALTH, PORTS\n\
+       2 Boxes      every box, kern run or kern box (pods grouped): MEM, CPU%, PIDS, HEALTH,\n\
+     \x20                PORTS; a --restart box between two runs is listed as restarting\n\
      \x20                (yellow net:host / root-mapped / caps:+ / gpu:N flags a box LESS\n\
      \x20                 isolated than default; gpu:N says WHICH cards, never how busy)\n\
-       3 Runs       kern limit throughput: rate/sec, avg latency, peak, total (aggregate)\n\
+       3 Limits     kern limit throughput: rate/sec, avg latency, peak, total (aggregate)\n\
        4 Images     cached OCI images: repository:tag, size, pulled age (like kern images)\n\
        5 Builds     build history: status, duration, size, age (like kern builds)\n\
        6 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
@@ -4983,13 +4999,13 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
         gpu_nodes_from_flag,
         gpu_minor,
     ));
-    // `kern limit` throughput lives on its own **Runs** tab (fire-and-forget capped processes) - Overview
+    // `kern limit` throughput lives on its own **Limits** tab (fire-and-forget capped processes) - Overview
     // stays the host + box picture. A one-line pointer only while runs actively stream (same > 0.5/s
     // threshold as the Runs-tab `⚡`, so the two never disagree), never a stale idle cumulative.
     if host.runs_per_sec > 0.5 {
         s.push_str(&row(
-            "Runs",
-            format!("{d}⚡ live - see the {z}{b}Runs{z}{d} tab{z}"),
+            "Limits",
+            format!("{d}⚡ live - see the {z}{b}Limits{z}{d} tab{z}"),
         ));
     }
 
@@ -5107,10 +5123,10 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
         // NO FIGURE HERE. This said "gone in ~1 ms": a number with no machine and no method beside it,
         // in a panel that cannot carry either, and one that ages every time the runtime moves. What a
         // reader needs from this line is what a run IS. The measurements live in BENCHMARKS.md.
-        "\n  {b}Runs{z}{d} = CPU/memory-capped commands - {z}{c}kern limit -- <cmd>{z}{d} - with {z}{b}no sandbox{z}{d}.{z}\n"
+        "\n  {b}Limits{z}{d} = CPU/memory-capped commands - {z}{c}kern limit -- <cmd>{z}{d} - with {z}{b}no sandbox{z}{d}.{z}\n"
     ));
     s.push_str(&format!(
-        "  {d}A run is {z}{b}NOT a container{z}{d}: for an isolated box, use the {z}{c}Boxes{z}{d} tab. Runs are too fast/many to{z}\n"
+        "  {d}A limit is {z}{b}NOT a container{z}{d}: every box ({z}{c}kern run{z}{d}, {z}{c}kern box{z}{d}) is on the {z}{c}Boxes{z}{d} tab. These are too many to{z}\n"
     ));
     s.push_str(&format!(
         "  {d}list one-by-one, so this tab {z}{b}counts{z}{d} them as live throughput instead.{z}\n\n"
@@ -5118,13 +5134,13 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
 
     if host.runs_total == 0 {
         s.push_str(&format!(
-            "  {d}no runs yet - fire capped processes with {z}{c}kern limit -- <cmd>{z}\n"
+            "  {d}none yet - fire capped processes with {z}{c}kern limit -- <cmd>{z}\n"
         ));
         s.push_str(&format!(
             "  {d}e.g.  {z}{c}for i in $(seq 1000); do kern limit -- true; done{z}\n\n"
         ));
         s.push_str(&format!(
-            "  {d}a run is a CPU/mem-capped process with no sandbox: cgroup caps only, no namespaces.{z}\n"
+            "  {d}a limit is a CPU/mem-capped process with no sandbox: cgroup caps only, no namespaces.{z}\n"
         ));
         return s;
     }
@@ -5136,7 +5152,7 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
     s.push_str(&row(
         "Speed",
         format!(
-            "{rate_col}{} {d}runs/sec{z}   {d}({}/min){z}",
+            "{rate_col}{} {d}/sec{z}   {d}({}/min){z}",
             human_count(rate),
             human_count(per_min)
         ),
@@ -5151,16 +5167,13 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
     s.push_str(&row(
         "Peak speed",
         format!(
-            "{} {d}runs/sec · session max{z}",
+            "{} {d}/sec · session max{z}",
             human_count(host.runs_peak.round().max(0.0) as u64)
         ),
     ));
     s.push_str(&row(
         "Total",
-        format!(
-            "{} {d}runs, so far this session{z}",
-            human_count(host.runs_total)
-        ),
+        format!("{} {d}so far this session{z}", human_count(host.runs_total)),
     ));
 
     // Recent-shape sparkline of runs/sec (the reader-side ring). When the whole window is idle, an
@@ -6564,9 +6577,33 @@ mod tests {
             &Mode::Nav,
             &crate::logview::LogView::default(),
         );
+        // In full where the tight spacing makes room (it does at 100 columns), else written short.
         assert!(
-            large.contains("Builds (12k)") && large.contains("Images (1k)"),
-            "a large count is shortened, not dropped: {large}"
+            (large.contains("Builds (11961)") || large.contains("Builds (12k)"))
+                && (large.contains("Images (1464)") || large.contains("Images (1k)")),
+            "a large count is kept, not dropped: {large}"
+        );
+        // Where even the tight bar needs it, the large count is written short before it goes.
+        let shorter = render(
+            &plain(),
+            TAB_BOXES,
+            &boxes,
+            &host,
+            &[],
+            &[],
+            &[],
+            11_961,
+            &[],
+            1_464,
+            95,
+            24,
+            0,
+            &Mode::Nav,
+            &crate::logview::LogView::default(),
+        );
+        assert!(
+            shorter.contains("Builds (12k)") && shorter.contains("Images (1k)"),
+            "a large count is shortened, not dropped: {shorter}"
         );
         assert_eq!(short_count(999), "999");
         assert_eq!(short_count(1_464), "1k");
@@ -6594,7 +6631,7 @@ mod tests {
         );
         assert!(!narrow.contains("Boxes (3)"), "narrow bar drops counts");
         for t in [
-            "Overview", "Boxes", "Runs", "Images", "Builds", "Profiles", "Storage",
+            "Overview", "Boxes", "Limits", "Images", "Builds", "Profiles", "Storage",
         ] {
             assert!(
                 narrow.contains(t),
