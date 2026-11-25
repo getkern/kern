@@ -3691,6 +3691,32 @@ fn start_detached(bin: &Path, name: &str, c: &Created, argv: &[&str]) -> Result<
 static DIE_PENDING: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 static DIE_PUBLISHED: Condvar = Condvar::new();
 
+/// The containers watched past each `die` (a `--restart always` or `unless-stopped` one, see
+/// [`watch_die_with`]), and of those the ones a `docker restart` is restarting now: that watch
+/// publishes the `die` and leaves the next run to the restart, which says `stop`, `start` and
+/// `restart` and watches it. MEASURED before: `docker restart` of such a container printed `kill die
+/// start restart start`, the watch's own `start` after the restart's, where Docker's is `kill die
+/// stop start restart`.
+static FOREVER: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+static API_RESTART: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn in_set(set: &Mutex<Option<std::collections::HashSet<String>>>, name: &str) -> bool {
+    set.lock()
+        .ok()
+        .is_some_and(|g| g.as_ref().is_some_and(|s| s.contains(name)))
+}
+
+fn set_in(set: &Mutex<Option<std::collections::HashSet<String>>>, name: &str, on: bool) {
+    if let Ok(mut g) = set.lock() {
+        let s = g.get_or_insert_with(Default::default);
+        if on {
+            s.insert(name.to_string());
+        } else {
+            s.remove(name);
+        }
+    }
+}
+
 /// How long a removal or a restart waits for the `die` of the box it stopped.
 const DIE_FIRST: Duration = Duration::from_secs(3);
 
@@ -3738,6 +3764,7 @@ fn watch_die_with(
     if !fresh {
         return;
     }
+    set_in(&FOREVER, name, forever);
     let (bin, watched) = (bin.to_path_buf(), name.to_string());
     let gen = watch_gen(name);
     let spawned = std::thread::Builder::new()
@@ -3779,9 +3806,11 @@ fn watch_die_with(
                 } else {
                     code
                 };
+                // Asked BEFORE the `die` is settled, which is what wakes a restart waiting for it.
+                let follow = forever && !in_set(&API_RESTART, &now);
                 crate::events::publish_named("die", &now, Some(code));
                 die_settled(&now);
-                let next = if forever {
+                let next = if follow {
                     next_supervisor(&bin, &now, supervisor, gen)
                 } else {
                     None
@@ -4019,6 +4048,7 @@ fn watch_forget(name: &str) {
             .entry(name.to_string())
             .or_insert(0) += 1;
     }
+    set_in(&FOREVER, name, false);
     die_settled(name);
 }
 
@@ -4053,6 +4083,10 @@ fn watch_renamed(old: &str, new: &str) {
                 s.insert(new.to_string());
             }
         }
+    }
+    if in_set(&FOREVER, old) {
+        set_in(&FOREVER, old, false);
+        set_in(&FOREVER, new, true);
     }
     crate::events::renamed(old, new);
 }
@@ -4856,16 +4890,22 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             if die_pending(&name) {
                 crate::events::publish_named("kill", &name, None);
             }
+            let forever = in_set(&FOREVER, &name);
+            if *verb == "restart" {
+                set_in(&API_RESTART, &name, true);
+            }
             let (code, _, err) = kern(bin, &args);
+            if code == 0 && *verb != "kill" {
+                die_within(&name, DIE_FIRST);
+            }
+            set_in(&API_RESTART, &name, false);
             if code == 0 {
                 if *verb != "kill" {
-                    die_within(&name, DIE_FIRST);
+                    crate::events::publish_named("stop", &name, None);
                     if *verb == "restart" {
                         crate::events::publish_named("start", &name, None);
                         crate::events::publish_named("restart", &name, None);
-                        watch_die(bin, &name, false, None);
-                    } else {
-                        crate::events::publish_named("stop", &name, None);
+                        watch_die_with(bin, &name, false, None, forever);
                     }
                 }
                 no_content()
