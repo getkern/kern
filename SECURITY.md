@@ -145,10 +145,14 @@ software that probes one (a browser's or bubblewrap's `unshare`, a debugger's `p
 goes on instead of dying. `--security-opt seccomp-deny=kill` makes them **kill** the caller with
 `SIGSYS` instead, and so do `--security-profile untrusted` and every sandbox the SDKs start: the kill
 is the verdict a supervisor reads as "this code tried to leave" (`escape_blocked`). `kern exec` and a
-health probe get the box's own verdict. Twelve, in eight
-families (io_uring's three, `userfaultfd`, `perf_event_open`, the keyring's three, `syslog`,
-`clone3`, `open_by_handle_at` and `listns`), return **`ENOSYS`** instead: equally denied, and the difference
-is Redis falling back to its epoll path rather than Redis dying.
+health probe get the box's own verdict. Twelve more, in eight
+families, are denied and never kill, under any verdict, because software probes them at start and
+falls back: ten (io_uring's three, `userfaultfd`, `perf_event_open`, the keyring's three, `syslog` and
+`open_by_handle_at`) return **`EPERM`**, as Docker's default profile answers them, and two (`clone3`
+and `listns`) return **`ENOSYS`**, the one answer glibc falls back from in `pthread_create`. The
+difference is Redis or Node falling back to its epoll path rather than dying. Measured against Docker
+29 with a probe of `io_uring_setup`, `userfaultfd`, `perf_event_open`, `keyctl` and `clone3`: the
+same errno for each, in a box and under `seccomp-deny=kill`.
 
 Two rules refuse an **argument** rather than a syscall, and each returns what a kernel that lacks
 that feature returns: `socket(AF_VSOCK, …)` gets `EAFNOSUPPORT`, and the two `SOL_PACKET` options
@@ -164,7 +168,7 @@ inside a box on x86_64, kernel 7.0:
 
 | syscall probed inside the box | result |
 |---|---|
-| `io_uring_setup` (denied, degrade set) | `-1 ENOSYS`, process survives |
+| `io_uring_setup` (denied, degrade set) | `-1 EPERM`, process survives, also under `seccomp-deny=kill` |
 | syscall number 998 (exists on no kernel) | `-1 ENOSYS`, process survives |
 | `kexec_load`, `bpf`, `mount`, `ptrace` (denied) | `-1 EPERM`, process survives; killed by `SIGSYS` (exit 159) under `seccomp-deny=kill` |
 | the same calls with no kern filter (control) | a *different* errno, never `ENOSYS` |
