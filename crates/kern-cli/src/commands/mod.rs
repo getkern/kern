@@ -1486,7 +1486,43 @@ fn resolve_limit_policy(
     Ok((require, allow))
 }
 
+/// The host's resolver as `--dns`, `--dns-search` and `--dns-option` would state it: the
+/// `nameserver` lines, `search` (or `domain`) and `options`. Comments and other directives are not
+/// carried. Empty when the host has no readable `/etc/resolv.conf`.
+fn parse_resolv(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (mut ns, mut search, mut options) = (Vec::new(), Vec::new(), Vec::new());
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some("nameserver") => ns.extend(words.next().map(str::to_string)),
+            Some("search" | "domain") => search = words.map(str::to_string).collect(),
+            Some("options") => options.extend(words.map(str::to_string)),
+            _ => {}
+        }
+    }
+    (ns, search, options)
+}
+
 fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
+    // A `--net` box with its own `/etc` directory, in an overlay, and no resolver of its own asked
+    // for: it gets the host's, BOUND from that directory (`setup_resolv_conf`) rather than copied into
+    // the upper, which a `kern commit` would keep. A `--bind-rootfs` box is left as it was: kern does
+    // not write into a user's rootfs for DNS, by design (see the note further down).
+    let host_resolver_bound = b.share_net
+        && b.etc_dir.is_some()
+        && !b.bind_rootfs
+        && b.dns.is_empty()
+        && b.dns_search.is_empty()
+        && b.dns_options.is_empty();
+    let (dns, dns_search, dns_options) = if host_resolver_bound {
+        parse_resolv(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default())
+    } else {
+        (b.dns.clone(), b.dns_search.clone(), b.dns_options.clone())
+    };
     // Hostname: `--hostname` wins, else the box name (the box's own UTS namespace, so it's private).
     let hostname = b
         .hostname
@@ -1653,10 +1689,13 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         for d in [&work, &merged] {
             std::fs::create_dir_all(d).map_err(|e| Error::Sandbox(format!("scratch dir: {e}")))?;
         }
-        // With `--net` sharing the host network, copy the host's resolv.conf into the upper so DNS
-        // resolves inside the box. A private copy → the box can't touch the host's file, and it's
-        // removed with the scratch. (Best-effort: no host resolv.conf → IPs still work.)
-        if b.share_net {
+        // With `--net` sharing the host network, the box needs the host's resolver. Given through the
+        // box's own `/etc` directory when it has one (see `host_resolver_bound` below), a bind like
+        // `/etc/hosts`, so `kern commit` never bakes the host's DNS into an image. MEASURED before:
+        // the copy written HERE, into the upper, was a change of the box like any other, and a commit
+        // of a `--net host` box carried the host's systemd-resolved stub. The copy stays only for a
+        // box with no such directory. (Best-effort: no host resolv.conf → IPs still work.)
+        if b.share_net && b.etc_dir.is_none() {
             if let Ok(conf) = std::fs::read("/etc/resolv.conf") {
                 let etc = upper.join("etc");
                 // Best-effort, and now audible. A box whose `resolv.conf` could not be written still
@@ -1766,9 +1805,9 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         extra_hosts: b.extra_hosts,
         memory_low: b.memory_low,
         cpu_weight: b.cpu_weight,
-        dns: b.dns,
-        dns_search: b.dns_search,
-        dns_options: b.dns_options,
+        dns,
+        dns_search,
+        dns_options,
         ulimits: b.ulimits,
         sysctls: b.sysctls,
         privileged: b.privileged,
@@ -2110,10 +2149,14 @@ pub(crate) fn resolve_volume(
                 // sent to look for a kern directory where their doc told them to find a display
                 // socket, and the two paths are now both in the sentence.
                 if let Some(state) = crate::registry::trusted_state_overlap(&canon) {
-                    let data_root = crate::keepbox::boxes_dir().parent() == Some(state.as_path());
-                    return Err(Error::Sandbox(kern_state_refusal(
-                        s, &canon, &state, data_root,
-                    )));
+                    let root = if crate::keepbox::boxes_dir().parent() == Some(state.as_path()) {
+                        StateRoot::Data
+                    } else if crate::registry::config_root().as_deref() == Some(state.as_path()) {
+                        StateRoot::Config
+                    } else {
+                        StateRoot::Registry
+                    };
+                    return Err(Error::Sandbox(kern_state_refusal(s, &canon, &state, root)));
                 }
                 if let Some(msg) = host_ipc_source_refusal(s, &canon) {
                     return Err(Error::Sandbox(msg));
@@ -2613,11 +2656,22 @@ fn ports_summary(ports: &[kern_isolation::PortMap]) -> String {
 /// reason for both, and said "contains" for a path that is inside: MEASURED, `-v
 /// ~/.local/share/kern/history:/h` was refused as "contains kern's own state (~/.local/share/kern)
 /// ... elevate its own `kern exec`".
+/// Which root of kern's own state a refused `-v` touches, for the reason the refusal gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateRoot {
+    /// `$XDG_RUNTIME_DIR/kern`: the box registry.
+    Registry,
+    /// `$XDG_DATA_HOME/kern`: kept boxes, volumes, history.
+    Data,
+    /// `$XDG_CONFIG_HOME/kern`: `kern.toml` and the registry credentials.
+    Config,
+}
+
 fn kern_state_refusal(
     spec: &str,
     canon: &std::path::Path,
     state: &std::path::Path,
-    data_root: bool,
+    root: StateRoot,
 ) -> String {
     let relation = if canon == state {
         "IS"
@@ -2626,12 +2680,19 @@ fn kern_state_refusal(
     } else {
         "contains"
     };
-    let why = if data_root {
-        "a box able to write that could choose the command line a later `kern start` replays, \
-         reach every named volume, and read or forge the sandbox history"
-    } else {
-        "a box able to write that could forge another box's recorded capability/seccomp posture \
-         and elevate its own `kern exec`"
+    let why = match root {
+        StateRoot::Data => {
+            "a box able to write that could choose the command line a later `kern start` replays, \
+             reach every named volume, and read or forge the sandbox history"
+        }
+        StateRoot::Config => {
+            "a box able to read that could take the registry credentials, and one able to write it \
+             could set the profiles and grants kern applies to later boxes"
+        }
+        StateRoot::Registry => {
+            "a box able to write that could forge another box's recorded capability/seccomp posture \
+             and elevate its own `kern exec`"
+        }
     };
     format!(
         "{spec}: refusing it - {} {relation} kern's own state ({}), and {why}. Bind a path that \
@@ -12209,5 +12270,24 @@ mod diff_scaffolding_tests {
                 "{theirs} belongs to the workload"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod resolv_tests {
+    /// The host's resolver read as kern passes it on: servers, search (or domain), options; comments
+    /// and other directives dropped.
+    #[test]
+    fn parse_resolv_reads_servers_search_and_options() {
+        let (ns, search, opts) = super::parse_resolv(
+            "# managed by systemd-resolved\nnameserver 127.0.0.53\n; old\nnameserver 192.0.2.1\n\
+             options edns0 trust-ad\nsearch lan example.org\nsortlist 10.0.0.0\n",
+        );
+        assert_eq!(ns, ["127.0.0.53", "192.0.2.1"]);
+        assert_eq!(search, ["lan", "example.org"]);
+        assert_eq!(opts, ["edns0", "trust-ad"]);
+        let (_, s2, _) = super::parse_resolv("domain corp.example\n");
+        assert_eq!(s2, ["corp.example"]);
+        assert_eq!(super::parse_resolv(""), (vec![], vec![], vec![]));
     }
 }

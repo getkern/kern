@@ -19918,3 +19918,173 @@ fn a_rm_box_stopped_or_killed_leaves_no_row() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&xdg);
 }
+
+/// A `--net` box gets the host's resolver through its own `/etc` directory, a bind, so a
+/// `kern commit` of it carries neither the host's resolver nor what the box wrote into the file.
+/// MEASURED before: the host's `resolv.conf` was copied into the box's upper and a commit of a
+/// `--net host` box baked the host's systemd-resolved stub into the image.
+#[test]
+fn a_net_box_commit_carries_no_host_resolver() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let host = fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let Some(host_ns) = host
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("nameserver ").map(str::trim))
+    else {
+        eprintln!("skip: the host's /etc/resolv.conf names no nameserver");
+        return;
+    };
+    let root = build_rootfs(&busybox, "netcommit");
+    let rootfs = root.to_str().unwrap();
+    let base = std::env::temp_dir().join(format!("kern-it-netcommit-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    for d in ["run", "cache"] {
+        let _ = fs::create_dir_all(base.join(d));
+    }
+    let k = || {
+        let mut c = kern();
+        c.env("XDG_RUNTIME_DIR", base.join("run"))
+            .env("XDG_CACHE_HOME", base.join("cache"));
+        c
+    };
+    let out = k()
+        .args([
+            "box",
+            "netc",
+            "--rootfs",
+            rootfs,
+            "--net",
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&base);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let inside = k()
+        .args([
+            "exec",
+            "netc",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "cat /etc/resolv.conf; echo nameserver 192.0.2.7 >> /etc/resolv.conf; \
+             /bin/busybox grep -c ' /etc/resolv.conf ' /proc/self/mountinfo",
+        ])
+        .output()
+        .expect("exec");
+    let inside = String::from_utf8_lossy(&inside.stdout).to_string();
+    assert!(
+        inside.contains(host_ns),
+        "the box has the host's resolver: {inside}"
+    );
+    assert!(
+        inside.trim_end().ends_with('1'),
+        "and it is a bind: {inside}"
+    );
+    let c = k()
+        .args(["commit", "netc", "netimg:1"])
+        .output()
+        .expect("commit");
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let _ = k().args(["stop", "-t", "0", "netc"]).output();
+    let img = fs::read_dir(base.join("cache/kern/images"))
+        .expect("the image cache")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("netimg_1-"))
+        })
+        .expect("the committed image's tree");
+    let baked = fs::read_to_string(img.join("etc/resolv.conf")).unwrap_or_default();
+    assert!(
+        !baked.contains(host_ns) && !baked.contains("192.0.2.7"),
+        "the committed image carries a resolver it was not built with: {baked:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// kern's configuration directory, which holds the registry credentials and the `kern.toml` kern
+/// applies to later boxes, may not be mounted into a box, nor may a directory that contains it; a
+/// sibling with a similar name may. MEASURED before: `-v ~/.config/kern:/c` was accepted and the box
+/// listed `registry-auth`.
+#[test]
+fn kerns_config_dir_is_not_mountable() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "cfgmount");
+    let rootfs = root.to_str().unwrap();
+    let base = std::env::temp_dir().join(format!("kern-it-cfgmount-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    for d in ["run", "cfg/kern", "cfg/kern-other"] {
+        let _ = fs::create_dir_all(base.join(d));
+    }
+    fs::write(base.join("cfg/kern/registry-auth"), "secret").unwrap();
+    let run = |src: &std::path::Path| {
+        kern()
+            .env("XDG_RUNTIME_DIR", base.join("run"))
+            .env("XDG_CONFIG_HOME", base.join("cfg"))
+            .args(["box", "cfgm", "--rootfs", rootfs, "--rm", "-v"])
+            .arg(format!("{}:/k:ro", src.display()))
+            .args(["--", "/bin/busybox", "ls", "/k"])
+            .output()
+            .expect("run kern")
+    };
+    let sibling = run(&base.join("cfg/kern-other"));
+    if String::from_utf8_lossy(&sibling.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&base);
+        return;
+    }
+    assert!(
+        sibling.status.success(),
+        "a sibling dir is mountable: {}",
+        String::from_utf8_lossy(&sibling.stderr)
+    );
+    for src in [
+        base.join("cfg/kern"),
+        base.join("cfg"),
+        base.join("cfg/kern/registry-auth"),
+    ] {
+        let out = run(&src);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{} must be refused", src.display());
+        assert!(
+            err.contains("registry credentials"),
+            "{}: {err}",
+            src.display()
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("registry-auth"));
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&base);
+}

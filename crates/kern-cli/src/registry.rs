@@ -871,8 +871,25 @@ pub fn path_overlaps_trusted_state(src: &Path) -> bool {
 /// /mnt/wslg/runtime-dir/kern, two levels further down, and the reader is left looking for a kern
 /// directory where Microsoft told them to look for a display socket. The refusal is right and the
 /// naming was wrong, which is why this returns the path instead of a bool.
+/// kern's configuration directory (`$XDG_CONFIG_HOME/kern`), canonical when it exists: the third
+/// root a box may not mount. See [`trusted_state_overlap`].
+pub(crate) fn config_root() -> Option<PathBuf> {
+    let dir = crate::kern_xdg_root("XDG_CONFIG_HOME", ".config")?;
+    Some(fs::canonicalize(&dir).unwrap_or(dir))
+}
+
 pub fn trusted_state_overlap(src: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
+    // THE CONFIGURATION IS THE THIRD ROOT, refused whole and with its ancestors: it holds the
+    // registry credentials (`registry-auth`) a box could read, and `kern.toml`, whose profiles and
+    // `[kern]` keys (device and GPU grants among them) kern reads and APPLIES to later boxes - the
+    // class of the kept-box store below. MEASURED before: `-v ~/.config/kern:/c` and `-v ~/.config:/c`
+    // were accepted while the SDK refused them, and the box listed `registry-auth`.
+    if let Some(cfg) = config_root() {
+        if src.starts_with(&cfg) || cfg.starts_with(src) {
+            return Some(cfg);
+        }
+    }
     // THE KEPT-BOX STORE IS THE SECOND ROOT, and it is refused by the same three shapes. It holds
     // the `kern box` command line `kern start` replays, which makes it the one piece of state under
     // `$XDG_DATA_HOME` that kern READS AND ACTS ON for a later box - the definition of an

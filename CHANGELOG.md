@@ -104,6 +104,18 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**A `kern commit` of a `--net` box no longer bakes the host's resolver into the image.** The host's
+`/etc/resolv.conf` was copied into the box's writable layer, so it was a change like any other and a
+commit carried it (a systemd-resolved stub, here). It is now given through the box's own `/etc`
+files, bound as `/etc/hosts` and `/etc/hostname` are, read from the host's servers, `search` and
+`options`; a `--bind-rootfs` box is unchanged.
+
+**kern's configuration directory cannot be mounted into a box.** `-v ~/.config/kern:...` and
+`-v ~/.config:...` were accepted, and the box could read the registry credentials there and write
+the `kern.toml` whose profiles and grants kern applies to later boxes. They are refused now, as the
+runtime registry and `~/.local/share/kern` already were, with the reason; a sibling directory of
+`~/.config` is still mountable.
+
 **A `--rm` box ended by `kern stop` or `kern kill` is removed, as Docker removes it.** It stayed in
 `ps -a` as `exit 137` (0.56.0 the same), because the stop wrote the exit record and only the box's
 supervisor knew the box was `--rm`. The record of a running box now says so (`rm=1`; one written by
