@@ -230,6 +230,87 @@ pub fn start_scope_for_self(
     }
 }
 
+/// Move THIS process into `subcgroup` of the running unit `unit`, asked of the SYSTEM manager (PID 1)
+/// on the system bus with `AttachProcessesToUnit` (systemd 238+). No unit is made and no job is
+/// waited for. PID 1 lets an unprivileged caller do this for its own process into a unit of its own
+/// uid, which is what `user@<uid>.service` is: the move a user's manager itself asks PID 1 for when
+/// it cannot write the source's `cgroup.procs` (cgroup v2's common-ancestor rule, from an ssh session
+/// or WSL's `/init.scope`).
+///
+/// NOT through the user manager, though it has the same method. MEASURED on a VPS (Ubuntu 24.04,
+/// systemd 255) from an ssh session: asked of the user manager, the call answered in 12-16 ms OR hung
+/// until the caller exited, at random (3 of 6, 1 in 2 kern runs at best), the journal then saying
+/// "Couldn't move process N ... No such process". Asked of PID 1 directly, 30 of 30 answered, median
+/// 10.6 ms including the connection, against 17-23 ms for a transient scope per box.
+///
+/// [`ATTACH_DEADLINE`], not [`DEADLINE`]: this is an optimisation the caller can do without, so a
+/// manager that is slow to answer costs a second and the scope, not five.
+pub fn attach_self_to_unit(unit: &str, subcgroup: &str) -> Result<(), ScopeError> {
+    let started = Instant::now();
+    let sock = UnixStream::connect(SYSTEM_BUS)
+        .map_err(|e| ScopeError(format!("{SYSTEM_BUS}: {e}")))?;
+    let mut conn = Conn {
+        sock,
+        buf: Vec::new(),
+        limit: ATTACH_DEADLINE,
+    };
+    conn.auth()?;
+    conn.send(&method_call(
+        1,
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "Hello",
+        Some("org.freedesktop.DBus"),
+        "",
+        &[],
+    ))?;
+    let call_serial = 2;
+    let mut body = Writer::default();
+    body.string(unit);
+    body.string(subcgroup);
+    body.array(4, |w| w.u32(std::process::id()));
+    conn.send(&method_call(
+        call_serial,
+        SYSTEMD_PATH,
+        MANAGER_IFACE,
+        "AttachProcessesToUnit",
+        Some(SYSTEMD_DEST),
+        "ssau",
+        &body.buf,
+    ))?;
+    loop {
+        let m = conn.recv(started)?;
+        match m.kind {
+            KIND_ERROR if m.reply_serial == Some(call_serial) => {
+                let detail = Reader::new(&m.body).string().unwrap_or_default();
+                return Err(ScopeError(format!(
+                    "{}: {detail}",
+                    m.error_name.unwrap_or_default()
+                )));
+            }
+            KIND_RETURN if m.reply_serial == Some(call_serial) => break,
+            _ => {}
+        }
+    }
+    // The manager's word, checked against the kernel's.
+    let leaf = format!("/{unit}{subcgroup}");
+    let here = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    if here
+        .lines()
+        .any(|l| l.starts_with("0::") && l.trim_end().ends_with(&leaf))
+    {
+        Ok(())
+    } else {
+        Err(ScopeError(format!("not in {leaf} after the manager answered")))
+    }
+}
+
+/// The system bus, at the path every distribution with a system dbus serves it on.
+const SYSTEM_BUS: &str = "/run/dbus/system_bus_socket";
+
+/// How long [`attach_self_to_unit`] waits: two orders above the measured answer.
+const ATTACH_DEADLINE: Duration = Duration::from_secs(1);
+
 /// A connection to the manager, and whether it goes through a bus daemon.
 fn connect(system: bool, runtime_dir: Option<&Path>) -> Result<(Conn, bool), ScopeError> {
     let doors: Vec<(PathBuf, bool)> = if system {
@@ -245,6 +326,7 @@ fn connect(system: bool, runtime_dir: Option<&Path>) -> Result<(Conn, bool), Sco
                 let mut c = Conn {
                     sock: s,
                     buf: Vec::new(),
+                    limit: DEADLINE,
                 };
                 c.auth()?;
                 return Ok((c, on_bus));
@@ -263,6 +345,8 @@ const KIND_SIGNAL: u8 = 4;
 struct Conn {
     sock: UnixStream,
     buf: Vec<u8>,
+    /// How long, from the call's start, an answer is waited for.
+    limit: Duration,
 }
 
 impl Conn {
@@ -313,7 +397,8 @@ impl Conn {
                 self.buf.drain(..used);
                 return Ok(m);
             }
-            let left = DEADLINE
+            let left = self
+                .limit
                 .checked_sub(started.elapsed())
                 .filter(|d| !d.is_zero())
                 .ok_or_else(|| ScopeError("the manager did not answer in time".into()))?;

@@ -53,8 +53,9 @@ impl R {
 /// under the SYSTEM manager in a different delegation domain, and cgroup v2 will not migrate a process
 /// across that boundary (the common ancestor, `user-<uid>.slice`, is not the user's to write; verified
 /// on an Arduino UNO Q: creating the child cgroup and writing `memory.max` both succeed, writing the
-/// pid into `cgroup.procs` is refused). So on a headless board kern falls back to one transient scope
-/// PER BOX, and that is the whole board-vs-desktop gap.
+/// pid into `cgroup.procs` is refused). So from such a session a box first asks PID 1 to move kern into
+/// its own unit (`kern-boxes.service`, one `AttachProcessesToUnit`), and where that is refused kern
+/// falls back to one transient scope PER BOX: either way a toll a desktop session does not pay.
 ///
 /// The toll is MEASURED, not described, because a guess would be wrong by an order of magnitude: one
 /// `systemd-run --user --scope /bin/true` costs ~4 ms on an x86 desktop, ~9 ms on a Raspberry Pi 5 and
@@ -131,7 +132,7 @@ fn check_scope_toll() -> R {
     // command is the same whether the toll is 4 ms or 40. Per-host numbers belong in BENCHMARKS.md,
     // beside the machine and the method, which is the only place a figure means anything.
     R::Warn(
-        "this session is outside the systemd user manager, so every box pays a transient scope"
+        "this session is outside the systemd user manager, so every box first asks systemd to move it"
             .into(),
         // AND THE TWO CONSEQUENCES THAT ARE NOT ABOUT SPEED, because this row is the only place they
         // are reachable. The same boundary that costs a transient scope per box also stops `kern
@@ -170,9 +171,9 @@ fn check_scope_toll() -> R {
         // describes a refusal the reader will not get is worse than no row: it sends them to
         // `KERN_ALLOW_UNCAPPED` to buy their way out of a problem they do not have, and that
         // variable drops the caps.
-        "every box pays an extra startup cost here. Pay it once instead: \
+        "every box pays a few ms of extra startup here. Pay it once instead: \
          `systemd-run --user --scope bash`, then run kern in that shell. Caps are enforced either \
-         way, and `kern exec` takes such a scope itself, one per command, so it works here rather \
+         way, and `kern exec` takes a scope itself, one per command, so it works here rather \
          than refusing - the shell above removes that per-command cost too. KERN_ALLOW_UNCAPPED=1 \
          runs it uncapped instead, and a `--health-cmd` probe is never refused but runs outside \
          the box's caps."
@@ -183,8 +184,8 @@ fn check_scope_toll() -> R {
 /// Will a DETACHED box outlive the session that started it?
 ///
 /// On a headless board this is the whole point of `-d`: ssh in, start a service, log out, expect it to
-/// keep serving. It does not, by default. kern puts each box in a transient systemd scope under
-/// `user@<uid>.service`, and when the last session of a user without **lingering** ends, systemd stops
+/// keep serving. It does not, by default. kern puts each box under `user@<uid>.service` (its own
+/// `kern-boxes.service`, or a transient scope), and when the last session of a user without **lingering** ends, systemd stops
 /// that service and every scope under it. The box dies, its `/run/user/<uid>` runtime dir (where kern's
 /// registry lives) is removed with it, and the next login finds no box, no port and no `kern logs`.
 ///

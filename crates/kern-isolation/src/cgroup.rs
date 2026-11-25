@@ -1632,11 +1632,12 @@ pub fn choose_direct_cap_path() -> bool {
 /// second probe could only ever return the same answer. `choose_direct_cap_path()` above supplies it for
 /// the standalone callers (doctor, the fleet-cap check) that have not already probed.
 pub fn choose_direct_cap_path_given(manager_present: bool) -> bool {
-    if outer_enforcer_present()
-        || crate::cgroup::env_flag("KERN_NO_SCOPE")
-        || !manager_present
-        || !direct_caps_available()
-    {
+    if outer_enforcer_present() || crate::cgroup::env_flag("KERN_NO_SCOPE") || !manager_present {
+        return false;
+    }
+    // The one caller allowed to move kern into the anchor (see `join_anchor_from_outside`).
+    MAY_JOIN_ANCHOR.store(true, std::sync::atomic::Ordering::Release);
+    if !direct_caps_available() {
         return false;
     }
     std::env::set_var(DIRECT_MARKER, "1");
@@ -3329,6 +3330,53 @@ fn ensure_kern_slice() -> Option<PathBuf> {
     ENSURED.get_or_init(ensure_kern_slice_uncached).clone()
 }
 
+/// Set by the box-start decision ([`choose_direct_cap_path_given`]) before it asks for the slice: only
+/// a box start may move kern itself into the anchor (see [`join_anchor_from_outside`]). `kern doctor`,
+/// `ps` and the sweeps read the slice too, and must find out where they are, not be moved.
+static MAY_JOIN_ANCHOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From OUTSIDE the user manager's tree (an ssh session, a WSL `/init.scope` shell), ask PID 1 to move
+/// this process into the anchor's holder leaf, so the box goes on the direct path: a leaf of its own
+/// under the delegated anchor, capped there, with no transient unit made for it.
+///
+/// MEASURED on a VPS from an ssh session (Ubuntu 24.04, systemd 255, 4 cores): every box paid a
+/// transient scope, 17-23 ms of the `config+volumes` phase, nearly all of it PID 1 moving the process
+/// for the user manager (moved at 14-19 ms, the job's end 1-4 ms later); a box from a shell already
+/// inside the manager's tree paid nothing there. One `AttachProcessesToUnit` to PID 1 is the same move
+/// without the unit and the job (see [`crate::sdbus::attach_self_to_unit`] for why not the user
+/// manager). The supervisor then lives beside the anchor's own process in `holder`, a leaf with no
+/// controllers, as kern's processes do on a desktop session.
+///
+/// Rootless only (root creates its own slice), and only once the anchor is up and delegated. Any
+/// failure leaves this process where it was, and the caller takes the scope as before.
+fn join_anchor_from_outside(anchor: &Path) -> bool {
+    if as_root() || placement_into_is_permitted(anchor) {
+        return false;
+    }
+    let Some((unit, sub)) = user_unit_and_holder(anchor) else {
+        return false;
+    };
+    crate::sdbus::attach_self_to_unit(&unit, &sub).is_ok() && placement_into_is_permitted(anchor)
+}
+
+/// The anchor's holder leaf as PID 1 names it: the `user@<uid>.service` unit the anchor lives under,
+/// and the path below it. Read from where the anchor actually IS, so a manager that put `kern.slice`
+/// elsewhere is followed, and a path with no user unit in it (root's slice) gives nothing.
+fn user_unit_and_holder(anchor: &Path) -> Option<(String, String)> {
+    let parts: Vec<&str> = anchor.iter().filter_map(|c| c.to_str()).collect();
+    let at = parts
+        .iter()
+        .position(|c| c.starts_with("user@") && c.ends_with(".service"))?;
+    let below = &parts[at + 1..];
+    if below.is_empty() {
+        return None;
+    }
+    Some((
+        parts[at].to_string(),
+        format!("/{}/{KERN_ANCHOR_HOLDER}", below.join("/")),
+    ))
+}
+
 fn ensure_kern_slice_uncached() -> Option<PathBuf> {
     let slice = locate_or_create_kern_slice()?;
     // THE LAST QUESTION, AND THE ONE THAT WAS NEVER ASKED: can a process actually be PUT in there?
@@ -3349,7 +3397,13 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
     // Gating here rather than at either caller is what makes it one answer: `direct_caps_available()`,
     // `apply_limits`' parent choice and the sweep all read this function, and a host that cannot place
     // must look to all three exactly as it did before the slice could be found.
-    placement_into_is_permitted(&slice).then_some(slice)
+    if placement_into_is_permitted(&slice) {
+        return Some(slice);
+    }
+    // A BOX START FROM OUTSIDE THE MANAGER'S TREE moves kern itself in, rather than paying a
+    // transient scope per box (see `join_anchor_from_outside`).
+    (MAY_JOIN_ANCHOR.load(std::sync::atomic::Ordering::Acquire) && join_anchor_from_outside(&slice))
+        .then_some(slice)
 }
 
 /// Is the caller allowed to move a process into a child of `target`?
@@ -6810,6 +6864,33 @@ mod tests {
             ExecCgroupJoin::Unbounded
         ));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The holder leaf PID 1 is asked to move kern into is named from where the anchor IS.
+    #[test]
+    fn the_anchor_holder_is_named_relative_to_the_user_unit() {
+        let p = std::path::Path::new(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/kern.slice/kern-boxes.service",
+        );
+        assert_eq!(
+            user_unit_and_holder(p),
+            Some((
+                "user@1000.service".to_string(),
+                "/kern.slice/kern-boxes.service/holder".to_string()
+            ))
+        );
+        // Root's slice has no user unit above it: nothing to ask PID 1 for.
+        assert_eq!(
+            user_unit_and_holder(std::path::Path::new("/sys/fs/cgroup/kern.slice")),
+            None
+        );
+        // The user unit itself is not a place to move into.
+        assert_eq!(
+            user_unit_and_holder(std::path::Path::new(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
+            )),
+            None
+        );
     }
 
     #[test]
