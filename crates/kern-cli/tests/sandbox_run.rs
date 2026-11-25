@@ -20088,3 +20088,76 @@ fn kerns_config_dir_is_not_mountable() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&base);
 }
+
+/// `ps -a --json` says how many times a box was restarted (`restart_count`, Docker's
+/// `RestartCount`): a box failing under `--restart on-failure:2` ran three times and reads 2.
+#[test]
+fn a_restarted_box_reports_its_restart_count() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "rcount");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-rcount-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let k = || {
+        let mut c = kern();
+        c.env("XDG_RUNTIME_DIR", &xdg);
+        c
+    };
+    let out = k()
+        .args([
+            "box",
+            "rcount",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--restart",
+            "on-failure:2",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "echo run; exit 1",
+        ])
+        .output()
+        .expect("box");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Backoff 1 s then 2 s: done well inside 12 s.
+    let up = std::time::Instant::now();
+    let mut row = String::new();
+    while up.elapsed() < std::time::Duration::from_secs(12) {
+        let ps = k().args(["ps", "-a", "--json"]).output().expect("ps");
+        let ps = String::from_utf8_lossy(&ps.stdout).to_string();
+        if let Some(r) = ps
+            .split("},{")
+            .find(|r| r.contains("\"name\":\"rcount\"") && r.contains("\"exited\""))
+        {
+            row = r.to_string();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        row.contains("\"restart_count\":2"),
+        "after on-failure:2: {row}"
+    );
+    let _ = k().args(["rm", "rcount"]).output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}

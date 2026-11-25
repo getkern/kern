@@ -620,6 +620,37 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
             ))
         }
     }
+    // `HostConfig.RestartPolicy` is `kern box --restart`: Docker's names, and `MaximumRetryCount` as
+    // `on-failure:N`. MEASURED before: the field was not read at all, so `docker run --restart
+    // on-failure:2` through the socket ran once and stayed down, accepted and not honoured. A policy
+    // with `AutoRemove` is refused, as Docker's daemon refuses it.
+    let policy = host.and_then(|h| h.get("RestartPolicy"));
+    match policy.and_then(|p| p.get("Name")).and_then(Value::as_str) {
+        None | Some("" | "no") => {}
+        Some(name @ ("on-failure" | "always" | "unless-stopped")) => {
+            if auto_remove {
+                return Err(format!(
+                    "HostConfig.RestartPolicy {name:?} with AutoRemove: a container that removes \
+                     itself cannot be restarted (Docker refuses the pair too)"
+                ));
+            }
+            let retries = policy
+                .and_then(|p| p.get("MaximumRetryCount"))
+                .and_then(Value::as_i64)
+                .filter(|n| *n > 0);
+            argv.push("--restart".into());
+            argv.push(match (name, retries) {
+                ("on-failure", Some(n)) => format!("on-failure:{n}"),
+                _ => name.to_string(),
+            });
+        }
+        Some(other) => {
+            return Err(format!(
+                "HostConfig.RestartPolicy {other:?}: Docker's policies are no, on-failure, always \
+                 and unless-stopped"
+            ))
+        }
+    }
     let entry = strings(body.get("Entrypoint"));
     let mut cmd = strings(body.get("Cmd"));
     if let Some((first, rest)) = entry.split_first() {
@@ -742,7 +773,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
         return json_response(
             200,
             format!(
-                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
+                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"RestartCount\":0,\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
                 json_str(&id),
                 json_str(&rfc3339(c.created)),
                 json_str(&format!("/{name}")),
@@ -790,6 +821,8 @@ fn inspect(bin: &Path, name: &str) -> Response {
         _ => ZERO_TIME.to_string(),
     };
     let exit_code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
+    // Docker's `RestartCount`, which kern records per run (0 for a box that never restarted).
+    let restart_count = v.get("restart_count").and_then(Value::as_i64).unwrap_or(0);
     let pid = if running {
         v.get("pid1").and_then(Value::as_i64).unwrap_or(0)
     } else {
@@ -811,7 +844,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
             json_str(&id),
             json_str(&created),
             json_str(&format!("/{name}")),
@@ -3087,6 +3120,52 @@ mod tests {
         assert_eq!(status(handle(&stop, &bin)), 304);
         drop(created_take("kd-created"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `HostConfig.RestartPolicy` is `kern box --restart`, in Docker's names; with `AutoRemove` it
+    /// is refused, as Docker refuses it. MEASURED before: the field was not read at all.
+    #[test]
+    fn a_restart_policy_becomes_kerns_and_one_with_auto_remove_is_refused() {
+        let argv = |host: &str| {
+            create_argv(
+                "kd-r",
+                &body(&format!(r#"{{"Image":"x","HostConfig":{host}}}"#)),
+            )
+            .map(|c| c.argv)
+        };
+        let restart = |host: &str| {
+            argv(host).ok().and_then(|a| {
+                a.iter()
+                    .position(|x| x == "--restart")
+                    .and_then(|i| a.get(i + 1).cloned())
+            })
+        };
+        assert_eq!(
+            restart(r#"{"RestartPolicy":{"Name":"on-failure","MaximumRetryCount":2}}"#),
+            Some("on-failure:2".into())
+        );
+        assert_eq!(
+            restart(r#"{"RestartPolicy":{"Name":"on-failure","MaximumRetryCount":0}}"#),
+            Some("on-failure".into())
+        );
+        assert_eq!(
+            restart(r#"{"RestartPolicy":{"Name":"always"}}"#),
+            Some("always".into())
+        );
+        assert_eq!(
+            restart(r#"{"RestartPolicy":{"Name":"unless-stopped"}}"#),
+            Some("unless-stopped".into())
+        );
+        for none in [
+            r#"{"RestartPolicy":{"Name":"no"}}"#,
+            r#"{"RestartPolicy":{"Name":""}}"#,
+            "{}",
+        ] {
+            assert_eq!(restart(none), None, "{none}");
+        }
+        assert!(argv(r#"{"AutoRemove":true,"RestartPolicy":{"Name":"always"}}"#).is_err());
+        assert!(argv(r#"{"AutoRemove":true,"RestartPolicy":{"Name":"no"}}"#).is_ok());
+        assert!(argv(r#"{"RestartPolicy":{"Name":"sometimes"}}"#).is_err());
     }
 
     /// A container keeps its layer (`--keep`, so `docker start` runs it again on the same files)

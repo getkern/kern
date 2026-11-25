@@ -104,6 +104,12 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**`docker run --restart` through kern's Docker API is honoured, and the restart count is reported.**
+The API did not read `HostConfig.RestartPolicy`, so `--restart on-failure:2` ran once and stayed down.
+It is `kern box --restart` now (`on-failure:N`, `always`, `unless-stopped`), refused with
+`AutoRemove` as Docker refuses the pair, and `docker inspect` gives `RestartCount`, as do
+`kern inspect --json` and `kern ps -a --json` (`restart_count`), counted as Docker counts them.
+
 **A `kern commit` of a `--net` box no longer bakes the host's resolver into the image.** The host's
 `/etc/resolv.conf` was copied into the box's writable layer, so it was a change like any other and a
 commit carried it (a systemd-resolved stub, here). It is now given through the box's own `/etc`

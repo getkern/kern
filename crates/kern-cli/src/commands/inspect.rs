@@ -513,24 +513,27 @@ pub fn ps(
             .cmp(&a.meta.created)
             .then(a.name.cmp(&b.name))
     });
-    let exited: Vec<registry::ExitedBox> = if want_exited {
+    // ONE BOX, ONE ROW, for a name that has a kept layer. The exit record is transient (an hour,
+    // or `kern gc`) and the kept record is durable and now carries the same code (the supervisor
+    // records it), so printing both put one box in two sections of one `ps -a` saying two different
+    // things - measured: `exit 137` in one and "never ran" in the other - and made `ps -a -q` print
+    // its name twice, which a script acts on. Those records are set apart, not dropped: the kept
+    // row reads its restart count from them.
+    let (kept_runs, exited): (Vec<registry::ExitedBox>, Vec<registry::ExitedBox>) = if want_exited {
         // AGAINST THIS `ps`'s OWN SNAPSHOT, UNFILTERED: between a box's `waitexit` write and its
         // unregister both artefacts exist, and a record of a box in `live` is left out by
         // `list_exited_among`, on the full (pid, starttime) identity, so no box appears in BOTH
         // sections of one `ps -a`; a running box a `--filter` hides is still running, not exited.
         registry::list_exited_among(&live)
             .into_iter()
-            .filter(|e| exited_matches(e, filters) && named(&e.name))
-            // ONE BOX, ONE ROW, for a name that has a kept layer. The exit record is transient (an
-            // hour, or `kern gc`) and the kept record is durable and now carries the same code (the
-            // supervisor records it), so printing both put one box in two sections of one `ps -a`
-            // saying two different things - measured: `exit 137` in one and "never ran" in the
-            // other - and made `ps -a -q` print its name twice, which a script acts on.
-            .filter(|e| !kept.iter().any(|k| k.name == e.name))
-            .collect()
+            .partition(|e| kept.iter().any(|k| k.name == e.name))
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
+    let exited: Vec<registry::ExitedBox> = exited
+        .into_iter()
+        .filter(|e| exited_matches(e, filters) && named(&e.name))
+        .collect();
     // `--last N` / `-n N`: THE N MOST RECENTLY CREATED, ACROSS BOTH LISTS. Docker counts containers,
     // not "running containers and then some exited ones", so a stack where three services are still
     // up and two have finished must answer `-n 2` with the two newest of the five - the cut is made
@@ -740,7 +743,7 @@ pub fn ps(
                 // read ONE key across live and exited rows instead of knowing that a dead box spells
                 // its state in the health field. `health` keeps saying `exited` because something may
                 // already read it.
-                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"image\":{},\"labels\":{},\"exit_code\":{},\"exited_ago\":{}{started},\"health\":{},\"status\":{}}}",
+                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"image\":{},\"labels\":{},\"exit_code\":{},\"exited_ago\":{}{started},\"restart_count\":{},\"health\":{},\"status\":{}}}",
                 json_str(&e.name),
                 e.pid,
                 json_str(&e.pod),
@@ -749,6 +752,7 @@ pub fn ps(
                 labels_object(e.labels.split(',').filter(|l| !l.is_empty()).map(str::to_string)),
                 e.code,
                 e.exited_ago,
+                e.restarts,
                 json_str("exited"),
                 json_str("exited"),
             ));
@@ -772,8 +776,16 @@ pub fn ps(
                 (Some(c), None) => format!(",\"exit_code\":{c}"),
                 (None, _) => String::new(),
             };
+            // Docker's `RestartCount`, from the exit record of its last run (0 once that record
+            // has expired, or for a box that never restarted).
+            let restarts = kept_runs
+                .iter()
+                .filter(|e| e.name == k.name)
+                .map(|e| e.restarts)
+                .max()
+                .unwrap_or(0);
             items.push(format!(
-                "{{\"name\":{},\"command\":{},\"image\":{},\"created\":{}{exit},\"labels\":{},\"health\":{},\"status\":{}}}",
+                "{{\"name\":{},\"command\":{},\"image\":{},\"created\":{}{exit},\"restart_count\":{restarts},\"labels\":{},\"health\":{},\"status\":{}}}",
                 json_str(&k.name),
                 json_str(&crate::ui::scrub(&k.command)),
                 json_str(&crate::ui::scrub(&k.meta.image)),
@@ -1851,7 +1863,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&gpu)
         };
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"created\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"created\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{},\"restart_count\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
@@ -1899,6 +1911,8 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             num(registry::box_deadline(&b.name, b.pid)
                 .filter(|d| d.at_unix_ms > 0)
                 .map(|d| d.at_unix_ms / 1000)),
+            // Docker's `RestartCount`: the restarts so far, from the supervisor's attempt record.
+            registry::box_attempt(&b.name, b.pid).map_or(0, registry::Attempt::restarts),
         );
     } else {
         let p = crate::ui::Palette::detect();

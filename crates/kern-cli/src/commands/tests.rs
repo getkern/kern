@@ -880,6 +880,7 @@ mod ps_exited_tests {
 
     fn dead(name: &str, code: i32, pod: &str) -> registry::ExitedBox {
         registry::ExitedBox {
+            restarts: 0,
             name: name.to_string(),
             pid: 42,
             starttime: 1000,

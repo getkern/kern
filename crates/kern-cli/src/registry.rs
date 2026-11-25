@@ -375,17 +375,26 @@ fn attempt_dir() -> io::Result<PathBuf> {
 /// A box's current attempt, as its supervisor last recorded it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attempt {
-    /// A run started at this time (Unix milliseconds).
-    Running { since_ms: u64 },
-    /// The last run exited with `code` at this time, and the next one has not started yet.
-    Restarting { since_ms: u64, code: i32 },
+    /// A run started at this time (Unix milliseconds), after `restarts` restarts.
+    Running { since_ms: u64, restarts: u32 },
+    /// The last run exited with `code` at this time, and the next one (restart number `restarts`)
+    /// has not started yet.
+    Restarting {
+        since_ms: u64,
+        code: i32,
+        restarts: u32,
+    },
 }
 
 impl Attempt {
     fn render(self) -> String {
         match self {
-            Attempt::Running { since_ms } => format!("run {since_ms}\n"),
-            Attempt::Restarting { since_ms, code } => format!("restarting {since_ms} {code}\n"),
+            Attempt::Running { since_ms, restarts } => format!("run {since_ms} {restarts}\n"),
+            Attempt::Restarting {
+                since_ms,
+                code,
+                restarts,
+            } => format!("restarting {since_ms} {code} {restarts}\n"),
         }
     }
 
@@ -393,15 +402,39 @@ impl Attempt {
         let mut f = text.split_whitespace();
         let kind = f.next()?;
         let since_ms: u64 = f.next()?.parse().ok()?;
+        // THE RESTART COUNT IS THE LAST FIELD AND OPTIONAL: a record from before it reads as 0.
         let a = match kind {
-            "run" => Attempt::Running { since_ms },
+            "run" => Attempt::Running {
+                since_ms,
+                restarts: 0,
+            },
             "restarting" => Attempt::Restarting {
                 since_ms,
                 code: f.next()?.parse().ok()?,
+                restarts: 0,
             },
             _ => return None,
         };
+        let restarts = match f.next() {
+            Some(n) => n.parse().ok()?,
+            None => 0,
+        };
+        let a = match a {
+            Attempt::Running { since_ms, .. } => Attempt::Running { since_ms, restarts },
+            Attempt::Restarting { since_ms, code, .. } => Attempt::Restarting {
+                since_ms,
+                code,
+                restarts,
+            },
+        };
         f.next().is_none().then_some(a)
+    }
+
+    /// How many times the box has been restarted, as Docker's `RestartCount` counts them.
+    pub fn restarts(self) -> u32 {
+        match self {
+            Attempt::Running { restarts, .. } | Attempt::Restarting { restarts, .. } => restarts,
+        }
     }
 }
 
@@ -1064,8 +1097,11 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance) {
         // --filter label=` finds a test session's containers by, and what kern's Docker API lists
         // and inspects once the box has gone: it held them only in its own memory, which a server
         // that restarts loses.
+        // AND HOW MANY TIMES IT WAS RESTARTED, from its supervisor's attempt record (which a stop
+        // also finds), for Docker's `RestartCount`.
+        let restarts = box_attempt(&b.name, b.pid).map_or(0, Attempt::restarts);
         let body = format!(
-            "{code}\n{}\n{}\n{}\nimage\t{}\nlabels\t{}",
+            "{code}\n{}\n{}\n{}\nimage\t{}\nlabels\t{}\nrestarts\t{restarts}",
             b.name,
             b.pod,
             one_line(&b.command, 512),
@@ -1353,6 +1389,8 @@ pub struct ExitedBox {
     pub image: String,
     /// Its `--label` pairs, comma-joined as [`Instance::labels`]; empty when none or not recorded.
     pub labels: String,
+    /// How many times it was restarted (Docker's `RestartCount`); 0 when not recorded.
+    pub restarts: u32,
     /// Seconds since the box exited, from the sidecar's mtime.
     pub exited_ago: u64,
 }
@@ -1450,6 +1488,7 @@ pub fn list_exited_among(boxes: &[Instance]) -> Vec<ExitedBox> {
             command: command.to_string(),
             image: crate::ui::scrub(&keyed("image")),
             labels: crate::ui::scrub(&keyed("labels")),
+            restarts: keyed("restarts").trim().parse().unwrap_or(0),
             exited_ago: ago,
         });
     }
@@ -3834,25 +3873,41 @@ mod attempt_tests {
         for a in [
             Attempt::Running {
                 since_ms: 1_795_000_000_000,
+                restarts: 0,
+            },
+            Attempt::Running {
+                since_ms: 5,
+                restarts: 3,
             },
             Attempt::Restarting {
                 since_ms: 7,
                 code: 137,
+                restarts: 2,
             },
             Attempt::Restarting {
                 since_ms: 7,
                 code: -1,
+                restarts: 0,
             },
         ] {
             assert_eq!(Attempt::parse(&a.render()), Some(a));
         }
+        // A record written before the count reads as no restart.
+        assert_eq!(
+            Attempt::parse("run 5\n"),
+            Some(Attempt::Running {
+                since_ms: 5,
+                restarts: 0
+            })
+        );
         for bad in [
             "",
             "run",
             "run x",
             "restarting 5",
             "restarting 5 x",
-            "run 5 6",
+            "run 5 6 7",
+            "run 5 x",
             "up 5",
         ] {
             assert_eq!(Attempt::parse(bad), None, "{bad:?}");

@@ -5544,6 +5544,9 @@ fn supervise_box(
         .ok()
         .map(|d| d.join(format!("{}-{}.log", name.as_str(), std::process::id())));
     let mut attempt = 0u32;
+    // RESTARTS, NEVER RESET: Docker's `RestartCount`. `attempt` above is reset after a run that
+    // stayed up, for the backoff and the retry budget; this one only counts.
+    let mut restarts = 0u32;
     // Whether any attempt reached its workload: what decides below whether `--rm` may take the
     // logs (a box that never started is explained to its launcher FROM its log).
     let mut ran_once = false;
@@ -5608,6 +5611,7 @@ fn supervise_box(
             inst.pid,
             registry::Attempt::Running {
                 since_ms: registry::unix_ms(),
+                restarts,
             },
         );
         // THE RUNNER'S VERDICT, CARRIED BACK. The signal that ended the workload and whether its own
@@ -6000,12 +6004,14 @@ fn supervise_box(
                 adopt_current_name(inst);
                 registry::set_box_exit(std::process::id() as i32, inst.starttime, code, inst);
             }
+            restarts = restarts.saturating_add(1);
             registry::set_box_attempt(
                 &inst.name,
                 inst.pid,
                 registry::Attempt::Restarting {
                     since_ms: registry::unix_ms(),
                     code,
+                    restarts,
                 },
             );
             unsafe { libc::sleep(backoff) };

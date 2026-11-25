@@ -3213,8 +3213,10 @@ fn docker_state(b: &registry::Instance) -> &'static str {
 /// from here, as Docker's does: a box run again by `--restart` is up since that run.
 pub(crate) fn current_run(b: &registry::Instance) -> (u64, Option<i32>) {
     match registry::box_attempt(&b.name, b.pid) {
-        Some(registry::Attempt::Running { since_ms }) => ((since_ms / 1000).max(b.started), None),
-        Some(registry::Attempt::Restarting { since_ms, code }) => (since_ms / 1000, Some(code)),
+        Some(registry::Attempt::Running { since_ms, .. }) => {
+            ((since_ms / 1000).max(b.started), None)
+        }
+        Some(registry::Attempt::Restarting { since_ms, code, .. }) => (since_ms / 1000, Some(code)),
         None => (b.started, None),
     }
 }
