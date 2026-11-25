@@ -1231,10 +1231,51 @@ fn inspect(name: Option<&String>, json: bool) -> Result<(), Error> {
     Ok(())
 }
 
-fn prune() -> Result<(), Error> {
-    // Remove EMPTY volumes only (nothing written) - conservative; a non-empty volume is never
-    // deleted implicitly.
+/// The anonymous volumes no box can reach any more: their box is not running, has no exit record,
+/// is not kept and has no `--restart` unit. A detached box's record lives in the runtime dir and is
+/// read for an hour, so after that, or after a reboot, its anonymous volumes would otherwise stay on
+/// disk for ever; `docker volume prune` removes the unused anonymous volumes the same way.
+fn orphan_anon_volumes() -> Vec<String> {
     let dir = volumes_dir();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let anon: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(ANON_PREFIX))
+        .collect();
+    if anon.is_empty() {
+        return Vec::new();
+    }
+    let running = crate::registry::list();
+    let mut boxes: Vec<String> = running.iter().map(|b| b.name.clone()).collect();
+    boxes.extend(
+        crate::registry::list_exited_among(&running)
+            .into_iter()
+            .map(|b| b.name),
+    );
+    boxes.extend(
+        crate::keepbox::list_matching(|_| true)
+            .into_iter()
+            .map(|k| k.name),
+    );
+    boxes.extend(crate::commands::managed_unit_names());
+    anon.into_iter()
+        .filter(|v| !boxes.iter().any(|b| is_anon_of(v, b)))
+        .collect()
+}
+
+fn prune() -> Result<(), Error> {
+    // Remove EMPTY volumes (nothing written) - conservative; a non-empty volume is never deleted
+    // implicitly, EXCEPT an anonymous one whose box is gone (see `orphan_anon_volumes`).
+    let dir = volumes_dir();
+    let mut orphans = 0usize;
+    for v in orphan_anon_volumes() {
+        if crate::commands::remove_tree_mapped(&dir.join(&v)).is_ok() {
+            orphans += 1;
+        }
+    }
     // Named volumes a running box still mounts - never prune these out from under a box.
     let in_use = crate::registry::volumes_in_use();
     let mut removed = 0usize;
@@ -1252,11 +1293,19 @@ fn prune() -> Result<(), Error> {
         }
     }
     let p = crate::ui::Palette::detect();
-    if removed == 0 {
+    if removed == 0 && orphans == 0 {
         println!("{}no empty volumes to prune{}", p.d, p.z);
-    } else {
+    }
+    if removed > 0 {
         let s = if removed == 1 { "volume" } else { "volumes" };
         println!("{}pruned{} {removed} empty {s}", p.g, p.z);
+    }
+    if orphans > 0 {
+        let s = if orphans == 1 { "volume" } else { "volumes" };
+        println!(
+            "{}pruned{} {orphans} anonymous {s} of boxes that are gone",
+            p.g, p.z
+        );
     }
     Ok(())
 }

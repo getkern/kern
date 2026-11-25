@@ -2343,6 +2343,27 @@ fn an_image_volume_gets_an_anonymous_volume_that_goes_with_the_box() {
     let kept_name = format!("kav{}", std::process::id());
     let started = k(&["run", "-d", "-q", "--name", &kept_name, &tag, "sleep", "30"]);
     let while_kept = anon();
+    // A box that leaves nothing (foreground, not kept, no --rm) takes its volume with it: the next
+    // box of the name must start fresh, as a new docker container does (Grok's round 6, case 22).
+    let fg_name = format!("kfg{}", std::process::id());
+    let fg = k(&[
+        "run",
+        "--name",
+        &fg_name,
+        &tag,
+        "sh",
+        "-c",
+        "echo CHANGED > /data/f",
+    ]);
+    let after_fg = anon();
+    let fg_again = k(&["run", "--rm", "--name", &fg_name, &tag, "cat", "/data/f"]);
+    // `volume prune` takes the anonymous volume of a box that is gone, and leaves a running one's.
+    let ghost = format!("kern-anon-ghost{}-0123456789abcdef", std::process::id());
+    let made_ghost = k(&["volume", "create", &ghost]);
+    // NOT EMPTY, or the prune of empty volumes takes it and this proves nothing about orphans.
+    let _ = std::fs::write(data.join("kern/volumes").join(&ghost).join("data/x"), b"x");
+    let pruned = k(&["volume", "prune"]);
+    let after_prune = anon();
     let removed = k(&["rm", "-f", &kept_name]);
     let after_kept = anon();
     let _ = k(&["rmi", &tag]);
@@ -2373,6 +2394,30 @@ fn an_image_volume_gets_an_anonymous_volume_that_goes_with_the_box() {
             .iter()
             .any(|n| n.starts_with(&format!("kern-anon-{kept_name}-"))),
         "a kept box's anonymous volume: {while_kept:?}"
+    );
+    assert!(fg.status.success(), "{:?}", out_err(&fg));
+    assert!(
+        !after_fg
+            .iter()
+            .any(|n| n.starts_with(&format!("kern-anon-{fg_name}-"))),
+        "a box that leaves nothing kept its anonymous volume: {after_fg:?}"
+    );
+    assert!(
+        out_err(&fg_again).0.contains("seeded"),
+        "the next box of the name must find the image's content, not the last one's: {:?}",
+        out_err(&fg_again)
+    );
+    assert!(made_ghost.status.success(), "{:?}", out_err(&made_ghost));
+    assert!(pruned.status.success(), "{:?}", out_err(&pruned));
+    assert!(
+        !after_prune.contains(&ghost),
+        "prune left a gone box's anonymous volume: {after_prune:?}"
+    );
+    assert!(
+        after_prune
+            .iter()
+            .any(|n| n.starts_with(&format!("kern-anon-{kept_name}-"))),
+        "prune took a running box's anonymous volume: {after_prune:?}"
     );
     assert!(removed.status.success(), "{:?}", out_err(&removed));
     assert!(

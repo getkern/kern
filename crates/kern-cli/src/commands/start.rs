@@ -3652,12 +3652,19 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     &pod_label,
                     std::slice::from_ref(&args.name.to_string()),
                 );
-                // And its anonymous volumes, as `docker run --rm` removes a container's. Only when
-                // it had some: the removal lists kern's volumes, which is a directory read on the
-                // exit path of every `--rm` box (MEASURED: +22 getdents64 for an image with none).
-                if !anon_specs.is_empty() {
-                    crate::volume::remove_anon_of(args.name);
-                }
+            }
+            // ITS ANONYMOUS VOLUMES END WITH IT when nothing of the box is left: `--rm`, and a
+            // foreground box that is not kept, which leaves no record (`kern ps -a` does not list
+            // it, `kern rm` finds nothing). Kept, they would be unreachable, and the next box of
+            // this name would find another box's data where docker gives a new container a fresh
+            // volume. MEASURED in Grok's round 6, case 22. NOT when a `--restart` unit runs this
+            // box again, which must find its data. Only when it had some: the removal lists kern's
+            // volumes, a directory read on every exit (+22 getdents64 for an image with none).
+            if (args.rm || !args.keep)
+                && !anon_specs.is_empty()
+                && !crate::commands::has_managed_unit(args.name)
+            {
+                crate::volume::remove_anon_of(args.name);
             }
             // A kept box remembers how its last run ended, which is what `kern ps -a` shows for it.
             // Best effort: a code that could not be recorded costs a column, not the box.

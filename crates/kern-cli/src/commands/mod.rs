@@ -5797,6 +5797,27 @@ const MANAGED_MARKER: &str = "X-KernManagedBox";
 ///
 /// Fail-safe by construction: a file that cannot be read, or is too large to be one of ours, is NOT
 /// ours. The read is bounded because this runs over every candidate in a directory kern does not own.
+/// The names of the boxes kern's `--restart` units run, read from the unit files kern wrote.
+pub(crate) fn managed_unit_names() -> Vec<String> {
+    let Ok(dir) = user_systemd_dir() else {
+        return Vec::new();
+    };
+    std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let f = e.file_name().into_string().ok()?;
+                    let name = f
+                        .strip_prefix("kern-")?
+                        .strip_suffix(".service")?
+                        .to_string();
+                    is_kern_managed_unit(&e.path()).then_some(name)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn is_kern_managed_unit(path: &std::path::Path) -> bool {
     use std::io::Read;
     // A kern unit is a few hundred bytes. 64 KiB is far above any of ours and far below a file worth
