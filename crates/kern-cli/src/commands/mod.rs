@@ -2168,7 +2168,17 @@ pub(crate) fn resolve_volume(
                 // sent to look for a kern directory where their doc told them to find a display
                 // socket, and the two paths are now both in the sentence.
                 if let Some(state) = crate::registry::trusted_state_overlap(&canon) {
-                    let root = if crate::keepbox::boxes_dir().parent() == Some(state.as_path()) {
+                    // The volumes and the history, when set on a disk of their own, are parts of the
+                    // data root and carry its reason, not the registry's.
+                    let data_part = ["volumes_dir", "history_dir"].iter().any(|k| {
+                        crate::config::dir_setting(k)
+                            .map(|d| std::fs::canonicalize(&d).unwrap_or(d))
+                            .as_deref()
+                            == Some(state.as_path())
+                    });
+                    let root = if data_part
+                        || crate::keepbox::boxes_dir().parent() == Some(state.as_path())
+                    {
                         StateRoot::Data
                     } else if crate::registry::config_root().as_deref() == Some(state.as_path()) {
                         StateRoot::Config
