@@ -335,6 +335,51 @@ fn ready_count(root: &Path, kind: Kind) -> usize {
         .unwrap_or(0)
 }
 
+/// Wait, bounded, until a prepared network is ready or none is coming, for `kern bench`, which times
+/// boxes back to back: without it half of them met a pool still refilling and the series was two
+/// populations (measured: median 8.9 ms between a 3.0 ms minimum and a 16.4 ms p90, and an A/A
+/// interval of +-10 ms). Returns at once when the pool is off, has a slot, or its last fill failed; a
+/// box that takes no slot (another uid map, a bind as root) waits only `GRACE`, the time a filler
+/// needs to take its lock, and the caller does not time the wait.
+pub(crate) fn settle() {
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(20);
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+    if !enabled() {
+        return;
+    }
+    let Some(root) = root() else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        let ready = ready_count(&root, Kind::Single) + ready_count(&root, Kind::Range);
+        let failed = recently_failed(&root, Kind::Single) || recently_failed(&root, Kind::Range);
+        let elapsed = started.elapsed();
+        if ready > 0 || failed || elapsed >= BOUND || (elapsed >= GRACE && !filling(&root)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Is a filler at work: does one hold a `.fill-<kind>.lock`?
+fn filling(root: &Path) -> bool {
+    [Kind::Single, Kind::Range].iter().any(|k| {
+        std::fs::File::open(root.join(format!(".fill-{}.lock", k.as_str())))
+            .ok()
+            // SAFETY: `flock` on a descriptor this function owns; a shared lock taken is dropped
+            // with the file at the end of the closure.
+            .is_some_and(
+                |f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0,
+            )
+    })
+}
+
+/// Is the pool on, for a report that says how its boxes were timed.
+pub(crate) fn is_enabled() -> bool {
+    enabled()
+}
+
 /// The slots, ready and claimed, for `kern info`: `(ready single, ready range, in use)`.
 pub(crate) fn counts() -> (usize, usize, usize) {
     let Some(root) = root() else {

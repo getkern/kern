@@ -172,12 +172,22 @@ fn box_argv(kern: &str, a: &BenchArgs, name: &str) -> Vec<String> {
     v
 }
 
-/// The argv of one container start with another runtime: the same image and command, and no
-/// network, as a box has none by default.
+/// The argv of one container start with another runtime: the same image and command, on its
+/// default network, as a box is on kern's. It said `--network none` "as a box has none by default",
+/// which stopped being true when a box got Docker's default network: the pair timed a box with a
+/// NAT against a container without one.
 fn other_argv(tool: &str, image: &str) -> Vec<String> {
-    [tool, "run", "--rm", "--network", "none", image, "/bin/true"]
+    [tool, "run", "--rm", image, "/bin/true"]
         .map(String::from)
         .to_vec()
+}
+
+/// [`box_argv`], built once the network kern prepares ahead is ready (`netpool::settle`, bounded and
+/// not timed: this runs before the clock starts), so every box is timed the way a box started on its
+/// own is, and not half against a pool still refilling from the previous one.
+fn ready_box_argv(kern: &str, a: &BenchArgs, name: &str) -> Vec<String> {
+    crate::netpool::settle();
+    box_argv(kern, a, name)
 }
 
 /// A unique box name per run, so a run never meets the previous one's leftovers.
@@ -265,12 +275,12 @@ pub(crate) fn run(args: &BenchArgs) -> Result<(), Error> {
     say("kern bench: the floor (spawning /bin/true)");
     let floor = series(args.runs, &|_| vec!["/bin/true".to_string()]).map_err(fail)?;
     say("kern bench: kern box");
-    let boxes = series(args.runs, &|i| box_argv(&kern, args, &name(i))).map_err(fail)?;
+    let boxes = series(args.runs, &|i| ready_box_argv(&kern, args, &name(i))).map_err(fail)?;
     say("kern bench: A/A, the same box start in two interleaved series");
     let (aa_a, aa_b) = interleaved(
         args.runs,
-        &|i| box_argv(&kern, args, &name(4_000_000 + i)),
-        &|i| box_argv(&kern, args, &name(5_000_000 + i)),
+        &|i| ready_box_argv(&kern, args, &name(4_000_000 + i)),
+        &|i| ready_box_argv(&kern, args, &name(5_000_000 + i)),
     )
     .map_err(fail)?;
     let aa = paired(&aa_a, &aa_b);
@@ -283,7 +293,7 @@ pub(crate) fn run(args: &BenchArgs) -> Result<(), Error> {
             ));
             let (k, o) = interleaved(
                 args.runs,
-                &|i| box_argv(&kern, args, &name(6_000_000 + i)),
+                &|i| ready_box_argv(&kern, args, &name(6_000_000 + i)),
                 &|_| other_argv(tool, args.value),
             )
             .map_err(fail)?;
@@ -349,6 +359,17 @@ pub(crate) fn run(args: &BenchArgs) -> Result<(), Error> {
         z = p.z
     );
     println!("  machine: {}", machine());
+    // HOW THE BOXES WERE TIMED, said beside the number it shapes: each one after the network kern
+    // prepares ahead was ready (the wait is not timed), which is a box started on its own, not one
+    // in a burst.
+    if crate::netpool::is_enabled() {
+        println!(
+            "  network: kern's default NAT, each box timed once the NAT prepared ahead was ready \
+             (KERN_NET_POOL=0 times a box that starts its own)"
+        );
+    } else {
+        println!("  network: kern's default NAT, each box starting its own (KERN_NET_POOL=0)");
+    }
     println!(
         "  load average (1 min): {} before, {} after{}",
         load_before.map_or("?".into(), |l| format!("{l:.2}")),
@@ -491,18 +512,10 @@ mod tests {
     }
 
     #[test]
-    fn a_comparison_runs_the_same_image_and_command_with_no_network() {
+    fn a_comparison_runs_the_same_image_and_command_on_the_default_network() {
         assert_eq!(
             other_argv("podman", "alpine:3.19"),
-            [
-                "podman",
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "alpine:3.19",
-                "/bin/true"
-            ]
+            ["podman", "run", "--rm", "alpine:3.19", "/bin/true"]
         );
         let a = BenchArgs {
             flag: "--image",
