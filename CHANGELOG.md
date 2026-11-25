@@ -105,6 +105,19 @@ made through kern's socket) starts at once: the launcher held its layer, so the 
 failed and ran a second later, and `docker run -d --restart always` took 1.4 s with a restart counted
 that never happened (now about 190 ms and 0).
 
+**A stopped box is not run again by its own restart policy.** A box whose `--restart always` its
+supervisor keeps (a pod member: every compose service, and every container of kern's Docker API on a
+network) ran again a second after `kern stop`; `kern restart` and `docker restart` then failed with
+"already running", and the stop removed the scratch under the new run, which exited 125 at every
+retry. The policy now asks whether a stop has begun before it runs the box again.
+
+**`docker build` and `docker save` through kern's socket.** Both answered "not served". A build is
+`kern build` of the context the client streams, with its tags, Dockerfile, build args, target,
+platform and `--no-cache`, its lines as Docker's and the image's id at the end (`-q` prints it
+alone); `docker compose up --build` builds through it. `docker save` is `kern save`, streamed, one
+image an archive. `docker restart` publishes `kill die stop start restart`, once; a `--restart
+always` container's watch added its own `start` after the restart's.
+
 **`docker events` and `docker inspect` follow a `--restart always` container and a rename.** Such a
 container's stream was `create start die destroy` while systemd ran it ten times, and it read
 `exited`; it is a `start` and a `die` per run now, `restarting` between them, and visible from the
