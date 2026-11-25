@@ -1525,6 +1525,30 @@ fn parse_resolv(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     (ns, search, options)
 }
 
+/// The mounts in the order they can all be seen: a parent before what is mounted under it, whatever
+/// order they were written in, as Docker orders them. STABLE, so mounts at one depth keep the order
+/// they were given. MEASURED (Grok's round 17, case y10): `-v a:/data/sub -v b:/data` mounted `/data`
+/// over `/data/sub`, and a write to `/data/sub` failed with "nonexistent directory".
+fn mount_order(mut volumes: Vec<Volume>) -> Vec<Volume> {
+    volumes.sort_by_key(|v| std::path::Path::new(&v.target).components().count());
+    volumes
+}
+
+#[cfg(test)]
+#[test]
+fn mounts_go_parent_first_and_keep_their_order_at_one_depth() {
+    let v = |t: &str| Volume {
+        source: format!("/s{t}"),
+        target: t.to_string(),
+        read_only: false,
+    };
+    let got: Vec<String> = mount_order(vec![v("/data/sub"), v("/x"), v("/data"), v("/y")])
+        .into_iter()
+        .map(|m| m.target)
+        .collect();
+    assert_eq!(got, ["/x", "/data", "/y", "/data/sub"]);
+}
+
 fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
     // A `--net` box with its own `/etc` directory, in an overlay, and no resolver of its own asked
     // for: it gets the host's, BOUND from that directory (`setup_resolv_conf`) rather than copied into
@@ -1761,6 +1785,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         root,
         mode,
         overlay,
+        volumes: mount_order(b.volumes),
         read_only: b.read_only,
         landlock_rw: b.landlock_rw,
         net_ips: b.net_ips,
@@ -1769,7 +1794,6 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         apparmor: b.apparmor,
         command: b.cmd,
         hostname,
-        volumes: b.volumes,
         env: b.env,
         workdir: b.workdir,
         share_net: b.share_net,
