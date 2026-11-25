@@ -230,11 +230,10 @@ fn fresh_name() -> Option<String> {
 /// A name a box may have (kern's own check refuses anything else; this keeps a client's name from
 /// reaching kern's argv as something else).
 pub(crate) fn valid_name(n: &str) -> bool {
-    !n.is_empty()
-        && n.len() <= 63
-        && n.bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'.')
-        && !n.starts_with(['-', '.'])
+    // kern's own rule for a box's name, the one every path it becomes is sized for: up to
+    // `BoxName::MAX_LEN`, not 63. MEASURED before: a 128-character name Docker accepts was refused
+    // here, while `kern run --name` takes it (its hostname cut to 64, as the kernel's limit is).
+    kern_common::BoxName::parse(n).is_ok()
 }
 
 /// A container created and not yet started: what `start` needs to run it.
@@ -596,6 +595,37 @@ fn with_platform(mut c: Created, platform: Option<&str>) -> Created {
     c
 }
 
+/// This process's hard limit for the `ulimit` named as Docker names it, `None` when unlimited or
+/// not a name kern maps.
+fn hard_limit_of(name: &str) -> Option<u64> {
+    let res = match name {
+        "nofile" => libc::RLIMIT_NOFILE,
+        "nproc" => libc::RLIMIT_NPROC,
+        "memlock" => libc::RLIMIT_MEMLOCK,
+        "core" => libc::RLIMIT_CORE,
+        "stack" => libc::RLIMIT_STACK,
+        "fsize" => libc::RLIMIT_FSIZE,
+        "cpu" => libc::RLIMIT_CPU,
+        "as" => libc::RLIMIT_AS,
+        "data" => libc::RLIMIT_DATA,
+        "locks" => libc::RLIMIT_LOCKS,
+        "sigpending" => libc::RLIMIT_SIGPENDING,
+        "msgqueue" => libc::RLIMIT_MSGQUEUE,
+        "nice" => libc::RLIMIT_NICE,
+        "rtprio" => libc::RLIMIT_RTPRIO,
+        _ => return None,
+    };
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit on this process with a struct owned here.
+    if unsafe { libc::getrlimit(res, &mut lim) } != 0 || lim.rlim_max == libc::RLIM_INFINITY {
+        return None;
+    }
+    Some(lim.rlim_max)
+}
+
 fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
     let image = body
         .get("Image")
@@ -654,6 +684,13 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
+        // Docker's daemon refuses a relative one, in these words (measured: `docker run -w ./tmp`
+        // exits 125 under Docker; through kern's socket it ran in `/tmp`).
+        if !w.starts_with('/') {
+            return Err(format!(
+                "the working directory '{w}' is invalid, it needs to be an absolute path"
+            ));
+        }
         argv.push("-w".into());
         argv.push(w.to_string());
     }
@@ -961,6 +998,17 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
             continue;
         };
         let hard = u.get("Hard").and_then(Value::as_i64).unwrap_or(soft);
+        // A rootless box cannot raise a hard limit above the one this server has, and kern then
+        // applies that one and says so on its stderr, which the Docker client never reads.
+        // MEASURED before: `--ulimit nofile=9999999:9999999` ran with 1048576 and not a word.
+        if let Some(cap) = hard_limit_of(name) {
+            if u64::try_from(hard).is_ok_and(|h| h > cap) {
+                warnings.push(format!(
+                    "Ulimits {name}={soft}:{hard}: kern runs the box rootless and cannot raise a \
+                     hard limit above {cap}, so the box gets {cap}"
+                ));
+            }
+        }
         argv.push("--ulimit".into());
         argv.push(format!("{name}={soft}:{hard}"));
     }
@@ -5263,6 +5311,11 @@ mod tests {
         assert_eq!(a, id_of("kd-1"));
         assert_ne!(a, id_of("kd-2"));
         assert!(valid_name("web_1.a-b"));
+        assert!(
+            valid_name(&"x".repeat(128)),
+            "Docker takes a 128-character name"
+        );
+        assert!(!valid_name(&"x".repeat(201)));
         for bad in ["", "-x", ".x", "a b", "a/b", "a;b"] {
             assert!(!valid_name(bad), "{bad}");
         }
@@ -5698,6 +5751,36 @@ mod tests {
                 ("die", Some(3)),
                 ("start", None)
             ]
+        );
+    }
+
+    /// A relative working directory is Docker's 400; a hard limit above this process's own is
+    /// applied as that one, and the create says so.
+    #[test]
+    fn a_relative_workdir_is_refused_and_a_ulimit_above_ours_is_a_warning() {
+        let b = |s: &str| json::parse(s).unwrap();
+        let e = create_argv("n", &b(r#"{"Image":"x","WorkingDir":"./tmp"}"#))
+            .err()
+            .unwrap();
+        assert!(e.contains("needs to be an absolute path"), "{e}");
+        assert!(create_argv("n", &b(r#"{"Image":"x","WorkingDir":"/tmp"}"#)).is_ok());
+        let Some(cap) = hard_limit_of("nofile") else {
+            return;
+        };
+        let over = cap.saturating_add(1);
+        let c = create_argv(
+            "n",
+            &b(&format!(
+                r#"{{"Image":"x","HostConfig":{{"Ulimits":[{{"Name":"nofile","Soft":{over},"Hard":{over}}}]}}}}"#
+            )),
+        )
+        .unwrap();
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("cannot raise a hard limit")),
+            "{:?}",
+            c.warnings
         );
     }
 

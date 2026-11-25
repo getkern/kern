@@ -101,6 +101,12 @@ answered "not served by kern's Docker API"; it is `kern tag`, the source by name
 platform's entry included (`kern tag --platform <os/arch>`). An image is found by name first and
 then by a unique id prefix of two characters or more, as Docker finds one; it took twelve.
 
+**A create through kern's socket takes the names Docker takes, and says what it changes.** A name
+over 63 characters was refused (kern's own limit is 200, as `kern run --name` has it); a relative
+working directory ran in the root where Docker refuses it, and now gets Docker's refusal; a hard
+`ulimit` above what a rootless box can have is applied at that ceiling with a warning the client
+prints, where it was lowered without a word to the client.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).
