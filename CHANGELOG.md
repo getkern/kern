@@ -81,6 +81,14 @@ the connections queued, and runs with its soft file limit raised to the hard one
 does; the boxes it starts keep the limit they had (soft 1024, as a Docker container's). Measured: 200
 at once, three times, 200 of 200 in about one second, the same server, no box left.
 
+**A `--restart always` box can be created when its command exits at once, and removed.** `kern run
+-d --restart always alpine false` (and `docker run` through kern's socket) failed with "the box unit
+was installed but didn't start": systemd holds such a unit in `activating` between runs, which the
+check read as a failure, and it left the unit behind, so the box came back after every `kern rm
+-f`. The start is judged by systemd's state, a unit that did not come up is removed, `kern rm` of a
+restarting box refuses without `-f` as Docker's does, and `kern rm -f` stops it for good. Between
+two runs it lists as `restarting`, with systemd's count of its restarts.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

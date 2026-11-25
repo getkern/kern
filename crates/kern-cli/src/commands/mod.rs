@@ -2737,6 +2737,79 @@ fn systemctl_user(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// A unit's `ActiveState` (`active`, `activating`, `failed`, ...), `None` when systemctl could not say.
+fn unit_active_state(unit: &str) -> Option<String> {
+    std::process::Command::new("systemctl")
+        .envs(kern_isolation::manager_envs())
+        .args(["--user", "show", "-p", "ActiveState", "--value", unit])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// What systemd says of the unit a `--restart always` box runs under: whether it is between two runs
+/// (Docker's `restarting`), and how many times it ran it again (Docker's `RestartCount`, which the
+/// box's own supervisor cannot count: each run is a new one). `None` for a name with no kern unit,
+/// which costs one `stat`; one `systemctl show` otherwise.
+pub(crate) fn managed_unit_runs(name: &str) -> Option<(bool, u32)> {
+    let path = managed_unit_path(name)?;
+    if !is_kern_managed_unit(&path) {
+        return None;
+    }
+    let out = std::process::Command::new("systemctl")
+        .envs(kern_isolation::manager_envs())
+        .args([
+            "--user",
+            "show",
+            "-p",
+            "ActiveState,NRestarts",
+            &unit_file_name(name),
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let field = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k).and_then(|v| v.strip_prefix('=')))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let state = field("ActiveState");
+    let restarting = matches!(state.as_str(), "activating" | "deactivating");
+    Some((restarting, field("NRestarts").parse().unwrap_or(0)))
+}
+
+/// Did a freshly started unit come up? `active`, or `activating`, which is also where a
+/// `Restart=always` service waits between two runs (`activating (auto-restart)`), or `reloading`.
+/// `Some(false)` for `failed` or `inactive`; `None` for a state on the way somewhere else
+/// (`deactivating`, which a `Restart=always` service also passes between two runs). PURE.
+fn unit_came_up(state: &str) -> Option<bool> {
+    match state {
+        "active" | "activating" | "reloading" => Some(true),
+        "failed" | "inactive" => Some(false),
+        _ => None,
+    }
+}
+
+/// Wait (2 s at most) for a freshly started unit to say whether it came up; a state still in
+/// transition at the end counts as up, since only `failed` and `inactive` say it did not.
+fn wait_unit_came_up(unit: &str) -> (bool, String) {
+    let mut last = String::new();
+    for _ in 0..20 {
+        last = unit_active_state(unit).unwrap_or_default();
+        if let Some(up) = unit_came_up(&last) {
+            return (up, last);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    (true, last)
+}
+
 /// Quote one argv element for a systemd `ExecStart=` line: wrap in double quotes and escape the
 /// characters systemd would otherwise act on - `"`/`\` (C-escapes), `$` (env expansion → `$$`), and
 /// `%` (specifier → `%%`). Keeps arbitrary box names/commands/paths intact when systemd re-runs us.

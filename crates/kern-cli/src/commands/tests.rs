@@ -9224,3 +9224,19 @@ fn the_protected_homes_come_from_the_password_database_and_none_known_adopts_not
         "a repository holding a home was adopted"
     );
 }
+
+/// A `Restart=always` unit between two runs is `activating`, which is the policy working, not a
+/// start that failed; `failed` and `inactive` are.
+#[test]
+fn a_unit_waiting_to_restart_came_up_and_a_failed_one_did_not() {
+    for s in ["active", "activating", "reloading"] {
+        assert_eq!(super::unit_came_up(s), Some(true), "{s}");
+    }
+    for s in ["failed", "inactive"] {
+        assert_eq!(super::unit_came_up(s), Some(false), "{s}");
+    }
+    // On the way between two runs of a `Restart=always` service, or not yet known: read again.
+    for s in ["deactivating", ""] {
+        assert_eq!(super::unit_came_up(s), None, "{s:?}");
+    }
+}

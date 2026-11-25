@@ -792,6 +792,13 @@ pub fn ps(
                 .iter()
                 .find(|e| e.name == k.name)
                 .is_some_and(|e| e.oom);
+            // A `--restart always` box between two runs is `restarting`, and its count is the
+            // unit's: systemd runs it again with a new supervisor each time, which counts nothing.
+            let (status, restarts) = match crate::commands::managed_unit_runs(&k.name) {
+                Some((true, n)) => ("restarting", n.max(restarts)),
+                Some((false, n)) => ("kept", n.max(restarts)),
+                None => ("kept", restarts),
+            };
             items.push(format!(
                 "{{\"name\":{},\"command\":{},\"image\":{},\"created\":{}{exit},\"restart_count\":{restarts},\"oom_killed\":{oom},\"labels\":{},\"health\":{},\"status\":{}}}",
                 json_str(&k.name),
@@ -799,8 +806,8 @@ pub fn ps(
                 json_str(&crate::ui::scrub(&k.meta.image)),
                 k.meta.created,
                 labels_object(k.labels.iter().cloned()),
-                json_str("kept"),
-                json_str("kept"),
+                json_str(status),
+                json_str(status),
             ));
         }
         if shape == JsonShape::Lines {
@@ -1957,8 +1964,11 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             num(registry::box_deadline(&b.name, b.pid)
                 .filter(|d| d.at_unix_ms > 0)
                 .map(|d| d.at_unix_ms / 1000)),
-            // Docker's `RestartCount`: the restarts so far, from the supervisor's attempt record.
-            registry::box_attempt(&b.name, b.pid).map_or(0, registry::Attempt::restarts),
+            // Docker's `RestartCount`: the restarts so far, from the supervisor's attempt record, or
+            // the unit's count for a `--restart always` box, which systemd runs again each time.
+            registry::box_attempt(&b.name, b.pid)
+                .map_or(0, registry::Attempt::restarts)
+                .max(crate::commands::managed_unit_runs(&b.name).map_or(0, |(_, n)| n)),
             box_oom_killed(&b),
         );
     } else {
@@ -3798,6 +3808,23 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
                 continue;
             }
             if let Err(e) = stop(std::slice::from_ref(&inst.name), false) {
+                failures.push(format!("'{name}': could not be stopped: {e}"));
+                continue;
+            }
+        } else if managed_unit_path(name).is_some_and(|p| is_kern_managed_unit(&p)) {
+            // A `--restart always` BOX BETWEEN TWO RUNS: not in the registry, and its systemd unit
+            // starts it again in a second, and at every boot. Docker refuses `rm` of a restarting
+            // container and `rm -f` stops it for good; `kern stop` removes the unit. MEASURED
+            // before: `docker rm -f` of a `--restart always` container through kern's socket, and
+            // `kern rm -f`, answered 0 and the box was back a second later, every time.
+            if !force {
+                failures.push(format!(
+                    "'{name}' is restarting (its unit `kern-{name}.service` runs it again) - \
+                     `kern stop {name}` first, or `kern rm -f`"
+                ));
+                continue;
+            }
+            if let Err(e) = stop(std::slice::from_ref(name), false) {
                 failures.push(format!("'{name}': could not be stopped: {e}"));
                 continue;
             }

@@ -6538,12 +6538,18 @@ fn install_persistent_box(
     }
     // Feedback-first: `enable --now` returns success once the start is *dispatched*, so verify the
     // service actually came up rather than printing a "started" that might be a lie (e.g. a bad
-    // ExecStart, an image that exits immediately). `is-active` is true for active|activating.
-    if !systemctl_user(&["is-active", "--quiet", &unit_name]) {
+    // ExecStart). ⛔ NOT `is-active`, which is true for `active` alone: a `--restart always` box
+    // whose command exits at once sits in `activating (auto-restart)` between runs, which is the
+    // policy working. MEASURED before: `docker run -d --restart always alpine false` through kern's
+    // socket answered "the box unit was installed but didn't start", and the unit it left behind
+    // brought the box back after every `rm`. A unit that really did not come up is removed here,
+    // as Docker creates no container whose start failed.
+    let (up, state) = wait_unit_came_up(&unit_name);
+    if !up {
+        let _ = stop_managed_unit(name.as_str());
         return Err(Error::Sandbox(format!(
-            "the box unit was installed but didn't start - check `systemctl --user status {unit_name}` \
-             (then `kern stop {}` to remove it)",
-            name.as_str(),
+            "the box unit did not start (systemd says `{state}`), and was removed: \
+             `journalctl --user -u {unit_name}` says why",
         )));
     }
     println!(
