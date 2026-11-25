@@ -105,6 +105,21 @@ made through kern's socket) starts at once: the launcher held its layer, so the 
 failed and ran a second later, and `docker run -d --restart always` took 1.4 s with a restart counted
 that never happened (now about 190 ms and 0).
 
+**`docker compose up --build` recreates a rebuilt service.** Through kern's socket an image's id was
+derived from its name, so an image rebuilt under the same tag kept its id and compose left the old
+container running the old build. The id is the image's content now (its config and layers), and a
+rebuild is a new id. Ids of names one byte apart no longer share their first digits.
+
+**`docker build` with buildx is refused at once, naming `DOCKER_BUILDKIT=0`.** With buildx installed
+the docker CLI hands every build to it, and buildx pulled `moby/buildkit` (23 s, 230 MB) to run in a
+privileged container this API refuses, then said only that. It is refused before the pull, saying
+that `DOCKER_BUILDKIT=0 docker build` and `DOCKER_BUILDKIT=0 docker compose build` use the classic
+builder kern's API serves.
+
+**`docker inspect` reports the restart policy, and `kern save` takes several images.**
+`HostConfig.RestartPolicy` was empty for every container; it is the policy the container was made
+with, as Docker reports it. `kern save a b` and `docker save a b` write one archive with both images.
+
 **A closed port is refused behind pasta, and a lost SYN costs one retry.** With the pasta Ubuntu
 24.04 ships, a box's connection to a closed port waited for the client's timeout (`wget -T20`: 20 s;
 Docker: refused in 311 ms), and a SYN the remote dropped cost two seconds instead of one, which bursts
