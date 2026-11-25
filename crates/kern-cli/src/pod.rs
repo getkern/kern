@@ -1800,8 +1800,9 @@ fn setup_outbound_in(dir: &std::path::Path, holder: i32, ns_ifname: &str) -> Out
     }
     // THE TWO TCP RULES the pasta of Ubuntu 24.04 needs, a closed port refused instead of hung and
     // one lost SYN costing one second instead of two (see `kern_isolation::nft`, which has the
-    // measurements). Best effort: without nftables in the kernel the box keeps pasta's behaviour,
-    // and the outcome is left next to pasta's state for `kern doctor` to read.
+    // measurements). Best effort: without nftables in the kernel the box keeps pasta's behaviour.
+    // The outcome is left in `tcp-rules` beside pasta's state, for a person looking at one box; no
+    // command reads it (`kern info`'s `pasta tcp` row asks the host with a probe of its own).
     let rules = match rules.map(kern_isolation::nft::Install::wait) {
         Ok(Ok(())) => "ok\n".to_string(),
         Ok(Err(e)) | Err(e) => format!("{e}\n"),
