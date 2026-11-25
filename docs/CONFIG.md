@@ -244,6 +244,7 @@ measured to reach a box in the distro over HTTPS.
 log_max_size             = "10m"  # every box's log rotates at this size (default 16m)
 log_max_file             = 2      # files each box keeps, the active one included (default 2)
 log_keep_ended           = "24h"  # the log of a box that ended goes after this long
+log_driver               = "journald"  # also send every box's output to the systemd journal (default json-file)
 build_keep               = 200    # build records kept; older ones go when a build ends
 sandbox_history_max_size = "1m"   # the history rotates at this size, two files kept (default 1m)
 sandbox_transcripts      = true   # keep the code SDK sandboxes ran and its output (default true)
@@ -256,7 +257,11 @@ win over these two, as `--log-opt` wins over Docker's `daemon.json`; they apply 
 after the change.
 
 The logs are on disk, in the data dir's `logs/` (or `logs_dir`), so a reboot keeps them, as Docker
-keeps a container's. The log of a box that ended is removed after 7 days, or after `log_keep_ended`
+keeps a container's. `log_driver = "journald"`, as `daemon.json`'s `log-driver`, also sends every line
+to the systemd journal (`journalctl -t <box>`, stdout at priority info and stderr at err) for a box that
+names no `--log-driver`; the file stays, so `kern logs` reads the box as before. Where there is no
+journal (WSL without systemd, a container) such a box is refused with the reason, not started without
+it. The log of a box that ended is removed after 7 days, or after `log_keep_ended`
 when it is set, each time a box starts with `-d`, the only moment a new log is made; a running box's
 log is never touched, and a kept box's (`--keep`) stays until the box is removed. `kern prune` and
 `kern gc` remove the ended ones at once. `30m`, `24h` and `7d` are periods.

@@ -170,6 +170,10 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern top`: a box's log is live, and `s`, `p`, `u` act on that box from it.** Enter on the Boxes
   tab showed the log as it was when pressed, and any key closed it, so `s` pressed to stop the box
   only closed the log. It follows the output now, `s` asks to stop that box, Esc goes back.
+- **`--log-driver journald`**, compose `logging: driver: journald`, the Docker API's `LogConfig` and
+  `[kern] log_driver`: every line also goes to the systemd journal, tagged with the box's name, stdout
+  as info and stderr as err; `kern logs` keeps working from the file. Refused where there is no journal.
+  `kern info` names the driver, and as root suggests `/var/lib/kern` for a server's data.
 - **Box logs are kept on disk, so a reboot keeps them**, as Docker keeps a container's: in the data
   dir's `logs/` (or `logs_dir`). An ended box's log goes after 7 days (`log_keep_ended`), a kept box's
   when the box is removed. A box started before the upgrade keeps its `kern logs`. Measured, a
