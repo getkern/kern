@@ -375,6 +375,9 @@ pub fn record_from_stdin(
 /// and tab dropped, every line indented so nothing a box printed starts at column 0.
 fn for_terminal(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
+    // The newline that ends the last line ends it: split on it as well and an empty, indented line
+    // followed every block (`print(1)` showed `1` and then a blank line).
+    let text = text.strip_suffix('\n').unwrap_or(&text);
     let mut out = String::with_capacity(text.len() + 16);
     for line in text.split('\n') {
         out.push_str("    ");
@@ -463,6 +466,13 @@ mod tests {
         v.extend_from_slice(out);
         v.extend_from_slice(err);
         v
+    }
+
+    #[test]
+    fn a_block_ends_with_its_last_line_not_a_blank_one() {
+        assert_eq!(for_terminal(b"1\n"), "    1\n");
+        assert_eq!(for_terminal(b"1\n2"), "    1\n    2\n");
+        assert_eq!(for_terminal(b"a\n\n"), "    a\n    \n");
     }
 
     #[test]
