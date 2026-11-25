@@ -682,6 +682,20 @@ fn point_the_box_at_the_egress_proxy(
                 .to_string(),
         ));
     }
+    let proxy = format!("http://127.0.0.1:{EGRESS_PROXY_PORT}");
+    for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        env.push((k.to_string(), proxy.clone()));
+    }
+    Ok(())
+}
+
+/// The egress filter's one hole, said once: in the FINAL process, after the scope re-exec. Said
+/// with the refusals in `point_the_box_at_the_egress_proxy`, a host whose boxes take the scope (an
+/// SSH session outside the user manager, Ubuntu 24.04 measured) printed it twice.
+fn say_what_the_egress_filter_cannot_close(args: &BoxRunArgs) {
+    if args.egress_allow.is_empty() {
+        return;
+    }
     // FOR A PERSON AT A TERMINAL, as the rest of kern's narration: an SDK runs a box per call, and this
     // paragraph landed in the stderr of every cell and every transcript (MEASURED, kern-sandbox 0.3.0
     // with `egress_allow`). A script and an SDK read it in docs/EGRESS.md, which it names.
@@ -700,11 +714,6 @@ fn point_the_box_at_the_egress_proxy(
          a microVM with a real firewall."
     );
     }
-    let proxy = format!("http://127.0.0.1:{EGRESS_PROXY_PORT}");
-    for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-        env.push((k.to_string(), proxy.clone()));
-    }
-    Ok(())
 }
 
 /// Copy the image's content at each mount point into any NAMED volume that is still empty.
@@ -1985,6 +1994,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             allow_uncapped: args.allow_uncapped || kern_common::env_flag("KERN_ALLOW_UNCAPPED"),
         });
     }
+    say_what_the_egress_filter_cannot_close(&args);
     // THE GPU GRANT IS DECIDED IN THE FINAL PROCESS, after the scope re-exec and still before the
     // image is pulled, so a request this host cannot meet is refused before any download. Decided
     // above the re-exec, it was decided twice: MEASURED on a Jetson, where an SSH session sits
@@ -3267,6 +3277,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         .pod
         .filter(|_| args.stack_outbound)
         .and_then(|p| HeldNat::arm(p, name.as_str()));
+    // THE WORKLOAD WAITS FOR ITS FILTER: armed after `HeldNat`, which `--egress-allow` never meets
+    // (it refuses `--pod`), so the two never compete for the one gate a box has.
+    let mut egress_gate = egress_pending.as_ref().and_then(|_| EgressGate::arm());
     let result = run_in_sandbox_with(
         &spec,
         alive_fd,
@@ -3293,9 +3306,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     }
                 }
             }
-            // The launcher turns the recorded message into the box's own error.
+            // The launcher turns the recorded message into the box's own error. Delivered means the
+            // pump listens in the box: only then does the workload pass its gate.
             if let Some(e) = deliver_egress(&mut egress_pending, &mut egress_guard, pid1) {
                 egress_failed = Some(e);
+            } else if let Some(gate) = egress_gate.as_mut() {
+                gate.release();
             }
             if let Some(nat) = held_nat.as_mut() {
                 nat.release(pid1);
@@ -3311,6 +3327,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         !managed,
     );
     drop(held_nat);
+    drop(egress_gate);
     pt.mark("box lifetime (spawn->exit)");
     // THE EGRESS PUMP NEVER CAME UP, so the box we just ran had no outbound access at all, not
     // even to the domains the caller allowed. PID 1 was SIGKILLed in the callback; report the
@@ -5593,6 +5610,10 @@ fn supervise_box(
             // and never members of the box's (the placement `EgressPlan::arm` documents).
             let mut egress_pending = egress.and_then(EgressPlan::arm);
             let mut egress_guard: Option<crate::egress::EgressFilter> = None;
+            // THE WORKLOAD WAITS FOR ITS FILTER here too, for every attempt, as on the foreground path:
+            // the detached box had the same race (see `EgressGate`). After `HeldNat`, which a box with
+            // `--egress-allow` never has (it refuses `--pod`), so the one gate is never contended.
+            let mut egress_gate = egress_pending.as_ref().and_then(|_| EgressGate::arm());
             // The exec witness: whether this attempt's workload ran, for the restart decision below.
             kern_isolation::want_exec_witness();
             let code = match run_in_sandbox_with(
@@ -5689,6 +5710,8 @@ fn supervise_box(
                             // SAFETY: the readiness pipe's write end, a valid descriptor here.
                             let _ = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
                         }
+                    } else if let Some(gate) = egress_gate.as_mut() {
+                        gate.release();
                     }
                     // A detached box has no terminal at all, so there is never a master to swap.
                     None
@@ -5707,8 +5730,10 @@ fn supervise_box(
                 }
             };
             drop(held_nat);
-            // This attempt is over: its proxy and pump go now. The runner leaves through `_exit`,
-            // which runs no destructor, so an implicit drop would leave both running.
+            // This attempt is over: its proxy, pump and gate go now. The runner leaves through
+            // `_exit`, which runs no destructor, so an implicit drop would leave them running, and a
+            // `KERN_GATE_FD` left set would make the next attempt's gate refuse to arm.
+            drop(egress_gate);
             drop(egress_guard);
             drop(egress_pending);
             // WHY IT DIED, WHEN THE CGROUP KNOWS. A box that hit its pids cap does not say so: the
@@ -7140,6 +7165,68 @@ mod image_defaults_tests {
     ///
     /// THE CONTROLS ARE THE POINT. Without the `POLLIN`-with-a-closed-writer row, "closed writer
     /// means never" would read as correct while silently discarding a box the launcher DID release.
+    /// The gate of a box with `--egress-allow`: armed, it names its read end in `KERN_GATE_FD` for
+    /// the box this process forks; released, that end reads ONE byte, which is the box's release;
+    /// dropped unreleased (a pump that never listened, a launcher that died), it reads EOF, which
+    /// the box's gate takes as refusal; and a launcher's gate already set is left alone. Read here
+    /// from the descriptor the variable names, as the box reads it.
+    #[test]
+    fn the_egress_gate_releases_with_one_byte_and_refuses_with_eof() {
+        let _g = crate::env_guard();
+        crate::unset_global_env("KERN_GATE_FD");
+        let read_named = || -> (isize, u8) {
+            let fd: libc::c_int = crate::global_env_str("KERN_GATE_FD")
+                .expect("an armed gate names its read end")
+                .parse()
+                .expect("a descriptor number");
+            let mut b = [0u8; 1];
+            // SAFETY: one byte into a local buffer from the descriptor the gate holds open.
+            let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
+            (n, b[0])
+        };
+        let mut gate = EgressGate::arm().expect("no gate was set, so one is armed");
+        gate.release();
+        assert_eq!(read_named(), (1, 1), "a released gate holds one byte");
+        gate.release();
+        assert_eq!(
+            read_named(),
+            (0, 0),
+            "released once: the write end is gone after it"
+        );
+        drop(gate);
+        assert!(
+            crate::global_env_str("KERN_GATE_FD").is_err(),
+            "the gate's variable outlived it, and the next box would wait on a closed descriptor"
+        );
+        let unreleased = EgressGate::arm().expect("armed again");
+        let fd: libc::c_int = crate::global_env_str("KERN_GATE_FD")
+            .expect("named")
+            .parse()
+            .expect("a number");
+        // SAFETY: a duplicate of the read end, so the read below outlives the gate's drop.
+        let kept = unsafe { libc::dup(fd) };
+        assert!(kept >= 0, "dup");
+        let mut unreleased = unreleased;
+        unreleased.write = None; // what its drop does first: the pump never said it listens
+        let mut b = [9u8; 1];
+        // SAFETY: one byte into a local buffer from a descriptor this test owns.
+        let n = unsafe { libc::read(kept, b.as_mut_ptr().cast(), 1) };
+        // SAFETY: the duplicate this test made.
+        unsafe { libc::close(kept) };
+        assert_eq!(
+            n, 0,
+            "an unreleased gate must read EOF, which refuses the box"
+        );
+        drop(unreleased);
+        crate::set_global_env("KERN_GATE_FD", "7");
+        assert!(
+            EgressGate::arm().is_none(),
+            "a launcher's gate is already set: that launcher releases this box"
+        );
+        assert_eq!(crate::global_env_str("KERN_GATE_FD").as_deref(), Ok("7"));
+        crate::unset_global_env("KERN_GATE_FD");
+    }
+
     #[test]
     fn gate_can_still_release_separates_a_pending_byte_from_a_shut_pipe() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -7936,6 +8023,79 @@ impl HeldNat {
                 p.len(),
             )
         };
+    }
+}
+
+/// The pre-exec gate of a box with `--egress-allow`: the workload is released once the filter's pump
+/// listens in the box, and never before.
+///
+/// MEASURED ON A STOCK UBUNTU 24.04 (kern's AppArmor profile, nested KVM), where it did not hold:
+/// the pump was told PID 1 right after the fork and the box went on to its `execvp` at once, so the
+/// "PID 1 is killed before it reaches the workload" of the failure path was a race the box won. The
+/// workload's `wget` met `127.0.0.1:3128` with nothing behind it (`Connection refused`), the box
+/// exited, and the pump then found no `/proc/<pid1>/ns/net` and the launcher said the port "never
+/// came up". On this desktop the box's setup outlasted the pump's start and the race was never lost.
+///
+/// THE GATE `HeldNat` AND COMPOSE USE: the box is built and confined, waits in one `read`, and a
+/// byte releases it. This process holds the only write end once the box has shed its copy; one
+/// that dies, or a pump that never listens (`release` is not called), leaves EOF, and EOF refuses.
+pub(crate) struct EgressGate {
+    write: Option<std::os::fd::OwnedFd>,
+    _read: std::os::fd::OwnedFd,
+}
+
+impl EgressGate {
+    /// Arm the gate for the box this process forks next. `None` when a launcher's gate is already
+    /// set (that launcher releases this box) or no pipe can be made, and then the box runs as it
+    /// did before this gate, its pump racing it.
+    pub(crate) fn arm() -> Option<EgressGate> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        if crate::global_env_str("KERN_GATE_FD").is_ok() {
+            return None;
+        }
+        let mut fds = [-1i32; 2];
+        // SAFETY: `fds` is a two-element array, which is what `pipe2` writes.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            eprintln!(
+                "kern: warning: --egress-allow: no gate for the box ({}); its workload may start \
+                 before the filter listens",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        // SAFETY: two descriptors `pipe2` just returned, owned by nothing else.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // SAFETY: the supervisor is single-threaded here, between the helpers' spawn and the fork.
+        crate::set_global_env("KERN_GATE_FD", read.as_raw_fd().to_string());
+        Some(EgressGate {
+            write: Some(write),
+            _read: read,
+        })
+    }
+
+    /// Release the workload: the pump has said it listens. Once.
+    pub(crate) fn release(&mut self) {
+        let Some(w) = self.write.take() else {
+            return;
+        };
+        let byte = [1u8];
+        loop {
+            // SAFETY: a valid descriptor this struct owned and a one-byte buffer.
+            let r = unsafe {
+                libc::write(std::os::fd::AsRawFd::as_raw_fd(&w), byte.as_ptr().cast(), 1)
+            };
+            if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+    }
+}
+
+impl Drop for EgressGate {
+    fn drop(&mut self) {
+        self.write = None;
+        crate::unset_global_env("KERN_GATE_FD");
     }
 }
 

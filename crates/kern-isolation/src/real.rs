@@ -8245,15 +8245,78 @@ fn clear_caps_from_sets(mask: u64) -> Result<(), Error> {
 /// or unable to report that it is listening, and the second failure is silent by construction: the
 /// reader would wait on a pipe whose only writer had been closed underneath it.
 ///
-/// `keep` is expected to be tiny (two entries today), so the linear scan per fd costs nothing next to
-/// the syscalls; correctness here is worth more than one `close_range` call. Best-effort like the
-/// single-fd version: closing an unopened fd is a harmless EBADF.
+/// `close_range(2)` over the gaps between the kept descriptors, as the single-fd version does around
+/// its one. It was a `close()` per descriptor from 3 to 1023, which cost 1021 system calls in every
+/// child that kept two (+207 us on a gated box start, measured) and LEFT OPEN every inherited
+/// descriptor at 1024 or above, the one thing the shed is for. The per-descriptor loop stays for a
+/// kernel without `close_range` (< 5.9) and for more than [`KEPT_AT_MOST`] kept, which no caller
+/// asks for.
+///
+/// No allocation: this runs between `fork` and `execve`. Best-effort like the single-fd version:
+/// closing an unopened fd is a harmless EBADF, and a negative entry keeps nothing.
 pub fn shed_inherited_fds_keeping(keep: &[i32]) {
+    let mut kept = [0u32; KEPT_AT_MOST];
+    let mut n = 0usize;
+    let mut fits = true;
+    for &fd in keep {
+        let Ok(fd) = u32::try_from(fd) else {
+            continue;
+        };
+        if fd < 3 || kept.get(..n).is_some_and(|k| k.contains(&fd)) {
+            continue;
+        }
+        match kept.get_mut(n) {
+            Some(slot) => *slot = fd,
+            None => {
+                fits = false;
+                break;
+            }
+        }
+        n = n.saturating_add(1);
+    }
+    if fits {
+        if let Some(sorted) = kept.get_mut(..n) {
+            sorted.sort_unstable();
+            if close_the_gaps(sorted) {
+                return;
+            }
+        }
+    }
     for fd in 3..1024 {
         if !keep.contains(&fd) {
+            // SAFETY: closing a descriptor number; an unopened one is EBADF.
             unsafe { libc::close(fd) };
         }
     }
+}
+
+/// How many descriptors [`shed_inherited_fds_keeping`] keeps with `close_range`; three callers keep
+/// two, one keeps one.
+const KEPT_AT_MOST: usize = 8;
+
+/// Close every descriptor from 3 up except `sorted` (ascending, each `>= 3`, no repeats) with one
+/// `close_range` per gap. `false` when the kernel refused one, for the caller's loop.
+fn close_the_gaps(sorted: &[u32]) -> bool {
+    let close_range = |lo: u32, hi: u32| -> bool {
+        // SAFETY: `close_range` takes two descriptor numbers and a flag; it touches no memory.
+        unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                libc::c_uint::from(lo),
+                libc::c_uint::from(hi),
+                0,
+            ) == 0
+        }
+    };
+    let mut lo = 3u32;
+    for &k in sorted {
+        if k > lo && !close_range(lo, k.saturating_sub(1)) {
+            return false;
+        }
+        // A descriptor number is a non-negative `i32`, so this never saturates.
+        lo = k.saturating_add(1);
+    }
+    close_range(lo, u32::MAX)
 }
 
 /// Which of `drop_caps_around_identity`'s three steps failed.
@@ -11125,6 +11188,60 @@ mod shed_tests {
             "the kept fd must stay OPEN (it carries the readiness signal)"
         );
         assert_eq!(buf[3], 1, "stdio (fd 1) must be untouched");
+    }
+
+    /// The several-kept shed closes what lies BETWEEN, BELOW AND ABOVE the kept descriptors, 1024
+    /// and beyond included (the loop it replaced stopped at 1023), keeps every kept one, given in
+    /// any order and repeated, and leaves stdio alone. Forked, for the reason the test above gives.
+    #[test]
+    fn shed_keeping_several_closes_every_gap_and_past_1024() {
+        use super::shed_inherited_fds_keeping;
+        let mut report = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0, "pipe");
+        let (rd, wr) = (report[0], report[1]);
+        let at = |n: i32| -> i32 { unsafe { libc::dup2(0, n) } };
+        // Two kept (40 and `wr`), leaks below, between and above, and one past the old loop's end.
+        let (below, keep_a, between, above, far) = (at(30), at(40), at(50), at(60), at(1500));
+        assert!(
+            [below, keep_a, between, above].iter().all(|&fd| fd >= 3) && far == 1500,
+            "dup2 must land where asked (RLIMIT_NOFILE above 1500?)"
+        );
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            shed_inherited_fds_keeping(&[keep_a, wr, -1, 2, keep_a]);
+            let is_open =
+                |fd: i32| -> u8 { (unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1) as u8 };
+            let out = [
+                is_open(below),
+                is_open(keep_a),
+                is_open(between),
+                is_open(above),
+                is_open(far),
+                is_open(wr),
+                is_open(1),
+            ];
+            unsafe {
+                libc::write(wr, out.as_ptr().cast(), out.len());
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(wr) };
+        let mut buf = [9u8; 7];
+        let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+        unsafe {
+            for fd in [rd, below, keep_a, between, above, far] {
+                libc::close(fd);
+            }
+            let mut st = 0i32;
+            libc::waitpid(pid, &mut st, 0);
+        }
+        assert_eq!(n, 7, "child must report seven bytes");
+        assert_eq!(
+            buf,
+            [0, 1, 0, 0, 0, 1, 1],
+            "below, kept, between, above, 1500, kept, stdio"
+        );
     }
 }
 

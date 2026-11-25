@@ -99,11 +99,23 @@ the vetted and pinned leg `--egress-secret` uses, where it used to dial port 80 
 - `kern pod create` refuses where `kernel.apparmor_restrict_unprivileged_userns=1` applies to kern
   (kern outside its AppArmor profile), with the words `kern box` uses there; a pod member used to start
   on such a host while a plain box was refused.
+**`--egress-allow`: the box's command starts once its filter listens**, in the foreground and with
+`-d`. The command could start before the filter's in-box port was up and meet `127.0.0.1:3128` with
+nothing behind it: on a stock Ubuntu 24.04, 13 boxes in 20 whose command fetches at once failed with
+v0.56.0. The box now waits, fully set up, until the filter says it listens: 20 in 20. The filter also
+waits out a moment in which the box's loopback, already up, refused its port (one box in 2000): 0
+failures in 6000.
+
+**A process kern starts keeps none of the caller's descriptors numbered 1024 or above.** A service of
+a stack without a pod and the `--egress-allow` helpers closed what they inherited from 3 to 1023 only:
+with v0.56.0 a descriptor 1500 of the caller was open in both services of such a stack.
+
 - `kern doctor` typed in Windows: the row checked from Windows is one of the table's rows, counted in
   the tally, where it was printed after it.
 - `install.ps1` resolves the latest version once, with a timeout, and downloads every file from that
   release; a release published during an install no longer makes the signature check refuse it.
-- The `--egress-allow` note is printed to a terminal only, not into every SDK cell's stderr.
+- The `--egress-allow` note is printed to a terminal only, not into every SDK cell's stderr, and once,
+  not twice when the box runs in a systemd scope of its own.
 - The `.localhost` router says it listens instead of being polled every 10 ms: a cold `kern box -d -p`
   takes about 3 ms less.
 - `kern sandbox show` ends a block with its last line, not a blank one.

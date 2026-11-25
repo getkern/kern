@@ -737,7 +737,15 @@ pub fn pump_reexec(read_fd: i32, box_port: u16, sock_path: &str, ready_fd: i32) 
             )
         };
         if n <= 0 {
-            eprintln!("kern: egress pump: box pid pipe closed before delivery");
+            // EOF: the box never started, and box_run says why. A line from here came before that
+            // reason and read as a second failure (measured on Ubuntu 24.04, a box refused its uid
+            // map). Only a failed read is the pump's own news.
+            if n < 0 {
+                eprintln!(
+                    "kern: egress pump: reading the box's pid: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
             unsafe { libc::_exit(1) };
         }
         got += n as usize;
@@ -1019,6 +1027,44 @@ fn http_target_port(request_line: &str) -> u16 {
         .unwrap_or(80)
 }
 
+/// What the pump's failed `bind` met, said with the failure: `lo`'s flag and address as this
+/// namespace has them, whether the box's PID 1 is still there, and whether this is still its
+/// network namespace. It is what found the route window above: the address present and the bind
+/// refused, where a flag seen before its address had been looked for and never met (8000 tries
+/// on 6.8 and 7.0).
+fn where_the_bind_failed(box_pid1: i32) -> String {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: a socket, two ioctls on a request this frame owns and names `lo`, and its close.
+    let (up, addressed) = unsafe {
+        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        ifr.ifr_name[0] = b'l' as libc::c_char;
+        ifr.ifr_name[1] = b'o' as libc::c_char;
+        let up = sock >= 0
+            && libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) == 0
+            && ifr.ifr_ifru.ifru_flags & libc::IFF_UP as i16 != 0;
+        let addressed = sock >= 0 && libc::ioctl(sock, libc::SIOCGIFADDR as _, &mut ifr) == 0;
+        if sock >= 0 {
+            libc::close(sock);
+        }
+        (up, addressed)
+    };
+    let ino = |p: &str| std::fs::metadata(p).map(|m| m.ino()).ok();
+    let theirs = ino(&format!("/proc/{box_pid1}/ns/net"));
+    let ours = ino("/proc/self/ns/net");
+    format!(
+        "lo {}, 127.0.0.1 {}, the box's PID 1 {}, {}",
+        if up { "up" } else { "down" },
+        if addressed { "present" } else { "absent" },
+        if theirs.is_some() { "alive" } else { "gone" },
+        match (theirs, ours) {
+            (Some(t), Some(o)) if t == o => "in its network namespace".to_string(),
+            (Some(_), Some(_)) => "in another network namespace".to_string(),
+            _ => "namespace not comparable".to_string(),
+        }
+    )
+}
+
 /// The box-netns pump: join the box's user+net ns, listen on `127.0.0.1:box_port` inside the box, and
 /// relay every accepted connection to the host-side UNIX socket where the proxy listens.
 fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd: i32) -> ! {
@@ -1095,10 +1141,35 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
         );
         unsafe { libc::_exit(1) };
     }
-    let listener = match std::net::TcpListener::bind(("127.0.0.1", box_port)) {
+    // `lo` IS UP AND ITS PORT CAN STILL BE REFUSED FOR A MOMENT. The box raises it too. MEASURED on
+    // Ubuntu 24.04 (6.8.0-147, nested): one egress box in 2000 had its bind refused with
+    // EADDRNOTAVAIL while, read right after, `lo` was up, 127.0.0.1 present, PID 1 alive and in this
+    // namespace. Which half of the box's raise the bind met was not shown (127.0.0.1's local route,
+    // which `bind` reads and the raise adds after the address, is the likely one; the flag seen before
+    // the address was looked for and never met). So EADDRNOTAVAIL is waited out, bounded, and every
+    // other refusal is final at once.
+    // The box's workload cannot meet the same window: it is held at its gate until this bind is done.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut pause = std::time::Duration::from_micros(50);
+    let bound = loop {
+        match std::net::TcpListener::bind(("127.0.0.1", box_port)) {
+            Err(e)
+                if e.raw_os_error() == Some(libc::EADDRNOTAVAIL)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_millis(10));
+            }
+            other => break other,
+        }
+    };
+    let listener = match bound {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("kern: egress pump: cannot bind 127.0.0.1:{box_port} in box: {e}");
+            eprintln!(
+                "kern: egress pump: cannot bind 127.0.0.1:{box_port} in box: {e} ({})",
+                where_the_bind_failed(box_pid1)
+            );
             unsafe { libc::_exit(1) };
         }
     };
@@ -1146,13 +1217,31 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
 /// NOT put the pump in the box PID ns, so it cannot become the zombie that would deadlock pidns teardown.
 /// The fast direct path is kept for the privileged case (real root / `--privileged`).
 fn enter_box_ns(box_pid1: i32) -> bool {
+    // THE BOX MAY BE IN ITS CREDENTIAL WINDOW: a change of credentials clears its `dumpable` flag,
+    // and until the box sets it again (just before it waits on its gate) the kernel refuses its
+    // `/proc/<pid>/ns/*` to everyone, its owner included. The box now waits at that gate for this
+    // pump, so the pump comes while it is being built, and waits out the window as `HeldNat`'s
+    // helper does: on `EACCES` only, bounded. Any other refusal is final at once.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let open_ns = |kind: &str| -> i32 {
         let p = format!("/proc/{box_pid1}/ns/{kind}\0");
-        unsafe {
-            libc::open(
-                p.as_ptr() as *const libc::c_char,
-                libc::O_RDONLY | libc::O_CLOEXEC,
-            )
+        let mut pause = std::time::Duration::from_micros(200);
+        loop {
+            // SAFETY: a NUL-terminated path this frame owns.
+            let fd = unsafe {
+                libc::open(
+                    p.as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0
+                || std::io::Error::last_os_error().raw_os_error() != Some(libc::EACCES)
+                || std::time::Instant::now() >= deadline
+            {
+                return fd;
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(20));
         }
     };
     unsafe {
