@@ -22,7 +22,7 @@ COMMANDS:
     build -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
     build --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that file, and build NOTHING
     images [<repo>] [--json] [--digests] [--filter K=V] [--format T]  List pulled (cached) images (<repo> = --filter reference=<repo>)
-    image ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs grouped under `image` (one parser each, not a second)
+    image ls|inspect|rm|pull|push|tag|save|load|build             The same verbs grouped under `image` (one parser each, not a second)
     rmi [-f] <image>...                                            Remove cached images (frees unshared layers); -f also one a box uses
     save <image> [-o file]                                         Export an image to a tar (the common image-archive format)
     load [-i file]                                                 Import an image from a tar (the common image-archive format)

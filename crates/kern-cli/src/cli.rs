@@ -1279,7 +1279,16 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 "pull" => "pull",
                 "push" => "push",
                 "tag" => "tag",
-                "history" => "history",
+                // NOT `history`, which is kern's list of recently run BOXES: `docker image history`
+                // shows an image's layers, a different answer under the same words. MEASURED:
+                // `kern image history alpine:3.21` printed the last boxes run, as if they were it.
+                "history" => {
+                    return Err(Error::Cli(
+                        "image history: kern keeps no layer history of an image (`kern history` \
+                         lists recently run boxes, `kern inspect <image>` shows its config)"
+                            .to_string(),
+                    ))
+                }
                 "save" => "save",
                 "load" => "load",
                 "build" => "build",
@@ -1294,10 +1303,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                          Run it deliberately, or `kern rmi <image>` for one",
                     ))
                 }
-                "" => return Err(Error::Usage("image ls|inspect|rm|pull|push|tag|history|save|load|build")),
+                "" => return Err(Error::Usage("image ls|inspect|rm|pull|push|tag|save|load|build")),
                 other => {
                     return Err(Error::Cli(format!(
-                        "image {other}: not a kern verb (image ls|inspect|rm|pull|push|tag|history|save|load|build)"
+                        "image {other}: not a kern verb (image ls|inspect|rm|pull|push|tag|save|load|build)"
                     )))
                 }
             };
@@ -2460,6 +2469,22 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         Some("history") => {
             reject_unknown_flags("history", &rest, &["-n"])?;
+            // A NAME IS NOT A FILTER HERE, and it was dropped in silence: `kern history <image>`,
+            // Docker's spelling for an image's layers, printed the last boxes run as if they were
+            // its answer. A positional (anything but `-n` and its value) is refused by name.
+            let n_value = rest.iter().position(|a| *a == "-n").map(|i| i + 1);
+            if let Some(extra) = rest
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(i, a)| Some(*i) != n_value && **a != "-n")
+                .map(|(_, a)| a)
+            {
+                return Err(Error::Cli(format!(
+                    "history takes no name ('{extra}'): it lists recently run boxes, all of them; \
+                     kern keeps no layer history of an image (`kern inspect <image>` shows its config)"
+                )));
+            }
             Command::History {
                 count: flag_value(&rest, "-n")
                     .and_then(|v| v.parse().ok())

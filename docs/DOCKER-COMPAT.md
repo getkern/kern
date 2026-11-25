@@ -29,7 +29,7 @@ a file that is not its own, and never hands a command to a docker engine.
 
 **Translated, flag by flag.** A flag passes only when kern's flag of that name means the same:
 `run` (onto `kern box`), `create`, `exec`, `ps`, `logs`, `inspect`, `rm`, `stop`, `restart`,
-`start`, `kill`, `images`, `rmi`, `pull`, `push`, `tag`, `save`, `load`, `history`, `cp`, `stats`,
+`start`, `kill`, `images`, `rmi`, `pull`, `push`, `tag`, `save`, `load`, `cp`, `stats`,
 `wait`, `rename`, `port`, `login`, `logout`, `info`, `build`, `volume ls|rm|create|inspect`,
 `network ls|inspect|create|rm`, `container <verb>`, `image <verb>`, and `compose` whole. Any other
 flag or verb stops the command with exit 125, naming it: `kern-docker: docker run --log-opt: kern has

@@ -37,6 +37,12 @@ image and execs into it: `--mount`, `exec -i`, and `docker events` for the conta
 container keeps its filesystem until `docker rm` (a kept box), so the `docker start` of a reopen
 runs it again on the same files; `--rm` containers and a Testcontainers run's stay in memory.
 
+**`history` answers only what it is: the boxes run lately.** `kern history <image>` dropped the
+name and printed the last boxes run, and `kern image history` and the shim's `docker history` ran
+the same verb, where Docker means an image's layers, which kern does not keep. A name is now
+refused with that sentence, `image history` and `docker history` are not translated, and
+`kern history [-n N]` is unchanged.
+
 **`kern ps` no longer calls a renamed box lost.** After `kern rename r r2`, `ps` warned that a box
 `r` was running with no record, about the box it listed as `r2`: the cgroup directory and the
 supervisor's command line keep the name a box started with. A box is now recognised by the cgroup

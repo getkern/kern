@@ -692,7 +692,13 @@ fn verb(name: &str, args: &[String]) -> Result<Plan, Refused> {
         "tag" => simple("tag", &["tag"], NONE, args),
         "save" => simple("save", &["save"], SAVE, args),
         "load" => simple("load", &["load"], LOAD, args),
-        "history" => simple("history", &["history"], NONE, args),
+        // `docker history <image>` is an image's layers; `kern history` is the boxes run lately.
+        // Translated, it answered one question with the other.
+        "history" => Err(Refused(
+            "docker history: not translated (an image's layer history is not kept by kern; \
+             `kern history` lists recently run boxes)"
+                .to_string(),
+        )),
         "cp" => simple("cp", &["cp"], CP, args),
         "stats" => simple("stats", &["stats"], STATS, args),
         "wait" => simple("wait", &["wait"], NONE, args),
@@ -726,10 +732,9 @@ fn verb(name: &str, args: &[String]) -> Result<Plan, Refused> {
             match sub {
                 Some("ls" | "list") => verb("images", rest),
                 Some("rm" | "remove") => verb("rmi", rest),
-                Some(
-                    s @ ("pull" | "push" | "tag" | "save" | "load" | "history" | "build"
-                    | "inspect"),
-                ) => verb(s, rest),
+                Some(s @ ("pull" | "push" | "tag" | "save" | "load" | "build" | "inspect")) => {
+                    verb(s, rest)
+                }
                 Some(other) => Err(Refused(format!("docker image {other}: not translated"))),
                 None => Err(Refused("docker image needs a verb".to_string())),
             }
