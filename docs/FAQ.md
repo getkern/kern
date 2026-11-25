@@ -75,7 +75,7 @@ and the Python SDK drives it. What you give up on that guest:
   VM the installer creates gets kern's own AppArmor profile instead, which survives a restart.
 - **The resource caps do not bite**: no `systemd --user` manager and no delegated `memory`
   controller, so a box's `--memory` is accepted and never enforced. kern says so at every box start
-  instead of pretending, `--require-limits` refuses to run uncapped, and `kern run --memory` refuses
+  instead of pretending, `--require-limits` refuses to run uncapped, and `kern limit --memory` refuses
   there without being asked. The isolation itself (namespaces,
   pivoted root, seccomp, Landlock) is unaffected.
 

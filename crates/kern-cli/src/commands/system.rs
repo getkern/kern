@@ -69,7 +69,7 @@ fn help_overview(p: &crate::ui::Palette) -> String {
                 out.push(String::new());
                 out.push(format!(
                     "{b}OPTIONS:{z}\n    {d}Per verb, where you are asking about it:{z} \
-                     {c}kern <verb> --help{z}{d} (box, run, compose, pod, volume, image, config, top){z}"
+                     {c}kern <verb> --help{z}{d} (box, run, limit, compose, pod, volume, image, config, top){z}"
                 ));
             }
             continue;
@@ -127,8 +127,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
   {d}Essentials{z}
     {c}box{z} <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     {c}box{z} <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
-    {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
-    {c}run{z} --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
+    {c}run{z} [opts] <image> [CMD...]                                    Run CMD in a sandbox from <image>, docker run's shape (box's options)
+    {c}limit{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...       Run CMD on this host under CPU/mem caps (no sandbox)
+    {c}limit{z} --landlock-rw <path> [--] CMD...                         Confine CMD's writes to <path> (kernel LSM, no sandbox)
     {c}exec{z} <name> [-i|-t|-it] [-u <user>] [--env K=V] [-w <dir>] [--] [CMD...]  Run CMD in a running box
                                                                      -t allocates a PTY; -i only keeps stdin attached, so
                                                                      `exec -i <box> psql … < file.sql` reaches EOF instead of hanging
@@ -202,7 +203,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}wait{z} <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
     {c}diff{z} <box> [--json]                                            List filesystem changes vs the image (C/D); a kept box's too, running or not
     {c}export{z} <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
-    {c}container{z} <verb> ...                                           The box verbs under one name (container ls = ps; not run/top/prune)
+    {c}container{z} <verb> ...                                           The box verbs under one name (container ls = ps; not top/prune)
     {c}compat docker{z} (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
     {c}unshare{z} [--] [CMD...]                                          Run CMD (default: your shell) with the ids a box's files carry on disk
                                                                      (chown/rm what a box's non-root users wrote in a bind), as podman unshare
@@ -280,7 +281,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      with the floor and an A/A noise interval; a comparison paired run by run
     {c}completions{z} <bash|zsh|fish>                                    Print a shell-completion script
 
-{b}OPTIONS for box:{z}
+{b}OPTIONS for box and run:{z}
     --rootfs <dir>      Root filesystem to enter
     --image <ref>       OCI image to pull and run (e.g. alpine, alpine:3.19)
     --pull missing|never|always  missing = default (pull only when absent); never = fail if not
@@ -448,7 +449,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         nowhere. It claims one address, not a subnet, and adds no route out
     -l, --label <k=v>   Attach metadata, selectable with `ps --filter label=`; repeatable
     --landlock-rw <path> Confine writes to these paths with the Landlock LSM; root stays read+exec (repeatable)
-                        Also valid on `run`, where it is the only real confinement: it needs no
+                        Also valid on `limit`, where it is the only real confinement: it needs no
                         namespace. There it grants ONLY these paths (plus /dev/null and friends),
                         refuses if the kernel has no Landlock, and implies no-new-privs (no sudo)
     --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data, and for
@@ -470,7 +471,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         `--security-opt apparmor=` form too), layered over seccomp; a missing/unloaded profile fails closed
     --plan              Preview the isolation sequence and any device grants, without running
 
-{b}OPTIONS for run:{z}
+{b}OPTIONS for limit:{z}
     -m, --memory <SIZE>     RAM ceiling for the process (e.g. 512m, 2g)
     --memory-swap-max <S>   cgroup v2 swap allowance (NOT a mem+swap total; 0 = no swap)
     --cpus <N>              CPU quota, fractional allowed (0.5 = half a core)
@@ -479,8 +480,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --landlock-rw <PATH>    Confine the process's WRITES to PATH (kernel LSM, needs no namespace);
                             everything else stays readable and executable. Repeatable. Refuses to
                             run if this kernel has no Landlock, and implies no-new-privs (no sudo)
-    {d}`run` caps a process on the HOST: no image, no namespaces, no sandbox - except --landlock-rw,{z}
-    {d}which is a real kernel-enforced write boundary. For full isolation use `box`.{z}
+    {d}`limit` caps a process on the HOST: no image, no namespaces, no sandbox - except --landlock-rw,{z}
+    {d}which is a real kernel-enforced write boundary. For a sandbox use `run` or `box`.{z}
 
 {b}OPTIONS:{z}
     -V, --version  Print version (`--version --json`: the version and the schema of `kern top --json`)
@@ -574,7 +575,8 @@ pub fn help_for(verb: &str) -> Result<(), Error> {
                 .trim_start_matches("OPTIONS for ")
                 .trim_end_matches(':')
                 .trim();
-            in_verb_options = which == verb;
+            // "box and run" is one block for both verbs.
+            in_verb_options = which.split(" and ").any(|w| w.trim() == verb);
             in_commands = false;
             if in_verb_options {
                 out.push(line.to_string());

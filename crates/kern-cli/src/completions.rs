@@ -17,6 +17,7 @@ use crate::error::Error;
 const VERBS: &[&str] = &[
     "box",
     "run",
+    "limit",
     "exec",
     "attach",
     "cp",

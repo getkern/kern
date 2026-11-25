@@ -5,8 +5,9 @@ COMMANDS:
   Essentials
     box <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     box <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
-    run [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
-    run --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
+    run [opts] <image> [CMD...]                                    Run CMD in a sandbox from <image>, docker run's shape (box's options)
+    limit [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...       Run CMD on this host under CPU/mem caps (no sandbox)
+    limit --landlock-rw <path> [--] CMD...                         Confine CMD's writes to <path> (kernel LSM, no sandbox)
     exec <name> [-i|-t|-it] [-u <user>] [--env K=V] [-w <dir>] [--] [CMD...]  Run CMD in a running box
     ps [-a] [--json] [-q] [--filter name=|status=|id=|label=|pod=|health=] [--format T] [--no-trunc] [--last N|-n N]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     logs <name>|--all [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
@@ -53,7 +54,7 @@ COMMANDS:
     wait <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
     diff <box> [--json]                                            List filesystem changes vs the image (C/D); a kept box's too, running or not
     export <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
-    container <verb> ...                                           The box verbs under one name (container ls = ps; not run/top/prune)
+    container <verb> ...                                           The box verbs under one name (container ls = ps; not top/prune)
     compat docker (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
     unshare [--] [CMD...]                                          Run CMD (default: your shell) with the ids a box's files carry on disk
     compat docker (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
@@ -103,6 +104,6 @@ COMMANDS:
 
 
 OPTIONS:
-    Per verb, where you are asking about it: kern <verb> --help (box, run, compose, pod, volume, image, config, top)
+    Per verb, where you are asking about it: kern <verb> --help (box, run, limit, compose, pod, volume, image, config, top)
 
 Docs & issues: https://github.com/getkern/kern

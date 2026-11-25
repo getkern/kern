@@ -1,7 +1,7 @@
-//! `kern run` throughput counter - a single mmap'd atomic, daemonless and lock-free.
+//! `kern limit` throughput counter - a single mmap'd atomic, daemonless and lock-free.
 //!
-//! `kern run` is a fire-and-forget capped process (~1 ms, no sandbox, not registered). To let `kern
-//! top` show LIVE run throughput without tracking each ephemeral run, every `kern run` does ONE
+//! `kern limit` is a fire-and-forget capped process (~1 ms, no sandbox, not registered). To let `kern
+//! top` show LIVE run throughput without tracking each ephemeral run, every `kern limit` does ONE
 //! `fetch_add` on a shared-memory counter just before it `exec()`s the workload - cost a few
 //! nanoseconds plus a one-time page map. `kern top` samples the MONOTONIC total each refresh and
 //! derives runs/sec + a sparkline entirely reader-side.
@@ -24,7 +24,7 @@
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// A page (room for future fields). Offset 0 = u64 `kern run` count, offset 8 = u64 sum of run
+// A page (room for future fields). Offset 0 = u64 `kern limit` count, offset 8 = u64 sum of run
 // setup-latency µs, offset 16 = u64 box-START count (kern top's box-rate lens for ephemeral boxes).
 const MAP_LEN: usize = 4096;
 
@@ -34,14 +34,14 @@ const MAP_LEN: usize = 4096;
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Stamp the process-start instant, as early as possible in `main`. Cheap (one `Instant::now`), safe to
-/// call on every `kern` invocation - only `kern run` reads it back via [`record`].
+/// call on every `kern` invocation - only `kern limit` reads it back via [`record`].
 pub fn mark_start() {
     let _ = START.set(std::time::Instant::now());
 }
 
 /// Microseconds since process entry, or `None` if [`mark_start`] never ran.
 ///
-/// The SAME stamp `kern run` already measures its setup against, reused rather than taken a second
+/// The SAME stamp `kern limit` already measures its setup against, reused rather than taken a second
 /// time: a second clock read at a second point would drift from this one and the two would disagree
 /// about the same box. `None` rather than zero, because "not stamped" and "took no time" are
 /// different facts and a profiler that renders them the same is the class of defect this exists to
@@ -51,7 +51,7 @@ pub fn since_start_us() -> Option<u128> {
 }
 
 /// `$XDG_RUNTIME_DIR/kern/runstats` (falling back to `/run/user/<uid>` then `/tmp/kern-<uid>`), the
-/// same runtime-dir resolution as the box registry - so writer (`kern run`) and reader (`kern top`)
+/// same runtime-dir resolution as the box registry - so writer (`kern limit`) and reader (`kern top`)
 /// agree on the file without a shared constant. `pub(crate)` so the volume guard can add this FILE's
 /// dev/ino to the non-mountable identity set (it is a runtime registry child, not a directory).
 pub(crate) fn path() -> std::path::PathBuf {
@@ -66,8 +66,8 @@ pub(crate) fn path() -> std::path::PathBuf {
     std::path::PathBuf::from(format!("/tmp/kern-{uid}/runstats"))
 }
 
-/// Record one `kern run`. Best-effort and lock-free: ANY failure is silent (a metrics counter must
-/// never fail a run). Called once, right before `kern run` exec()s the workload.
+/// Record one `kern limit`. Best-effort and lock-free: ANY failure is silent (a metrics counter must
+/// never fail a run). Called once, right before `kern limit` exec()s the workload.
 pub fn record() {
     let p = path();
     if let Some(dir) = p.parent() {
@@ -85,7 +85,7 @@ pub fn record() {
         libc::PROT_READ | libc::PROT_WRITE,
         |ptr| unsafe {
             // SAFETY: `ptr` is a valid MAP_SHARED page; offsets 0 and 8 are naturally-aligned u64s we only
-            // ever touch atomically, so concurrent writers from other `kern run` processes are race-free.
+            // ever touch atomically, so concurrent writers from other `kern limit` processes are race-free.
             (*(ptr as *const AtomicU64)).fetch_add(1, Ordering::Relaxed);
             (*((ptr as *const u8).add(8) as *const AtomicU64)).fetch_add(micros, Ordering::Relaxed);
         },
@@ -93,7 +93,7 @@ pub fn record() {
 }
 
 /// Record one box START. Same lock-free mmap page as [`record`], at offset 16 (box starts, kept
-/// distinct from `kern run`s at offset 0). Called once when a `kern box` registers, so `kern top` can
+/// distinct from `kern limit`s at offset 0). Called once when a `kern box` registers, so `kern top` can
 /// show a box-start RATE the flickering live list can't: a box lives ~ms, below a 1 s refresh, so an
 /// agent firing hundreds of ephemeral boxes/sec is otherwise invisible except as a rate.
 pub fn record_box() {
@@ -122,7 +122,7 @@ pub fn box_total() -> u64 {
     out
 }
 
-/// `(total, setup_latency_µs_sum)` - the cumulative `kern run` count and the summed entry→exec latency
+/// `(total, setup_latency_µs_sum)` - the cumulative `kern limit` count and the summed entry→exec latency
 /// (both 0 if the counter file is absent/unreadable). Read-only and lock-free - safe to sample from
 /// `kern top` on every refresh; the average latency is `sum / total`.
 pub fn snapshot() -> (u64, u64) {
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn box_starts_count_independently_of_runs() {
-        // The box-start counter (offset 16) must be independent of the `kern run` counter (offset 0):
+        // The box-start counter (offset 16) must be independent of the `kern limit` counter (offset 0):
         // recording box starts must not move the run total, and vice-versa.
         let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-boxstats-{}", std::process::id()));
@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(box_total(), 0, "fresh box counter starts at 0");
         record_box();
         record_box();
-        record(); // one `kern run` - must NOT bump the box counter
+        record(); // one `kern limit` - must NOT bump the box counter
         assert_eq!(box_total(), 2, "two box starts → box total 2");
         assert_eq!(
             snapshot().0,

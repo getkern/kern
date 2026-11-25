@@ -9,7 +9,7 @@
 //! The model is **resource-centric**, not box-centric: you *declare* the host resources you want
 //! kern to consider (`[[cpu]]`, `[[gpio]]`, `[[disk]]`) and *define* named virtual profiles that
 //! carve them up (`[[vcpu]]`, `[[vgpio]]`, `[[vdisk]]`). A profile is then attached to a command by
-//! its prefix: `kern run vcpu:heavy vgpio:leds -- cmd`.
+//! its prefix: `kern limit vcpu:heavy vgpio:leds -- cmd`.
 //!
 //! kern-public models **CPU, GPIO and disk** resources only; there is no GPU concept here. The
 //! parser is deliberately **tolerant**: a `kern.toml` shared with another kern edition may carry
@@ -200,7 +200,7 @@ pub struct KernSettings {
     /// cannot raise it by writing a bigger number. That is what makes it a policy instead of a
     /// suggestion.
     ///
-    /// `kern box` and `kern run` are NOT affected. Their 512 MiB default is a sensible bound for a
+    /// `kern box`, `kern run` and `kern limit` are NOT affected. Their 512 MiB default is a sensible bound for a
     /// one-off sandbox typed at a prompt; a compose service is a declared long-running workload
     /// whose file has a way to say what it needs.
     pub compose_memory_max: Option<String>,

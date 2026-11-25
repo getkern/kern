@@ -335,7 +335,7 @@ fn every_verb_has_its_own_help() {
             !text.contains("COMMANDS:"),
             "`kern {verb} --help` carries the COMMANDS: section: it is answering with the whole page"
         );
-        for other in ["box", "run"] {
+        for other in ["box", "run", "limit"] {
             if other != verb {
                 assert!(
                     !text.contains(&format!("OPTIONS for {other}:")),
@@ -616,7 +616,7 @@ fn the_per_verb_help_stays_per_verb_on_a_real_terminal() {
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default()
     };
-    for verb in ["box", "run", "volume", "pod", "config", "diff"] {
+    for verb in ["box", "run", "limit", "volume", "pod", "config", "diff"] {
         let text = text_of(&format!("{verb} --help"));
         let n = text.lines().count();
         assert!(

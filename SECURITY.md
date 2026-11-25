@@ -224,7 +224,7 @@ standalone box.
 ## Resource caps
 Inside the systemd **user** manager's tree, `kern box` caps directly in its delegated `kern.slice`;
 where that is out of reach it falls back to a transient `systemd-run --user --scope` with
-`MemoryMax`/`TasksMax`. Either way fork bombs and OOM are cgroup-enforced, verified by read-back. `kern run --memory`, which
+`MemoryMax`/`TasksMax`. Either way fork bombs and OOM are cgroup-enforced, verified by read-back. `kern limit --memory`, which
 caps a process on the host rather than building a box, refuses to start at all where no ceiling at or
 below the one named can be proven: a governor that accepts a limit and does not apply it is the one
 outcome that verb must not produce.

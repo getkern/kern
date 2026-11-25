@@ -99,7 +99,7 @@ fn help_lists_commands() {
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
     for verb in [
-        "box", "run", "pull", "compose", // core
+        "box", "run", "limit", "pull", "compose", // core
         "rename", "update", "wait", "diff", "events", // container-lifecycle verbs
     ] {
         assert!(s.contains(verb), "help missing {verb}");
@@ -608,19 +608,19 @@ fn show_config_reports_the_uid_range_the_box_will_actually_get() {
 
 /// `KERN_NO_SCOPE=1` drops kern's own DEFAULT memory cap, and has to say so.
 ///
-/// A plain `kern run` is not uncapped: it re-execs into a transient systemd scope carrying
+/// A plain `kern limit` is not uncapped: it re-execs into a transient systemd scope carrying
 /// `MemoryMax=512M`, `MemorySwapMax=0` and `TasksMax=512`, so a workload over that ceiling is
 /// OOM-killed and told why. The opt-out skips the scope, and the default goes with it. Both warnings
 /// on that path used to be gated on the caller having ASKED for a cap, so the case where nothing was
 /// typed ran uncapped in the caller's own cgroup and printed nothing at all.
 ///
-/// SKIP-GRACEFUL, and the control is what decides it: if a plain `kern run` already warns, this host
+/// SKIP-GRACEFUL, and the control is what decides it: if a plain `kern limit` already warns, this host
 /// has no delegation to lose and there is nothing here to assert. A skip that says why beats a
 /// failure that blames the host.
 #[test]
 fn the_opt_out_that_drops_the_default_cap_says_so() {
     let plain = kern()
-        .args(["run", "--", "/bin/true"])
+        .args(["limit", "--", "/bin/true"])
         .output()
         .expect("run kern");
     let plain_err = String::from_utf8_lossy(&plain.stderr).to_string();
@@ -634,7 +634,7 @@ fn the_opt_out_that_drops_the_default_cap_says_so() {
 
     let dropped = kern()
         .env("KERN_NO_SCOPE", "1")
-        .args(["run", "--", "/bin/true"])
+        .args(["limit", "--", "/bin/true"])
         .output()
         .expect("run kern");
     let err = String::from_utf8_lossy(&dropped.stderr);
@@ -649,7 +649,7 @@ fn the_opt_out_that_drops_the_default_cap_says_so() {
         let quiet = kern()
             .env("KERN_NO_SCOPE", "1")
             .env(k, v)
-            .args(["run", "--", "/bin/true"])
+            .args(["limit", "--", "/bin/true"])
             .output()
             .expect("run kern");
         assert!(
@@ -669,7 +669,7 @@ fn the_opt_out_that_drops_the_default_cap_says_so() {
 /// regression put back, all 1048 tests passed. A helper nobody is required to call is not covered.
 ///
 /// SKIP-GRACEFUL, and the condition is read from the BOX rather than from this test's assumptions:
-/// if a plain `kern run` is not capped here (no cgroup delegation, no systemd, a container), then the
+/// if a plain `kern limit` is not capped here (no cgroup delegation, no systemd, a container), then the
 /// cap cannot fire and there is nothing to report. `memory.max` inside the box answers that, and it
 /// is the same question the feature depends on, so the skip cannot hide the defect.
 ///
@@ -693,7 +693,7 @@ fn a_box_killed_by_its_memory_cap_says_why() {
     // and asking for it separately would name a different, already-gone per-run cgroup.
     let probe = kern()
         .args([
-            "run",
+            "limit",
             "--",
             "sh",
             "-c",
@@ -726,7 +726,7 @@ fn a_box_killed_by_its_memory_cap_says_why() {
 
     // Ask for more than the cap. `bytearray` touches every page, so the kernel has to back it.
     let out = kern()
-        .args(["run", "--", "python3", "-c", "bytearray(900*1024*1024)"])
+        .args(["limit", "--", "python3", "-c", "bytearray(900*1024*1024)"])
         .output()
         .expect("run kern");
     if out.status.code() != Some(137) {
@@ -777,7 +777,7 @@ fn a_box_killed_by_its_memory_cap_says_why() {
 #[test]
 fn a_sigkill_that_is_not_an_oom_is_not_reported_as_one() {
     let out = kern()
-        .args(["run", "--", "sh", "-c", "kill -9 $$"])
+        .args(["limit", "--", "sh", "-c", "kill -9 $$"])
         .output()
         .expect("run kern");
     if out.status.code() != Some(137) {
@@ -795,7 +795,7 @@ fn a_sigkill_that_is_not_an_oom_is_not_reported_as_one() {
 }
 
 /// `kern box` killed by its own cap must say why, DETERMINISTICALLY, and this is the case that the
-/// `kern run` test above cannot cover.
+/// `kern limit` test above cannot cover.
 ///
 /// TWO DEFECTS SIT UNDER THIS. The first: the message only ever existed on the systemd-scope path, so a
 /// host with no systemd printed nothing. The second, found when the first was fixed and it still
@@ -949,8 +949,8 @@ fn the_host_capability_guard_matches_what_the_runner_prints() {
 /// IT USED TO SKIP ON EVERY HOST, which is a green that guards nothing. The workload was
 /// `sh -c "kill -9 $$"`, and the box's shell is pid 1 of its own pid namespace: the kernel does not
 /// deliver an unhandled SIGKILL to a namespace's init from inside it, so the shell survived and exited 0
-/// and the assertion below was never reached. Measured: `kern run` (no pid namespace of its own for the
-/// shell) exits 137 there, `kern box` exits 0 - which is why the `kern run` twin of this test did run.
+/// and the assertion below was never reached. Measured: `kern limit` (no pid namespace of its own for the
+/// shell) exits 137 there, `kern box` exits 0 - which is why the `kern limit` twin of this test did run.
 ///
 /// A workload CHOOSING exit 137 reaches the same branch (kern only sees the code) and is the sharper
 /// case anyway: 137 without a signal behind it is exactly the ambiguity the message must not guess at.
@@ -2536,8 +2536,9 @@ fn kern_does_not_translate_a_docker_command_line() {
     );
 
     // THE ASSERTION. `docker run --rm IMAGE cmd` is Docker's grammar, and the shim turned it into
-    // `kern box NAME --image IMAGE -- cmd`. kern's own parser has no `--rm` on `run`, so a binary
-    // that still translated would succeed here and one that does not must refuse in kern's voice.
+    // `kern box NAME --image IMAGE -- cmd`. kern refuses the name `docker` before it parses any
+    // argument, so a binary that still answered to it would succeed here (`kern run` takes this
+    // grammar since 0.57.0) and one that does not must refuse in kern's voice.
     let out = std::process::Command::new(&link)
         .args(["run", "--rm", "alpine", "/bin/true"])
         .env_remove("KERN_DOCKER_SHIM")

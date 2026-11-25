@@ -5463,7 +5463,7 @@ fn run_shell_script(argv: &[String]) -> Option<&str> {
 
 /// Single-quote a string for POSIX sh (`'` → `'\''`), so an arbitrary RUN script can be embedded in
 /// the batched command without the outer shell reinterpreting it.
-fn shell_quote_single(s: &str) -> String {
+pub(crate) fn shell_quote_single(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {

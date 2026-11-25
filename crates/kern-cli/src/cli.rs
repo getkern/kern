@@ -316,10 +316,10 @@ pub enum Command {
         /// caps (see `kern.toml`). Empty when none.
         profiles: Vec<String>,
     },
-    /// `kern run [--memory M] [--memory-swap-max S] [--cpus N] [--cpuset-cpus L] [--] <cmd...>`:
+    /// `kern limit [--memory M] [--memory-swap-max S] [--cpus N] [--cpuset-cpus L] [--] <cmd...>`:
     /// run a command under cgroup CPU/memory caps WITHOUT a full sandbox - the resource-governor
     /// verb (composes with `box`'s isolation). Takes the same resource flags as `kern box`.
-    Run {
+    Limit {
         command: Vec<String>,
         memory: Option<u64>,
         memory_swap_max: Option<u64>,
@@ -1246,14 +1246,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 "rm" | "remove" => "rm",
                 v @ ("attach" | "commit" | "cp" | "create" | "diff" | "exec" | "export"
                 | "inspect" | "kill" | "logs" | "pause" | "port" | "rename" | "restart"
-                | "start" | "stats" | "stop" | "unpause" | "update" | "wait") => v,
-                "run" => {
-                    return Err(Error::Cli(
-                        "container run: kern's sandboxed run is `kern box <name> --image <ref> \
-                         [-- CMD]` (`kern run` caps a host process and runs no image)"
-                            .to_string(),
-                    ))
-                }
+                | "start" | "stats" | "stop" | "unpause" | "update" | "wait" | "run") => v,
                 "top" => {
                     return Err(Error::Cli(
                         "container top: kern's `top` is the task manager; a stack's processes are \
@@ -1268,7 +1261,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                             .to_string(),
                     ))
                 }
-                "" => return Err(Error::Usage("container ls|create|start|stop|restart|rm|exec|logs|cp|diff|commit|export|inspect|kill|pause|unpause|port|rename|stats|update|wait|attach")),
+                "" => return Err(Error::Usage("container ls|run|create|start|stop|restart|rm|exec|logs|cp|diff|commit|export|inspect|kill|pause|unpause|port|rename|stats|update|wait|attach")),
                 other => {
                     return Err(Error::Cli(format!(
                         "container {other}: not a kern verb (`kern container` with no verb lists them)"
@@ -3483,6 +3476,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         },
         // `run [--memory M] [--cpus N] [--] <cmd...>`: cap a command without a full sandbox.
         Some("run") => parse_run(&rest)?,
+        Some("limit") => parse_limit(&rest)?,
         Some(other) => return Err(Error::UnknownCommand(other.to_string())),
     };
     Ok((opts, cmd))
@@ -4096,7 +4090,7 @@ const NO_VALUE_FLAGS: &[&str] = &[
 /// closure, `run` REFUSES `--memory-swap` outright (so it consumes nothing and goes in the no-value
 /// list, where `--memory-swap=512m` is told to write the flag alone and then meets the real
 /// refusal), and `exec`'s `--interactive` arm is empty.
-const RUN_VALUE_FLAGS: &[&str] = &[
+const LIMIT_VALUE_FLAGS: &[&str] = &[
     "--config",
     "--cpus",
     "--cpuset-cpus",
@@ -4104,7 +4098,7 @@ const RUN_VALUE_FLAGS: &[&str] = &[
     "--memory",
     "--memory-swap-max",
 ];
-const RUN_NO_VALUE_FLAGS: &[&str] = &["--memory-swap"];
+const LIMIT_NO_VALUE_FLAGS: &[&str] = &["--memory-swap"];
 const EXEC_VALUE_FLAGS: &[&str] = &["--env", "--user", "--workdir"];
 const EXEC_NO_VALUE_FLAGS: &[&str] = &["--interactive", "--tty"];
 const PULL_VALUE_FLAGS: &[&str] = &["--dest", "--platform"];
@@ -5686,9 +5680,128 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     // namespace, so it is the one `box` flag that `run` can honour for real. See `parse_run`.
 ];
 
+/// The `box` flags written short that take a value, which the long [`VALUE_FLAGS`] do not list.
+const BOX_SHORT_VALUE_FLAGS: &[&str] = &["-e", "-l", "-m", "-p", "-v", "-w"];
+
+/// A `kern run <word> ...` whose image is a bare word (no registry, tag or digest): the word and
+/// the whole command line, for a failed run to ask whether the word is a program of this host
+/// (`kern limit -- <word> ...`), which is what `kern run` ran before 0.57.0. Only asked on a
+/// failure, so a run that works pays nothing for it.
+static RUN_BARE_IMAGE: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// See [`RUN_BARE_IMAGE`]: `(word, command line)`.
+pub(crate) fn run_bare_image() -> Option<(&'static str, &'static str)> {
+    RUN_BARE_IMAGE.get().map(|(w, c)| (w.as_str(), c.as_str()))
+}
+
+/// `kern run [OPTIONS] IMAGE [COMMAND [ARG...]]`: `docker run`'s shape, onto `kern box`.
+///
+/// ONE PARSER, NOT TWO. The options are `box`'s own, read by `parse_box`, so a flag means here
+/// exactly what it means there, and a Docker-named flag is one `box` already gives Docker's
+/// meaning; nothing is translated, so nothing can be translated wrong. This only finds the image
+/// (the first word that is not an option, an option's value or a `vcpu:` profile) and hands the
+/// rest to `box` as `--image IMAGE [-- COMMAND...]`; everything after the image is the command, as
+/// `docker run` reads it. The name is `--name`, or `box`'s own `box-<pid>`.
+///
+/// `kern run` capped a HOST process before 0.57.0; that is `kern limit` now. Its old forms are
+/// answered with the new verb: `kern run [opts] -- CMD` (an option list then `--`, no image) and
+/// an image that is a path.
 fn parse_run(rest: &[&str]) -> Result<Command, Error> {
+    let split = split_equals_flags(rest, VALUE_FLAGS, NO_VALUE_FLAGS)?;
+    let rest: &[&str] = &split;
+    let mut argv: Vec<&str> = vec!["box"];
+    // `--image`/`--rootfs` written as options: then there is no positional image.
+    let mut source_given = false;
+    let mut image: Option<&str> = None;
+    let mut i = 1; // rest[0] == "run"
+    while i < rest.len() {
+        let a = rest[i];
+        if a == "--" {
+            if source_given {
+                break;
+            }
+            let cmd = shell_line(&rest[i + 1..]);
+            return Err(Error::Cli(format!(
+                "`kern run` runs an image, as `docker run` does: kern run [options] <image> \
+                 [command...]. To cap a command on this host without a sandbox, which is what \
+                 `kern run -- {cmd}` did before kern 0.57.0: kern limit [options] -- {cmd}"
+            )));
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            argv.push(a);
+            source_given |= a == "--image" || a == "--rootfs";
+            if VALUE_FLAGS.contains(&a) || BOX_SHORT_VALUE_FLAGS.contains(&a) {
+                i += 1;
+                // A missing value is `box`'s to name, with the usage line of that flag.
+                if let Some(v) = rest.get(i) {
+                    argv.push(v);
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if crate::config::classify(a).is_some() {
+            argv.push(a);
+            i += 1;
+            continue;
+        }
+        if !source_given {
+            image = Some(a);
+            i += 1;
+        }
+        break;
+    }
+    let command = rest.get(i..).unwrap_or_default();
+    match image {
+        Some(img) if img.starts_with('/') || img.starts_with("./") || img.starts_with("../") => {
+            return Err(Error::Cli(format!(
+                "'{img}' is a path, not an image: `kern run` runs an image (kern run alpine:3.21 \
+                 sh). To run a program of this host, capped and without a sandbox: \
+                 kern limit -- {}",
+                shell_line(&rest[i - 1..])
+            )));
+        }
+        Some(img) => {
+            if !img.contains(['/', ':', '@']) {
+                let _ = RUN_BARE_IMAGE.set((img.to_string(), shell_line(&rest[i - 1..])));
+            }
+            argv.push("--image");
+            argv.push(img);
+        }
+        None if source_given => {}
+        None => return Err(Error::Usage(
+            "run [options] <image> [command...]   (a host command, capped: kern limit -- <cmd>)",
+        )),
+    }
+    if !command.is_empty() {
+        argv.push("--");
+        argv.extend_from_slice(command);
+    }
+    parse_box(&argv)
+}
+
+/// `words` as one command line a reader can paste into a shell: a word with anything but plain
+/// characters single-quoted.
+fn shell_line(words: &[&str]) -> String {
+    words
+        .iter()
+        .map(|w| {
+            if !w.is_empty()
+                && w.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=,@%+".contains(c))
+            {
+                (*w).to_string()
+            } else {
+                commands::shell_quote_single(w)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_limit(rest: &[&str]) -> Result<Command, Error> {
     // `--flag=value`, as docker takes it on every long flag. See `split_equals_flags`.
-    let split = split_equals_flags(rest, RUN_VALUE_FLAGS, RUN_NO_VALUE_FLAGS)?;
+    let split = split_equals_flags(rest, LIMIT_VALUE_FLAGS, LIMIT_NO_VALUE_FLAGS)?;
     let rest: &[&str] = &split;
     let mut memory: Option<u64> = None;
     let mut memory_swap_max: Option<u64> = None;
@@ -5697,13 +5810,13 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
     let mut config: Option<String> = None;
     let mut landlock_rw: Vec<String> = Vec::new();
     let mut command: Vec<String> = Vec::new();
-    let mut i = 1; // rest[0] == "run"
+    let mut i = 1; // rest[0] == "limit"
     while i < rest.len() {
         match rest[i] {
             "--" => {
                 // Preserve the `--` as the first command token so `peel_run_profiles` knows the command
                 // was EXPLICITLY delimited and must NOT re-classify a leading `vcpu:`/`vgpio:`/`vdisk:`
-                // token as a profile. Without this, `kern run -- vcpu:heavy prog` would strip `vcpu:heavy`
+                // token as a profile. Without this, `kern limit -- vcpu:heavy prog` would strip `vcpu:heavy`
                 // as a profile (violating the `--` end-of-options contract, and diverging from `box`).
                 command.push("--".to_string());
                 command.extend(rest[i + 1..].iter().map(|s| (*s).to_string()));
@@ -5767,18 +5880,18 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
                 }
             }
             // A `box` flag on `run` is the Docker reflex, and it is the one place where the two-verb
-            // split can hurt rather than merely confuse: `docker run` starts a container, `kern run`
+            // split can hurt rather than merely confuse: `docker run` starts a container, `kern limit`
             // caps a process on the host with NO image, NO namespaces and NO sandbox. Someone who
-            // types `kern run --read-only --network none -- ./untrusted` believes they are isolated
+            // types `kern limit --read-only --network none -- ./untrusted` believes they are isolated
             // and is not. The generic answer below made it worse: it read "put `--` before the
-            // command", so the next attempt is `kern run -- --image alpine`, which passes the flag
+            // command", so the next attempt is `kern limit -- --image alpine`, which passes the flag
             // to the workload. Name the flag, say what `run` is, and name the verb that does it.
             // THE GPU FLAGS GET THEIR OWN ANSWER, because the generic redirect is actively wrong
             // advice for them. It reads "that flag belongs to `kern box`", which sends somebody who
             // wanted a memory-capped training run on their own machine to build a sandbox they did
-            // not ask for. The truth is the opposite and it is measured: a process under `kern run`
+            // not ask for. The truth is the opposite and it is measured: a process under `kern limit`
             // is a HOST process, so `/dev/nvidia*` are already there and it sees every card the
-            // caller can open. Measured 2026-11-12: `kern run --memory 2g -- python3 <cuda probe>`
+            // caller can open. Measured 2026-11-12 (`kern run`, `kern limit` now): `--memory 2g -- python3 <cuda probe>`
             // reports 2 cards and loads a PTX module with rc=0, identical to running it bare.
             //
             // So the flag is not missing, it is UNNECESSARY, and the honest instruction is to drop
@@ -5788,23 +5901,23 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
             // them and only one of the two has an answer here.
             flag @ ("--gpus" | "--device") => {
                 return Err(Error::Cli(format!(
-                    "`kern run` has no {flag}, and does not need one: it caps a process on the \
+                    "`kern limit` has no {flag}, and does not need one: it caps a process on the \
                      HOST, where every card you can open is already there. Drop the flag and the \
                      process sees your GPUs. To hand a card to an ISOLATED box instead, or to let \
                      a workload see only some of your cards, that needs a mount namespace: \
-                     kern box <name> --image <ref> {flag} <spec> [-- CMD...]"
+                     kern run {flag} <spec> <image> [CMD...]"
                 )))
             }
             s if BOX_ONLY_FLAGS.contains(&s) => {
                 return Err(Error::Cli(format!(
-                    "`kern run` has no {s}. It caps a process on the host: no image, \
-                     no namespaces, no sandbox. That flag belongs to the sandboxed verb: \
-                     kern box <name> --image <ref> [-- CMD...]"
+                    "`kern limit` has no {s}. It caps a process on the host: no image, \
+                     no namespaces, no sandbox. That flag is for a box: \
+                     kern run [options] <image> [CMD...]"
                 )))
             }
             s if s.starts_with('-') => {
                 return Err(Error::Usage(
-                    "run: unknown flag (put `--` before the command)",
+                    "limit: unknown flag (put `--` before the command)",
                 ))
             }
             // First bare token → the command starts here; everything from here on is the command.
@@ -5817,10 +5930,10 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
     }
     if command.is_empty() {
         return Err(Error::Usage(
-            "run [--memory M] [--memory-swap-max S] [--cpus N] [--cpuset-cpus L] [--landlock-rw P] [--config F] [vcpu:PROFILE] [--] <cmd...>",
+            "limit [--memory M] [--memory-swap-max S] [--cpus N] [--cpuset-cpus L] [--landlock-rw P] [--config F] [vcpu:PROFILE] [--] <cmd...>",
         ));
     }
-    Ok(Command::Run {
+    Ok(Command::Limit {
         command,
         memory,
         memory_swap_max,
@@ -6896,7 +7009,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 cpu_weight,
             })
         }
-        Command::Run {
+        Command::Limit {
             command,
             memory,
             memory_swap_max,
@@ -9263,7 +9376,7 @@ mod tests {
     fn run_parses_flags_then_command() {
         // Flags first, then the command; the first bare token begins the command.
         let (_, cmd) = parse(&[
-            "run".into(),
+            "limit".into(),
             "--memory".into(),
             "256m".into(),
             "--cpus".into(),
@@ -9272,7 +9385,7 @@ mod tests {
             "hi".into(),
         ])
         .unwrap();
-        let Command::Run {
+        let Command::Limit {
             command,
             memory,
             cpus,
@@ -9287,18 +9400,130 @@ mod tests {
         // `--` form; flags after it belong to the command. The leading `--` is PRESERVED in the parsed
         // command (so the run profile-peeler knows the command was explicitly delimited and won't
         // re-classify a `vcpu:`-looking first token); `peel_run_profiles` then strips it before exec.
-        let (_, cmd) = parse(&["run".into(), "--".into(), "ls".into(), "-la".into()]).unwrap();
-        let Command::Run { command, .. } = cmd else {
+        let (_, cmd) = parse(&["limit".into(), "--".into(), "ls".into(), "-la".into()]).unwrap();
+        let Command::Limit { command, .. } = cmd else {
             panic!()
         };
         assert_eq!(command, ["--", "ls", "-la"]);
         // An unknown flag before the command is a usage error (catches typos), not a silent run.
         assert!(matches!(
-            parse(&["run".into(), "--bogus".into()]),
+            parse(&["limit".into(), "--bogus".into()]),
             Err(Error::Usage(_))
         ));
         // Empty command → usage error.
-        assert!(matches!(parse(&["run".into()]), Err(Error::Usage(_))));
+        assert!(matches!(parse(&["limit".into()]), Err(Error::Usage(_))));
+    }
+
+    /// `kern run` IS `kern box` in `docker run`'s shape: the options are box's (short ones with a
+    /// value included), a `vcpu:` profile is a profile, the first other word is the image and
+    /// everything after it the command, flags included; `--image` as an option leaves no image
+    /// word. `container run` is the same verb.
+    #[test]
+    fn run_is_box_in_docker_runs_shape() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let Ok((
+            _,
+            Command::BoxRun {
+                name,
+                image,
+                command,
+                rm,
+                env,
+                memory,
+                profiles,
+                ..
+            },
+        )) = p(&[
+            "run",
+            "--rm",
+            "-e",
+            "X=1",
+            "--name",
+            "w",
+            "-m",
+            "64m",
+            "vcpu:heavy",
+            "alpine:3.21",
+            "sh",
+            "-c",
+            "echo --not-a-flag",
+        ])
+        else {
+            panic!("run must parse as a box")
+        };
+        assert_eq!(name, "w");
+        assert_eq!(image.as_deref(), Some("alpine:3.21"));
+        assert_eq!(command, ["sh", "-c", "echo --not-a-flag"]);
+        assert!(rm && env == ["X=1"] && memory == Some(64 * 1024 * 1024));
+        assert_eq!(profiles, ["vcpu:heavy"]);
+        let Ok((
+            _,
+            Command::BoxRun {
+                image,
+                command,
+                name,
+                ..
+            },
+        )) = p(&["run", "-p", "8080:80", "-v", "/a:/b", "nginx"])
+        else {
+            panic!("run with short value flags")
+        };
+        assert!(
+            image.as_deref() == Some("nginx") && command.is_empty() && name.starts_with("box-")
+        );
+        let Ok((_, Command::BoxRun { command, .. })) = p(&["run", "alpine", "--version"]) else {
+            panic!("a flag after the image is the command's")
+        };
+        assert_eq!(command, ["--version"]);
+        let Ok((_, Command::BoxRun { image, command, .. })) =
+            p(&["run", "--image", "alpine", "echo", "hi"])
+        else {
+            panic!("--image as an option")
+        };
+        assert!(image.as_deref() == Some("alpine") && command == ["echo", "hi"]);
+        assert_eq!(
+            format!(
+                "{:?}",
+                p(&["container", "run", "--rm", "alpine", "true"])
+                    .map(|(_, c)| c)
+                    .ok()
+            )
+            .replace(char::is_numeric, ""),
+            format!(
+                "{:?}",
+                p(&["run", "--rm", "alpine", "true"]).map(|(_, c)| c).ok()
+            )
+            .replace(char::is_numeric, ""),
+        );
+    }
+
+    /// `kern run`'s old forms answer with `kern limit` and the command already written for it:
+    /// options then `--` (no image), a path where the image goes; and nothing at all is a usage.
+    #[test]
+    fn run_s_old_forms_point_at_limit() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        for old in [
+            &["run", "--", "sh", "-c", "echo $HOME"][..],
+            &["run", "--memory", "1g", "--", "sh", "-c", "echo $HOME"],
+        ] {
+            match p(old) {
+                Err(Error::Cli(m)) => assert!(
+                    m.contains("kern limit [options] -- sh -c 'echo $HOME'"),
+                    "{m}"
+                ),
+                other => panic!("{old:?} must point at kern limit: {other:?}"),
+            }
+        }
+        match p(&["run", "./job.sh", "x"]) {
+            Err(Error::Cli(m)) => assert!(m.contains("kern limit -- ./job.sh x"), "{m}"),
+            other => panic!("a path is not an image: {other:?}"),
+        }
+        assert!(matches!(p(&["run"]), Err(Error::Usage(_))));
+        assert!(matches!(p(&["run", "-d"]), Err(Error::Usage(_))));
+        assert!(matches!(
+            p(&["limit", "--memory", "64m", "--", "true"]),
+            Ok((_, Command::Limit { .. }))
+        ));
     }
 
     /// A `box` flag typed on `run` gets the two-verb explanation, not "put `--` before the command".
@@ -9317,7 +9542,7 @@ mod tests {
             "-v",
             "-d",
         ] {
-            let err = parse(&["run".into(), (*flag).into(), "x".into()])
+            let err = parse(&["limit".into(), (*flag).into(), "x".into()])
                 .expect_err("a box flag on run must be refused");
             let msg = err.to_string();
             assert!(
@@ -9325,8 +9550,8 @@ mod tests {
                 "{flag}: the message must name the flag, got {msg}"
             );
             assert!(
-                msg.contains("kern box"),
-                "{flag}: must point at `box`, got {msg}"
+                msg.contains("kern run [options] <image>"),
+                "{flag}: must point at the box verb, got {msg}"
             );
             assert!(
                 !msg.contains("put `--` before"),
@@ -9335,7 +9560,7 @@ mod tests {
         }
         // The generic answer still stands for a flag that is nobody's: `run` has no `--frobnicate`
         // and neither does `box`, so there is no verb to redirect to.
-        let err = parse(&["run".into(), "--frobnicate".into()]).expect_err("unknown flag");
+        let err = parse(&["limit".into(), "--frobnicate".into()]).expect_err("unknown flag");
         assert!(err.to_string().contains("unknown flag"), "{err}");
     }
 
@@ -9357,7 +9582,7 @@ mod tests {
     #[test]
     fn the_gpu_flags_on_run_say_the_card_is_already_there() {
         for flag in ["--gpus", "--device"] {
-            let err = parse(&["run".into(), flag.into(), "device=0".into()])
+            let err = parse(&["limit".into(), flag.into(), "device=0".into()])
                 .expect_err("the flag is still refused");
             let msg = err.to_string();
             assert!(
@@ -9388,11 +9613,11 @@ mod tests {
 
         // POSITIVE CONTROL: a flag that really is box-only keeps the generic answer, so the arm
         // above is the two GPU flags and not every flag losing its redirect.
-        let err = parse(&["run".into(), "--image".into(), "alpine".into()])
+        let err = parse(&["limit".into(), "--image".into(), "alpine".into()])
             .expect_err("--image is box-only");
         let msg = err.to_string();
         assert!(
-            msg.contains("That flag belongs to the sandboxed verb"),
+            msg.contains("That flag is for a box"),
             "a box-only flag must keep its redirect: {msg}"
         );
         assert!(
@@ -10281,7 +10506,7 @@ mod tests {
     fn cpu_ram_flag_freeze() {
         // `run --cpuset-cpus --memory-swap-max` populate the Run fields.
         let (_, cmd) = parse(&[
-            "run".into(),
+            "limit".into(),
             "--cpuset-cpus".into(),
             "0-3".into(),
             "--memory-swap-max".into(),
@@ -10289,7 +10514,7 @@ mod tests {
             "true".into(),
         ])
         .unwrap();
-        let Command::Run {
+        let Command::Limit {
             cpuset,
             memory_swap_max,
             ..
@@ -10328,7 +10553,7 @@ mod tests {
             assert!(
                 matches!(
                     parse(&[
-                        "run".into(),
+                        "limit".into(),
                         "--cpuset-cpus".into(),
                         bad.into(),
                         "true".into()
@@ -10341,14 +10566,14 @@ mod tests {
         // ...while the well-formed forms are accepted.
         for good in ["0", "0-3", "0,2,4", "1-2,5", "7"] {
             let (_, cmd) = parse(&[
-                "run".into(),
+                "limit".into(),
                 "--cpuset-cpus".into(),
                 good.into(),
                 "true".into(),
             ])
             .unwrap();
             assert!(
-                matches!(cmd, Command::Run { cpuset: Some(c), .. } if c == good),
+                matches!(cmd, Command::Limit { cpuset: Some(c), .. } if c == good),
                 "cpuset {good:?} must parse"
             );
         }
@@ -10356,7 +10581,7 @@ mod tests {
         // Docker's `--memory-swap` is explicitly rejected on both verbs (not aliased).
         assert!(matches!(
             parse(&[
-                "run".into(),
+                "limit".into(),
                 "--memory-swap".into(),
                 "1g".into(),
                 "true".into()

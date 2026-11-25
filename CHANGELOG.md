@@ -21,6 +21,16 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**Breaking: `kern run` runs an image, as `docker run` does; what it did before is `kern limit`.**
+`kern run [options] <image> [command...]` is `kern box` in `docker run`'s shape: the options are
+`box`'s, the first other word is the image and everything after it the command, the name is
+`--name` or one kern picks, and `kern container run` is the same verb. Capping a process on this
+host with no sandbox (`--memory`, `--cpus`, `--cpuset-cpus`, `--landlock-rw`, `vcpu:` profiles) is
+`kern limit [options] -- <command...>`, unchanged but for its name. `kern run`'s old forms are
+answered with the new verb and the command written for it: `kern run [options] -- <command>` and a
+path where the image goes are refused naming `kern limit`, and a `kern run <word>` whose image does
+not exist while `<word>` is a program of this host says `kern limit -- <word> ...` would run it.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

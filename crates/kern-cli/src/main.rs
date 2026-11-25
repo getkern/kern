@@ -351,6 +351,17 @@ fn shim_refused(r: &dockershim::Refused) -> ExitCode {
     ExitCode::from(dockershim::REFUSED_EXIT)
 }
 
+/// `word` names an executable on this host's `PATH`.
+fn is_host_program(word: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    global_env("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(word))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
 fn main() -> ExitCode {
     // Rust ignores SIGPIPE by default, so a broken pipe (`kern … | head`, `| grep -q`, quitting a
     // pager) makes the next `println!` return EPIPE and PANIC → SIGABRT (exit 134) with an ugly
@@ -362,7 +373,7 @@ fn main() -> ExitCode {
     // In kern's own WSL distro, root becomes the distro's ordinary user before anything else runs
     // (see `wslentry`). One failed `stat` everywhere else.
     wslentry::enter_as_user_if_kern_distro();
-    // Stamp process entry as early as possible: `kern run` measures entry→exec against it to record its
+    // Stamp process entry as early as possible: `kern limit` measures entry→exec against it to record its
     // own per-run setup latency (the honest "~1 ms" shown in `kern top`'s Runs tab). Cheap and harmless
     // on every other subcommand.
     runstats::mark_start();
@@ -513,6 +524,21 @@ fn main() -> ExitCode {
             eprintln!("error: {}", ui::scrub_message(&e.to_string()));
             if let Some(hint) = e.hint() {
                 eprintln!("hint: {}", ui::scrub_message(&hint));
+            }
+            // `kern run <word>` where the word is a program here and no image: before 0.57.0 that
+            // command line capped the program on this host, which is `kern limit` now.
+            if let Some((word, cmd)) = cli::run_bare_image() {
+                let msg = e.to_string();
+                if (msg.contains("no such image") || msg.contains("cannot access"))
+                    && is_host_program(word)
+                {
+                    eprintln!(
+                        "hint: {} is also a program on this host: `kern limit -- {}` runs it here, \
+                         capped and without a sandbox (what `kern run` did before kern 0.57.0)",
+                        ui::scrub_message(word),
+                        ui::scrub_message(cmd)
+                    );
+                }
             }
             ExitCode::FAILURE
         }

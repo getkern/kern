@@ -2257,7 +2257,7 @@ fn landlock() -> R {
             "Landlock: absent - --landlock-rw REFUSES to run here, on `box` and on `run` (fail-closed)"
                 .into(),
             "commands WITHOUT that flag are unaffected: a box still gets namespaces + seccomp + \
-             cgroups, and `kern run` still gets its cgroup caps. For the path allowlist you need a \
+             cgroups, and `kern limit` still gets its cgroup caps. For the path allowlist you need a \
              kernel with CONFIG_SECURITY_LANDLOCK=y (and `lsm=...,landlock` if your distro gates it)"
                 .into(),
         ),

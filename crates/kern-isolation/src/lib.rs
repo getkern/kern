@@ -70,9 +70,9 @@ pub fn landlock_abi() -> Option<i32> {
 
 /// Confine the CALLING process's writes to `rw` (plus the minimum character devices a program needs to
 /// open for writing), leaving the whole filesystem readable and executable. Survives `execve`, so the
-/// workload `kern run` is about to exec inherits it and cannot lift it.
+/// workload `kern limit` is about to exec inherits it and cannot lift it.
 ///
-/// This is the `kern run` counterpart of the box's `--landlock-rw`: same kernel mechanism, but with the
+/// This is the `kern limit` counterpart of the box's `--landlock-rw`: same kernel mechanism, but with the
 /// auto-grant set that is correct when there is NO mount namespace and every path is the host's own.
 /// The box path is not reachable from outside this crate and stays where it is, applied on box PID 1.
 ///
@@ -236,7 +236,7 @@ pub use cgroup::user_delegation_root;
 pub use cgroup::user_systemd_present;
 pub use cgroup::warn_unenforced_caps;
 /// The RAII handle on a capped cgroup leaf: it names the directory the workload must run in and
-/// removes it on drop. Exported because `kern run` holds one across its own fork now - the parent
+/// removes it on drop. Exported because `kern limit` holds one across its own fork now - the parent
 /// keeps it precisely so that something outlives the workload and can `rmdir` the leaf.
 /// See [`cgroup::CgroupGuard`].
 pub use cgroup::CgroupGuard;
@@ -251,7 +251,7 @@ pub use cgroup::{arm_launcher_notice, disarm_launcher_notice};
 /// records itself in an in-process marker), the READ-BACK of that decision, and the scrub of an
 /// INHERITED marker (a nested kern must not be poisoned by its parent's decision).
 ///
-/// `took_direct_cap_path` is exported because `kern run` now branches on it in the CLI: on the direct
+/// `took_direct_cap_path` is exported because `kern limit` now branches on it in the CLI: on the direct
 /// path it forks the workload into a `kern-run-*` leaf and reaps it, on the scope path it `exec()`s in
 /// place as it always did. Reading the RECORDED decision rather than re-deriving it from the
 /// environment is the whole point - a re-derivation reports the direct path on a host where the scope
@@ -346,7 +346,7 @@ pub use real::forward_signals_to_the_box;
 /// record it. For every kern process behind a supervisor. See [`real::keep_waiting_through_signals`].
 pub use real::keep_waiting_through_signals;
 /// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
-/// Used by `kern box` (inside the sandbox) and `kern run` (caps without a sandbox).
+/// Used by `kern box` (inside the sandbox) and `kern limit` (caps without a sandbox).
 /// The per-phase timer, exported because the PARENT was not instrumented at all: `KERN_TIMING`
 /// covered only the child's setup, so the time spent before the fork was invisible, and no amount
 /// of looking would have shown it.

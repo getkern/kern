@@ -29,7 +29,7 @@ display = ["/dev/dri/renderD128"]   # the GPU, as a device
 ```
 
 ```sh
-kern run vcpu:heavy vdisk:scratch -- ./job
+kern limit vcpu:heavy vdisk:scratch -- ./job
 kern box app --image alpine vgpio:sensors -- sh
 ```
 

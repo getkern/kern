@@ -510,7 +510,7 @@ manual on purpose.
 
 | `docker …` | `kern …` | Notes |
 |---|---|---|
-| `run` | `box` | `-d`, `-t`/`-it`, `--entrypoint` replaces ENTRYPOINT and discards CMD, `--network <name>` joins a running pod, a stack, or a stack's `<project>_<network>` |
+| `run` | `run` (the same box as `box`, in `docker run`'s shape) | `-d`, `-t`/`-it`, `--entrypoint` replaces ENTRYPOINT and discards CMD, `--network <name>` joins a running pod, a stack, or a stack's `<project>_<network>` |
 | `create` | `create` | a kept box recorded and not started; `start` runs it |
 | `exec` | `exec` | joins the box's namespaces; `-t` allocates a PTY, `-i` does not |
 | `ps` / `inspect` / `stats` | same | `--filter`, `--format`, `--json`, `--no-trunc`; `inspect -f` takes docker's own paths; `kern top` is the live view |

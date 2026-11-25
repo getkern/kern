@@ -1,7 +1,7 @@
 //! `kern top` - a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
 //! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Seven tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
 //! per-box table - MEM/CPU/PIDS plus HEALTH and PORTS (parity with `kern ps`) - with lifecycle
-//! actions: stop/pause/unpause/logs), **Runs** (aggregate `kern run` throughput - rate/sec, avg
+//! actions: stop/pause/unpause/logs), **Runs** (aggregate `kern limit` throughput - rate/sec, avg
 //! setup latency, peak, total + sparkline; a `⚡` on the tab marks live activity), **Builds** (`kern
 //! build` history), **Profiles** (the reusable
 //! specs you attach by prefix - vcpu/vgpio/vdisk; a vdisk *selects* one of the read-only physical
@@ -2811,7 +2811,7 @@ fn refresh_full(
     let (mut host, cpu_now) = read_host(*prev_cpu);
     *prev_cpu = cpu_now;
     // Two daemonless throughput lenses from the same mmap counter, same reader-side rate+sparkline shape
-    // (see `sample_rate`): `kern run` invocations (offset 0, + an honest average setup latency), and box
+    // (see `sample_rate`): `kern limit` invocations (offset 0, + an honest average setup latency), and box
     // STARTS (offset 16). The box lens is what makes an ephemeral agent firehose visible - the live list
     // can't show a ~ms box, the rate can. Neither is a live "peak concurrent" (that would need a reaper).
     let (rt, lat_sum_us) = crate::runstats::snapshot();
@@ -2992,7 +2992,7 @@ struct HostStats {
     cpu_pct: f64,
     cores: usize,
     load1: f64,
-    /// Cumulative `kern run` invocations (from the daemonless runstats mmap counter) + the derived
+    /// Cumulative `kern limit` invocations (from the daemonless runstats mmap counter) + the derived
     /// rate/sec: fire-and-forget capped processes are too many to list, so they are counted instead.
     runs_total: u64,
     runs_per_sec: f64,
@@ -3773,7 +3773,7 @@ fn help_text() -> String {
        2 Boxes      every running box (pods grouped): MEM, CPU%, PIDS, HEALTH, PORTS\n\
      \x20                (yellow net:host / root-mapped / caps:+ / gpu:N flags a box LESS\n\
      \x20                 isolated than default; gpu:N says WHICH cards, never how busy)\n\
-       3 Runs       kern run throughput: rate/sec, avg latency, peak, total (aggregate)\n\
+       3 Runs       kern limit throughput: rate/sec, avg latency, peak, total (aggregate)\n\
        4 Images     cached OCI images: repository:tag, size, pulled age (like kern images)\n\
        5 Builds     build history: status, duration, size, age (like kern builds)\n\
        6 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
@@ -4811,7 +4811,7 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
         gpu_nodes_from_flag,
         gpu_minor,
     ));
-    // `kern run` throughput lives on its own **Runs** tab (fire-and-forget capped processes) - Overview
+    // `kern limit` throughput lives on its own **Runs** tab (fire-and-forget capped processes) - Overview
     // stays the host + box picture. A one-line pointer only while runs actively stream (same > 0.5/s
     // threshold as the Runs-tab `⚡`, so the two never disagree), never a stale idle cumulative.
     if host.runs_per_sec > 0.5 {
@@ -4889,7 +4889,7 @@ fn spark(samples: &[f64]) -> String {
         .collect()
 }
 
-/// The Runs tab. `kern run` is fire-and-forget (~1 ms, no sandbox, exec-in-place, not registered), so it
+/// The Runs tab. `kern limit` is fire-and-forget (~1 ms, no sandbox, exec-in-place, not registered), so it
 /// has NO per-row list - it's shown as **aggregate throughput**. Every figure here is really measured
 /// from the daemonless mmap counter: the live rate, the honest average setup latency (entry→exec - this
 /// IS the "~1 ms"), the session-peak rate, the cumulative total, and a recent-shape sparkline.
@@ -4903,7 +4903,7 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
         // NO FIGURE HERE. This said "gone in ~1 ms": a number with no machine and no method beside it,
         // in a panel that cannot carry either, and one that ages every time the runtime moves. What a
         // reader needs from this line is what a run IS. The measurements live in BENCHMARKS.md.
-        "\n  {b}Runs{z}{d} = CPU/memory-capped commands - {z}{c}kern run -- <cmd>{z}{d} - with {z}{b}no sandbox{z}{d}.{z}\n"
+        "\n  {b}Runs{z}{d} = CPU/memory-capped commands - {z}{c}kern limit -- <cmd>{z}{d} - with {z}{b}no sandbox{z}{d}.{z}\n"
     ));
     s.push_str(&format!(
         "  {d}A run is {z}{b}NOT a container{z}{d}: for an isolated box, use the {z}{c}Boxes{z}{d} tab. Runs are too fast/many to{z}\n"
@@ -4914,10 +4914,10 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
 
     if host.runs_total == 0 {
         s.push_str(&format!(
-            "  {d}no runs yet - fire capped processes with {z}{c}kern run -- <cmd>{z}\n"
+            "  {d}no runs yet - fire capped processes with {z}{c}kern limit -- <cmd>{z}\n"
         ));
         s.push_str(&format!(
-            "  {d}e.g.  {z}{c}for i in $(seq 1000); do kern run -- true; done{z}\n\n"
+            "  {d}e.g.  {z}{c}for i in $(seq 1000); do kern limit -- true; done{z}\n\n"
         ));
         s.push_str(&format!(
             "  {d}a run is a CPU/mem-capped process with no sandbox: cgroup caps only, no namespaces.{z}\n"
@@ -5167,7 +5167,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
     // Box-START rate. The live list below shows only boxes alive right NOW, but a `kern box` lives ~ms:
     // an agent firing hundreds/sec (via the SDK / kern-mcp) flickers past a 1 s refresh and never appears
     // in the list. This header counts STARTS as a rate + sparkline (same daemonless counter as the Runs
-    // tab uses for `kern run`), so the ephemeral firehose is visible even when the list is empty.
+    // tab uses for `kern limit`), so the ephemeral firehose is visible even when the list is empty.
     if host.box_starts_total > 0 {
         let rate = host.box_starts_per_sec.round().max(0.0) as u64;
         let col = if host.box_starts_per_sec > 0.5 { g } else { d };

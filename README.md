@@ -45,7 +45,7 @@ agent's code runs in, called from Python, Node or any MCP client. kern calls a c
 - **Your `docker-compose.yml`, unchanged**, or kern's own `stack.toml`.
 - **Full NVIDIA GPU support**: `--gpus all`, `--gpus 2`, `--gpus device=0,1`,
   and compose's `deploy.resources.reservations.devices`, on Linux and WSL2.
-- **Limits without a sandbox.** `kern run` puts the same caps on a plain process on the host.
+- **Limits without a sandbox.** `kern limit` puts the same caps on a plain process on the host.
   [docs/RESOURCES.md](docs/RESOURCES.md)
 - **The tools you expect**: `ps`, `logs`, `exec`, `stats`, `inspect`, `top`, `doctor`.
 
@@ -82,6 +82,7 @@ first: [docs/INSTALL.md](docs/INSTALL.md#linux).
 |---|---|
 | A shell in a real OCI image | `kern box dev --image alpine -it -- sh` |
 | A service, published on the host | `kern box svc --image nginx:alpine -d -p 8080:80` |
+| The same, in `docker run`'s words | `kern run -d --name svc -p 8080:80 nginx:alpine` |
 | Untrusted code, with the strict profile | `kern box job --image python:3.12-slim --security-profile untrusted -- python3 -c "print('hi')"` |
 | What is running (`--json` too) | `kern ps` |
 

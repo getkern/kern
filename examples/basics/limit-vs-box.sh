@@ -1,11 +1,10 @@
 #!/bin/sh
-# The two verbs, side by side, because the names collide with Docker's and the collision is
-# backwards. In Docker there is ONE verb and it isolates: `docker run` starts a container. In kern
-# there are two, and the one spelled `run` is the one that does NOT isolate:
+# The verbs side by side, because one of them does not isolate and its name says so:
 #
-#   kern box   wraps a process in a full slice: image, namespaces, pivoted root, seccomp, cgroups.
-#              This is what `docker run` does. It is the verb you want 90% of the time.
-#   kern run   caps a process YOU launch, on the host, with no image and no sandbox. Docker has no
+#   kern run   runs an image in a box, as `docker run` does: image, namespaces, pivoted root,
+#              seccomp, cgroups. `kern box` is the same box with the name written first. This is
+#              the verb you want 90% of the time.
+#   kern limit caps a process YOU launch, on the host, with no image and no sandbox. Docker has no
 #              equivalent. It is the verb for "cap this build, this ffmpeg, this test run".
 #
 # Reading that is not the same as seeing it, so this script prints what each verb actually hands the
@@ -13,8 +12,8 @@
 # reachable. Run it and the difference stops being an argument about names.
 #
 # The practical rule, and the reason the script exists: if the thing you are running might misbehave,
-# `kern box`. `kern run` is for code you already trust and only want to keep within a resource
-# budget. `kern run` will not stop a program from reading your files, because it was never asked to.
+# `kern run`. `kern limit` is for code you already trust and only want to keep within a resource
+# budget. `kern limit` will not stop a program from reading your files, because it was never asked to.
 set -eu
 
 KERN="${KERN:-kern}"
@@ -38,19 +37,19 @@ echo "1. the command bare, no kern at all"
 sh -c "$probe" _ "$HOME"
 
 echo
-echo "2. kern run: a cap on that same host process. Same uid, same hostname, same pid 1, and your"
+echo "2. kern limit: a cap on that same host process. Same uid, same hostname, same pid 1, and your"
 echo "   files are still right there. Nothing was isolated, and nothing claimed to be."
-"$KERN" run --memory 256m --cpus 0.5 -- sh -c "$probe" _ "$HOME"
+"$KERN" limit --memory 256m --cpus 0.5 -- sh -c "$probe" _ "$HOME"
 
 echo
-echo "3. kern box: a real slice. Root inside its own user namespace, its own hostname, its own pid 1,"
+echo "3. kern run: a real slice. Root inside its own user namespace, its own hostname, its own pid 1,"
 echo "   and your home directory is simply not in the filesystem it can see."
-"$KERN" box rvb --image alpine --memory 256m -- sh -c "$probe" _ "$HOME"
+"$KERN" run --rm --name lvb --memory 256m alpine sh -c "$probe" _ "$HOME"
 
 echo
-echo "4. and what you get when you reach for the wrong one, which is the common mistake:"
-echo "   \$ kern run --read-only --network none -- ./untrusted"
-"$KERN" run --read-only --network none -- ./untrusted 2>&1 | sed 's/^/   /' || true
+echo "4. and what you get when you ask the host-process verb to isolate, which it cannot:"
+echo "   \$ kern limit --read-only --network none -- ./untrusted"
+"$KERN" limit --read-only --network none -- ./untrusted 2>&1 | sed 's/^/   /' || true
 
 echo
 echo "Both verbs take the same resource tokens, which is the point: one vcpu:heavy governs a bare"

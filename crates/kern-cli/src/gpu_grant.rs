@@ -1070,12 +1070,12 @@ const THREAD_NAME_DIR: &str = "/proc/self/task";
 /// MEASURED on 2026-11-12 on a host with two cards, and both halves are needed:
 ///
 /// ```text
-/// kern run -- python3 gpu_work.py                              -> GPU_COMPUTE_RAN
-/// kern run --landlock-rw /tmp                                  -> cuInit 304
-/// kern run --landlock-rw /dev                                  -> cuInit 304
-/// kern run --landlock-rw /proc                                 -> cuInit 100
-/// kern run --landlock-rw /dev --landlock-rw /proc/self/task     -> GPU_COMPUTE_RAN
-/// kern run --landlock-rw <the card's nodes> --landlock-rw /proc/self/task -> GPU_COMPUTE_RAN
+/// kern limit -- python3 gpu_work.py                              -> GPU_COMPUTE_RAN
+/// kern limit --landlock-rw /tmp                                  -> cuInit 304
+/// kern limit --landlock-rw /dev                                  -> cuInit 304
+/// kern limit --landlock-rw /proc                                 -> cuInit 100
+/// kern limit --landlock-rw /dev --landlock-rw /proc/self/task     -> GPU_COMPUTE_RAN
+/// kern limit --landlock-rw <the card's nodes> --landlock-rw /proc/self/task -> GPU_COMPUTE_RAN
 /// ```
 ///
 /// So 100 (`CUDA_ERROR_NO_DEVICE`) is the nodes and 304 (`CUDA_ERROR_OPERATING_SYSTEM`) is the
@@ -1130,7 +1130,7 @@ pub fn describe_cuda_write_paths(missing: &[PathBuf]) -> Option<String> {
          needs write access to {} path(s) that are not among them: {}. Measured here: with the \
          device nodes unreachable cuInit returns 100, and with only {THREAD_NAME_DIR} unreachable \
          it returns 304, because the driver names its threads by writing \
-         {THREAD_NAME_DIR}/<tid>/comm. Neither names this flag. `kern run` has no mount namespace, \
+         {THREAD_NAME_DIR}/<tid>/comm. Neither names this flag. `kern limit` has no mount namespace, \
          so unlike a box it grants neither /dev nor /proc as a whole. If the command needs the \
          card, this exact set was measured to work: {flags}",
         names.len(),
@@ -5132,8 +5132,8 @@ mod tests {
 
     /// A WRITE ALLOWLIST THAT DOES NOT NAME THE NODES IS REPORTED, and one that does is silent.
     ///
-    /// THE FIELD CASE, measured on 2026-11-12 on a two-card host: `kern run -- python3 gpu_work.py`
-    /// computed on the card and `kern run --landlock-rw /tmp -- python3 gpu_work.py` died with
+    /// THE FIELD CASE, measured on 2026-11-12 on a two-card host: `kern limit -- python3 gpu_work.py`
+    /// computed on the card and `kern limit --landlock-rw /tmp -- python3 gpu_work.py` died with
     /// `cuInit` 304. Correct behaviour, invisible cause. The same combination inside a BOX works,
     /// because there `/dev` is in Landlock's automatic set, so this predicate is about `run` only.
     #[test]

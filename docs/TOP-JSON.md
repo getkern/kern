@@ -26,7 +26,7 @@ never renamed or retyped; a field may be added, so a reader ignores keys it does
 | `schema`, `kern`, `ts_ms`, `tabs` | the schema, kern's version, the frame's time (Unix ms), the tabs it carries |
 | `host` | `cpu_pct`, `cores`, `load1`, `mem_used`, `mem_total`, `disk_used`, `disk_total`, `disk_fill_pct`, `logs_used`, `logs_total`, `logs_fill_pct` (bytes) |
 | `gpus` | one object per NVIDIA card: `index`, `name`, `bus`, `mem_used_mib`, `mem_total_mib`, `util_pct`, `temp_c`, `power_w` (`null` when the driver does not say) |
-| `runs` | `kern run` invocations: `total`, `per_sec`, `peak_per_sec`, `avg_setup_us` |
+| `runs` | `kern limit` invocations: `total`, `per_sec`, `peak_per_sec`, `avg_setup_us` |
 | `box_starts` | box starts: `total`, `per_sec`, `peak_per_sec` |
 | `boxes` | one object per running box: `name`, `pid`, `uptime_s`, `mem_bytes`, `cpu_pct`, `tasks`, `paused`, `orphaned`, `health`, `ports`, `pod`, `isolation` (how it is less confined than the default), `confinement` (`egress`, `landlock`) |
 | `counts` | how many `boxes`, `images`, `builds`, `profiles`, `volumes`, `sandboxes` there are |

@@ -42,7 +42,7 @@ identically. A kill by the box's own cap always carries kern's OOM message on st
 
 **Enforce, or refuse to start.** Where the controllers are not delegated, a `kern box` warns once and
 runs uncapped; `--require-limits` (or `KERN_REQUIRE_LIMITS`) makes that fatal, reading the caps back
-from the cgroup before starting. `kern run --memory` does not wait to be asked: since v0.31.0 it
+from the cgroup before starting. `kern limit --memory` does not wait to be asked: since v0.31.0 it
 refuses on its own when no ceiling at or below the one you named can be proven, because that verb
 governs resources and nothing else. `--allow-uncapped` (`KERN_ALLOW_UNCAPPED`) is the explicit inverse;
 the two are mutually exclusive. cpu and cpuset stay best-effort under both.
@@ -59,9 +59,9 @@ exec'd binary and on whether the box is detached: measured at 2 on one box, so `
 | Verb | Question it answers | What it does |
 |---|---|---|
 | **`kern box`** | *"Isolate this workload, and slice its resources."* | Its own namespaces, overlay or read-only fs, private process tree, seccomp, **plus** the resource slices |
-| **`kern run`** | *"Just slice resources, no sandbox."* | The same caps with no namespaces, **plus** `--landlock-rw` to confine writes |
+| **`kern limit`** | *"Just slice resources, no sandbox."* | The same caps with no namespaces, **plus** `--landlock-rw` to confine writes |
 
-They compose: `run` inside `box`. Both carry a default memory cap of **512 MiB** where the host can hold
+They compose: `limit` inside `box`. Both carry a default memory cap of **512 MiB** where the host can hold
 one, plus no swap and a ceiling of 512 tasks.
 
 ### What memory ceiling you get, in five cases
@@ -70,7 +70,7 @@ The first two differ on purpose, and a reader who meets them one at a time concl
 
 | what you ran | ceiling with no flag or key | why |
 |---|---|---|
-| `kern box` / `kern run` | **512 MiB** | kern's own default: a sandbox is capped until you say otherwise |
+| `kern box`, `kern run`, `kern limit` | **512 MiB** | kern's own default: a sandbox is capped until you say otherwise |
 | `kern box --gpus` (or `--device`, `--runtime nvidia`) | **the host's RAM** | a GPU workload is never 512 MiB: on a WSL2 guest each CUDA context took about 75 MiB of host memory. On a Jetson the cap bounds GPU memory only with nvmap's page pool off (`kern doctor`) |
 | a `kern compose` service with no `mem_limit:` | **the host's RAM** | compose parity. Docker does not cap a service by default |
 
@@ -82,7 +82,7 @@ puts a strict ceiling back ([CONFIG.md](CONFIG.md), [DOCKER-COMPAT.md](DOCKER-CO
 
 **Third case: no mechanism at all.** A host with no systemd user manager, whose own cgroup cannot take
 a capped child, has neither path, so NO cap is in force, default or asked-for. A `kern box` warns at
-start, a `kern run --memory` refuses outright, and `kern doctor` names the directories it probed. For a
+start, a `kern limit --memory` refuses outright, and `kern doctor` names the directories it probed. For a
 running box it is a fact you can read:
 
 ```console
@@ -121,7 +121,7 @@ Name a slice once, attach it by name, and stop repeating flags. Profiles live in
 ```sh
 kern config add vcpu:slim --cpus 0.5 --memory 256m       # or edit the file by hand
 kern box app --image alpine vcpu:slim -- ./app           # no flag: the profile is just there
-kern run vcpu:slim -- ./train.sh                         # the same slice, no sandbox
+kern limit vcpu:slim -- ./train.sh                       # the same slice, no sandbox
 ```
 
 That writes both the profile and the physical resource it slices:
@@ -146,7 +146,7 @@ per-project file, or `KERN_CONFIG` to make that the file every command reads. Th
 ## Confining writes without a sandbox
 
 `--landlock-rw <path>` works on `run` as well as on `box`, because Landlock restricts the calling
-process rather than needing a mount namespace. So `kern run --landlock-rw ~/project -- ./agent` runs a
+process rather than needing a mount namespace. So `kern limit --landlock-rw ~/project -- ./agent` runs a
 host binary with its writes confined by the kernel to that directory. Two differences from the same
 flag on `box`:
 

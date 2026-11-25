@@ -1,6 +1,6 @@
 #!/bin/sh
 # Govern *resources* (CPU + memory), with or without a sandbox:
-#   kern run --memory M --cpus N -- CMD    run a HOST command under cgroup caps - no namespaces, no
+#   kern limit --memory M --cpus N -- CMD  run a HOST command under cgroup caps - no namespaces, no
 #                                          seccomp, no overlay; the leanest path (a capped exec).
 #   kern box --memory M --cpus N           the same hard caps on a sandboxed box; a workload over the
 #                                          memory limit is OOM-killed by the kernel.
@@ -15,8 +15,8 @@ kern="${KERN:-kern}"
 printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
 
 
-echo "==> kern run: a host command under a 256 MB / 0.5-core quota (governor only, no sandbox):"
-"$kern" run --memory 256M --cpus 0.5 -- sh -c 'echo "running under a governed slice"; echo "cpus visible: $(nproc)"'
+echo "==> kern limit: a host command under a 256 MB / 0.5-core quota (governor only, no sandbox):"
+"$kern" limit --memory 256M --cpus 0.5 -- sh -c 'echo "running under a governed slice"; echo "cpus visible: $(nproc)"'
 
 echo
 echo "==> a hard memory cap is kernel-enforced. Inside a box with a 256 MB cap, allocate ~400 MB:"
