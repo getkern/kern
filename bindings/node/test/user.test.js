@@ -450,7 +450,7 @@ test(
   },
 );
 
-test("a cap is enforced DURING a call and not only between calls", async () => {
+test("a cap is enforced DURING a call and not only between calls", { skip: !kernBin() && "no runnable kern (set KERN_BIN)" }, async () => {
   // The measured defect: one call wrote 8,115 MB in ten seconds against a 50 MiB cap and was admitted,
   // because the next check is the next call. Here the cell writes 4 MiB against a 1 MiB cap and then
   // sleeps 30 seconds: before this the call returned after those 30 seconds with the bytes on disk and

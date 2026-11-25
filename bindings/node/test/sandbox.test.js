@@ -40,6 +40,11 @@ try {
   KERN_OK = false;
 }
 const exec = { skip: !KERN_OK && "kern binary not found (set KERN_BIN)" };
+// WITHOUT A REAL KERN THE UNIT TESTS RUN AGAINST THE DOUBLE, as the other two suites' do: they build
+// a Sandbox and assert the argv it would run, and the constructor finds a kern first. Set only after
+// KERN_OK was decided on the real one, so every test that starts a box still skips here. Without it
+// 38 tests failed on a machine with no kern (the CI shape), all with "kern was not found".
+if (!KERN_OK) process.env.KERN_BIN = FAKE_KERN;
 
 // THE IMAGE STORE THE TESTS FOUND, read before any test moves $XDG_CACHE_HOME. The bytecode-cache tests
 // move it to isolate the cache, and kern keeps its IMAGES under the same variable, so every one of
@@ -738,14 +743,27 @@ test("the sweep runs once per process even when nothing is built", async () => {
     const adopted = path.join(root, "adopted");
     fs.mkdirSync(adopted);
     fs.utimesSync(adopted, new Date(), new Date());
-    await kern._pycStartSweep(root);
+    // THE SWEEP IS AN UNREF'D IMMEDIATE, on purpose (it must never keep a caller's process alive), so
+    // in a test process with nothing else pending Node exits before it runs: held open here, by the
+    // test, for the length of the await. Without it the test was cancelled on a host with no kern.
+    const hold = setInterval(() => {}, 1000);
+    try {
+      await kern._pycStartSweep(root);
+    } finally {
+      clearInterval(hold);
+    }
     const left = fs.readdirSync(root).sort();
     assert.ok(left.includes("adopted"), "evicted the newest cache");
     assert.strictEqual(left.length, 8, `${left.length} caches left, expected 8`);
     // AND ONLY ONCE: a second call must not scan again. Asserted by deleting the ceiling's worth of
     // evidence - a second sweep would take the count down again, and it must not.
     fs.mkdirSync(path.join(root, "extra"));
-    await kern._pycStartSweep(root);
+    const hold2 = setInterval(() => {}, 1000);
+    try {
+      await kern._pycStartSweep(root);
+    } finally {
+      clearInterval(hold2);
+    }
     assert.ok(fs.existsSync(path.join(root, "extra")), "swept twice in one process");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
