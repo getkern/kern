@@ -1966,6 +1966,17 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
                 continue;
             }
             let cur = descend_mut(&mut root, &path);
+            // A NODE IS A MAPPING OR A LIST, NEVER BOTH. A `key:` line and a `- item` under the same
+            // key is a file every YAML parser refuses ("did not find expected key"); kern kept the
+            // items and dropped the keys. MEASURED (Grok's round 17, case y02): `volumes:` with
+            // `<<: *list` and then `- b:/data` ran with only `b`, where Docker refused the file.
+            if !cur.children.is_empty() && !path.is_empty() {
+                return Err(format!(
+                    "line {}: a list item (`- ...`) under a key that already holds `key: value` \
+                     entries; a YAML value is a mapping or a list, not both",
+                    ln.lineno
+                ));
+            }
             // A list item that is itself a `key: value` (a block-mapping element, e.g. the long-form
             // `- target: 443` with `published: 8443` on the next deeper line) opens a mapping. Model it
             // WITHOUT a full list-of-maps type: start folding it into an inline `{k: v, …}` string that
@@ -2035,9 +2046,25 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
             }
         }
         let cur = descend_mut(&mut root, &path);
+        if !cur.items.is_empty() {
+            return Err(format!(
+                "line {}: `{key}:` under a key that already holds list items (`- ...`); a YAML \
+                 value is a mapping or a list, not both",
+                ln.lineno
+            ));
+        }
         cur.children.push((key.to_string(), node));
         // No inline scalar → this key opens a nested mapping/sequence: push it as the new open level.
-        if inline.is_none() {
+        // AND A TAG ALONE (`ports: !override` then `- '6000:6000'` on the next lines) opens one too:
+        // the tag decorates the block below it. Kept as `scalar` for the merge-tag reader; the items
+        // used to land on the PARENT mapping, which only went unnoticed because nothing read them.
+        let lone_tag = inline.is_some_and(|v| {
+            let v = v.trim();
+            (v.starts_with('!') && !v.contains(char::is_whitespace))
+                || v == RESET_SENTINEL
+                || v == OVERRIDE_SENTINEL
+        });
+        if inline.is_none() || lone_tag {
             let idx = cur.children.len() - 1;
             path.push(idx);
             cols.push(ln.indent);
@@ -3615,7 +3642,9 @@ fn apply_volume_drivers(
     for b in boxes.iter_mut() {
         let mut keep = Vec::with_capacity(b.volumes.len());
         for v in std::mem::take(&mut b.volumes) {
-            let decl = v.split_once(':').and_then(|(src, _)| drivers.get(src).map(|d| (src, d)));
+            let decl = v
+                .split_once(':')
+                .and_then(|(src, _)| drivers.get(src).map(|d| (src, d)));
             match decl {
                 Some((src, VolumeDriverDecl::Bind(dev))) => {
                     let pair = (src.to_string(), dev.clone());
@@ -11160,19 +11189,44 @@ mod tests {
             "  e: {external: true}\n",
         ));
         let b = parse(&ok).expect("parses").remove(0);
-        assert_eq!(b.volume_paths, vec![("b".to_string(), "/srv/data".to_string())]);
-        assert!(b.volumes.contains(&"b:/b".to_string()), "a bind volume stays a named mount");
-        assert!(!b.volumes.iter().any(|v| v.ends_with(":/t")), "tmpfs leaves the volumes");
+        assert_eq!(
+            b.volume_paths,
+            vec![("b".to_string(), "/srv/data".to_string())]
+        );
+        assert!(
+            b.volumes.contains(&"b:/b".to_string()),
+            "a bind volume stays a named mount"
+        );
+        assert!(
+            !b.volumes.iter().any(|v| v.ends_with(":/t")),
+            "tmpfs leaves the volumes"
+        );
         assert_eq!(b.tmpfs_from_volumes, vec!["/t:size=16m".to_string()]);
-        assert!(b.volumes.contains(&"e:/e".to_string()), "an external volume is untouched");
+        assert!(
+            b.volumes.contains(&"e:/e".to_string()),
+            "an external volume is untouched"
+        );
         for (bad, why) in [
             ("  b: {driver: rexray}\n", "driver"),
-            ("  b: {driver_opts: {type: none, o: bind, device: rel/dir}}\n", "absolute"),
-            ("  b: {driver_opts: {type: ext4, device: /dev/sdb1}}\n", "type 'ext4'"),
-            ("  b: {driver_opts: {type: nfs, o: addr=h, device: \":/x\"}}\n", "foreground box"),
-            ("  b: {driver_opts: {type: cifs, device: //h/s}}\n", "Mount the share on the host"),
+            (
+                "  b: {driver_opts: {type: none, o: bind, device: rel/dir}}\n",
+                "absolute",
+            ),
+            (
+                "  b: {driver_opts: {type: ext4, device: /dev/sdb1}}\n",
+                "type 'ext4'",
+            ),
+            (
+                "  b: {driver_opts: {type: nfs, o: addr=h, device: \":/x\"}}\n",
+                "foreground box",
+            ),
+            (
+                "  b: {driver_opts: {type: cifs, device: //h/s}}\n",
+                "Mount the share on the host",
+            ),
         ] {
-            let src = format!("services:\n  a:\n    image: alpine\n    volumes: [b:/b]\nvolumes:\n{bad}");
+            let src =
+                format!("services:\n  a:\n    image: alpine\n    volumes: [b:/b]\nvolumes:\n{bad}");
             let e = parse(&src).expect_err(bad);
             assert!(e.to_string().contains(why), "{bad}: {e}");
         }
