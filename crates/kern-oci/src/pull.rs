@@ -2450,7 +2450,7 @@ fn verify_digest_bytes(bytes: &[u8], digest: &str) -> Result<(), OciError> {
     let mut child = Command::new("sha256sum")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| OciError::Tool("sha256sum", e.to_string()))?;
     child
@@ -2643,8 +2643,15 @@ fn userns_ok() -> bool {
     use std::sync::OnceLock;
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
+        // A PROBE: its verdict is the exit status, and its words have no reader. Inherited, they
+        // reached the user ahead of kern's own refusal: MEASURED on Ubuntu 24.04 with
+        // `apparmor_restrict_unprivileged_userns=1`, a first `kern box --image` printed
+        // `unshare: write failed /proc/self/uid_map: Operation not permitted` before kern's sentence.
         Command::new("unshare")
             .args(["-r", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
