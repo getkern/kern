@@ -115,6 +115,31 @@ up, as `docker ps` lists a `Restarting (1)` container: `restarting (1)` in `kern
 in `kern top` (with no pid, `null` in `--json`) and through kern's socket, where it was missing,
 or `exited` for an instant. `kern rename` takes the box's earlier runs with it, records and logs.
 
+**`kern rename` of a `--restart` box renames its unit, and does not stop it.** The layer took the
+new name and the unit went on running the old one, so `ps -a` had two rows and the old name came
+back from an empty layer. Between two runs the unit is moved to the new name; a running box keeps
+running, and its unit is handed over to the new name when it next exits (a crash included). The
+logs of every earlier run follow the name. `kern wait` and `docker wait` of a box that is stopped
+or between two runs answer its last code at once, as Docker does (they refused, and the socket
+said -1). A `--restart always` command may span several lines: the unit writes a newline as its
+escape (it was refused).
+
+**`kern inspect` reports a kept box, and its `-f` names the image as Docker does.** A box that is
+stopped or between two runs is shown from its record (status, image, command, policy, restarts),
+where it was refused. In `-f`, `.Config.Image` is the image's name and `.Image` its id; both printed
+the box's scratch path. `.State.Restarting` and `.HostConfig.RestartPolicy.Name` are answered where
+kern holds the policy (a `--restart` unit, a kept box's record), and refused elsewhere. `kern ps
+--format json` prints Docker's line per box (it printed the word `json`), and `--format` says
+`restarting` / `Restarting (1) ...` for a box between two runs.
+
+**A container keeps the image id it was started from.** The id is recorded when the box starts,
+so a rebuild of its tag no longer moves the id `docker inspect` and `kern inspect` report for a
+box that still runs the old image, as Docker keeps it.
+
+**`docker compose up --profile <p>` adds a service to a running stack.** A file with one plain
+service and one under a profile got a stack without a bridge, and the later `up --profile` failed
+to attach the second service. The wiring is decided on every service the file declares.
+
 **`docker inspect` reports a container's image id.** `Image` in `inspect` and `ImageID` in the list
 are the image's id, the `Id` `docker images` gives it; its name is `Config.Image` and the list's
 `Image`. Both said the name. `docker inspect` of a name that does not exist ends with Docker's `no
