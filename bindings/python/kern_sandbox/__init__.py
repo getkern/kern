@@ -1039,6 +1039,10 @@ def _oci_canonical_ref(image: str) -> str:
 _PYC_SOURCE_ID = ".kern-source-id"
 
 
+# How much of kern's config and layer files the cache identity reads: all of any real one.
+_PYC_ID_READ_MAX = 1 << 20
+
+
 def _pyc_source_id(image: str) -> str:
     """What kern's own image cache holds for `image`, as a short string, or "" if it cannot be read.
 
@@ -1062,8 +1066,11 @@ def _pyc_source_id(image: str) -> str:
         # `$XDG_CACHE_HOME` moves both the bytecode cache and the identity it is checked against.
         h = hashlib.sha256()
         # THE CONFIG, which changes when ENTRYPOINT/ENV/WORKDIR/USER do.
+        # THE WHOLE CONFIG, to a bound no config reaches: the first 4096 bytes were read, and kern's
+        # configs run to 10 KB on this host, so an ENV, a WORKDIR or a USER changed past that point
+        # kept the old cache. The test that appends one byte said so.
         with open(_kern_image_file(image, ".image"), "rb") as fh:
-            h.update(fh.read(4096))
+            h.update(fh.read(_PYC_ID_READ_MAX))
         # THE SENTINEL'S STAMP, NOT ITS BYTES. `.ok` holds the REFERENCE, so its contents are the tag
         # and never move when the tag does: hashing them missed the commonest case there is, a rebuilt
         # rootfs under an unchanged config. Its mtime and length are what kern ITSELF uses to decide
@@ -1077,7 +1084,7 @@ def _pyc_source_id(image: str) -> str:
         # layered is not the same image.
         try:
             with open(_kern_image_file(image, ".layers"), "rb") as fh:
-                h.update(fh.read(8192))
+                h.update(fh.read(_PYC_ID_READ_MAX))
         except OSError:
             h.update(b"\0no-layers")
         return h.hexdigest()[:32]
@@ -1575,6 +1582,9 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
             "--memory", "512m",
             "--pids-limit", "256",
             "--timeout", str(int(timeout_s)),
+            # The image's entrypoint is not run: it is not part of compiling the stdlib, and node's
+            # turns a missing `python3` into `node python3 -c ...`. Mirrors the Node binding.
+            "--entrypoint", "",
             "--", "python3", "-c", _PYC_BUILD_CODE,
         ]
         # STDERR IS KEPT, NOT DISCARDED. A build that fails leaves no cache, and the session runs
@@ -1588,7 +1598,8 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
         # pipe is drained by hand, keeping only what the warning can use and discarding the rest, so
         # the child never blocks on a full pipe either.
         r = _run_capped(argv, timeout_s + 10)
-        if r.returncode != 0:
+        # 127 is "this image has no python3": nothing to precompile, nothing to report.
+        if r.returncode not in (0, 127):
             _pyc_report_failure(image, r.returncode, r.stderr)
         if r.returncode == 0 and any(os.scandir(tmp)) and _pyc_tree_is_publishable(tmp):
             # WRITTEN BEFORE THE PUBLISH, so a tree that becomes visible always carries the identity
@@ -4136,6 +4147,12 @@ class SandboxMetrics:
     disk_bytes: int
     #: When the box's deadline ends it, Unix seconds; ``None`` for no deadline or no box.
     ends_at: "int | None"
+    #: WHY the box fields are ``None``, in words a UI can show; ``None`` when they are all measured.
+    #: A one-shot sandbox has no box between calls, a resident box may not be running, and a host
+    #: without a delegated cgroup (an unprivileged container, for one) does not account a box at all.
+    #: Reported from the field: in such a container CPU, memory and tasks came back ``None`` with
+    #: nothing saying why.
+    unavailable: "str | None" = None
 
 
 def _inspect_box(kern: str, box: str) -> "dict | None":
@@ -4168,7 +4185,12 @@ def _box_metrics(kern: str, box: "str | None", interval_s: float, disk_bytes: in
         raise SandboxError("interval_s must be zero or positive")
     first = _inspect_box(kern, box) if box else None
     if first is None:
-        return SandboxMetrics(None, None, None, None, None, None, disk_bytes, None)
+        why = (
+            "no box between calls: a one-shot sandbox runs one per call (persist=True keeps one)"
+            if not box
+            else "the resident box is not running"
+        )
+        return SandboxMetrics(None, None, None, None, None, None, disk_bytes, None, unavailable=why)
     doc = first
     rate: "float | None" = None
     if interval_s > 0:
@@ -4183,6 +4205,7 @@ def _box_metrics(kern: str, box: "str | None", interval_s: float, disk_bytes: in
             doc = second
     usec = _int_or_none(doc.get("cpu_usec"))
     enforced = _int_or_none(doc.get("memory_max_enforced"))
+    unaccounted = usec is None and _int_or_none(doc.get("mem_bytes")) is None and _int_or_none(doc.get("tasks")) is None
     return SandboxMetrics(
         cpu_seconds=None if usec is None else usec / 1e6,
         cpu_percent=rate,
@@ -4192,6 +4215,12 @@ def _box_metrics(kern: str, box: "str | None", interval_s: float, disk_bytes: in
         pids_limit=_int_or_none(doc.get("pids_max")),
         disk_bytes=disk_bytes,
         ends_at=_int_or_none(doc.get("ends_at")),
+        unavailable=(
+            "this host does not account the box's CPU, memory and tasks (no delegated cgroup, as "
+            "in an unprivileged container); `kern doctor` says what is missing"
+            if unaccounted
+            else None
+        ),
     )
 
 

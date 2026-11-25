@@ -293,6 +293,8 @@ export interface SandboxMetrics {
   diskBytes: number;
   /** When the box's deadline ends it, Unix seconds; null for no deadline or no box. */
   endsAt: number | null;
+  /** Why the box fields are null, in words a UI can show; null when they are all measured. */
+  unavailable: string | null;
 }
 
 /** One change in a watched workspace directory. A move into the watched tree arrives as "create" and

@@ -26,6 +26,7 @@
   },
   "license": "Apache-2.0",
   "main": "index.js",
+  "type": "commonjs",
   "types": "index.d.ts",
   "files": [
     "index.js",

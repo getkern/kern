@@ -1138,11 +1138,16 @@ const PYC_SOURCE_ID = ".kern-source-id";
  *
  * "" MEANS "CANNOT TELL" and is treated as unchanged, so a cache from before this check, or a host
  * whose image kern has pruned, is never rebuilt in a loop. */
+/** How much of kern's config and layer files the cache identity reads: all of any real one. */
+const PYC_ID_READ_MAX = 1 << 20;
+
 function pycSourceId(image) {
   try {
     const h = crypto.createHash("sha256");
     // THE CONFIG, which changes when ENTRYPOINT/ENV/WORKDIR/USER do.
-    h.update(fs.readFileSync(kernImageFile(image, ".image")).subarray(0, 4096));
+    // THE WHOLE CONFIG, to a bound no config reaches: the first 4096 bytes were read, and kern's
+    // configs run to 10 KB, so an ENV or a USER changed past that point kept the old cache.
+    h.update(fs.readFileSync(kernImageFile(image, ".image")).subarray(0, PYC_ID_READ_MAX));
     // THE SENTINEL'S STAMP, NOT ITS BYTES. `.ok` holds the REFERENCE, so its contents are the tag and
     // never move when the tag does: hashing them missed the commonest case there is, a rebuilt rootfs
     // under an unchanged config. Its mtime and length are what kern ITSELF uses to decide an image's
@@ -1154,7 +1159,7 @@ function pycSourceId(image) {
     // none, and that absence is part of the identity: an image that stops being layered is not the
     // same image.
     try {
-      h.update(fs.readFileSync(kernImageFile(image, ".layers")).subarray(0, 8192));
+      h.update(fs.readFileSync(kernImageFile(image, ".layers")).subarray(0, PYC_ID_READ_MAX));
     } catch {
       h.update("\0no-layers");
     }
@@ -1426,6 +1431,10 @@ function pycBuild(kernBin, image, dest, timeoutS) {
       "--memory", "512m",
       "--pids-limit", "256",
       "--timeout", String(Math.trunc(timeoutS)),
+      // THE IMAGE'S ENTRYPOINT IS NOT RUN: it is not part of compiling the stdlib, and node's turns a
+      // missing `python3` into `node python3 -c ...`, whose crash trailer (`Node.js v22.x`) was what
+      // the warning quoted as the build box's answer (reported from the field on node:22-alpine).
+      "--entrypoint", "",
       "--", "python3", "-c", PYC_BUILD_CODE,
     ];
     // ASYNCHRONOUS, and `spawnSync` was the first version. It blocks the event loop for the whole
@@ -1455,7 +1464,10 @@ function pycBuild(kernBin, image, dest, timeoutS) {
       });
       child.on("close", (code) => {
         clearTimeout(killer);
-        if (code !== 0) pycReportFailure(image, code, errText);
+        // 127 IS "THIS IMAGE HAS NO python3": nothing to precompile, so nothing to report. A session
+        // on a node or busybox image runs its calls as always; a Python call there fails with its own
+        // clear error. Every other failure is still said once.
+        if (code !== 0 && code !== 127) pycReportFailure(image, code, errText);
         try {
           // An image without python3 leaves no cache and no trace: the next session runs as before.
           if (code === 0 && fs.readdirSync(tmp).length > 0 && pycTreeIsPublishable(tmp)) {
@@ -2840,9 +2852,17 @@ function credentialInsideBounded(real, deadlineMs = MOUNT_SCAN_DEADLINE_MS) {
   const { Worker } = require("node:worker_threads");
   const flag = new Int32Array(new SharedArrayBuffer(4));
   const out = new Uint8Array(new SharedArrayBuffer(8192));
+  // THE WORKER'S SOURCE IS READ AS WHATEVER THE PARENT RUNS AS. Started with `--input-type=module`
+  // (code piped to `node` on stdin) or a default type of `module`, it was an ES module, `require` did
+  // not exist, and the worker's error, with no listener, took the caller's whole process down:
+  // `ReferenceError: require is not defined in ES module scope` on the first `mounts=` (reported from
+  // the field, reproduced on Node 22.22.2; the same code from a `.mjs` file worked). The flags that
+  // change the module type are not passed on, and the source takes the built-ins either way
+  // (`process.getBuiltinModule` where `require` is absent), so a type set through NODE_OPTIONS holds.
   const src = `
-    const fs = require("node:fs"), path = require("node:path");
-    const { workerData } = require("node:worker_threads");
+    const req = typeof require === "function" ? require : process.getBuiltinModule;
+    const fs = req("node:fs"), path = req("node:path");
+    const { workerData } = req("node:worker_threads");
     const REFUSED_MOUNT_COMPONENTS = new Set(${JSON.stringify([...REFUSED_MOUNT_COMPONENTS])});
     const REFUSED_MOUNT_PAIRS = new Set(${JSON.stringify([...REFUSED_MOUNT_PAIRS])});
     const MOUNT_SCAN_EXEMPT = new Set(${JSON.stringify([...MOUNT_SCAN_EXEMPT])});
@@ -2858,7 +2878,13 @@ function credentialInsideBounded(real, deadlineMs = MOUNT_SCAN_DEADLINE_MS) {
     Atomics.store(workerData.flag, 0, n + 1);
     Atomics.notify(workerData.flag, 0);
   `;
-  const w = new Worker(src, { eval: true, workerData: { real, flag, out } });
+  const execArgv = process.execArgv.filter(
+    (a) => !/^--(input-type|experimental-default-type)(=|$)/.test(a),
+  );
+  const w = new Worker(src, { eval: true, execArgv, workerData: { real, flag, out } });
+  // A worker that FAILS reports nothing, which the wait below reads as a scan that did not finish
+  // (and the mount is refused); without a listener the error would end the caller's process.
+  w.on("error", () => {});
   w.unref();
   Atomics.wait(flag, 0, 0, deadlineMs);
   // No result written means the scan did not finish, whatever woke the wait.
@@ -3301,12 +3327,17 @@ function intOrNull(v) {
 async function boxMetrics(kernBin, box, intervalS, diskBytes) {
   if (typeof intervalS !== "number" || !(intervalS >= 0))
     throw new SandboxError("intervalS must be zero or positive");
-  const none = {
-    cpuSeconds: null, cpuPercent: null, memoryBytes: null, memoryLimitBytes: null,
-    pids: null, pidsLimit: null, diskBytes, endsAt: null,
-  };
   const first = box ? await inspectBox(kernBin, box) : null;
-  if (first === null) return none;
+  if (first === null) {
+    // WHY the box fields are null, for a UI to show (mirrors Python's `unavailable`).
+    return {
+      cpuSeconds: null, cpuPercent: null, memoryBytes: null, memoryLimitBytes: null,
+      pids: null, pidsLimit: null, diskBytes, endsAt: null,
+      unavailable: box
+        ? "the resident box is not running"
+        : "no box between calls: a one-shot sandbox runs one per call (persist: true keeps one)",
+    };
+  }
   let doc = first;
   let rate = null;
   if (intervalS > 0) {
@@ -3322,6 +3353,7 @@ async function boxMetrics(kernBin, box, intervalS, diskBytes) {
     }
   }
   const usec = intOrNull(doc.cpu_usec);
+  const unaccounted = usec === null && intOrNull(doc.mem_bytes) === null && intOrNull(doc.tasks) === null;
   return {
     cpuSeconds: usec === null ? null : usec / 1e6,
     cpuPercent: rate,
@@ -3331,6 +3363,10 @@ async function boxMetrics(kernBin, box, intervalS, diskBytes) {
     pidsLimit: intOrNull(doc.pids_max),
     diskBytes,
     endsAt: intOrNull(doc.ends_at),
+    unavailable: unaccounted
+      ? "this host does not account the box's CPU, memory and tasks (no delegated cgroup, as in an " +
+        "unprivileged container); `kern doctor` says what is missing"
+      : null,
   };
 }
 

@@ -1179,7 +1179,11 @@ def test_pyc_cache_under_a_credential_directory_is_refused_and_the_build_box_is_
     argv = seen[0]
     assert "--memory" in argv and "--pids-limit" in argv, argv
     assert "--cap-drop" in argv and argv[argv.index("--cap-drop") + 1] == "ALL", argv
-    assert "--net" not in argv, "the build box must not get the network"
+    # `--network none` IS the posture (a kern box has a NAT by default); what must be absent is a flag
+    # that turns the network ON. A substring test for `--net` matched the flag that takes it away.
+    flat = argv if isinstance(argv, str) else " ".join(argv)
+    assert re.search(r"--network\s+none", flat), "the build box must be given --network none"
+    assert not re.search(r"--net(work)?\s+(host|bridge)|--egress-allow", flat), "the build box must not get the network"
 
 
 def test_pyc_build_publishes_atomically_and_leaves_nothing_on_failure(tmp_path, monkeypatch):
@@ -1209,7 +1213,11 @@ def test_pyc_build_publishes_atomically_and_leaves_nothing_on_failure(tmp_path, 
     assert not [p for p in published.parent.iterdir() if ".tmp-" in p.name], "temp sibling survived"
     argv = marker.read_text()
     assert "--ro" in argv and f"PYTHONPYCACHEPREFIX={kern._PYC_MOUNT}" in argv, argv
-    assert "--net" not in argv, "the build box must not get the network"
+    # `--network none` IS the posture (a kern box has a NAT by default); what must be absent is a flag
+    # that turns the network ON. A substring test for `--net` matched the flag that takes it away.
+    flat = argv if isinstance(argv, str) else " ".join(argv)
+    assert re.search(r"--network\s+none", flat), "the build box must be given --network none"
+    assert not re.search(r"--net(work)?\s+(host|bridge)|--egress-allow", flat), "the build box must not get the network"
 
     # AND THE TREE IS INSPECTED BEFORE IT IS PUBLISHED, asserted through `_pyc_build` rather than on
     # the helper alone: sabotage showed that testing the predicate while the build ignored it left this

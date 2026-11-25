@@ -904,7 +904,11 @@ test("pycBuild publishes atomically, leaves nothing on failure, and takes no net
     );
     const argv = fs.readFileSync(marker, "utf8");
     assert.ok(argv.includes("--ro") && argv.includes(`PYTHONPYCACHEPREFIX=${kern._PYC_MOUNT}`), argv);
-    assert.ok(!argv.includes("--net"), "the build box must not get the network");
+    // `--network none` IS the posture (a kern box has a NAT by default); what must be absent is
+    // anything that turns the network ON. A substring test for `--net` matched the very flag that
+    // takes it away.
+    assert.ok(/--network\s+none/.test(argv), "the build box must be given --network none");
+    assert.ok(!/--net(work)?\s+(host|bridge)|--egress-allow/.test(argv), "the build box must not get the network");
 
     // AND THE TREE IS INSPECTED BEFORE IT IS PUBLISHED, asserted through pycBuild and not on the
     // helper alone: sabotage showed that testing the predicate while the build ignored it left this
