@@ -3194,6 +3194,15 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     }
     // The box's own NAT is started at its gate only when no prepared one was taken.
     let own_nat = args.own_outbound && net_slot.is_none();
+    // AN UPPER THROWN AWAY WITH THE BOX, MOUNTED ONCE, skips overlayfs's sync at unmount (see
+    // `kern_isolation`'s `mount_overlay`). `build_spec` set it only for the ephemeral scratch upper
+    // (a kept box, a build step and a copy of a stopped box persist theirs); a box that restarts in
+    // place mounts the same upper again, which a volatile mount refuses, so it is off there too.
+    // MEASURED before this read the build: `--keep` computes its layer after the flags, so a check
+    // of `args.overlay_upper` called a kept box's persistent layer ephemeral.
+    if let Some(o) = spec.overlay.as_mut() {
+        o.volatile &= !restart && !restart_always && args.restart == RestartPolicy::No;
+    }
     // Each box records the named volumes it mounts (below, in the registry) BEFORE it mounts them, so
     // `kern volume rm` sees an in-use volume and refuses - race-free without holding an fd open on the
     // volume dir (which would disturb the sandbox's mount setup).

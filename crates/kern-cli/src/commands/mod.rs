@@ -1728,6 +1728,10 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
                 lower: b.lower,
                 upper: upper.to_string_lossy().into_owned(),
                 work: work.to_string_lossy().into_owned(),
+                // Volatile only where the upper is the box's ephemeral scratch: a `--overlay-upper`
+                // (a kept box's layer, a build step's, a copy of a stopped box) persists. The caller
+                // turns it off for a box that restarts in place (see `mount_overlay`).
+                volatile: b.overlay_upper.is_none(),
             }),
             // Clean up work/merged (and, when the upper is ephemeral, the upper too) after the box
             // exits; a build's persistent upper lives outside `eph`, owned by the build driver.

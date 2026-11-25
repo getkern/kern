@@ -689,6 +689,71 @@ fn a_box_killed_by_its_cap_says_why() {
     );
 }
 
+/// A box's ephemeral upper is mounted `volatile` (no sync at unmount), a kept box's persistent one is
+/// not, and neither is a box that restarts in place (it mounts its upper again, which a volatile mount
+/// refuses). MEASURED before the second half: a `--keep` box was mounted volatile, because the check
+/// read the `--overlay-upper` flag and `--keep` computes its layer after the flags. A crash would then
+/// lose a kept box's writes without the sync its layer is owed.
+#[test]
+fn only_an_ephemeral_upper_is_mounted_volatile() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why}");
+        return;
+    }
+    // The root's mount OPTIONS, one per entry: a match on the line alone would find the word in
+    // a path (the box's name is in its upperdir).
+    let root_opts = |args: &[&str]| -> Vec<String> {
+        let out = kern().args(args).output().expect("run kern");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.split_whitespace().nth(1) == Some("/"))
+            .and_then(|l| l.split_whitespace().nth(3))
+            .unwrap_or_default()
+            .split(',')
+            .map(str::to_string)
+            .collect()
+    };
+    // `volatile` as the option was asked, `fsync=volatile` as a newer kernel reports it (7.0 here).
+    let volatile = |o: &[String]| o.iter().any(|x| x == "volatile" || x == "fsync=volatile");
+    let ephemeral = root_opts(&["run", "--rm", "alpine:latest", "cat", "/proc/mounts"]);
+    if !volatile(&ephemeral) {
+        eprintln!("SKIP: this kernel mounts no volatile overlay (before 5.10?): {ephemeral:?}");
+        return;
+    }
+    let name = format!("volatile-kept-{}", std::process::id());
+    let kept = root_opts(&[
+        "run",
+        "--rm",
+        "--keep",
+        "--name",
+        &name,
+        "alpine:latest",
+        "cat",
+        "/proc/mounts",
+    ]);
+    let _ = kern().args(["rm", "-f", &name]).output();
+    assert!(
+        !volatile(&kept),
+        "a kept box's layer was mounted volatile: {kept:?}"
+    );
+    let name = format!("volatile-restart-{}", std::process::id());
+    let restarting = root_opts(&[
+        "run",
+        "--name",
+        &name,
+        "--restart",
+        "on-failure",
+        "alpine:latest",
+        "cat",
+        "/proc/mounts",
+    ]);
+    let _ = kern().args(["rm", "-f", &name]).output();
+    assert!(
+        !volatile(&restarting),
+        "a box that restarts in place was mounted volatile: {restarting:?}"
+    );
+}
+
 /// Did this host refuse to BUILD a box at all, as opposed to running one and disagreeing with us?
 ///
 /// THE DISTINCTION IS THE WHOLE POINT, and getting it wrong has cost this project in both directions.

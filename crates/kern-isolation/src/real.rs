@@ -504,6 +504,9 @@ pub struct OverlayDirs {
     pub lower: Vec<String>,
     pub upper: String,
     pub work: String,
+    /// Mount with overlayfs's `volatile`: no sync of the upper at unmount (or ever). Only for an
+    /// upper that is thrown away with the box and mounted ONCE; see [`mount_overlay`].
+    pub volatile: bool,
 }
 
 /// One path as overlayfs reads it inside a mount option.
@@ -892,6 +895,7 @@ fn mount_overlay(
     work: &str,
     merged: &str,
     nosuid: bool,
+    volatile: bool,
 ) -> Result<(), Error> {
     // An overlay needs a lower, and an empty `lowerdir=` is a kernel `EINVAL` naming nothing. No
     // caller can produce one today; the message says what is missing if a later one does.
@@ -904,15 +908,38 @@ fn mount_overlay(
         ));
     }
     let merged_c = cstr(merged)?;
-    let opts = OverlayOpts::new(
-        &format!(
-            "lowerdir={},upperdir={},workdir={}",
-            overlay_lowerdir(lower),
-            overlay_escape(upper),
-            overlay_escape(work)
-        ),
-        Some(std::path::Path::new(upper)),
-    )?;
+    let base = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        overlay_lowerdir(lower),
+        overlay_escape(upper),
+        overlay_escape(work)
+    );
+    // `volatile` FOR AN UPPER THROWN AWAY WITH THE BOX: overlayfs otherwise syncs the upper's
+    // filesystem when the box's mount namespace goes, inside the exit of its PID 1. MEASURED with the
+    // runtime dir (where an ephemeral upper lives) on ext4: `kern run --rm alpine true` 20-35 ms
+    // against 2.8-3.1 ms on tmpfs, the difference all in that exit (strace: 10.5 ms between PID 1's
+    // `exit_group` and its end). It is where kern's runtime dir is on a disk, as on a host or distro
+    // without a tmpfs `/run/user`. Nothing is lost: the upper is removed when the box ends.
+    //
+    // ONLY ONCE PER UPPER: a volatile mount leaves `work/incompat/volatile` and overlayfs refuses
+    // to mount that upper again, so the caller leaves it off for a box that restarts in place. A
+    // kernel before 5.10 does not know the option: the mount is made again without it.
+    if volatile {
+        let opts = OverlayOpts::new(
+            &format!("{base},volatile"),
+            Some(std::path::Path::new(upper)),
+        )?;
+        let hardening = if nosuid {
+            (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong
+        } else {
+            libc::MS_NODEV as libc::c_ulong
+        };
+        // SAFETY: `merged_c` is a valid C string and `opts` holds two valid C option strings.
+        if unsafe { mount_overlay_c(merged_c.as_ptr(), hardening, &opts) }.ok() {
+            return Ok(());
+        }
+    }
+    let opts = OverlayOpts::new(&base, Some(std::path::Path::new(upper)))?;
     // `NODEV` on the box root: a device node on the rootfs is inert (userns superblocks are
     // `SB_I_NODEV` already; device nodes the box uses live on the separate `/dev` tmpfs). `NOSUID`
     // only with `no-new-privileges`: docker mounts an image's root without it, and a setuid program
@@ -1917,6 +1944,7 @@ fn child_setup_and_exec(
                 &o.work,
                 &spec.root,
                 spec.effective_no_new_privs(),
+                o.volatile,
             )?;
             Rootfs::premounted(&spec.root)
         }
@@ -13846,6 +13874,7 @@ mod ldcache_key_tests {
             lower: vec![p("lower")],
             upper: p("upper"),
             work: p("work"),
+            volatile: false,
         };
         let vols = vec![
             Volume {
