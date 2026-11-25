@@ -89,6 +89,13 @@ check read as a failure, and it left the unit behind, so the box came back after
 restarting box refuses without `-f` as Docker's does, and `kern rm -f` stops it for good. Between
 two runs it lists as `restarting`, with systemd's count of its restarts.
 
+**`docker events` and `docker inspect` follow a `--restart always` container and a rename.** Such a
+container's stream was `create start die destroy` while systemd ran it ten times, and it read
+`exited`; it is a `start` and a `die` per run now, `restarting` between them, and visible from the
+moment `docker run -d` returns (it was "No such container" for about a second). `docker rename`
+publishes Docker's `rename` (`name` and `oldName`), and the renamed container's `die` comes under its
+new name.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

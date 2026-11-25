@@ -1237,6 +1237,10 @@ fn inspect(bin: &Path, name: &str) -> Response {
     // `kern pause` freezes the box: Docker's `paused`, still `Running` as Docker reports it. MEASURED
     // before: `docker pause` then `inspect` answered `running`, and `Paused` was false whatever.
     let paused = running && v.get("status").and_then(Value::as_str) == Some("paused");
+    // A `--restart always` box between two runs: Docker's `restarting`, which it also counts as
+    // `Running`. MEASURED before: such a container read `exited` with `RestartCount` 0 while systemd
+    // had run it ten times.
+    let restarting = v.get("status").and_then(Value::as_str) == Some("restarting");
     // Docker's `OOMKilled`: the OOM killer struck in the container, the one that ended it or a
     // child it lost while it runs, as kern records and reads it (`oom_killed`).
     let oom_killed = v.get("oom_killed").and_then(Value::as_bool) == Some(true);
@@ -1267,18 +1271,21 @@ fn inspect(bin: &Path, name: &str) -> Response {
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":{paused},\"Restarting\":false,\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{},\"Paused\":{paused},\"Restarting\":{restarting},\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
             json_str(&id),
             json_str(&created),
             json_str(&format!("/{name}")),
             json_str(command),
             json_str(if paused {
                 "paused"
+            } else if restarting {
+                "restarting"
             } else if running {
                 "running"
             } else {
                 "exited"
             }),
+            running || restarting,
             json_str(&started),
             json_str(&finished),
             labels_json(&labels),
@@ -1413,6 +1420,8 @@ fn list(bin: &Path, req: &Request) -> Response {
         let labels = labels_of(&v);
         let state = if paused {
             "paused"
+        } else if v.get("status").and_then(Value::as_str) == Some("restarting") {
+            "restarting"
         } else if running {
             "running"
         } else {
@@ -2888,6 +2897,7 @@ fn remove_container(bin: &Path, name: &str, running: bool) {
         run_forget(name);
         let _ = kern(bin, &["rm", "-f", name]);
     }
+    watch_forget(name);
     crate::events::destroyed(name);
 }
 
@@ -3521,6 +3531,20 @@ pub(crate) fn set_attempt_dir(dir: std::path::PathBuf) {
 /// One watch per box: a second call for a box already watched does nothing. `supervisor` when the
 /// caller has it, else it is looked up.
 fn watch_die(bin: &Path, name: &str, auto_remove: bool, supervisor: Option<libc::pid_t>) {
+    watch_die_with(bin, name, auto_remove, supervisor, false);
+}
+
+/// [`watch_die`], and with `forever` (a `--restart always` or `unless-stopped` container) on past
+/// each `die`: systemd runs such a box again with a new supervisor, whose run is Docker's next
+/// `start`, watched the same way. MEASURED before: such a container's stream was `create start die
+/// destroy` while systemd ran it ten times, where Docker's is a `start` and a `die` per run.
+fn watch_die_with(
+    bin: &Path,
+    name: &str,
+    auto_remove: bool,
+    supervisor: Option<libc::pid_t>,
+    forever: bool,
+) {
     let fresh = DIE_PENDING.lock().is_ok_and(|mut g| {
         g.get_or_insert_with(Default::default)
             .insert(name.to_string())
@@ -3529,32 +3553,137 @@ fn watch_die(bin: &Path, name: &str, auto_remove: bool, supervisor: Option<libc:
         return;
     }
     let (bin, watched) = (bin.to_path_buf(), name.to_string());
+    let gen = watch_gen(name);
     let spawned = std::thread::Builder::new()
         .name("kern-serve-die".into())
         .stack_size(256 << 10)
         .spawn(move || {
-            let supervisor = supervisor.or_else(|| {
+            let mut supervisor = supervisor.or_else(|| {
                 kern_boxes(&bin)
                     .into_iter()
                     .find(|(n, v)| *n == watched && box_running(v))
                     .and_then(|(_, v)| supervisor_of(&v))
             });
-            // A box already down has its record; without a pidfd (a kernel before 5.3, or the
-            // supervisor gone) `kern wait` below is the wait.
-            if let Some((pid, fd)) = supervisor.and_then(|p| pidfd_open(p).map(|fd| (p, fd))) {
-                follow_restarts(&watched, pid, &fd);
+            loop {
+                // A box already down has its record; without a pidfd (a kernel before 5.3, or the
+                // supervisor gone) `kern wait` below is the wait.
+                if let Some((pid, fd)) = supervisor.and_then(|p| pidfd_open(p).map(|fd| (p, fd))) {
+                    follow_restarts(&watched, pid, &fd);
+                }
+                // By the name the box has now: a rename while it ran moved it.
+                let now = current_name(&watched);
+                // Removed meanwhile: its `die` went before its `destroy`, or there is none to say.
+                if watch_gen(&now) != gen {
+                    break;
+                }
+                let code = if auto_remove {
+                    kern_wait_code_with(&bin, "__wait-removed", &now)
+                } else {
+                    kern_wait_code(&bin, &now)
+                };
+                // A run systemd restarts leaves its code where `kern ps -a` reads it, and not always
+                // where `kern wait` looks first (MEASURED: the first `die` said -1, Docker's 1).
+                let code = if code < 0 {
+                    kern_boxes(&bin)
+                        .into_iter()
+                        .find(|(n, _)| *n == now)
+                        .and_then(|(_, v)| v.get("exit_code").and_then(Value::as_i64))
+                        .and_then(|c| i32::try_from(c).ok())
+                        .unwrap_or(code)
+                } else {
+                    code
+                };
+                crate::events::publish_named("die", &now, Some(code));
+                die_settled(&now);
+                let next = if forever {
+                    next_supervisor(&bin, &now, supervisor, gen)
+                } else {
+                    None
+                };
+                let Some(next) = next else { break };
+                if watch_gen(&now) != gen {
+                    break;
+                }
+                // Pending again, for the run systemd started.
+                if let Ok(mut g) = DIE_PENDING.lock() {
+                    g.get_or_insert_with(Default::default).insert(now.clone());
+                }
+                crate::events::publish_named("start", &now, None);
+                supervisor = Some(next);
             }
-            let code = if auto_remove {
-                kern_wait_code_with(&bin, "__wait-removed", &watched)
-            } else {
-                kern_wait_code(&bin, &watched)
-            };
-            crate::events::publish_named("die", &watched, Some(code));
-            die_settled(&watched);
+            if let Ok(mut g) = RENAMED.lock() {
+                if let Some(m) = g.as_mut() {
+                    m.remove(&watched);
+                }
+            }
         });
     if spawned.is_err() {
         die_settled(name);
     }
+}
+
+/// The supervisor of the next run systemd starts for `name` that is still running when looked at,
+/// a different one from `before`; `None` once the container is gone (stopped or removed, which
+/// removes its unit). A run that ends before it is seen (a command that exits at once, run again
+/// every second) is still Docker's `start` and `die`: read off the unit's restart count, which
+/// `kern ps` reports, with the code the run left. Looked at twice a second, and only for a
+/// container systemd restarts that is between two runs.
+fn next_supervisor(
+    bin: &Path,
+    name: &str,
+    before: Option<libc::pid_t>,
+    gen: u64,
+) -> Option<libc::pid_t> {
+    let count_of = |v: &Value| v.get("restart_count").and_then(Value::as_i64).unwrap_or(0);
+    let mut counted: Option<i64> = None;
+    let mut missing = 0;
+    loop {
+        // The container was removed, and the name may be another one's now.
+        if watch_gen(name) != gen {
+            return None;
+        }
+        // Gone only when missing three looks in a row: between two runs, as one supervisor leaves
+        // and systemd starts the next, the name can be absent from `kern ps -a` for a moment.
+        let Some(row) = kern_boxes(bin)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v)
+        else {
+            missing += 1;
+            if missing >= 3 {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+        missing = 0;
+        let restarting = row.get("status").and_then(Value::as_str) == Some("restarting");
+        if box_running(&row) && !restarting {
+            if let Some(p) = supervisor_of(&row).filter(|p| Some(*p) != before) {
+                return Some(p);
+            }
+        }
+        let now = count_of(&row);
+        if let Some(seen) = counted {
+            let code = row
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .and_then(|c| i32::try_from(c).ok());
+            for _ in seen..now {
+                crate::events::publish_named("start", name, None);
+                crate::events::publish_named("die", name, code);
+            }
+        }
+        counted = Some(now);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Does this create's argv run the box under a policy systemd restarts forever (`--restart always`
+/// or `unless-stopped`)?
+fn restarts_forever(argv: &[String]) -> bool {
+    argv.windows(2)
+        .any(|w| w[0] == "--restart" && matches!(w[1].as_str(), "always" | "unless-stopped"))
 }
 
 /// The supervisor's pid of a box as `kern ps --json` lists it.
@@ -3578,7 +3707,7 @@ fn follow_restarts(name: &str, pid: libc::pid_t, pidfd: &std::os::fd::OwnedFd) {
             .and_then(|t| kern_common::attempt::Attempt::parse(&t))
         {
             if let Some((action, exit)) = seen.next(a) {
-                crate::events::publish_named(action, name, exit);
+                crate::events::publish_named(action, &current_name(name), exit);
             }
         }
         let mut fds = [
@@ -3681,6 +3810,65 @@ pub(crate) fn watch_unwatched(bin: &Path) {
         // `__wait-removed` also answers for a `--rm` box, which `ps` does not mark.
         watch_die(bin, &n, true, supervisor_of(&v));
     }
+}
+
+/// How many times a container of each name was removed: a watch belongs to the generation it was
+/// armed in, and one of a removed container stops instead of following the next container that
+/// takes the name (MEASURED before: `docker rm -f x` then `docker run --restart always --name x`
+/// left the new one with no watch at all, the old one's pending `die` standing in for it).
+static WATCH_GEN: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+fn watch_gen(name: &str) -> u64 {
+    WATCH_GEN
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(name).copied()))
+        .unwrap_or(0)
+}
+
+/// `name` was removed: its watch, if one runs, is of a container that is gone.
+fn watch_forget(name: &str) {
+    if let Ok(mut g) = WATCH_GEN.lock() {
+        *g.get_or_insert_with(HashMap::new)
+            .entry(name.to_string())
+            .or_insert(0) += 1;
+    }
+    die_settled(name);
+}
+
+/// The containers renamed while their `die` was watched, old name to new: the watch reads the box's
+/// code and publishes under the name it has NOW (`kern wait` by the old one finds nothing).
+static RENAMED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// The name `name` goes by now, following renames (bounded, a cycle cannot hang it).
+fn current_name(name: &str) -> String {
+    let Ok(g) = RENAMED.lock() else {
+        return name.to_string();
+    };
+    let mut now = name.to_string();
+    for _ in 0..16 {
+        match g.as_ref().and_then(|m| m.get(&now)) {
+            Some(next) => now.clone_from(next),
+            None => break,
+        }
+    }
+    now
+}
+
+/// `old` is now `new`: its pending `die` and its watch follow it, and its events carry the new name.
+fn watch_renamed(old: &str, new: &str) {
+    if let Ok(mut g) = RENAMED.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(old.to_string(), new.to_string());
+    }
+    if let Ok(mut g) = DIE_PENDING.lock() {
+        if let Some(s) = g.as_mut() {
+            if s.remove(old) {
+                s.insert(new.to_string());
+            }
+        }
+    }
+    crate::events::renamed(old, new);
 }
 
 fn die_pending(name: &str) -> bool {
@@ -4326,7 +4514,21 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                     let argv: Vec<&str> = c.argv.iter().map(String::as_str).collect();
                     match start_detached(bin, &name, &c, &argv) {
                         Ok(()) => {
-                            watch_die(bin, &name, c.auto_remove, None);
+                            let forever = restarts_forever(&c.argv);
+                            // VISIBLE BEFORE THE ANSWER: systemd starts a `--restart always` box a
+                            // moment after its unit is enabled, and until that first run kern lists
+                            // no such box. MEASURED before: for about 1.2 s after `docker run -d
+                            // --restart always` returned, `docker inspect` answered "No such
+                            // container". Waited for here (3 s at most), where nothing holds the box.
+                            if forever {
+                                let deadline = Instant::now() + Duration::from_secs(3);
+                                while Instant::now() < deadline
+                                    && !kern_boxes(bin).iter().any(|(n, _)| *n == name)
+                                {
+                                    std::thread::sleep(Duration::from_millis(100));
+                                }
+                            }
+                            watch_die_with(bin, &name, c.auto_remove, None, forever);
                             no_content()
                         }
                         Err(e) => e,
@@ -4400,11 +4602,13 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 Some(name) => {
                     if created_get(&name).is_some() {
                         id_rename(&name, new);
+                        crate::events::renamed(&name, new);
                         return rename_created(&name, new).unwrap_or_else(no_content);
                     }
                     let (code, _, err) = kern(bin, &["rename", &name, new]);
                     if code == 0 {
                         id_rename(&name, new);
+                        watch_renamed(&name, new);
                         no_content()
                     } else if err.contains("in use") || err.contains("exists") {
                         error(
@@ -5405,6 +5609,22 @@ mod tests {
                 ("start", None)
             ]
         );
+    }
+
+    /// Only `always` and `unless-stopped` are restarted for ever (by systemd); `on-failure` is the
+    /// box's own supervisor, which follows its runs itself.
+    #[test]
+    fn only_a_forever_policy_is_followed_past_its_die() {
+        let argv = |p: &str| {
+            ["box", "x", "--restart", p, "--image", "a"]
+                .map(str::to_string)
+                .to_vec()
+        };
+        assert!(restarts_forever(&argv("always")));
+        assert!(restarts_forever(&argv("unless-stopped")));
+        assert!(!restarts_forever(&argv("on-failure:3")));
+        assert!(!restarts_forever(&argv("no")));
+        assert!(!restarts_forever(&["box".to_string(), "x".to_string()]));
     }
 
     /// A removal or a restart waits for the pending `die`, so it is published first; with none

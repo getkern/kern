@@ -85,6 +85,33 @@ pub(crate) fn publish_named(action: &str, name: &str, exit: Option<i32>) {
     }
 }
 
+/// The container `old` is now `new`: what its events carry moves with it, and Docker's `rename`
+/// event says both names (`name` the new one, `oldName` the old with its `/`). MEASURED before:
+/// `docker events --filter event=rename` on kern's socket printed nothing for a `docker rename`.
+pub(crate) fn renamed(old: &str, new: &str) {
+    let meta = META.lock().ok().and_then(|mut g| {
+        let m = g.get_or_insert_with(Default::default);
+        let v = m.remove(old)?;
+        m.insert(new.to_string(), v.clone());
+        Some(v)
+    });
+    if let Some((image, mut labels)) = meta {
+        labels.push(("oldName".to_string(), format!("/{old}")));
+        let e = Event {
+            action: "rename".into(),
+            name: new.to_string(),
+            image,
+            labels,
+            exit: None,
+        };
+        // Published without touching META again: its labels carry `oldName`, the container's do not.
+        let line = to_json(&e);
+        if let Ok(mut subs) = SUBSCRIBERS.lock() {
+            subs.retain(|s| s.send(line.clone()).is_ok());
+        }
+    }
+}
+
 /// The container is removed: Docker's `destroy`, with the image and labels its events carried,
 /// which go with it. A container this server made no event for makes none here either.
 pub(crate) fn destroyed(name: &str) {
@@ -435,6 +462,61 @@ mod tests {
             .unwrap()
             .as_ref()
             .is_some_and(|m| !m.contains_key("kd-destroy")));
+    }
+
+    /// `rename` carries the new name and the old with its `/`, and the container's later events
+    /// carry the new name with the labels it had.
+    #[test]
+    fn a_rename_says_both_names_and_the_labels_follow() {
+        let _one = SUBSCRIBING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (tx, rx) = mpsc::channel();
+        SUBSCRIBERS.lock().unwrap().push(tx);
+        publish(&Event {
+            action: "start".into(),
+            name: "kd-rn-old".into(),
+            image: "alpine:3.20".into(),
+            labels: vec![("k".into(), "v".into())],
+            exit: None,
+        });
+        renamed("kd-rn-old", "kd-rn-new");
+        publish_named("die", "kd-rn-new", Some(0));
+        let mine: Vec<Value> =
+            std::iter::from_fn(|| rx.recv_timeout(Duration::from_millis(200)).ok())
+                .filter_map(|l| json::parse(&l).ok())
+                .filter(|v| {
+                    v.get("Actor")
+                        .and_then(|a| a.get("Attributes"))
+                        .and_then(|a| a.get("name"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.starts_with("kd-rn-"))
+                })
+                .collect();
+        let actions: Vec<&str> = mine
+            .iter()
+            .filter_map(|v| v.get("Action").and_then(Value::as_str))
+            .collect();
+        assert_eq!(actions, ["start", "rename", "die"]);
+        let attrs = |i: usize| {
+            mine[i]
+                .get("Actor")
+                .and_then(|a| a.get("Attributes"))
+                .unwrap()
+        };
+        assert_eq!(
+            attrs(1).get("name").and_then(Value::as_str),
+            Some("kd-rn-new")
+        );
+        assert_eq!(
+            attrs(1).get("oldName").and_then(Value::as_str),
+            Some("/kd-rn-old")
+        );
+        assert_eq!(attrs(2).get("k").and_then(Value::as_str), Some("v"));
+        assert!(
+            attrs(2).get("oldName").is_none(),
+            "oldName is the rename's alone"
+        );
     }
 
     /// A published event reaches an open stream, and a stream that went away is dropped.
