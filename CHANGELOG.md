@@ -104,6 +104,12 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**An image's size counts a hardlinked file once.** busybox is one binary under some 400 names, and
+each name was added: `kern images` said 394.6M for an image of 4.2M (4417150 bytes, the 4.42MB
+Docker prints), and `kern rmi` reported freeing the inflated figure. A volume's size in `kern volume
+ls`/`inspect` had the same count. Sizes recorded by an earlier kern are measured again on the next
+listing.
+
 **A build's `ARG` and `ENV` are scoped to their stage, as Docker scopes them.** A `--build-arg` for an
 `ARG` declared in one stage was expanded in a later stage that never declared it, so a value passed
 for one stage reached another; and an `ARG` before the first `FROM` was used inside every stage. Now

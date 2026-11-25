@@ -1193,30 +1193,9 @@ Use a volume:  kern box web --image alpine -v data:/var/lib/app",
     );
 }
 
-/// Recursive on-disk size of a directory (bytes), symlink-safe (never follows out).
+/// The bytes under a volume's data, a hardlinked file once: the image cache's own measure.
 fn dir_size(path: &std::path::Path) -> u64 {
-    let mut total = 0;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            // THE DIRENT ALREADY CARRIES THE TYPE on Linux, so a directory costs no `stat` at all:
-            // `file_type()` returns what `getdents64` reported and only falls back to a syscall on
-            // a filesystem that answers DT_UNKNOWN. `metadata()` was called on EVERY entry, which
-            // is one `lstat` per directory spent to learn something the kernel had already said.
-            // Neither call follows symlinks, so the accounting is unchanged.
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() {
-                stack.push(e.path());
-            } else if let Ok(md) = e.metadata() {
-                // Files still need their length, and only files.
-                total += md.len();
-            }
-        }
-    }
-    total
+    crate::commands::dir_size(path)
 }
 
 /// Human-readable byte size - the shared [`kern_common::fmt_bytes`] convention (one for the whole CLI).

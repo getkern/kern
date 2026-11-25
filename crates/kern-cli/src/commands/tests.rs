@@ -1577,6 +1577,47 @@ mod image_size_is_memoised {
     /// The test asserts the two things that make the cache safe rather than merely fast: it returns
     /// the SAME value as the walk, and a changed stamp makes it recompute instead of serving a stale
     /// total. A cache that is only checked for speed is how a wrong size ships.
+    /// busybox is one binary under ~400 names: `kern images` said 394.6M for what `du` measures at
+    /// 4.4M. A hardlinked file is counted once, a second FILE of the same size still counts, and a
+    /// sidecar from before the fix (no `h1` marker) is recomputed rather than believed.
+    #[test]
+    fn a_hardlinked_file_is_counted_once_and_an_old_sidecar_is_recomputed() {
+        let root = std::env::temp_dir().join(format!("kern-hl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("img");
+        std::fs::create_dir_all(dir.join("bin")).expect("mkdir");
+        std::fs::write(dir.join("bin/busybox"), vec![0u8; 1000]).expect("write");
+        for n in ["sh", "ls", "cat"] {
+            std::fs::hard_link(dir.join("bin/busybox"), dir.join("bin").join(n)).expect("link");
+        }
+        std::fs::write(dir.join("other"), vec![0u8; 1000]).expect("write");
+        assert_eq!(
+            dir_size(&dir),
+            2000,
+            "four names of one file are one file, plus another"
+        );
+
+        let stamp = root.join("img.ok");
+        std::fs::write(&stamp, b"ref").expect("stamp");
+        let secs = std::fs::metadata(&stamp)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        std::fs::write(root.join("img.size"), format!("{secs} 3 5000\n")).expect("old sidecar");
+        assert_eq!(
+            dir_size_cached(&dir, &stamp),
+            2000,
+            "the pre-fix total is not believed"
+        );
+        assert_eq!(
+            dir_size_cached(&dir, &stamp),
+            2000,
+            "and the rewritten one is"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn memoised_size_matches_the_walk_and_reacts_to_a_new_stamp() {
         let root = std::env::temp_dir().join(format!("kern-sz-{}", std::process::id()));

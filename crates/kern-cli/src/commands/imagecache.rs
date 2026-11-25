@@ -1386,8 +1386,14 @@ pub(crate) fn dir_size_cached(dir: &std::path::Path, stamp_of: &std::path::Path)
             // THREE fields now: `<mtime> <sentinel-size> <bytes>`. Reading two left `b` holding the
             // size instead of the total - a shape the old two-field file would also have parsed, which
             // is why the format check is positional and strict rather than lenient.
+            //
+            // `h1` FIRST: a sidecar written before hardlinks were counted once holds a total that is
+            // wrong for every image with hardlinks (busybox: 100x), so one without the marker is
+            // recomputed instead of believed.
             let mut it = body.split_whitespace();
-            if let (Some(s), Some(sl), Some(b)) = (it.next(), it.next(), it.next()) {
+            if let (Some("h1"), Some(s), Some(sl), Some(b)) =
+                (it.next(), it.next(), it.next(), it.next())
+            {
                 if s.parse::<u64>() == Ok(stamp) && sl.parse::<u64>() == Ok(slen) {
                     if let Ok(bytes) = b.parse::<u64>() {
                         return bytes;
@@ -1398,19 +1404,37 @@ pub(crate) fn dir_size_cached(dir: &std::path::Path, stamp_of: &std::path::Path)
     }
     let bytes = dir_size(dir);
     if stamp != 0 {
-        let _ = std::fs::write(&side, format!("{stamp} {slen} {bytes}\n"));
+        let _ = std::fs::write(&side, format!("h1 {stamp} {slen} {bytes}\n"));
     }
     bytes
 }
 
+/// The bytes of the regular files under `dir`, A FILE ONCE HOWEVER MANY NAMES IT HAS.
+///
+/// A hardlink is one file: busybox is one 1 MB binary under ~400 names, and adding each name's
+/// length made `kern images` say 394.6M for an image `du` measures at 4.4M (and `rmi` report
+/// "freed 830.0M" for two of them). Counted per `(dev, inode)` now, which is the image's real size
+/// and the one other tools print for it. Symlinks are not followed, and the walk is iterative.
 pub(crate) fn dir_size(dir: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     let mut total = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in entries.flatten() {
-            match e.file_type() {
-                Ok(ft) if ft.is_dir() => total += dir_size(&e.path()),
-                Ok(ft) if ft.is_file() => total += e.metadata().map_or(0, |m| m.len()),
-                _ => {}
+            // The dirent carries the type, so a directory costs no `stat`; only files do.
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(e.path());
+            } else if ft.is_file() {
+                let Ok(md) = e.metadata() else { continue };
+                if md.nlink() > 1 && !seen.insert((md.dev(), md.ino())) {
+                    continue;
+                }
+                total += md.len();
             }
         }
     }
