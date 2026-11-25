@@ -64,7 +64,9 @@ what Docker lists as `RepoDigests` and what `name@sha256:...` pulls the same ima
 `kern inspect --json` of an image lists `RepoDigests`, and so does kern's Docker API. A build, a
 commit and a load have none, as with Docker. An image cached before gets it at the next
 `kern pull` of it, from the manifest alone, when the registry still names the same image. Measured
-against Docker Hub's `Docker-Content-Digest`: `alpine:3.21` and `alpine:3.19` match.
+against Docker Hub's `Docker-Content-Digest`: `alpine:3.21` and `alpine:3.19` match. A pull by a digest the
+registry does not have says so (`no such manifest`), where it reported a digest mismatch and advised
+pulling again for a damaged blob.
 
 **A port published through kern's Docker API with no address is on every address.** `HostIp` left
 empty became `0.0.0.0`, IPv4 alone, where Docker binds `0.0.0.0` and `::`; a Windows client asking

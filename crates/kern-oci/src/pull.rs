@@ -265,6 +265,13 @@ fn resolve_manifest(
     // That digest is also the repository digest; asked by tag, it is the hash of what the registry
     // answered, taken before descending into the platform's manifest.
     let repo_digest = if reference.starts_with("sha256:") {
+        // THE REGISTRY'S ANSWER FIRST: a digest it does not have comes back as an `errors[]`
+        // document, and hashing that against the digest reported "manifest digest mismatch" with
+        // advice to pull again for a damaged blob, about a digest that names nothing. MEASURED on
+        // Docker Hub with `alpine@sha256:000...`. A body that is not an error is verified as before.
+        if is_registry_error(&manifest) {
+            return Err(manifest_error(&manifest, &registry, &repo));
+        }
         verify_digest_bytes(manifest.as_bytes(), &reference)?;
         Some(reference.clone())
     } else {
@@ -912,6 +919,12 @@ fn valid_path_component(c: &str) -> bool {
 /// Explain a manifest that yielded no layers. A registry error body (`UNAUTHORIZED`/`denied`) or an
 /// empty body (a bare `401`) almost always means a **private repo you're not logged into**, so point
 /// at `kern login` rather than the opaque "no layers"; otherwise the tag is malformed or absent.
+/// Is `body` a registry's error document (an `errors[]` with at least one entry), the same reading
+/// [`manifest_error`] gives it?
+fn is_registry_error(body: &str) -> bool {
+    array_after(body, "errors").is_some_and(|arr| !split_objects(arr).is_empty())
+}
+
 fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
     let low = manifest.to_ascii_lowercase();
     // ⛔ THE CAUSE IS READ FROM THE FIELD THE SPEC DEFINES FOR IT, not from a substring of the whole
@@ -4971,6 +4984,17 @@ mod tests {
             "https://localhost/token",
             "localhost:5000"
         ));
+    }
+
+    /// A registry's error document is told from a manifest, so a digest the registry does not
+    /// have is reported as missing, not as a damaged blob.
+    #[test]
+    fn a_registry_error_document_is_not_a_manifest() {
+        assert!(is_registry_error(
+            r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}"#
+        ));
+        assert!(!is_registry_error(r#"{"schemaVersion":2,"layers":[]}"#));
+        assert!(!is_registry_error(r#"{"errors":[]}"#));
     }
 
     #[test]
