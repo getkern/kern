@@ -931,6 +931,15 @@ pub(crate) unsafe fn start_log_pump(path: &std::path::Path, cap: LogCap) -> Opti
         return None;
     }
     if pid == 0 {
+        // ITS OWN PROCESS GROUP, so no signal meant for the box's group can end it before the log
+        // is whole. `kern stop` signals the supervisor's group (`kill(-pid, sig)`: a foreground
+        // box's helpers must hear it), and then SIGKILLs it; in that group the pump died on the
+        // SIGTERM while the workload's handler was still writing, and on the SIGKILL before it had
+        // drained the pipe. MEASURED (0.56.0 and this branch): a box whose `trap ... TERM` printed
+        // two lines and exited 0 had neither in `kern logs` after `kern stop`, a second later or
+        // ever. The pump ends as it always has, at the end of its pipes, once every writer (the
+        // box and the supervisor) has closed them.
+        libc::setpgid(0, 0);
         // DETACH the pump from the parent's stdio FIRST. The pump is forked before `detach_stdio`
         // redirects fd 1/2 onto this pipe, so it inherits the LAUNCHER's stdout/stderr - and holding
         // that write end open would block a `kern box -d` whose stdout is a pipe (a test harness, a

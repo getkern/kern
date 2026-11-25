@@ -3791,6 +3791,96 @@ fn stop_skips_a_grace_the_kernel_would_make_pointless() {
     let _ = fs::remove_dir_all(&xdg);
 }
 
+/// WHAT A WORKLOAD WRITES WHILE IT STOPS IS IN ITS LOG. `kern stop` signals the supervisor's
+/// process group, and the log pump was in it: it died on the SIGTERM while the workload's handler was
+/// still writing. MEASURED (0.56.0 too): a `trap ... TERM` that printed and exited 0 had none of it
+/// in `kern logs`, ever. The pump has a group of its own now.
+#[test]
+fn what_a_box_writes_on_stop_is_in_its_log() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "stoplog");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-stoplog-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let script = "trap 'i=0; while [ $i -lt 500 ]; do echo bye-$i; i=$((i+1)); done; echo LAST; exit 0' TERM; \
+                  echo UP; while :; do /bin/busybox sleep 0.05; done";
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "stoplog",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Up and its trap set: the first line is written after the `trap`.
+    let up = std::time::Instant::now();
+    while up.elapsed() < std::time::Duration::from_secs(5) {
+        let l = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["logs", "stoplog"])
+            .output()
+            .expect("logs");
+        if String::from_utf8_lossy(&l.stdout).contains("UP") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let stop = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "stoplog"])
+        .output()
+        .expect("stop");
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let logs = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["logs", "stoplog"])
+        .output()
+        .expect("logs");
+    let text = String::from_utf8_lossy(&logs.stdout);
+    let bye = text.lines().filter(|l| l.starts_with("bye-")).count();
+    assert_eq!(
+        bye, 500,
+        "the handler's lines after `kern stop`: {bye} of 500\n{text}"
+    );
+    assert_eq!(text.lines().last(), Some("LAST"), "{text}");
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["rm", "stoplog"])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
 #[test]
 fn inspect_shows_detail_then_prune_reclaims_logs() {
     let Some(busybox) = static_busybox() else {

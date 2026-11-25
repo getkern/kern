@@ -84,6 +84,13 @@ The image's steps are kept too, as metadata under the one layer kern writes, whi
 buildah still take as the base of a build. A rebuild answered entirely from the cache keeps its
 steps' times, so the same image saves and pushes under the same digest.
 
+**What a box writes while it stops is in its log.** `kern stop` signals the supervisor's process group,
+and the log pump of a detached box was in it: it died on the SIGTERM while the workload's handler was
+still writing, so a `trap ... TERM` that printed its last lines and exited 0 left none of them in
+`kern logs` (nor in `docker logs` through kern's API). The pump has a process group of its own and
+ends when the box's output does: 500 lines written on SIGTERM are all in the log, and the 3000
+written before a SIGKILL too; `kern stop` takes as long as before.
+
 **`--timeout N` ends a box at N seconds when its init cannot hear SIGTERM.** At the deadline kern sent
 SIGTERM and waited 2 s before the SIGKILL, also for an init with the default disposition, which the
 kernel never delivers it to: `kern box --timeout 1 -- sleep 30` ended after 3 s. It ends after 1 s
