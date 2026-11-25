@@ -106,6 +106,9 @@ _DEFAULT_IMAGE_HAS_NODE = False
 _SANDBOX_POSTURE = (
     "--security-opt", "no-new-privileges",
     "--security-opt", "seccomp-deny=kill",
+    # And an OOM ends the whole box, which is the verdict this binding reports as `oom`; a kern box
+    # follows docker by default and kills only the process the kernel picks.
+    "--oom-group",
 )
 
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box

@@ -128,6 +128,7 @@ pub use cgroup::exec_was_oom_killed;
 pub use cgroup::exec_was_refused;
 /// The signal that ended a `kern exec`'d command, 0 for an exit. See [`cgroup::exec_workload_signal`].
 pub use cgroup::exec_workload_signal;
+pub use cgroup::set_whole_box_oom;
 /// Which family of capped cgroup leaf an [`apply_cgroup_limits`] call creates, and why the two must
 /// not share a directory name. See [`cgroup::Leaf`].
 pub use cgroup::Leaf as CgroupLeaf;

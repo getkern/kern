@@ -104,6 +104,11 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**An OOM kills the process the kernel picks, and the box goes on, as under Docker.** kern wrote
+`memory.oom.group=1` on every box, so an `exec` that ran out of memory took the whole box with it
+(`exited`), where Docker's container stays `running`. That is now `--oom-group`, which the Python and
+Node sandboxes pass, so their `oom` verdict covers every process of a cell as before.
+
 **A denied syscall answers `EPERM`, as under Docker, instead of killing the caller.** A box that
 called a refused syscall (`unshare`, `mount`, `bpf`, `ptrace`, a namespace-creating `clone`) died with
 `Bad system call` (exit 159), where Docker's answer is `Operation not permitted` and the program goes

@@ -978,6 +978,22 @@ pub fn open_oom_events_fd(dir: &Path) -> Option<libc::c_int> {
     (fd >= 0).then_some(fd)
 }
 
+/// `--oom-group` (and every sandbox the SDKs start): an OOM kills every process in the box at once
+/// (`memory.oom.group=1`). Without it the kernel kills the process it picks, as under Docker, and a
+/// box whose `exec` ran out of memory keeps running. MEASURED before (owner's decision, 22/11): an
+/// exec allocating past `--memory 64m` took the box down with it (`exited`) under kern and left it
+/// `running` under Docker. Process-wide, set by kern before it applies a box's limits.
+static WHOLE_BOX_OOM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Choose whether the boxes this process caps from now on are OOM-killed as one.
+pub fn set_whole_box_oom(on: bool) {
+    WHOLE_BOX_OOM.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn whole_box_oom() -> bool {
+    WHOLE_BOX_OOM.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// `oom_group_kill` re-read from a descriptor opened by [`open_oom_events_fd`], allocating nothing.
 ///
 /// `oom_group_kill` and not `oom_kill`: the first counts times a whole cgroup was killed AS A UNIT,
@@ -3870,8 +3886,9 @@ pub fn apply_limits(
     // Does the supervisor's OWN cgroup become a whole-group killer? Captured here, at the one place
     // that decides it, because the sibling-leaf question below is the same question: the supervisor
     // needs moving out of `origin` if and only if `origin` is about to group-kill.
-    let origin_group_kills =
-        (env_flag("KERN_SCOPE") || env_flag("KERN_MANAGED")) && delegated_scope().is_none();
+    let origin_group_kills = whole_box_oom()
+        && (env_flag("KERN_SCOPE") || env_flag("KERN_MANAGED"))
+        && delegated_scope().is_none();
     if origin_group_kills {
         if let Some(o) = &origin {
             let _ = fs::write(o.join("memory.oom.group"), "1");
@@ -3980,7 +3997,12 @@ pub fn apply_limits(
     // delegated - exactly the case the "--memory not enforced" warning below already reports, so a
     // second message here would be noise. Available since Linux 4.19 (all supported hosts: the oldest
     // board is 5.15).
-    let _ = fs::write(child.join("memory.oom.group"), "1");
+    //
+    // ONLY WHEN THE BOX ASKED FOR IT (`--oom-group`, the SDKs' sandboxes): by default the kernel kills
+    // the process it picks, as under Docker (see [`set_whole_box_oom`]).
+    if whole_box_oom() {
+        let _ = fs::write(child.join("memory.oom.group"), "1");
+    }
     // Success gate. DEFAULT (`require_all = false`): keep the box if AT LEAST ONE mandatory cap bound -
     // partial protection beats none, and the caller warns about the rest. `--require-limits`
     // (`require_all = true`): demand that BOTH bound; a box that caps memory but not pids (or the

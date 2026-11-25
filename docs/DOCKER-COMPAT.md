@@ -414,7 +414,8 @@ loopback addresses. See [CONFIG.md](CONFIG.md#local-names-for-compose-services) 
 port and `[kern] local_domains = false`.
 
 **A service with no `mem_limit:` gets the host's RAM**, as under Docker. It is not uncapped: the box
-carries a `memory.max` and `oom.group = 1`, so a failure stays attributable to its own cgroup.
+carries a `memory.max` of its own, so a failure stays attributable to its own cgroup, and an OOM kills
+the process the kernel picks, as under Docker.
 `[kern] compose_memory_max` restores a strict ceiling; see [CONFIG.md](CONFIG.md).
 
 **An empty NAMED volume is seeded from the image**, contents, owner and mode. Only when empty, and

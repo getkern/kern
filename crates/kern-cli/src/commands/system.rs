@@ -470,6 +470,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --require-limits    Refuse to start unless the memory and pids caps (incl. their defaults) are
                         actually enforced (the OOM/fork-bomb backstop); cpu/cpuset stay best-effort,
                         as on the scope path. Default warns and runs uncapped
+    --oom-group         An OOM kills every process in the box at once (memory.oom.group); default:
+                        the process the kernel picks, the box stays up, as under Docker
     --allow-uncapped    Accept running uncapped silently where no cgroup is delegated (nested CI);
                         mutually exclusive with --require-limits
     --security-profile <untrusted>  Opt-in hardening bundle (seccomp allowlist + cap-drop ALL +

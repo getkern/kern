@@ -314,6 +314,8 @@ pub struct BoxRunArgs<'a> {
     /// `--security-opt seccomp-deny=kill|eperm`: what a denied syscall gets. `None`: EPERM, Docker's,
     /// or the kill under `--security-profile untrusted`.
     pub seccomp_deny_kill: Option<bool>,
+    /// `--oom-group`: an OOM kills the whole box (the SDKs' sandboxes); by default, one process.
+    pub oom_group: bool,
     /// `--secret-env <name>`: content from `KERN_SECRET_<name>` rather than from argv.
     pub secret_envs: &'a [String],
     /// `--secret-mode <octal>`: the file mode every `--secret` of this box is created with.

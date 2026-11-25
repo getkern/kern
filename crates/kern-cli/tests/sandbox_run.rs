@@ -10014,6 +10014,8 @@ fn an_exec_killed_by_the_box_oom_cap_says_why() {
         eprintln!("skip: unprivileged user namespaces unavailable");
         return;
     }
+    // `--oom-group`: the whole-box OOM this test is about. Without it an exec's OOM kills the command
+    // alone and the box goes on, as under Docker, and there is no box death to explain.
     let start = |tag: &str, rootfs: &str, mem: &str| {
         kern()
             .args([
@@ -10021,6 +10023,7 @@ fn an_exec_killed_by_the_box_oom_cap_says_why() {
                 tag,
                 "--rootfs",
                 rootfs,
+                "--oom-group",
                 "--memory",
                 mem,
                 "--pids-limit",
@@ -10960,6 +10963,74 @@ fn box_memory_cap_oom_kills_an_over_allocation() {
     }
 }
 
+/// BY DEFAULT AN OOM KILLS THE PROCESS THE KERNEL PICKS, AND THE BOX GOES ON, as under Docker: an
+/// `exec` that allocates past the box's cap dies (137) and the box is still running. MEASURED before
+/// (owner's decision, 22/11): the same exec took the box down with it under kern (`exited`) and left
+/// it `running` under Docker. `--oom-group` keeps the whole-box kill (see the test below).
+#[test]
+fn an_exec_oom_kills_the_command_and_the_box_goes_on() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "oomproc");
+    let rootfs = root.to_str().unwrap();
+    let name = format!("oomproc-{}", std::process::id());
+    let up = kern()
+        .args(["box", &name, "--rootfs", rootfs, "-m", "48m", "-d", "--"])
+        .args([
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "cat /sys/fs/cgroup/memory.oom.group; exec /bin/busybox sleep 60",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&up.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let grp = kern().args(["logs", &name]).output().expect("logs");
+    let grp = String::from_utf8_lossy(&grp.stdout).trim().to_string();
+    if grp.is_empty() {
+        let _ = kern().args(["stop", "-t", "0", &name]).output();
+        let _ = fs::remove_dir_all(&root);
+        eprintln!("skip: no memory controller delegated (memory.oom.group unreadable)");
+        return;
+    }
+    let exec = kern()
+        .args([
+            "exec",
+            &name,
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "a=x; while :; do a=$a$a; done",
+        ])
+        .output()
+        .expect("exec");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let alive = kern().args(["ps"]).output().expect("ps");
+    let alive = String::from_utf8_lossy(&alive.stdout)
+        .lines()
+        .any(|l| l.split_whitespace().next() == Some(name.as_str()));
+    let _ = kern().args(["stop", "-t", "0", &name]).output();
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(grp, "0", "a plain box is not OOM-killed as a group");
+    assert_eq!(
+        exec.status.code(),
+        Some(137),
+        "the exec is OOM-killed: {exec:?}"
+    );
+    assert!(alive, "the box goes on after its exec's OOM");
+}
+
 /// `memory.oom.group = 1` is the design promise that an OOM takes the WHOLE box, not one process:
 /// kern sets it, and a group-kill leaves no survivor. Two boxes: the first reads the cgroup back and
 /// skips where the `memory` controller is not delegated (a CI sandbox, WSL2 without
@@ -10989,6 +11060,7 @@ fn box_oom_group_kills_the_whole_box_atomically() {
             "oomgrpread",
             "--rootfs",
             rootfs,
+            "--oom-group",
             "-m",
             "64m",
             "--",
@@ -11032,6 +11104,7 @@ fn box_oom_group_kills_the_whole_box_atomically() {
             "oomgrpkill",
             "--rootfs",
             rootfs,
+            "--oom-group",
             "-m",
             "64m",
             "--",

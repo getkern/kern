@@ -32,10 +32,12 @@ kern box oom   --image alpine --memory 256m -- \
   sh -c 'dd if=/dev/zero of=/dev/shm/x bs=1M count=512' ; echo "exit=$?"       # exit=137, OOM-killed
 ```
 
-An over-allocation is OOM-killed as a WHOLE box (exit **137**, recorded for `kern wait` and
-`kern ps -a`): kern writes `memory.oom.group=1` on the box's own cgroup, so the kernel SIGKILLs every
-task at once instead of leaving the box half-dead. That holds on both cap paths, re-checked on four
-hosts and four systemd versions (**249, 252, 255, 257**).
+An over-allocation is OOM-killed (exit **137**, recorded for `kern wait` and `kern ps -a`). By
+default the kernel kills the process it picks, as under Docker: an `exec` that runs out of memory dies
+and the box goes on (measured: `kern exec` 137, the box still `running`). `--oom-group` makes the
+whole box go as one: kern writes `memory.oom.group=1` on the box's own cgroup, so the kernel SIGKILLs
+every task at once, which is what the Python and Node sandboxes ask for. That holds on both cap paths,
+re-checked on four hosts and four systemd versions (**249, 252, 255, 257**).
 
 ⚠️ Exit **137** alone does not prove a cap fired: it is SIGKILL, which the system OOM killer delivers
 identically. A kill by the box's own cap always carries kern's OOM message on stderr.
@@ -77,7 +79,7 @@ The first two differ on purpose, and a reader who meets them one at a time concl
 Measured on a host with 33465040896 bytes of RAM: `kern box --image alpine -- cat
 /sys/fs/cgroup/memory.max` prints `536870912`, the same read inside a compose service prints
 `33465040896`. The compose case is still a ceiling, not an absence of one: the box keeps a `memory.max`
-and `oom.group = 1`, so a failure stays attributable to its own cgroup. `[kern] compose_memory_max`
+of its own, so a failure stays attributable to its own cgroup. `[kern] compose_memory_max`
 puts a strict ceiling back ([CONFIG.md](CONFIG.md), [DOCKER-COMPAT.md](DOCKER-COMPAT.md)).
 
 **Third case: no mechanism at all.** A host with no systemd user manager, whose own cgroup cannot take

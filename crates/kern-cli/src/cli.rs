@@ -144,6 +144,9 @@ pub enum Command {
         /// `--privileged`: relax the seccomp filter so a NESTED `kern box` (or docker-in-docker-style
         /// workload) can create its namespaces. Rootless-only; refused as real host root.
         privileged: bool,
+        /// `--oom-group`: an OOM kills every process in the box at once (see
+        /// [`kern_isolation::set_whole_box_oom`]); without it, the process the kernel picks, as Docker.
+        oom_group: bool,
         /// `--require-limits`: refuse to start (non-zero exit) if a requested/default resource cap
         /// cannot actually be enforced here, instead of running best-effort UNCAPPED with a warning.
         require_limits: bool,
@@ -4171,6 +4174,7 @@ const NO_VALUE_FLAGS: &[&str] = &[
     "--keep",
     "--log-streams",
     "--no-uid-range",
+    "--oom-group",
     "--plan",
     "--privileged",
     "--quiet",
@@ -4285,6 +4289,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut bind_rootfs = false;
     let mut privileged = false;
     let mut require_limits = false;
+    let mut oom_group = false;
     let mut allow_uncapped = false;
     let mut security_profile: Option<commands::SecurityProfile> = None;
     let mut overlay_lower: Vec<String> = Vec::new();
@@ -4781,6 +4786,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--bind-rootfs" => bind_rootfs = true,
                 "--privileged" => privileged = true,
                 "--require-limits" => require_limits = true,
+                "--oom-group" => oom_group = true,
                 "--allow-uncapped" => allow_uncapped = true,
                 "--security-profile" => {
                     i += 1;
@@ -5734,6 +5740,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             bind_rootfs,
             privileged,
             require_limits,
+            oom_group,
             allow_uncapped,
             security_profile,
             overlay_lower,
@@ -5846,6 +5853,7 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     "--cap-add",
     "--privileged",
     "--require-limits",
+    "--oom-group",
     "--allow-uncapped",
     "--security-profile",
     "--secret",
@@ -7154,6 +7162,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             bind_rootfs,
             privileged,
             require_limits,
+            oom_group,
             allow_uncapped,
             security_profile,
             overlay_lower,
@@ -7272,6 +7281,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     bind_rootfs,
                     privileged,
                     require_limits,
+                    oom_group,
                     allow_uncapped,
                     security_profile,
                     overlay_lower: &overlay_lower,

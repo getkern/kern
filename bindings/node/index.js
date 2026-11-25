@@ -60,6 +60,8 @@ const DEFAULT_IMAGE_HAS_NODE = false;
 const SANDBOX_POSTURE = [
   "--security-opt", "no-new-privileges",
   "--security-opt", "seccomp-deny=kill",
+  // An OOM ends the whole box: the verdict reported as `oom` (a kern box follows docker by default).
+  "--oom-group",
 ];
 
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box

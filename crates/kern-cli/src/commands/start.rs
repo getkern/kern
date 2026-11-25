@@ -2724,6 +2724,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         args.security_profile,
         Some(SecurityProfile::Untrusted)
     )));
+    // An OOM kills the process the kernel picks, as under Docker, unless the box asked for the
+    // whole box to go as one (`--oom-group`, the SDKs' sandboxes): set before any limit is applied.
+    kern_isolation::set_whole_box_oom(args.oom_group);
     let mut cap_drops = args.cap_drop.to_vec();
     let mut read_only = args.read_only;
     // The profile is for code nobody has read, so it also refuses a setuid gain, which a plain box
