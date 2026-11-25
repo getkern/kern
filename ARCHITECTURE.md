@@ -26,7 +26,10 @@ A `kern box` is one short-lived process tree: no daemon, no shared state.
 1. **Namespaces.** `unshare` into a fresh user + PID + UTS + IPC + net namespace. The net namespace
    gets Docker's default, a NAT of its own (pasta) with outbound and no reach into the host's loopback;
    `--network none` leaves it loopback only, as every SDK sandbox has it; `--net` shares the host's,
-   opt-in, flagged in the status panel. A single-uid map makes your uid root *inside* the box only; `--uid-range` opts into a full
+   opt-in, flagged in the status panel. A box on that default NAT usually ENTERS a user and net
+   namespace kern prepared ahead, its NAT already up, instead of waiting for pasta at start: one is
+   kept ready between boxes (an idle holder process and its pasta), serves exactly one box and goes
+   with it, and the box keeps its own hostname, hosts and resolvers. `KERN_NET_POOL=0` turns it off. A single-uid map makes your uid root *inside* the box only; `--uid-range` opts into a full
    sub-id range.
 2. **Root filesystem.** An **overlay** by default (image = read-only lower, a private upper takes
    writes); `--read-only` remounts it read-only *after* a self-pivot (`pivot_root(".", ".")`), which

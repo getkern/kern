@@ -155,6 +155,12 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern cp` of a stopped box, twice in a row, on WSL.** The second copy waited 20 s and failed "in
   use by another box": the box kern starts on the layer for a copy was not removed in kern's WSL
   distro. Five copies in a row now take 16-21 ms each there, and a copy is about 3 ms faster here.
+- **A box on the default network starts without waiting for its NAT.** A box that names no network
+  now enters a network namespace kern prepared ahead, with pasta already up; it serves that box alone
+  and goes with it. Measured, `kern run --rm alpine true`: 14.7 ms to 4.3-5.0 ms here (when boxes
+  are 20 ms or more apart; back to back, half of them), 114 to 33 ms on a VPS as root. What the box
+  sees is the same, compared line by line on four hosts. One is kept ready per user (an idle holder
+  and its pasta, about 32 MB); `kern info` shows it, `KERN_NET_POOL=0` turns it off.
 - **`kern stop` of a box that is already stopped** prints its name and exits 0, as `docker stop` does;
   it answered "no running box". A name that is no box at all is still an error.
 - **`kern doctor` says when kern is not where the AppArmor profile looks**, and to copy it to
