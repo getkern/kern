@@ -7997,21 +7997,20 @@ fn rm_takes_a_detached_boxs_logs_but_not_the_reason_it_failed_to_start() {
         let _ = fs::remove_dir_all(&xdg);
         return;
     }
-    let leftover = || -> Vec<String> {
-        fs::read_dir(&logs)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with("rmgone-"))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    // Gone from the registry: the box has ended.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !leftover().is_empty() && std::time::Instant::now() < deadline {
+    while std::time::Instant::now() < deadline
+        && String::from_utf8_lossy(&run(&["ps"]).stdout).contains("rmgone")
+    {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let left = leftover();
+    // SINCE 0.57.0 the log goes with the box's hidden record, after the window in which kern's
+    // Docker API follows it (`kern logs --frames`), and no other reader sees it meanwhile: `kern
+    // logs` answers there is none, and `ps -a` has no line for the box.
+    let public = run(&["logs", "rmgone"]);
+    let follower = run(&["logs", "--frames", "rmgone"]);
+    let listed = String::from_utf8_lossy(&run(&["ps", "-a"]).stdout).contains("rmgone");
+    let _ = &logs;
     let failed = run(&[
         "box",
         "rmfail",
@@ -8026,9 +8025,16 @@ fn rm_takes_a_detached_boxs_logs_but_not_the_reason_it_failed_to_start() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&xdg);
     assert!(
-        left.is_empty(),
-        "a `--rm` box that ran and ended left its logs: {left:?}"
+        !public.status.success(),
+        "`kern logs` of a `--rm` box that ended must find none: {}",
+        String::from_utf8_lossy(&public.stdout)
     );
+    assert!(
+        String::from_utf8_lossy(&follower.stdout).contains("hello"),
+        "the API's follower reads it inside its window: {}",
+        String::from_utf8_lossy(&follower.stderr)
+    );
+    assert!(!listed, "`ps -a` lists no `--rm` box");
     assert!(
         !failed.status.success(),
         "a box whose command does not exist must not start"

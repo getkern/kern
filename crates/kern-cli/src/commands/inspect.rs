@@ -2046,6 +2046,19 @@ const WAIT_FLOOR_MS: i32 = 100;
 /// The command itself returns 0 unless a name doesn't resolve. Woken when the box leaves the
 /// registry (inotify), with a 100 ms poll as the floor - no daemon, no busy-spin.
 pub fn wait(names: &[String]) -> Result<(), Error> {
+    wait_for(names, false)
+}
+
+/// `kern __wait-removed <name>` (hidden): `kern wait`, and for a box that has already gone with
+/// `--rm`, the code its hidden record keeps while it lasts (`registry::removed_exit_by_name`). For
+/// kern's Docker API, which asks once a `docker run --rm` has had its log followed: a `kern wait`
+/// begun then could find no box, and the run answered 255 for `exit 7`. Not `kern wait`'s own
+/// behaviour, which for a removed box is Docker's: none.
+pub fn wait_removed(name: &str) -> Result<(), Error> {
+    wait_for(std::slice::from_ref(&name.to_string()), true)
+}
+
+fn wait_for(names: &[String], removed_too: bool) -> Result<(), Error> {
     for name in names {
         let Some(inst) = registry::find_ref(name) else {
             // Not running: answer from the exit record if the box left one, which is Docker's
@@ -2059,6 +2072,13 @@ pub fn wait(names: &[String]) -> Result<(), Error> {
                 .find(|e| e.name == *name)
             {
                 println!("{}", exited.code);
+                continue;
+            }
+            if let Some(code) = removed_too
+                .then(|| registry::removed_exit_by_name(name))
+                .flatten()
+            {
+                println!("{code}");
                 continue;
             }
             return Err(Error::NotRunning(format!(
@@ -2318,7 +2338,17 @@ fn log_head<W: std::io::Write>(
     // whose log file persists) is used as-is.
     let by_pid = registry::find_ref(name).map(|i| i.name);
     let name = by_pid.as_deref().unwrap_or(name);
-    let Some((path, mut f)) = open_newest_log(name)? else {
+    // A `--rm` box's log, kept only for the follower of kern's Docker API (`--frames`): gone for
+    // every other reader, as `--rm` asks (see `registry::set_box_exit_removed`).
+    let removed = |p: &std::path::Path| {
+        !frames
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(registry::split_log_file)
+                .is_some_and(|(key, _)| registry::removed_log_key(key))
+    };
+    let newest = open_newest_log(name)?.filter(|(p, _)| !removed(p));
+    let Some((path, mut f)) = newest else {
         // 🔴 A LIVE BOX WITH NO LOG IS NOT A MISSING BOX, and the two used to share one sentence whose
         // hint sent the reader in a circle: `no logs for box 'x'` plus "run `kern ps` to see running
         // boxes", for a box that `kern ps` was ALREADY showing. MEASURED through the SDK, which is

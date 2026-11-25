@@ -504,6 +504,11 @@ pub enum Command {
     },
     /// Hidden: the local CA's name and certificate, for `kern.exe` (`crate::localtls::print_authority`).
     LocalCa,
+    /// Hidden: `kern wait`, also for a box that has just gone with `--rm`, for kern's Docker API
+    /// (`commands::wait_removed`).
+    WaitRemoved {
+        name: String,
+    },
     /// `compat docker ...`: run a command with `docker` answered by kern, or manage the `docker`
     /// links kern made (`crate::dockershim`).
     Compat {
@@ -1340,6 +1345,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("__local-router") => Command::LocalRouter,
         Some("__router-port") => Command::RouterPort,
         Some("__local-ca") => Command::LocalCa,
+        Some("__wait-removed") => match rest.get(1) {
+            Some(n) if rest.len() == 2 && !n.starts_with('-') => Command::WaitRemoved {
+                name: (*n).to_string(),
+            },
+            _ => return Err(Error::Usage("__wait-removed <name>")),
+        },
         Some("proxy") => Command::Proxy {
             action: match (rest.get(1).copied(), rest.len()) {
                 (Some("trust"), 2) => ProxyAction::Trust,
@@ -7142,6 +7153,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::LocalRouter => crate::localrouter::run(),
         Command::RouterPort => std::process::exit(crate::localrouter::port_verb()),
         Command::LocalCa => std::process::exit(crate::localtls::print_authority()),
+        Command::WaitRemoved { name } => commands::wait_removed(&name),
         Command::Proxy { action } => match action {
             ProxyAction::Trust => crate::localtls::trust(),
             ProxyAction::Untrust => crate::localtls::untrust(),

@@ -84,6 +84,13 @@ The image's steps are kept too, as metadata under the one layer kern writes, whi
 buildah still take as the base of a build. A rebuild answered entirely from the cache keeps its
 steps' times, so the same image saves and pushes under the same digest.
 
+**`docker run --rm` through kern's API is removed by kern, whatever becomes of the server.** The
+server removed such a box itself after following its log, so a server stopped meanwhile left the
+box listed as exited for good. The box is `kern box --rm` now: its log stays for the server's
+follower for 60 s after it ends, hidden from every other reader (`kern logs` finds none, `ps -a` no
+line), and goes with the box's hidden record; its exit code reaches the run as before (`exit 7` is
+7). A box whose server was stopped mid-run is gone when it ends.
+
 **A box's `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are its own files, bound over the
 image's.** kern wrote them into the box's root: a box started `--keep` (every container of kern's
 Docker API is one) paid a copy of `/etc` onto disk at its first start, and `kern commit` carried the

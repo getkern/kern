@@ -2105,10 +2105,13 @@ fn kern_frames(bin: &Path, args: &[&str], w: &mut crate::Out, wanted: (bool, boo
 /// from its first byte; the exit code comes from `kern wait`. Both wake when the box leaves the
 /// registry, not on a timer, so a command that ends at once pays no poll interval.
 ///
-/// `--rm` IS DONE HERE, after the attach has followed the whole log: kern's own `--rm` removes the
-/// log at the exit, and a box that ends at once could be gone before the follow had opened it.
+/// `--rm` IS KERN'S, as for every other container: it keeps the log for the follow for a while after
+/// the box has gone (`registry::set_box_exit_removed`), so a box that ends at once cannot be gone
+/// before the follow opened it, and no removal is left to this server, which may not be there to do
+/// it when the box ends.
 fn start_attached(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Started>) -> Response {
-    if let Err(e) = start_detached(bin, name, c, &without_rm(&c.argv)) {
+    let argv: Vec<&str> = c.argv.iter().map(String::as_str).collect();
+    if let Err(e) = start_detached(bin, name, c, &argv) {
         run_end(name, 125);
         return e;
     }
@@ -2124,13 +2127,15 @@ fn start_attached(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Started>
             // resident for the box's life. Bounded: past it (a long run, or a client that keeps
             // the connection and stops reading) the `kern wait` is the one that waits.
             let _ = read.recv_timeout(FOLLOW_FIRST);
-            let code = kern_wait_code(&bin, &watched);
+            // A `--rm` box has gone by now, so its code is the one its hidden record keeps, which
+            // `kern wait` does not read (a late wait finds no box, as Docker's does). MEASURED
+            // before: `docker run --rm alpine sh -c 'exit 7'` answered 255.
+            let code = if created.auto_remove {
+                kern_wait_code_with(&bin, "__wait-removed", &watched)
+            } else {
+                kern_wait_code(&bin, &watched)
+            };
             crate::events::publish(&event_of("die", &watched, &created, Some(code)));
-            // Removed before the run ends here, so the server does not leave on idle with the
-            // removal undone, and `wait?condition=removed` answers once it is true.
-            if created.auto_remove {
-                let _ = kern(&bin, &["rm", &watched]);
-            }
             run_end(&watched, code);
         });
     if reaper.is_err() {
@@ -2214,11 +2219,6 @@ fn start_detached(bin: &Path, name: &str, c: &Created, argv: &[&str]) -> Result<
     Ok(())
 }
 
-/// A `kern box` argv without its `--rm`.
-fn without_rm(argv: &[String]) -> Vec<&str> {
-    without_flags(argv, &["--rm"])
-}
-
 /// A `kern box` argv without the valueless flags `drop`, which stand among the flags (before the
 /// workload's `--`) and nowhere else: a workload argument spelled the same is the workload's.
 fn without_flags<'a>(argv: &'a [String], drop: &[&str]) -> Vec<&'a str> {
@@ -2237,7 +2237,13 @@ fn without_flags<'a>(argv: &'a [String], drop: &[&str]) -> Vec<&'a str> {
 
 /// The exit code of `name` from `kern wait`, -1 when it says none.
 fn kern_wait_code(bin: &Path, name: &str) -> i32 {
-    let (_, out, _) = kern(bin, &["wait", name]);
+    kern_wait_code_with(bin, "wait", name)
+}
+
+/// The exit code of `name` from the waiting verb `verb` (`wait`, or `__wait-removed` for a box that
+/// removed itself), -1 when it says none.
+fn kern_wait_code_with(bin: &Path, verb: &str, name: &str) -> i32 {
+    let (_, out, _) = kern(bin, &[verb, name]);
     out.trim().parse().unwrap_or(-1)
 }
 
@@ -3165,21 +3171,6 @@ mod tests {
         assert!(!argv.iter().any(|a| a.starts_with("0.0.0.0")), "{argv:?}");
     }
 
-    /// An attached run's `--rm` is this server's: taken out of the flags, never out of the
-    /// workload's arguments.
-    #[test]
-    fn without_rm_drops_the_flag_and_keeps_the_workloads_own() {
-        let argv: Vec<String> = [
-            "box", "n", "-d", "--rm", "--image", "x", "--", "rm", "--rm", "f",
-        ]
-        .iter()
-        .map(|a| (*a).to_string())
-        .collect();
-        assert_eq!(
-            without_rm(&argv),
-            ["box", "n", "-d", "--image", "x", "--", "rm", "--rm", "f"]
-        );
-    }
     /// The foreground run drops `-d` and `--log-streams` among the flags only.
     #[test]
     fn without_flags_leaves_the_workloads_arguments_alone() {

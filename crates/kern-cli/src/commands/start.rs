@@ -6036,7 +6036,13 @@ fn supervise_box(
     // suppressed: it is a different record, scoped to a stack and read by `compose up`, and a
     // one-off's `--rm` must not make a stack lose a service's status.
     if rm {
-        registry::set_box_exit_removed(std::process::id() as i32, inst.starttime, final_code);
+        let log_key = format!("{}-{}", inst.name, std::process::id());
+        registry::set_box_exit_removed(
+            std::process::id() as i32,
+            inst.starttime,
+            final_code,
+            ran_once.then_some(log_key.as_str()),
+        );
     } else {
         registry::set_box_exit(
             std::process::id() as i32,
@@ -6073,9 +6079,8 @@ fn supervise_box(
     // hold the active file open until its pipe closes; the unlinked file's space is freed then.
     // NOT FOR A BOX THAT NEVER STARTED: its launcher quotes the log's tail as the reason, after
     // this supervisor has exited, and taking it would leave "box failed to start" with no why.
-    if rm && ran_once {
-        crate::commands::boxlog::remove_run_logs(&format!("{}-{}", inst.name, std::process::id()));
-    }
+    // Since 0.57.0 they go with the box's hidden record, after its follower's window (see
+    // `registry::set_box_exit_removed`), and no reader but that follower sees them meanwhile.
     // A KEPT BOX REMEMBERS HOW ITS LAST RUN ENDED WHATEVER SHAPE THAT RUN HAD. The foreground arm
     // records it; this is the DETACHED one, and `-d` is the shape a kept box is most likely to have
     // (it is the attach-and-detach workflow the feature exists for). Without this the kept record

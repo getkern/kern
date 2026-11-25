@@ -1104,15 +1104,72 @@ const REMOVED_RECORD_TTL: std::time::Duration = std::time::Duration::from_secs(6
 /// `docker run -d --rm alpine sh -c 'sleep 1; exit 7'` then `docker wait` answered -1, where Docker
 /// answers 7. So the record is written HIDDEN (see [`REMOVED_SUFFIX`]) and expires after
 /// [`REMOVED_RECORD_TTL`]; each write sweeps the expired ones, so the directory never accumulates.
-pub fn set_box_exit_removed(pid: i32, starttime: u64, code: i32) {
+///
+/// THE BOX'S LOG GOES WITH THE RECORD, not at the exit: `log_key` (`<name>-<pid>`, for a box that
+/// ran) names it, and the sweep that removes the record removes the log. In between it is read by
+/// the follower kern's Docker API runs for `docker run --rm` (`kern logs --frames`), which a box
+/// that ends at once can beat to the file; MEASURED, an `echo` ended before the follower opened its
+/// log, and the run printed nothing. Every other reader is told the box has no logs, as `--rm` asks
+/// ([`removed_log_key`]).
+pub fn set_box_exit_removed(pid: i32, starttime: u64, code: i32, log_key: Option<&str>) {
     let Ok(d) = waitexit_dir() else {
         return;
     };
     let _ = fs::write(
         d.join(format!("{pid}-{starttime}{REMOVED_SUFFIX}")),
-        code.to_string(),
+        format!("{code}\n{}", log_key.unwrap_or_default()),
     );
     sweep_removed_records(&d, REMOVED_RECORD_TTL);
+}
+
+/// The hidden records of `--rm` boxes not yet expired: their bodies, `code\nlog key`.
+fn removed_records(dir: &Path) -> impl Iterator<Item = String> {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(REMOVED_SUFFIX))
+        })
+        .filter_map(|e| fs::read_to_string(e.path()).ok())
+}
+
+/// The exit code of the box `name` that ended most recently with `--rm`, from its hidden record
+/// while it lasts: for kern's Docker API, whose `docker run --rm` asks once the run's log has been
+/// followed, after the box has gone (see `kern __wait-removed`). `kern wait` does not read it: a wait
+/// begun after a `--rm` box has gone finds no box, as Docker's does.
+pub fn removed_exit_by_name(name: &str) -> Option<i32> {
+    let d = waitexit_dir().ok()?;
+    fs::read_dir(&d)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(REMOVED_SUFFIX))
+        })
+        .filter_map(|e| {
+            let body = fs::read_to_string(e.path()).ok()?;
+            let mut lines = body.lines();
+            let code: i32 = lines.next()?.trim().parse().ok()?;
+            let (rec_name, _pid) = lines.next()?.trim().rsplit_once('-')?;
+            let when = e.metadata().and_then(|m| m.modified()).ok()?;
+            (rec_name == name).then_some((when, code))
+        })
+        .max_by_key(|(when, _)| *when)
+        .map(|(_, code)| code)
+}
+
+/// Whether the run log `key` (`<name>-<pid>`) belongs to a `--rm` box that has ended and whose log
+/// is only kept for its follower (see [`set_box_exit_removed`]): every other reader is to treat it
+/// as gone.
+pub fn removed_log_key(key: &str) -> bool {
+    let Ok(d) = waitexit_dir() else {
+        return false;
+    };
+    removed_records(&d).any(|body| body.lines().nth(1).is_some_and(|k| k.trim() == key))
 }
 
 /// Remove the hidden `--rm` records older than `ttl`. Best effort: a record that cannot be read or
@@ -1134,6 +1191,14 @@ fn sweep_removed_records(dir: &Path, ttl: std::time::Duration) {
             .and_then(|t| now.duration_since(t).ok())
             .is_some_and(|age| age >= ttl);
         if expired {
+            // Its log first: once the record is gone, nothing names the log as a `--rm` box's.
+            if let Some(key) = fs::read_to_string(e.path())
+                .ok()
+                .and_then(|b| b.lines().nth(1).map(|k| k.trim().to_string()))
+                .filter(|k| !k.is_empty())
+            {
+                crate::commands::boxlog::remove_run_logs(&key);
+            }
             let _ = fs::remove_file(e.path());
         }
     }
@@ -1254,6 +1319,11 @@ const WAITEXIT_SHOW_SECS: u64 = 3600;
 /// self-heal, mirroring `list()`), so `ps -a` shows the recent, not history. A bare-code sidecar from
 /// an older kern has no name/pod/command; it still lists, named by its pid, rather than silently vanish.
 pub fn list_exited() -> Vec<ExitedBox> {
+    // The `--rm` logs past their follower's window go here too, so they do not wait for the next
+    // `--rm` box to be removed (see `set_box_exit_removed`).
+    if let Ok(d) = waitexit_dir() {
+        sweep_removed_records(&d, REMOVED_RECORD_TTL);
+    }
     list_exited_among(&list())
 }
 
@@ -5706,7 +5776,20 @@ mod removed_record_tests {
 
         // A pid that is not alive, so `list_exited` would show a normal record of it.
         let (pid, st) = (i32::MAX - 7, 42u64);
-        set_box_exit_removed(pid, st, 7);
+        set_box_exit_removed(pid, st, 7, Some("rmbox-1"));
+        assert!(removed_log_key("rmbox-1") && !removed_log_key("rmbox-2"));
+        assert_eq!(
+            removed_exit_by_name("rmbox"),
+            Some(7),
+            "the API's late wait reads it"
+        );
+        assert_eq!(removed_exit_by_name("other"), None);
+        // Its log, which the expired record's sweep takes with it (below).
+        let Ok(logs) = logs_dir() else {
+            panic!("logs dir");
+        };
+        let log = logs.join("rmbox-1.log");
+        fs::write(&log, "x").expect("a log");
         assert_eq!(box_exit(pid, st), Some(7), "a waiter reads the code");
         assert!(
             !list_exited().iter().any(|e| e.code == 7),
@@ -5720,6 +5803,7 @@ mod removed_record_tests {
         };
         sweep_removed_records(&dir, std::time::Duration::ZERO);
         assert_eq!(box_exit(pid, st), None, "the expired hidden record is gone");
+        assert!(!log.exists(), "and its log with it");
         assert_eq!(
             box_exit(pid - 1, st),
             Some(3),
