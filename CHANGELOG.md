@@ -55,6 +55,11 @@ refusal instead of crashing. The set of refused syscalls is unchanged, and none 
 exec` and health probes get the box's own verdict, and the Python and Node sandboxes ask for the kill
 on every box, so their `escape_blocked` reads as before.
 
+**A box resolves the host's search domains, as a Docker container does.** A box on the default
+network, a compose service and a pod got the host's nameservers and not its `search` line, so a
+short LAN name resolved under Docker and not under kern. The host's domains are the box's now, unless
+`--dns-search` (or `dns_search:`) names its own.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

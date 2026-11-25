@@ -1801,6 +1801,10 @@ fn setup_outbound_in(dir: &std::path::Path, holder: i32, ns_ifname: &str) -> Out
     for ns in host_nameservers() {
         resolv.push_str(&format!("nameserver {ns}\n"));
     }
+    let search = host_search_domains();
+    if !search.is_empty() {
+        resolv.push_str(&format!("search {}\n", search.join(" ")));
+    }
     // DNS is only "up" if we actually wrote the resolv.conf the box will bind - else don't claim it.
     // Distinguished from "no outbound at all": the NAT is attached either way, so a box can reach an
     // IP but not resolve a name, and saying "no outbound" would send the reader after the wrong
@@ -1842,6 +1846,43 @@ pub fn host_nameservers() -> Vec<String> {
     }
     if out.is_empty() {
         out.push("1.1.1.1".to_string()); // no usable resolver anywhere -> public fallback
+    }
+    out
+}
+
+/// The host's search domains for a NAT'd namespace, as Docker copies them into a container: from
+/// `/etc/resolv.conf`, else from systemd-resolved's upstream file. Empty when the host has none.
+/// MEASURED before: Docker's container had the host's `search homenet.telecomitalia.it` and kern's
+/// box had no `search` line, so a short LAN name (`nas`, `printer`) resolved in one and not the other.
+pub fn host_search_domains() -> Vec<String> {
+    let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let mut out = search_domains_in(&read("/etc/resolv.conf"));
+    if out.is_empty() {
+        out = search_domains_in(&read(RESOLVED_UPSTREAMS));
+    }
+    out
+}
+
+/// The domains of the `search` (or the older `domain`) lines of a `resolv.conf` text, each once, in
+/// order, the last line winning as the resolver reads it. Only names a resolver accepts: letters,
+/// digits, `-`, `_` and `.`, at most 253 bytes; `.` alone (the root, "no search") is dropped. PURE.
+fn search_domains_in(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in text.lines() {
+        let mut f = l.split_whitespace();
+        if !matches!(f.next(), Some("search" | "domain")) {
+            continue;
+        }
+        out.clear();
+        for d in f.take_while(|t| !t.starts_with('#') && !t.starts_with(';')) {
+            let ok = d.len() <= 253
+                && d != "."
+                && d.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+            if ok && !out.iter().any(|o| o == d) {
+                out.push(d.to_string());
+            }
+        }
     }
     out
 }
@@ -3540,6 +3581,28 @@ mod tests {
     /// lottery this replaced.
     /// A host on systemd-resolved's stub gives the box the stub's REAL upstreams, not a public
     /// resolver: the stub file has nothing a namespace can use, the upstream file does.
+    /// The host's search domains are the box's, as Docker's container gets them; the last line
+    /// wins, a comment ends it, the root and a name no resolver accepts are dropped.
+    #[test]
+    fn the_hosts_search_domains_are_read_as_the_resolver_reads_them() {
+        let stub =
+            "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch homenet.telecomitalia.it\n";
+        assert_eq!(
+            search_domains_in(stub),
+            vec!["homenet.telecomitalia.it".to_string()]
+        );
+        assert_eq!(
+            search_domains_in("domain old.lan\nsearch a.lan b.lan a.lan # x\n"),
+            vec!["a.lan".to_string(), "b.lan".to_string()]
+        );
+        assert!(search_domains_in("search .\n").is_empty());
+        assert_eq!(
+            search_domains_in("search ok.lan bad$name x\n"),
+            vec!["ok.lan".to_string(), "x".to_string()]
+        );
+        assert!(search_domains_in("nameserver 1.1.1.1\n").is_empty());
+    }
+
     #[test]
     fn a_stub_hosts_upstreams_are_the_boxs_resolvers() {
         let stub = "# This is /run/systemd/resolve/stub-resolv.conf\nnameserver 127.0.0.53\noptions edns0 trust-ad\nsearch lan\n";

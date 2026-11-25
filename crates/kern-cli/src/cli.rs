@@ -7350,6 +7350,13 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             } else {
                 dns
             };
+            // The host's search domains too, as Docker copies them, unless the caller named some.
+            let dns_search: Vec<String> =
+                if (stack_outbound || own_outbound) && dns_search.is_empty() {
+                    crate::pod::host_search_domains()
+                } else {
+                    dns_search
+                };
             // `--platform` of another machine: the kernel must run its binaries, asked BEFORE
             // anything is pulled, and the image is that platform's own cache entry for the whole
             // run, the way `kern build --platform` resolves it.

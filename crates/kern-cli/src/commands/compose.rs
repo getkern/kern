@@ -4259,6 +4259,13 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
                                         cmd.arg("--dns").arg(ns);
                                     }
                                 }
+                                // And the host's search domains, as Docker gives a service, unless
+                                // the file names its own.
+                                if outbound_for.contains(&b.name) && b.dns_search.is_empty() {
+                                    for d in crate::pod::host_search_domains() {
+                                        cmd.arg("--dns-search").arg(d);
+                                    }
+                                }
                                 // A box not on the host net joins the stack pod → reachable by name from peers.
                                 //
                                 // `network_mode: none` STAYS OUT TOO, for the opposite reason to `host`:
