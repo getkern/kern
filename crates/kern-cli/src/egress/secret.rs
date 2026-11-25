@@ -384,7 +384,7 @@ pub(crate) fn outgoing(
     headers: &str,
     host: &str,
     port: u16,
-    rule: &SecretRule,
+    rule: Option<&SecretRule>,
 ) -> Result<Outgoing, Reject> {
     let mut parts = request_line.split_whitespace();
     let (Some(method), Some(target), Some(_version), None) =
@@ -395,12 +395,16 @@ pub(crate) fn outgoing(
     if !is_token(method) {
         return Err((400, "the method is not a token"));
     }
-    // The proxied target is absolute (`http://host[:port]/path`); the path is what follows the
-    // authority, and the authority is the host the proxy already vetted.
-    let after_scheme = target.strip_prefix("http://").ok_or((
-        400,
-        "a request through the proxy names an absolute http:// URL",
-    ))?;
+    // The proxied target is absolute (`http://host[:port]/path`, or `https://...` as busybox wget
+    // sends one through a proxy); the path is what follows the authority, and the authority is the
+    // host the proxy already vetted. Either way the proxy's own leg is HTTPS.
+    let after_scheme = target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("https://"))
+        .ok_or((
+            400,
+            "a request through the proxy names an absolute http:// or https:// URL",
+        ))?;
     let path = match after_scheme.find(['/', '?']) {
         Some(at) if after_scheme[at..].starts_with('?') => format!("/{}", &after_scheme[at..]),
         Some(at) => after_scheme[at..].to_string(),
@@ -414,7 +418,9 @@ pub(crate) fn outgoing(
     };
     // The names `Connection` lists are this leg's too.
     let mut dropped: Vec<String> = RESERVED.iter().map(|s| (*s).to_string()).collect();
-    dropped.push(rule.header.to_ascii_lowercase());
+    if let Some(rule) = rule {
+        dropped.push(rule.header.to_ascii_lowercase());
+    }
     for line in headers.split("\r\n") {
         if let Some((n, v)) = line.split_once(':') {
             if n.trim().eq_ignore_ascii_case("connection") {
@@ -461,10 +467,12 @@ pub(crate) fn outgoing(
         out.push_str(value);
         out.push('\n');
     }
-    out.push_str(&rule.header);
-    out.push_str(": ");
-    out.push_str(&rule.value);
-    out.push('\n');
+    if let Some(rule) = rule {
+        out.push_str(&rule.header);
+        out.push_str(": ");
+        out.push_str(&rule.value);
+        out.push('\n');
+    }
     // curl's own defaults stay out of a request the box shaped: an empty value removes them.
     out.push_str("Expect:\n");
     if !has_ua {
@@ -609,7 +617,7 @@ pub(crate) fn serve(
     headers: &str,
     host: &str,
     port: u16,
-    rule: &SecretRule,
+    rule: Option<&SecretRule>,
     policy: &super::EgressPolicy,
 ) {
     let o = match outgoing(request_line, headers, host, port, rule) {
@@ -710,7 +718,11 @@ pub(crate) fn serve(
         (None, _) => None,
     };
     let relayed = match child.stdout.take() {
-        Some(out) => relay_answer(out, &mut client, rule.secret.as_bytes()),
+        Some(out) => relay_answer(
+            out,
+            &mut client,
+            rule.map_or(&b""[..], |r| r.secret.as_bytes()),
+        ),
         None => Relayed::NoHead,
     };
     // The box went away mid-answer: curl is stopped, not waited for (a stream can last minutes).
@@ -727,11 +739,12 @@ pub(crate) fn serve(
     }
     let _ = child.wait();
     if !sent {
-        let line = err
-            .lines()
-            .last()
-            .unwrap_or("no answer")
-            .replace(&rule.secret, "[kern-secret]");
+        let last = err.lines().last().unwrap_or("no answer");
+        // Only a real secret is scrubbed: replacing an empty one would mark every character.
+        let line = match rule {
+            Some(r) if !r.secret.is_empty() => last.replace(&r.secret, "[kern-secret]"),
+            _ => last.to_string(),
+        };
         reject(
             &mut client,
             502,
@@ -924,7 +937,7 @@ mod tests {
             headers,
             "api.example.com",
             80,
-            &rule(),
+            Some(&rule()),
         );
         let Ok(o) = o else {
             panic!("{o:?}");
@@ -941,7 +954,7 @@ mod tests {
             "",
             "api.example.com",
             8443,
-            &rule(),
+            Some(&rule()),
         );
         assert_eq!(o.map(|o| o.url), Ok("https://api.example.com:8443/".into()));
         let o = outgoing(
@@ -949,7 +962,7 @@ mod tests {
             "",
             "api.example.com",
             80,
-            &rule(),
+            Some(&rule()),
         );
         assert_eq!(o.map(|o| o.url), Ok("https://api.example.com/?q".into()));
         let o = outgoing(
@@ -957,7 +970,7 @@ mod tests {
             "Transfer-Encoding: chunked\r\n",
             "api.example.com",
             80,
-            &rule(),
+            Some(&rule()),
         );
         assert_eq!(
             o.map(|_| ()),
@@ -968,11 +981,31 @@ mod tests {
             "Upgrade: websocket\r\n",
             "api.example.com",
             80,
-            &rule(),
+            Some(&rule()),
         );
         assert!(matches!(o, Err((501, _))));
-        let o = outgoing("GET /relative HTTP/1.1", "", "api.example.com", 80, &rule());
+        let o = outgoing(
+            "GET /relative HTTP/1.1",
+            "",
+            "api.example.com",
+            80,
+            Some(&rule()),
+        );
         assert!(matches!(o, Err((400, _))));
+        // An absolute https:// target with no key to add (busybox wget through a proxy): the same
+        // HTTPS leg, the box's headers as they came, nothing added.
+        let o = outgoing(
+            "GET https://pypi.org/simple/ HTTP/1.1",
+            "Host: pypi.org\r\nUser-Agent: Wget\r\n",
+            "pypi.org",
+            80,
+            None,
+        );
+        let Ok(o) = o else {
+            panic!("{o:?}");
+        };
+        assert_eq!(o.url, "https://pypi.org/simple/");
+        assert_eq!(o.headers, "User-Agent: Wget\nExpect:\nAccept:\n");
     }
 
     #[test]

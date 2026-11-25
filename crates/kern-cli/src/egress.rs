@@ -944,7 +944,27 @@ fn handle_client(mut client: UnixStream, policy: &EgressPolicy, secrets: &[Secre
             return;
         }
         if let Some(rule) = secret::rule_for(secrets, &host) {
-            secret::serve(client, request_line, headers, &host, port, rule, policy);
+            secret::serve(
+                client,
+                request_line,
+                headers,
+                &host,
+                port,
+                Some(rule),
+                policy,
+            );
+            return;
+        }
+        // AN ABSOLUTE https:// TARGET, as busybox wget sends one through a proxy instead of a CONNECT.
+        // Dialled as plain HTTP it reached port 80 and the server refused the request; the proxy makes
+        // the HTTPS request itself, through the same vetted and pinned leg a secret uses, and answers
+        // the box in plain HTTP, as a forwarding proxy does for that form.
+        if request_line
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|t| t.len() > 8 && t[..8].eq_ignore_ascii_case("https://"))
+        {
+            secret::serve(client, request_line, headers, &host, port, None, policy);
             return;
         }
         let mut upstream = match connect_vetted(&host, port, policy) {

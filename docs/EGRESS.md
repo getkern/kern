@@ -48,18 +48,19 @@ kern hands the box the allowlist as a **forward proxy** and exports `http_proxy`
 their uppercase spellings into its environment, so anything that honours those variables works with
 no change: `curl`, `pip`, `npm`, Go, Python's `urllib` and `requests`.
 
-One common client does not, and it is the one in the smallest image people reach for first. Alpine's
-default `wget` is busybox's, and busybox does not implement the `CONNECT` tunnel that HTTPS through a
-proxy needs. Measured with `--egress-allow example.com`:
+Busybox's `wget`, Alpine's default, does not open a `CONNECT` tunnel for HTTPS through a proxy: it
+sends the whole `https://` URL to the proxy instead. The proxy answers that form itself: it makes the
+HTTPS request to the allowlisted host, over the same vetted and pinned leg a secret uses (below), and
+hands the answer back to the box. Measured with `--egress-allow pypi.org` on busybox 1.36:
 
 | client | `http://` | `https://` |
 |---|---|---|
-| busybox `wget` (alpine's default) | works | **fails**, `wget: error getting response` |
-| `curl` | works | works |
+| busybox `wget` (alpine's default) | works | works (82,826 bytes of `pypi.org/simple/requests/`) |
+| `curl` | works | works (`CONNECT`, the TLS session is the box's own) |
 
-So a first attempt with `kern box … --image alpine --egress-allow example.com -- wget https://example.com`
-reports a failure that is not the allowlist refusing anything: it is the client. `apk add curl` in the
-image, or any of the runtimes above, and the same box reaches the allowlisted host and nothing else.
+A host not on the list is refused either way. The difference that remains: with `curl` the TLS session
+is the box's own; with busybox `wget` it is the proxy's, which checks the certificate as `curl` on the
+host does.
 
 ## Keys the box never holds: `--egress-secret`
 
