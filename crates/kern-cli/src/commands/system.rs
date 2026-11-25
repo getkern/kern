@@ -355,7 +355,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --ssh PORT          Run an in-box sshd, published on host PORT (→ box :22); prints the ssh
                         command (auto-generates a keypair). Needs openssh in the image
     --ssh-key FILE      Authorize this public key instead of generating a throwaway keypair
-    --restart           Restart a detached box if it exits non-zero (on-failure)
+    --restart [POLICY]  Restart a detached box when it exits: on-failure (a bare --restart),
+                        always, unless-stopped, no. on-failure:N gives up after N retries
+                        (as --restart-max N)
     --health-cmd <cmd>  Shell command probed in the box; sets ps HEALTH (exit 0 = healthy)
     --health-cmd-argv A The same check with NO shell: one argv element per flag, repeated
                         (the exec form). Use it when the image has no /bin/sh

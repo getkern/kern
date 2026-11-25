@@ -4706,18 +4706,30 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // `unless-stopped` persist via a systemd user unit (survive reboot); `on-failure`
                 // uses kern's in-process supervisor. A bare `--restart` = on-failure (back-compat) -
                 // an unrecognized next token is left for the parser, not swallowed.
-                "--restart" => {
-                    match rest
-                        .get(i + 1)
-                        .and_then(|v| commands::RestartPolicy::parse(v))
-                    {
+                // Docker's `on-failure:N` is `on-failure` with `--restart-max N`, as compose's
+                // `restart: on-failure:N` already is. MEASURED before: `--restart on-failure:3` was
+                // refused as an unexpected argument.
+                "--restart" => match rest.get(i + 1).copied() {
+                    Some(v) if v.starts_with(RESTART_ON_FAILURE_MAX) => {
+                        restart = commands::RestartPolicy::OnFailure;
+                        restart_max = match v
+                            .strip_prefix(RESTART_ON_FAILURE_MAX)
+                            .and_then(|n| n.parse::<u32>().ok())
+                        {
+                            Some(n) => n,
+                            None => return Err(Error::Usage("--restart on-failure:<n>")),
+                        };
+                        i += 1;
+                    }
+                    Some(v) => match commands::RestartPolicy::parse(v) {
                         Some(p) => {
                             restart = p;
                             i += 1;
                         }
                         None => restart = commands::RestartPolicy::OnFailure,
-                    }
-                }
+                    },
+                    None => restart = commands::RestartPolicy::OnFailure,
+                },
                 // `--health-cmd <cmd>`: shell command run periodically in the box; exit 0 = healthy.
                 "--health-cmd" => {
                     i += 1;
@@ -5694,6 +5706,24 @@ const BOX_ONLY_FLAGS: &[&str] = &[
 /// The `box` flags written short that take a value, which the long [`VALUE_FLAGS`] do not list.
 const BOX_SHORT_VALUE_FLAGS: &[&str] = &["-e", "-l", "-m", "-p", "-v", "-w"];
 
+/// Docker's `--restart on-failure:<n>`: the prefix before the retry count.
+const RESTART_ON_FAILURE_MAX: &str = "on-failure:";
+
+/// Whether the `box` flag `flag` takes `next` as its value. Most of [`VALUE_FLAGS`] always do; two
+/// take one only when it is one, as `parse_box` reads them: `--restart` (a bare one is
+/// `on-failure`) and `--net` (a bare one, or one before another flag, shares the host's network).
+/// MEASURED before: `kern run --restart --restart-max 3 alpine sh` gave the policy `--restart-max`
+/// and ran `3` as the image.
+fn box_flag_takes(flag: &str, next: Option<&str>) -> bool {
+    match flag {
+        "--restart" => next.is_some_and(|v| {
+            v.starts_with(RESTART_ON_FAILURE_MAX) || commands::RestartPolicy::parse(v).is_some()
+        }),
+        "--net" => next.is_some_and(|v| !v.starts_with('-')),
+        _ => VALUE_FLAGS.contains(&flag) || BOX_SHORT_VALUE_FLAGS.contains(&flag),
+    }
+}
+
 /// A `kern run <word> ...` whose image is a bare word (no registry, tag or digest): the word and
 /// the whole command line, for a failed run to ask whether the word is a program of this host
 /// (`kern limit -- <word> ...`), which is what `kern run` ran before 0.57.0. Only asked on a
@@ -5742,7 +5772,7 @@ pub(crate) fn run_to_box(rest: &[&str]) -> Result<Vec<String>, Error> {
         if a.len() > 1 && a.starts_with('-') {
             argv.push(a);
             source_given |= a == "--image" || a == "--rootfs";
-            if VALUE_FLAGS.contains(&a) || BOX_SHORT_VALUE_FLAGS.contains(&a) {
+            if box_flag_takes(a, rest.get(i + 1).copied()) {
                 i += 1;
                 // A missing value is `box`'s to name, with the usage line of that flag.
                 if let Some(v) = rest.get(i) {
@@ -9432,6 +9462,87 @@ mod tests {
         ));
         // Empty command → usage error.
         assert!(matches!(parse(&["limit".into()]), Err(Error::Usage(_))));
+    }
+
+    /// A value-OPTIONAL `box` flag takes the next word only when it is one, in `kern run` as in
+    /// `kern box`: a bare `--restart` before another flag or the image eats neither, and Docker's
+    /// `on-failure:N` is `on-failure` with `--restart-max N`. MEASURED before: `kern run --restart
+    /// --restart-max 3 alpine sh` ran `3` as the image, and `--restart on-failure:3` was refused.
+    #[test]
+    fn run_and_box_read_an_optional_flag_value_alike() {
+        use commands::RestartPolicy;
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let restart_of = |a: &[&str]| match p(a) {
+            Ok((
+                _,
+                Command::BoxRun {
+                    image,
+                    command,
+                    restart,
+                    restart_max,
+                    ..
+                },
+            )) => Some((image, command, restart, restart_max)),
+            _ => None,
+        };
+        let sh = vec!["sh".to_string()];
+        let alpine = Some("alpine:3.21".to_string());
+        for argv in [
+            &[
+                "run",
+                "--restart",
+                "--restart-max",
+                "3",
+                "alpine:3.21",
+                "sh",
+            ][..],
+            &["run", "--restart", "on-failure:3", "alpine:3.21", "sh"],
+            &["run", "--restart=on-failure:3", "alpine:3.21", "sh"],
+            &[
+                "box",
+                "b",
+                "--restart",
+                "on-failure:3",
+                "--image",
+                "alpine:3.21",
+                "--",
+                "sh",
+            ],
+        ] {
+            assert_eq!(
+                restart_of(argv),
+                Some((alpine.clone(), sh.clone(), RestartPolicy::OnFailure, 3)),
+                "{argv:?}"
+            );
+        }
+        // A bare `--restart` before the image is on-failure, and the image stays the image.
+        assert_eq!(
+            restart_of(&["run", "--restart", "alpine:3.21", "sh"]),
+            Some((alpine.clone(), sh.clone(), RestartPolicy::OnFailure, 0))
+        );
+        assert_eq!(
+            restart_of(&["run", "--restart", "always", "alpine:3.21", "sh"]),
+            Some((alpine.clone(), sh.clone(), RestartPolicy::Always, 0))
+        );
+        assert!(matches!(
+            p(&["run", "--restart", "on-failure:x", "alpine:3.21"]),
+            Err(Error::Usage(_))
+        ));
+        // A bare `--net` before another flag shares the host's network and leaves that flag alone.
+        let Ok((
+            _,
+            Command::BoxRun {
+                image,
+                share_net,
+                memory,
+                ..
+            },
+        )) = p(&["run", "--net", "--memory", "64m", "alpine:3.21"])
+        else {
+            panic!("--net before another flag")
+        };
+        assert_eq!(image, alpine);
+        assert!(share_net && memory == Some(64 * 1024 * 1024));
     }
 
     /// `kern run` IS `kern box` in `docker run`'s shape: the options are box's (short ones with a

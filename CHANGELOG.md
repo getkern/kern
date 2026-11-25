@@ -97,6 +97,10 @@ API lists and inspects an ended container from kern's record, after a restart to
 container found by its label, its exit code and image). `kern ps --json` also gives a running box's
 `image`, and `docker ps` shows each container's image (it showed `<no image>` for all of them).
 
+**`--restart on-failure:N` works on `kern box` and `kern run`, as in Docker.** It is `on-failure`
+with `--restart-max N`, which is what compose's `restart: on-failure:N` already was; before, the
+command line refused it as an unexpected argument.
+
 **A `docker run --rm` whose start kern refuses ends with the error, as `docker run -d` did.** It
 hung for good (with an unreadable cache dir: killed after 25 s), because the client waits for the
 container's removal before it reports the error and the container stayed created. It is removed
