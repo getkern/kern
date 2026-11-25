@@ -29,6 +29,7 @@ use std::convert::Infallible;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// The one message for "this host won't let an unprivileged user namespace be created" - reused by
 /// every unshare site (box + pod) so they can't drift. Callers requiring a `&str` (the pod
@@ -6065,11 +6066,11 @@ const RANGE_HELPERS_FAILED: &str = "kern: --uid-range mapping via newuidmap/newg
 /// The early helper's pid and kern's end of its socket, or -1 when nothing is prepared. Two atomics
 /// rather than a lock: taking the preparation is one `swap`, so it can happen exactly once per
 /// process however the code above it is arranged.
-static EARLY_USERNS_SOCK: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-static EARLY_USERNS_HELPER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static EARLY_USERNS_SOCK: AtomicI32 = AtomicI32::new(-1);
+static EARLY_USERNS_HELPER: AtomicI32 = AtomicI32::new(-1);
 /// A helper whose namespace was taken but which had not exited yet: reaped after the box's fork,
 /// where waiting costs the box nothing, instead of on the path to it.
-static EARLY_USERNS_REAP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static EARLY_USERNS_REAP: AtomicI32 = AtomicI32::new(-1);
 
 /// The verdicts the helper sends, as the index of the one message on its socket.
 const EARLY_MAPPED: u32 = 1;
@@ -6087,7 +6088,6 @@ const EARLY_HELPERS_FAILED: u32 = 0;
 /// root (whose idmapped binds are made by the in-place helper, see `prepare_idmapped_binds`), no
 /// usable range on this host, or a `fork`/`socketpair` failure.
 pub fn prepare_id_mapped_userns_early() -> bool {
-    use std::sync::atomic::Ordering;
     if EARLY_USERNS_SOCK.load(Ordering::Acquire) >= 0 {
         return true;
     }
@@ -6273,7 +6273,6 @@ enum EarlyUserns {
 /// message can be read once: whoever reads it first gets the namespace and every other reader EOF,
 /// so a forked supervisor and its parent cannot both join it.
 fn take_early_userns() -> Option<EarlyUserns> {
-    use std::sync::atomic::Ordering;
     let sock = EARLY_USERNS_SOCK.swap(-1, Ordering::AcqRel);
     if sock < 0 {
         return None;
@@ -6300,18 +6299,18 @@ fn take_early_userns() -> Option<EarlyUserns> {
 /// Reap a helper `take_early_userns` left running. Called after the box's fork, where the wait (the
 /// helper is already past its last message) overlaps the box's own setup.
 fn reap_early_userns_helper() {
-    use std::sync::atomic::Ordering;
     let pid = EARLY_USERNS_REAP.swap(-1, Ordering::AcqRel);
     if pid > 0 {
         reap_blocking(pid);
     }
 }
 
-/// A preparation this box did not use (a pod member, no range after all, real root's idmapped
-/// binds): release it and reap its helper, so it is neither a zombie for the box's lifetime nor a
-/// namespace held for nothing.
-fn discard_early_userns() {
-    use std::sync::atomic::Ordering;
+/// Release an early preparation nobody will take: close kern's end and reap the helper, so it is
+/// neither a zombie for the box's lifetime nor a namespace held for nothing. `kill` for a process
+/// about to `execve` into something else (the scope re-exec), which must not wait the helper chain
+/// out first: the carrier dies with the helper (its `PR_SET_PDEATHSIG`), and a setuid map helper
+/// already running finishes against a namespace nobody holds and is reaped by whoever inherits it.
+fn release_early_userns(kill: bool) {
     let sock = EARLY_USERNS_SOCK.swap(-1, Ordering::AcqRel);
     if sock < 0 {
         return;
@@ -6319,27 +6318,22 @@ fn discard_early_userns() {
     unsafe { libc::close(sock) };
     let helper = EARLY_USERNS_HELPER.swap(-1, Ordering::AcqRel);
     if helper > 0 {
+        if kill {
+            unsafe { libc::kill(helper, libc::SIGKILL) };
+        }
         reap_blocking(helper);
     }
 }
 
-/// Stop an early preparation NOW, for a process about to `execve` into something else (the scope
-/// re-exec): its helper is killed rather than waited for, because the new image starts its own and
-/// would otherwise wait the whole helper chain here first. The carrier dies with the helper (its
-/// `PR_SET_PDEATHSIG`); a setuid map helper already running finishes against a namespace nobody
-/// holds and is reaped by whoever inherits it.
+/// A preparation this box did not use (a pod member, no range after all, real root's idmapped
+/// binds): waited for, since its helper is near its end by the time the box forks.
+fn discard_early_userns() {
+    release_early_userns(false);
+}
+
+/// Stop an early preparation NOW, for the scope re-exec; see [`release_early_userns`].
 pub fn abandon_id_mapped_userns_early() {
-    use std::sync::atomic::Ordering;
-    let sock = EARLY_USERNS_SOCK.swap(-1, Ordering::AcqRel);
-    if sock < 0 {
-        return;
-    }
-    unsafe { libc::close(sock) };
-    let helper = EARLY_USERNS_HELPER.swap(-1, Ordering::AcqRel);
-    if helper > 0 {
-        unsafe { libc::kill(helper, libc::SIGKILL) };
-        reap_blocking(helper);
-    }
+    release_early_userns(true);
 }
 
 /// The rows of a `/proc/self/{uid,gid}_map`, sorted, or `None` when it cannot be read or parsed.
@@ -6359,12 +6353,11 @@ fn read_id_map(path: &str) -> Option<Vec<(u64, u64, u64)>> {
 
 /// The map a ranged box must carry: box id 0 → the caller, box ids 1.. → the subordinate range.
 fn expected_id_map(own: u32, sub: u32, count: u32) -> Vec<(u64, u64, u64)> {
-    let mut rows = vec![
+    // Already in `read_id_map`'s order: sorted by the box id, 0 before 1.
+    vec![
         (0, u64::from(own), 1),
         (1, u64::from(sub), u64::from(count)),
-    ];
-    rows.sort_unstable();
-    rows
+    ]
 }
 
 /// Is the user namespace this process is now in mapped exactly as `range` says? Read from the
@@ -13519,7 +13512,7 @@ mod early_userns_tests {
         if made != 0 {
             return -1;
         }
-        EARLY_USERNS_SOCK.store(sp[0], std::sync::atomic::Ordering::Release);
+        EARLY_USERNS_SOCK.store(sp[0], Ordering::Release);
         sp[1]
     }
 
@@ -13619,7 +13612,7 @@ mod early_userns_tests {
             if userns_inode() != before {
                 return 12;
             }
-            if EARLY_USERNS_SOCK.load(std::sync::atomic::Ordering::Acquire) >= 0 {
+            if EARLY_USERNS_SOCK.load(Ordering::Acquire) >= 0 {
                 return 13; // taken once means gone
             }
             0
@@ -13747,7 +13740,7 @@ mod early_userns_tests {
             return 1;
         }
         release();
-        if EARLY_USERNS_SOCK.load(std::sync::atomic::Ordering::Acquire) >= 0 {
+        if EARLY_USERNS_SOCK.load(Ordering::Acquire) >= 0 {
             return 2;
         }
         if no_children_left() {

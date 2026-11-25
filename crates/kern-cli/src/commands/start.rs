@@ -1352,6 +1352,13 @@ struct Supervision {
     standalone_persistent: bool,
 }
 
+/// A detached box with a persistent restart policy and no pod: the one shape that may hand itself to
+/// a systemd unit instead of running here. Read by `decide_supervision` and by the early id map,
+/// which must not start work for a box this process may never run.
+fn standalone_persistent(args: &BoxRunArgs) -> bool {
+    args.detached && args.restart.persistent() && args.pod.is_none()
+}
+
 /// Decide the supervision arrangement, and refuse the one combination that would silently do nothing.
 ///
 /// A POD MEMBER with `always`/`unless-stopped` is supervised IN-PROCESS for the stack's lifetime
@@ -1366,13 +1373,6 @@ struct Supervision {
 ///
 /// The systemd probe runs ONLY for a standalone persistent box, so an ordinary box start pays no
 /// socket connect for it.
-/// A detached box with a persistent restart policy and no pod: the one shape that may hand itself to
-/// a systemd unit instead of running here. Read by `decide_supervision` and by the early id map,
-/// which must not start work for a box this process may never run.
-fn standalone_persistent(args: &BoxRunArgs) -> bool {
-    args.detached && args.restart.persistent() && args.pod.is_none()
-}
-
 fn decide_supervision(args: &BoxRunArgs) -> Result<Supervision, Error> {
     let health_action = parse_health_action(args.health_action)?;
     let restart =
