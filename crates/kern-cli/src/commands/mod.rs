@@ -242,6 +242,9 @@ pub struct BoxRunArgs<'a> {
     pub egress_allow: &'a [String],
     /// `--egress-deny`: destinations refused even when `egress_allow` covers them (deny wins).
     pub egress_deny: &'a [String],
+    /// `--egress-secret` rules as written (no value): resolved from kern's environment when the box
+    /// starts, handed to the egress proxy over a pipe (`egress::secret`).
+    pub egress_secrets: &'a [String],
     /// `--landlock-rw <path>` (repeatable): a Landlock (LSM) write-allowlist; the box root is read+exec
     /// and writes are confined to these paths (+ box scratch dirs). Empty = no Landlock. Each path must
     /// EXIST at box start (typically a `-v` volume or a dir the image ships): the box root is read-only

@@ -592,6 +592,77 @@ const LANDLOCK_REQUIRED_ENV: &str = "KERN_LANDLOCK_REQUIRED";
 /// combinations where the flag would mean nothing.
 ///
 /// See egress.rs and docs/EGRESS.md for the enforcement model and its honest limits.
+/// What a box's egress filter is built from: the lists, and the `--egress-secret` keys already read.
+/// ARMED AFRESH FOR EVERY ATTEMPT, because every attempt is a new network namespace: the foreground
+/// box arms it once; a detached box's runner arms it before each attempt, `--restart` included.
+pub(crate) struct EgressPlan {
+    allow: Vec<String>,
+    deny: Vec<String>,
+    secrets: Vec<crate::egress::SecretRule>,
+}
+
+impl EgressPlan {
+    /// `None` for a box with no egress filter. THE KEYS ARE READ HERE, from this kern's environment
+    /// or their files, and nowhere else: a rule that cannot be resolved stops the start, because a
+    /// box that was promised a key and runs without it fails later in a way that names nothing. For a
+    /// detached box this runs in the launcher, so the refusal reaches the caller's terminal.
+    fn from_args(args: &BoxRunArgs) -> Result<Option<Self>, Error> {
+        if args.egress_allow.is_empty() {
+            return Ok(None);
+        }
+        let mut secrets = Vec::with_capacity(args.egress_secrets.len());
+        for raw in args.egress_secrets {
+            let rule = crate::egress::SecretSpec::parse(raw)
+                .and_then(|spec| spec.resolve(crate::global_env))
+                .map_err(Error::Cli)?;
+            secrets.push(rule);
+        }
+        Ok(Some(Self {
+            allow: args.egress_allow.to_vec(),
+            deny: args.egress_deny.to_vec(),
+            secrets,
+        }))
+    }
+
+    /// Start the proxy and the pump. Call it in the HOST pid namespace, BEFORE `run_in_sandbox_with`
+    /// makes the box's (see the comment at the foreground site for the deadlock that placement
+    /// avoids). Fail-closed: on any failure the box simply has no outbound, and says so.
+    fn arm(&self) -> Option<crate::egress::EgressPending> {
+        match crate::egress::spawn(&self.allow, &self.deny, &self.secrets, EGRESS_PROXY_PORT) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!(
+                    "kern: warning: egress filter failed to start ({e}); the box has NO outbound"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// In a box's `on_started`: hand PID 1 to the armed filter. The filter's guard is kept in `guard`
+/// for the attempt's life. `Some(why)` when the pump never came up: PID 1 is then SIGKILLed before
+/// the workload's exec, because a box whose proxy is dead has no outbound at all, not even to the
+/// hosts it was given, and would fail with a `Connection refused` that names neither cause nor flag.
+fn deliver_egress(
+    pending: &mut Option<crate::egress::EgressPending>,
+    guard: &mut Option<crate::egress::EgressFilter>,
+    pid1: i32,
+) -> Option<String> {
+    let p = pending.take()?;
+    match p.deliver(pid1) {
+        Ok(g) => {
+            *guard = Some(g);
+            None
+        }
+        Err(e) => {
+            // SAFETY: kill with a pid this callback was handed for the box it just started.
+            unsafe { libc::kill(pid1, libc::SIGKILL) };
+            Some(e)
+        }
+    }
+}
+
 fn point_the_box_at_the_egress_proxy(
     args: &BoxRunArgs,
     env: &mut Vec<(String, String)>,
@@ -604,13 +675,6 @@ fn point_the_box_at_the_egress_proxy(
     // was silently offline.
     crate::egress::EgressPolicy::parse(args.egress_allow, args.egress_deny)
         .map_err(Error::Sandbox)?;
-    if args.detached {
-        return Err(Error::Sandbox(
-            "--egress-allow is foreground-only for now (the filter's lifetime is tied to the box); \
-             drop -d"
-                .to_string(),
-        ));
-    }
     if args.share_net || args.pod.is_some() {
         return Err(Error::Sandbox(
             "--egress-allow filters the box's OWN isolated network, so it can't combine with --net \
@@ -2974,6 +3038,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         })?;
     }
     if args.detached {
+        let egress_plan = EgressPlan::from_args(&args)?;
         return run_detached(
             &name,
             args.rm,
@@ -2995,6 +3060,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             args.image.unwrap_or(""),
             args.gpus.unwrap_or(""),
             args.pod.filter(|_| args.stack_outbound),
+            egress_plan,
         );
     }
     // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
@@ -3148,15 +3214,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // pid yet; it is delivered over a pipe in the callback below. The guard is held for the box's
     // lifetime; dropping it (after the box exits) SIGKILLs and reaps both helpers. Fail-CLOSED: on any
     // failure the box simply has no outbound.
-    let mut egress_pending: Option<crate::egress::EgressPending> = None;
-    if !args.egress_allow.is_empty() {
-        match crate::egress::spawn(args.egress_allow, args.egress_deny, EGRESS_PROXY_PORT) {
-            Ok(p) => egress_pending = Some(p),
-            Err(e) => eprintln!(
-                "kern: warning: egress filter failed to start ({e}); the box has NO outbound"
-            ),
-        }
-    }
+    let mut egress_pending = EgressPlan::from_args(&args)?
+        .as_ref()
+        .and_then(EgressPlan::arm);
     let mut egress_guard: Option<crate::egress::EgressFilter> = None;
     // Set by the PID-1 callback when the egress pump could not be confirmed listening. Checked
     // after the sandbox call returns, because the callback cannot fail the start by itself.
@@ -3202,20 +3262,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     }
                 }
             }
-            if let Some(p) = egress_pending.take() {
-                match p.deliver(pid1) {
-                    Ok(g) => egress_guard = Some(g),
-                    Err(e) => {
-                        // The in-box proxy port never came up, so this box has NO outbound access,
-                        // not even to the domains the caller allowed. Kill it here rather than let the
-                        // workload run against a dead proxy and fail with a `Connection refused` that
-                        // names neither the cause nor the flag: PID 1 is signalled before it reaches
-                        // the workload's exec, and the launcher turns the recorded message into the
-                        // box's own error.
-                        unsafe { libc::kill(pid1, libc::SIGKILL) };
-                        egress_failed = Some(e);
-                    }
-                }
+            // The launcher turns the recorded message into the box's own error.
+            if let Some(e) = deliver_egress(&mut egress_pending, &mut egress_guard, pid1) {
+                egress_failed = Some(e);
             }
             if let Some(nat) = held_nat.as_mut() {
                 nat.release(pid1);
@@ -5400,6 +5449,8 @@ fn supervise_box(
     inst: &mut registry::Instance,
     // See [`HeldNat`]: armed afresh for every attempt, because every attempt is a new namespace.
     outbound_pod: Option<&str>,
+    // The egress filter, armed afresh for every attempt for the same reason (see [`EgressPlan`]).
+    egress: Option<&EgressPlan>,
 ) {
     const DEFAULT_MAX_RESTARTS: u32 = 10;
     let max_restarts = if restart.max > 0 {
@@ -5506,6 +5557,11 @@ fn supervise_box(
                 Option<(Option<u64>, std::path::PathBuf)>,
             > = std::cell::OnceCell::new();
             let mut held_nat = outbound_pod.and_then(|p| HeldNat::arm(p, name.as_str()));
+            // HERE, IN THE RUNNER, BEFORE `run_in_sandbox_with`: the same place the foreground box
+            // arms its filter, so the helpers are this runner's children in the HOST pid namespace
+            // and never members of the box's (the placement `EgressPlan::arm` documents).
+            let mut egress_pending = egress.and_then(EgressPlan::arm);
+            let mut egress_guard: Option<crate::egress::EgressFilter> = None;
             // The exec witness: whether this attempt's workload ran, for the restart decision below.
             kern_isolation::want_exec_witness();
             let code = match run_in_sandbox_with(
@@ -5592,6 +5648,17 @@ fn supervise_box(
                     if let Some(nat) = held_nat.as_mut() {
                         nat.release(pid1);
                     }
+                    // THE PUMP NEVER CAME UP: PID 1 is already killed. Said in the box's log (this
+                    // process's stderr is the log pump, alive while the box is), and, on the first
+                    // attempt, as the readiness pipe's failure byte, so the launcher reports a box
+                    // that did not start, with this line as the reason, rather than "started".
+                    if let Some(e) = deliver_egress(&mut egress_pending, &mut egress_guard, pid1) {
+                        eprintln!("kern: {e}");
+                        if let Some(fd) = ready {
+                            // SAFETY: the readiness pipe's write end, a valid descriptor here.
+                            let _ = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
+                        }
+                    }
                     // A detached box has no terminal at all, so there is never a master to swap.
                     None
                 },
@@ -5609,6 +5676,10 @@ fn supervise_box(
                 }
             };
             drop(held_nat);
+            // This attempt is over: its proxy and pump go now. The runner leaves through `_exit`,
+            // which runs no destructor, so an implicit drop would leave both running.
+            drop(egress_guard);
+            drop(egress_pending);
             // WHY IT DIED, WHEN THE CGROUP KNOWS. A box that hit its pids cap does not say so: the
             // kernel refuses the fork or the thread with `EAGAIN` and the workload reports whatever
             // it makes of that, which is rarely the truth. MEASURED on Sentry's ClickHouse under
@@ -5977,6 +6048,8 @@ fn run_detached(
     // The stack whose network NAT this box gets at its own gate ([`HeldNat`]); `None` for every
     // other box.
     outbound_pod: Option<&str>,
+    // `--egress-allow` / `--egress-secret`, armed by the runner before every attempt.
+    egress: Option<EgressPlan>,
 ) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
@@ -6090,7 +6163,11 @@ fn run_detached(
         workdir: spec.workdir.clone().unwrap_or_default(),
         run_as: spec.run_as,
         extra_gids: spec.extra_gids.clone(),
-        egress: String::new(), // --egress-allow is foreground-only; a detached box never carries it
+        egress: match &egress {
+            None => String::new(),
+            Some(e) if e.deny.is_empty() => e.allow.join(","),
+            Some(e) => format!("{} deny {}", e.allow.join(","), e.deny.join(",")),
+        },
         bridges: registry::encode_bridges(&spec.pod_bridges),
         log_driver: if log_cap.keep {
             String::new()
@@ -6157,6 +6234,7 @@ fn run_detached(
         },
         &mut inst,
         outbound_pod,
+        egress.as_ref(),
     );
     // Box is gone - cancel the sidecars and reap them (they're our children; setsid doesn't change
     // parentage) so we don't leave brief zombies behind before this supervisor exits.

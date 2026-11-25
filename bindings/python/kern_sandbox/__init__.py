@@ -4885,6 +4885,13 @@ class Sandbox:
     #: any public host. Loopback, link-local (cloud metadata) and multicast are never reachable.
     #: Needs kern 0.52 or newer (``--egress-deny``).
     egress_deny: "Sequence[str] | None" = None
+    #: Keys the code in the box uses and never holds: each entry is kern's
+    #: ``host=H,header=N,env=VAR|file=PATH[,scheme=Bearer]``. kern's egress proxy adds the header to
+    #: the box's plain ``http://`` requests to H and sends them on as ``https://``; ``env=`` is read
+    #: from THIS process's environment, so the key stays with the caller. H joins the allowlist.
+    #: Point the client in the box at ``http://H/...`` (e.g. ``OPENAI_BASE_URL``). Needs kern with
+    #: ``--egress-secret``.
+    egress_secrets: "Sequence[str] | None" = None
     #: Box ports published on THIS host's loopback, for the resident box of a ``persist=True``
     #: sandbox and for every :meth:`kernel` box: ``ports=[8000]``, then :meth:`get_host` (or
     #: ``Kernel.get_host``) answers ``"127.0.0.1:<port kern picked>"``. Never on another address. A
@@ -4910,6 +4917,7 @@ class Sandbox:
     # and removes it at exit, as it would a temporary workspace of its own.
     _fork_owned: bool = field(default=False, init=False, repr=False)
     _egress_deny: list = field(default_factory=list, init=False, repr=False)
+    _egress_secrets: list = field(default_factory=list, init=False, repr=False)
     _label_args: list = field(default_factory=list, init=False, repr=False)
     _mount_args: list = field(default_factory=list, init=False, repr=False)
     _tmpfs_args: list = field(default_factory=list, init=False, repr=False)
@@ -5064,6 +5072,21 @@ class Sandbox:
         # A deny list alone is "any public host but these", as kern reads `--egress-deny` alone.
         if self._egress_deny and not self._egress_allow:
             self._egress_allow = ["*"]
+        # The rules as kern parses them: kern names a malformed one with the forms it takes. This
+        # layer refuses only what would not reach kern as one argument.
+        if isinstance(self.egress_secrets, str):
+            raise SandboxError(
+                "egress_secrets takes a list of rules, e.g. "
+                "['host=api.openai.com,header=Authorization,env=OPENAI_API_KEY,scheme=Bearer']"
+            )
+        self._egress_secrets = []
+        for rule in self.egress_secrets or []:
+            if not isinstance(rule, str) or not rule or rule != rule.strip() or "\n" in rule:
+                raise SandboxError(
+                    f"invalid egress_secrets rule {rule!r}: one non-empty string with no space or "
+                    "line break around it"
+                )
+            self._egress_secrets.append(rule)
         self._port_args = []
         if self.ports is not None:
             if isinstance(self.ports, (str, bytes)) or not isinstance(self.ports, Sequence):
@@ -5152,10 +5175,10 @@ class Sandbox:
                 'setup="pip install pandas matplotlib" for packages, or any one line the setup box '
                 "should run (it runs once, with the network on)"
             )
-        if self._egress_allow and self.network:
+        if (self._egress_allow or self._egress_secrets) and self.network:
             raise SandboxError(
-                "egress_allow and network=True are mutually exclusive: egress_allow gives a restricted "
-                "domain allowlist for run_code, network=True gives the full host network"
+                "egress_allow / egress_secrets and network=True are mutually exclusive: they give a "
+                "restricted allowlist for run_code, network=True gives the full host network"
             )
         self._kern = _find_kern()
         self._resident: str | None = None  # name of the adopted resident box (`persist=True`)
@@ -6201,10 +6224,13 @@ class Sandbox:
         # Network mode for THIS box. egress_allow (a domain allowlist via an isolated netns + kern's
         # filtering proxy) governs the untrusted run_code/run boxes; the setup box keeps the full network
         # it needs to install deps. egress_allow and network are mutually exclusive (checked at construct).
-        if self._egress_allow and not is_setup:
-            argv += ["--egress-allow", ",".join(self._egress_allow)]
+        if (self._egress_allow or self._egress_secrets) and not is_setup:
+            if self._egress_allow:
+                argv += ["--egress-allow", ",".join(self._egress_allow)]
             if self._egress_deny:
                 argv += ["--egress-deny", ",".join(self._egress_deny)]
+            for rule in self._egress_secrets:
+                argv += ["--egress-secret", rule]
         elif network:
             argv += ["--net"]
         # Resource profiles (vcpu:/vgpio:/vdisk:NAME) are positional tokens `kern box` resolves against the

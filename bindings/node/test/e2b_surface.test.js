@@ -143,6 +143,23 @@ test("egress entries take domains, ranges and *, and deny alone means *", () => 
     throwsWith(() => cfg(bad), says);
 });
 
+test("egress secrets reach kern as rules and never on the setup box", () => {
+  const rule = "host=api.openai.com,header=Authorization,env=OPENAI_API_KEY,scheme=Bearer";
+  const s = cfg({ egressSecrets: [rule] });
+  let argv = s._baseArgv("x", { network: false, timeoutS: 10, dry: true });
+  assert.strictEqual(argv[argv.indexOf("--egress-secret") + 1], rule);
+  assert.ok(!argv.includes("--egress-allow"), argv.join(" "));
+  const setup = s._baseArgv("x", { network: true, timeoutS: 10, dry: true, isSetup: true });
+  assert.ok(!setup.includes("--egress-secret"), setup.join(" "));
+  for (const [bad, says] of [
+    [{ egressSecrets: rule }, /array of rules/],
+    [{ egressSecrets: [" " + rule] }, /invalid egressSecrets/],
+    [{ egressSecrets: [""] }, /invalid egressSecrets/],
+    [{ egressSecrets: [rule], network: true }, /mutually exclusive/],
+  ])
+    throwsWith(() => cfg(bad), says);
+});
+
 test("egress addresses are written as Python's ipaddress writes them", () => {
   // Vectors measured with Python 3.12's `str(ipaddress.ip_network(x, strict=False))`.
   for (const [given, want] of [

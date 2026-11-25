@@ -4,9 +4,10 @@
 > implementation is worse than none: it invites a false sense of safety. This document states exactly
 > what the allowlist enforces, what it does **not**, and why.
 >
-> **Status.** The three gaps this doc originally flagged are now closed: the foreground box exits cleanly
-> (the helper is spawned in the host PID namespace, before box_run's `unshare(CLONE_NEWPID)`, so it never
-> becomes the box-pidns zombie that used to deadlock teardown); an allowlisted NAME that resolves to a
+> **Status.** The three gaps this doc originally flagged are now closed: the box exits cleanly
+> (the helper is spawned in the host PID namespace, before the box's `unshare(CLONE_NEWPID)`, so it
+> never becomes the box-pidns zombie that used to deadlock teardown; a `-d` box's runner does the
+> same before every attempt, `--restart` included); an allowlisted NAME that resolves to a
 > loopback / link-local / `169.254.169.254` / RFC-1918 IP is refused (resolved-IP SSRF guard); and only
 > ports 80/443 are tunnelled. The one hole that remains is inherent to any name-based HTTP-proxy
 > allowlist and is stated plainly below: an allowed domain on a **shared CDN** reaches every other
@@ -59,6 +60,40 @@ proxy needs. Measured with `--egress-allow example.com`:
 So a first attempt with `kern box … --image alpine --egress-allow example.com -- wget https://example.com`
 reports a failure that is not the allowlist refusing anything: it is the client. `apk add curl` in the
 image, or any of the runtimes above, and the same box reaches the allowlisted host and nothing else.
+
+## Keys the box never holds: `--egress-secret`
+
+```sh
+export OPENAI_API_KEY=sk-...        # in the shell that starts the box, not in the box
+kern box agent --image python:3.12 \
+  --egress-secret host=api.openai.com,header=Authorization,env=OPENAI_API_KEY,scheme=Bearer \
+  -e OPENAI_BASE_URL=http://api.openai.com/v1 -e OPENAI_API_KEY=unused \
+  -- python agent.py
+```
+
+The box sends plain `http://` to the host, through the proxy, without the key. The proxy drops any
+header of that name the box sent, adds the real one, and sends the request on as `https://` itself,
+through this machine's `curl`, pinned to the address it vetted under the same rules as every other
+request. The answer comes back with every verbatim copy of the key replaced by `[kern-secret]`.
+`file=/path` reads the key from a file instead of a variable; `scheme=` puts a word before it.
+
+Measured against `httpbin.org`, which echoes what it receives:
+
+| request from the box | what the box gets |
+|---|---|
+| `GET http://httpbin.org/bearer`, no key | `200`, `"authenticated": true, "token": "[kern-secret]"` |
+| the same with its own `Authorization: Bearer fake` | the upstream saw kern's key, not `fake` |
+| `POST` with a body | body and `Content-Type` arrive, key added |
+| a chunked stream (`/stream/3`) | 3 lines, as sent |
+| `CONNECT httpbin.org:443` | `403`: a host with a key is reached only through the proxy's own request |
+
+The key was not in the box's environment, in `kern inspect`, in any of the registry's files, or in
+any process's arguments; the proxy holding it is not dumpable, so another process of the same user
+cannot read its memory or environment.
+
+What it does not do: a key the upstream sends back in pieces or transformed is not recognised. A body
+sent with `Transfer-Encoding: chunked` is refused with 411, a WebSocket upgrade with 501. One rule per
+host, matched by exact name (a subdomain gets no key). The host is added to `--egress-allow`.
 
 ## How it is enforced (the enforceable part)
 

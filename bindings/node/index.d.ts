@@ -135,6 +135,10 @@ export interface SandboxOptions {
    * subdomains), addresses and ranges. Alone, every public host but these. Loopback, link-local (cloud
    * metadata) and multicast are never reachable. Needs kern 0.52 or newer (`--egress-deny`). */
   egressDeny?: string[];
+  /** Keys the code in the box uses and never holds: kern's `host=H,header=N,env=VAR|file=PATH[,scheme=Bearer]`
+   * rules. kern's egress proxy adds the header to the box's plain `http://` requests to H and sends them on
+   * as `https://`; `env=` is read from this process's environment. H joins the allowlist. */
+  egressSecrets?: string[];
   /** Labels on every box this sandbox starts (`kern box --label`): `Sandbox.list(labels)` finds
    * sandboxes by them. Not posture. Keys are letters, digits and `. _ / -` (`kern.` is reserved); a
    * value is one line. Visible to local users (process list, `kern ps`): a secret belongs in `env`. */

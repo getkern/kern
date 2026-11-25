@@ -88,6 +88,9 @@ pub enum Command {
         /// `--egress-deny d,cidr` (repeatable / comma-separated): destinations refused even when the
         /// allowlist covers them. Alone, it implies `--egress-allow '*'`.
         egress_deny: Vec<String>,
+        /// `--egress-secret host=H,header=N,env=VAR|file=PATH[,scheme=S]` (repeatable): a header
+        /// the egress proxy adds to the box's plain-HTTP requests to H. The rule, never the value.
+        egress_secret: Vec<String>,
         /// `--landlock-rw <path>` (repeatable): a Landlock write-allowlist (box RO except these paths).
         landlock_rw: Vec<String>,
         /// `--pod-bridge <ip>/<prefix>[@<n>]` (repeatable): join the pod through its bridge number
@@ -491,6 +494,8 @@ pub enum Command {
         sock: String,
         allow: String,
         deny: String,
+        /// The pipe the launcher wrote the `--egress-secret` rules into.
+        secrets_fd: Option<i32>,
     },
     /// Hidden: a build step's SSH agent proxy (spawned by `RUN --mount=type=ssh`).
     BuildSshProxy {
@@ -1280,6 +1285,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             allow: rest.get(2).map(|s| s.to_string()).unwrap_or_default(),
             // Absent from an older launcher: no deny list, the filter it asked for.
             deny: rest.get(3).map(|s| s.to_string()).unwrap_or_default(),
+            secrets_fd: rest.get(4).and_then(|s| s.parse().ok()),
         },
         Some("__egress-pump") => Command::EgressPump {
             read_fd: rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(-1),
@@ -3746,6 +3752,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--dns-search",
     "--egress-allow",
     "--egress-deny",
+    "--egress-secret",
     "--entrypoint",
     "--env",
     "--env-file",
@@ -4007,6 +4014,8 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut env: Vec<String> = Vec::new();
     let mut egress_allow: Vec<String> = Vec::new();
     let mut egress_deny: Vec<String> = Vec::new();
+    let mut egress_secret: Vec<crate::egress::SecretSpec> = Vec::new();
+    let mut egress_secret_raw: Vec<String> = Vec::new();
     let mut landlock_rw: Vec<String> = Vec::new();
     let mut net_ips: Vec<std::net::Ipv4Addr> = Vec::new();
     let mut apparmor: Option<String> = None;
@@ -4764,6 +4773,24 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         );
                     }
                 }
+                // READ NOW, RESOLVED AT THE START: a mistyped rule stops the command here, and the
+                // value is read from kern's environment only when the box starts.
+                "--egress-secret" => {
+                    i += 1;
+                    let v = rest
+                        .get(i)
+                        .copied()
+                        .ok_or(Error::Usage(crate::egress::SECRET_USAGE))?;
+                    let spec = crate::egress::SecretSpec::parse(v).map_err(Error::Cli)?;
+                    if egress_secret.iter().any(|s| s.host == spec.host) {
+                        return Err(Error::Cli(format!(
+                            "--egress-secret: {} has a rule already; one key per host",
+                            spec.host
+                        )));
+                    }
+                    egress_secret.push(spec);
+                    egress_secret_raw.push(v.to_string());
+                }
                 "--egress-deny" => {
                     i += 1;
                     match rest.get(i) {
@@ -5246,6 +5273,13 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
         if !egress_deny.is_empty() && egress_allow.is_empty() {
             egress_allow.push("*".to_string());
         }
+        // A host with a key is a host the box may reach: added AFTER the line above, so a deny list
+        // alone keeps meaning "everything public but these".
+        for s in &egress_secret {
+            if !egress_allow.iter().any(|a| a == &s.host) {
+                egress_allow.push(s.host.clone());
+            }
+        }
         Command::BoxRun {
             rm,
             // The name is optional (Docker-style): omit it and kern assigns `box-<pid>`, so a quick
@@ -5265,6 +5299,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             env,
             egress_allow,
             egress_deny,
+            egress_secret: egress_secret_raw,
             landlock_rw,
             net_ips,
             pod_bridges,
@@ -5407,6 +5442,7 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     "--device",
     "--egress-allow",
     "--egress-deny",
+    "--egress-secret",
     // `--landlock-rw` is deliberately NOT here: it is the one confinement that needs no mount
     // namespace, so it is the one `box` flag that `run` can honour for real. See `parse_run`.
 ];
@@ -6418,6 +6454,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env,
             egress_allow,
             egress_deny,
+            egress_secret,
             landlock_rw,
             net_ips,
             pod_bridges,
@@ -6525,6 +6562,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 env: &env,
                 egress_allow: &egress_allow,
                 egress_deny: &egress_deny,
+                egress_secrets: &egress_secret,
                 landlock_rw: &landlock_rw,
                 net_ips: &net_ips,
                 pod_bridges: pod_bridges.clone(),
@@ -6744,9 +6782,12 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             rel,
             recursive,
         } => crate::dirwatch::run(&root, &rel, recursive),
-        Command::EgressProxy { sock, allow, deny } => {
-            crate::egress::proxy_reexec(&sock, &allow, &deny)
-        }
+        Command::EgressProxy {
+            sock,
+            allow,
+            deny,
+            secrets_fd,
+        } => crate::egress::proxy_reexec(&sock, &allow, &deny, secrets_fd),
         Command::BuildSshProxy { listen, upstream } => {
             commands::ssh_agent_proxy(&listen, &upstream)
         }

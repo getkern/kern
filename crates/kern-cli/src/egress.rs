@@ -16,6 +16,9 @@
 //! This module's SECURITY CORE is pure and unit-tested: `host_allowed` (exact domain or subdomain, no
 //! substring tricks) and the request parsers. The socket plumbing is a thin byte pump around them.
 
+mod secret;
+pub use secret::{SecretRule, SecretSpec, USAGE as SECRET_USAGE};
+
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd; // for File::from_raw_fd (the pid-delivery pipe)
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -317,6 +320,24 @@ fn connect_vetted(
     port: u16,
     policy: &EgressPolicy,
 ) -> std::io::Result<std::net::TcpStream> {
+    // Every resolved address is public; connect to the first that accepts.
+    let mut last = std::io::Error::other("no address connected");
+    for addr in vetted_addrs(host, port, policy)? {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// The addresses `host:port` resolves to, ONLY if every one of them is open under `policy` (see
+/// [`connect_vetted`], which dials them; `--egress-secret` pins curl to the first).
+fn vetted_addrs(
+    host: &str,
+    port: u16,
+    policy: &EgressPolicy,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
     let literal = host
         .trim_start_matches('[')
@@ -342,15 +363,7 @@ fn connect_vetted(
             ),
         ));
     }
-    // Every resolved address is public; connect to the first that accepts.
-    let mut last = std::io::Error::other("no address connected");
-    for addr in addrs {
-        match std::net::TcpStream::connect(addr) {
-            Ok(s) => return Ok(s),
-            Err(e) => last = e,
-        }
-    }
-    Err(last)
+    Ok(addrs)
 }
 
 /// Is `ip` a routable public unicast address? Rejects loopback, link-local (incl. IPv4 `169.254/16`, the
@@ -512,6 +525,7 @@ fn helper_pre_exec() -> std::io::Result<()> {
 pub fn spawn_proxy(
     allow: &[String],
     deny: &[String],
+    secrets: &[SecretRule],
 ) -> Result<(std::process::Child, std::path::PathBuf), String> {
     // Validate every entry BEFORE flattening to the CSV argv: a domain containing a comma / space /
     // control char would otherwise split silently in the re-exec, producing phantom or truncated
@@ -531,10 +545,58 @@ pub fn spawn_proxy(
         .arg(deny_csv)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
-    unsafe { cmd.pre_exec(helper_pre_exec) };
-    let proxy = cmd
-        .spawn()
-        .map_err(|e| format!("egress: spawn proxy: {e}"))?;
+    // THE SECRETS RIDE A PIPE, NEVER AN ARGV: written in full before the spawn (they fit a pipe:
+    // a rule is at most a domain, a header name and 8 KiB twice), the write end closed, the read
+    // end's number on the proxy's argv. Its close-on-exec flag is cleared in the child alone.
+    let secrets_fd = if secrets.is_empty() {
+        None
+    } else {
+        let bytes = secret::encode(secrets);
+        if bytes.len() > 60 * 1024 {
+            return Err("egress: the --egress-secret rules are larger than 60 KiB".to_string());
+        }
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe2 into a local array of two descriptors.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(format!("egress: pipe: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: the write end just created, owned here alone; dropping the File closes it.
+        let mut w = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        if let Err(e) = w.write_all(&bytes) {
+            // SAFETY: the read end created above.
+            unsafe { libc::close(fds[0]) };
+            return Err(format!("egress: handing the secrets over: {e}"));
+        }
+        drop(w);
+        cmd.arg(fds[0].to_string());
+        Some(fds[0])
+    };
+    match secrets_fd {
+        None => unsafe { cmd.pre_exec(helper_pre_exec) },
+        Some(fd) => unsafe {
+            cmd.pre_exec(move || {
+                kern_isolation::shed_inherited_fds_keeping(&[fd]);
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::setsid();
+                libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
+                Ok(())
+            })
+        },
+    };
+    let spawned = cmd.spawn();
+    if let Some(fd) = secrets_fd {
+        // SAFETY: the launcher's copy of the read end; the proxy holds its own.
+        unsafe { libc::close(fd) };
+    }
+    let proxy = spawned.map_err(|e| format!("egress: spawn proxy: {e}"))?;
     // Wait briefly for the proxy to bind, so the box's first request doesn't race it. Poll at 1 ms (not
     // 10 ms) granularity: the proxy usually binds in 1-3 ms, and a coarse 10 ms sleep added ~10 ms of dead
     // time to EVERY egress box start (a real bottleneck when a fleet spins many). Same ~2 s total ceiling.
@@ -563,8 +625,13 @@ pub fn spawn_proxy(
 /// re-exec, so a CLOEXEC pipe fd would not survive its `execve`; the read end is therefore left
 /// non-CLOEXEC and box_run closes its own copy right after the spawn so the box (forked later) can never
 /// inherit it.
-pub fn spawn(allow: &[String], deny: &[String], box_port: u16) -> Result<EgressPending, String> {
-    let (proxy, sock_path) = spawn_proxy(allow, deny)?;
+pub fn spawn(
+    allow: &[String],
+    deny: &[String],
+    secrets: &[SecretRule],
+    box_port: u16,
+) -> Result<EgressPending, String> {
+    let (proxy, sock_path) = spawn_proxy(allow, deny, secrets)?;
 
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), 0) } != 0 {
@@ -687,8 +754,38 @@ pub fn pump_reexec(read_fd: i32, box_port: u16, sock_path: &str, ready_fd: i32) 
 
 /// Entry point for the re-exec'd filtering proxy (`kern __egress-proxy <sock_path> <allow-csv>`). Binds
 /// the UNIX socket and runs the proxy loop with a fresh libc (so `getaddrinfo` works). Never returns.
-pub fn proxy_reexec(sock_path: &str, allow_csv: &str, deny_csv: &str) -> ! {
+pub fn proxy_reexec(
+    sock_path: &str,
+    allow_csv: &str,
+    deny_csv: &str,
+    secrets_fd: Option<i32>,
+) -> ! {
     drop_signals();
+    // FAIL CLOSED ON THE SECRETS TOO: a pipe that does not decode is not served as "no rules",
+    // which would send the box's requests without the keys it was promised and say nothing.
+    let secrets = match secrets_fd {
+        None => Vec::new(),
+        Some(fd) => {
+            // SAFETY: the descriptor the launcher handed over, read once and closed by the File.
+            let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+            let mut bytes = Vec::new();
+            let read = f.read_to_end(&mut bytes);
+            match read.ok().and_then(|_| secret::decode(&bytes)) {
+                Some(r) => r,
+                None => {
+                    eprintln!("kern: egress proxy: the --egress-secret rules did not arrive whole");
+                    unsafe { libc::_exit(1) };
+                }
+            }
+        }
+    };
+    if !secrets.is_empty() {
+        // Not dumpable: no core file and no same-user ptrace or /proc/<pid>/mem of a process that
+        // holds keys. The box cannot name this process (another pid namespace); this closes it to
+        // the rest of the machine's same-user processes too.
+        // SAFETY: prctl with integer arguments.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    }
     let _ = std::fs::remove_file(sock_path);
     let listener = match UnixListener::bind(sock_path) {
         Ok(l) => l,
@@ -721,7 +818,7 @@ pub fn proxy_reexec(sock_path: &str, allow_csv: &str, deny_csv: &str) -> ! {
             unsafe { libc::_exit(1) };
         }
     };
-    proxy_main(listener, policy);
+    proxy_main(listener, policy, secrets);
 }
 
 fn drop_signals() {
@@ -730,21 +827,21 @@ fn drop_signals() {
 
 /// The filtering proxy: accept a UNIX connection (relayed from the box by the pump), read the request
 /// head, decide via `host_allowed`, and either dial the target and pump bytes, or refuse.
-fn proxy_main(listener: UnixListener, policy: EgressPolicy) -> ! {
+fn proxy_main(listener: UnixListener, policy: EgressPolicy, secrets: Vec<SecretRule>) -> ! {
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
         // one child per connection (cheap; keeps a slow/hostile client from blocking others)
         let c = unsafe { libc::fork() };
         if c == 0 {
             drop_signals();
-            handle_client(stream, &policy);
+            handle_client(stream, &policy, &secrets);
             unsafe { libc::_exit(0) };
         }
     }
     unsafe { libc::_exit(0) }
 }
 
-fn handle_client(mut client: UnixStream, policy: &EgressPolicy) {
+fn handle_client(mut client: UnixStream, policy: &EgressPolicy, secrets: &[SecretRule]) {
     // Read the request head (up to the blank line), bounded on BOTH size and time so a client that
     // connects and then dribbles (or goes silent) can't pin this per-connection proxy child: the 16 KiB
     // cap stops unbounded buffering, the per-read timeout kills a silent peer, and the wall-clock deadline
@@ -805,6 +902,11 @@ fn handle_client(mut client: UnixStream, policy: &EgressPolicy) {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
         }
+        // A host with a key kern adds is reached through the proxy's own request, never a tunnel.
+        if secret::rule_for(secrets, &host).is_some() {
+            secret::refuse_connect(&mut client);
+            return;
+        }
         let upstream = match connect_vetted(&host, port, policy) {
             Ok(u) => u,
             Err(e) => {
@@ -839,6 +941,10 @@ fn handle_client(mut client: UnixStream, policy: &EgressPolicy) {
         // log line has a channel.
         if !http_head_names_one_host(&host, headers) {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+            return;
+        }
+        if let Some(rule) = secret::rule_for(secrets, &host) {
+            secret::serve(client, request_line, headers, &host, port, rule, policy);
             return;
         }
         let mut upstream = match connect_vetted(&host, port, policy) {

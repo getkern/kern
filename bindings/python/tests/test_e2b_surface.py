@@ -246,6 +246,28 @@ def test_egress_entries_take_domains_ranges_and_star_and_deny_alone_means_star()
             _cfg(**bad)
 
 
+def test_egress_secrets_reach_kern_as_rules_and_never_on_the_setup_box():
+    rule = "host=api.openai.com,header=Authorization,env=OPENAI_API_KEY,scheme=Bearer"
+    s = _cfg(egress_secrets=[rule])
+    argv = s._base_argv("x", network=False, timeout_s=10, dry=True)
+    assert argv[argv.index("--egress-secret") + 1] == rule
+    # The rule alone gives the box outbound to its host (kern adds it): no allowlist flag invented.
+    assert "--egress-allow" not in argv
+    setup = s._base_argv("x", network=True, timeout_s=10, dry=True, is_setup=True)
+    assert "--egress-secret" not in setup
+    both = _cfg(egress_allow=["pypi.org"], egress_secrets=[rule])
+    argv = both._base_argv("x", network=False, timeout_s=10, dry=True)
+    assert argv[argv.index("--egress-allow") + 1] == "pypi.org" and "--egress-secret" in argv
+    for bad, says in [
+        ({"egress_secrets": rule}, "list of rules"),
+        ({"egress_secrets": [" " + rule]}, "invalid egress_secrets"),
+        ({"egress_secrets": [""]}, "invalid egress_secrets"),
+        ({"egress_secrets": [rule], "network": True}, "mutually exclusive"),
+    ]:
+        with pytest.raises(SandboxError, match=says):
+            _cfg(**bad)
+
+
 _EGRESS_PROBE = """
 import urllib.request, ssl
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE

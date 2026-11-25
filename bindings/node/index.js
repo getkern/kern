@@ -4421,6 +4421,11 @@ class Sandbox {
     // Destinations refused even when `egressAllow` covers them (deny wins); alone, every public host but
     // these. Needs kern 0.52 or newer (`--egress-deny`).
     this.egressDeny = opts.egressDeny ?? null;
+    // Keys the code in the box uses and never holds: each entry is kern's
+    // `host=H,header=N,env=VAR|file=PATH[,scheme=Bearer]`. kern's egress proxy adds the header to the
+    // box's plain `http://` requests to H and sends them on as `https://`; `env=` is read from THIS
+    // process's environment. H joins the allowlist. Needs kern with `--egress-secret`.
+    this.egressSecrets = opts.egressSecrets ?? null;
     // Box ports published on THIS host's loopback, for the resident box of a `persist` sandbox and for
     // every kernel() box; `getHost(port)` answers the address. A one-shot call publishes nothing.
     this.ports = opts.ports ?? null;
@@ -4580,6 +4585,19 @@ class Sandbox {
     this._egressDeny = (this.egressDeny || []).map((d) => validateEgressEntry(d, false));
     // A deny list alone is "any public host but these", as kern reads `--egress-deny` alone.
     if (this._egressDeny.length && !this._egressAllow.length) this._egressAllow = ["*"];
+    // The rules as kern parses them: kern names a malformed one with the forms it takes. This layer
+    // refuses only what would not reach kern as one argument.
+    if (this.egressSecrets !== null && !Array.isArray(this.egressSecrets))
+      throw new SandboxError(
+        'egressSecrets takes an array of rules, e.g. ["host=api.openai.com,header=Authorization,env=OPENAI_API_KEY,scheme=Bearer"]',
+      );
+    this._egressSecrets = (this.egressSecrets || []).map((rule) => {
+      if (typeof rule !== "string" || !rule || rule !== rule.trim() || rule.includes("\n"))
+        throw new SandboxError(
+          `invalid egressSecrets rule ${JSON.stringify(rule)}: one non-empty string with no space or line break around it`,
+        );
+      return rule;
+    });
     this._portArgs = [];
     if (this.ports !== null) {
       if (!Array.isArray(this.ports)) throw new SandboxError("ports takes an array of box ports, e.g. [8000]");
@@ -4614,9 +4632,9 @@ class Sandbox {
     // uid that account writes as, learned in open(). null for box root, which is free.
     this._asUser = null;
     this._userHostUid = null;
-    if (this._egressAllow.length && this.network)
+    if ((this._egressAllow.length || this._egressSecrets.length) && this.network)
       throw new SandboxError(
-        "egressAllow and network:true are mutually exclusive: egressAllow gives a restricted domain " +
+        "egressAllow / egressSecrets and network:true are mutually exclusive: they give a restricted " +
           "allowlist for runCode, network:true gives the full host network",
       );
     this._kern = findKern();
@@ -5597,9 +5615,10 @@ class Sandbox {
     // Network mode: egressAllow (a domain allowlist via an isolated netns + kern's filtering proxy)
     // governs the untrusted runCode/run boxes; the setup box keeps the full network it needs to install
     // deps. egressAllow and network are mutually exclusive (checked at construction).
-    if (this._egressAllow.length && !isSetup) {
-      argv.push("--egress-allow", this._egressAllow.join(","));
+    if ((this._egressAllow.length || this._egressSecrets.length) && !isSetup) {
+      if (this._egressAllow.length) argv.push("--egress-allow", this._egressAllow.join(","));
       if (this._egressDeny.length) argv.push("--egress-deny", this._egressDeny.join(","));
+      for (const rule of this._egressSecrets) argv.push("--egress-secret", rule);
     } else if (network) argv.push("--net");
     // Resource profiles (vcpu:/vgpio:/vdisk:NAME): positional tokens `kern box` resolves against the
     // user's kern.toml. Validated at construction, so nothing here can be a smuggled flag.
