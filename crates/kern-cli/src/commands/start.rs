@@ -3309,6 +3309,22 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             !log_none,
         )
     };
+    // A CONFIG THAT CANNOT BE READ AND SAYS WHERE THE DATA GOES stops the box: see
+    // `config::unread_data_place`.
+    if let Some(why) = crate::config::unread_data_place() {
+        return Err(Error::Config(why));
+    }
+    // A DETACHED BOX WHOSE LOG CANNOT BE MADE DOES NOT START. Its output would go nowhere: MEASURED,
+    // with the logs dir a file the box started (exit 0), its lines were lost, and only a later
+    // `kern logs` said "File exists".
+    if args.detached && log_cap.keep {
+        if let Err(e) = registry::logs_dir() {
+            return Err(Error::Sandbox(format!(
+                "the logs directory cannot be used ({e}), so a detached box's output would be lost; \
+                 fix it (`kern info` names it) or start the box with --log-driver none"
+            )));
+        }
+    }
     // A FOREGROUND BOX KEEPS NO LOG, journald included: its output is the terminal's, which is why
     // `json-file` makes no file for it either. MEASURED: `kern run --rm --log-driver journald ...`
     // printed its lines and the journal had none, the flag accepted and doing nothing. Said, on a

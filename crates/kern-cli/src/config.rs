@@ -505,6 +505,32 @@ pub(crate) fn data_dir() -> Option<std::path::PathBuf> {
     load_cached(None).ok()?.kern.data_dir.clone()
 }
 
+/// When the active `kern.toml` does not parse AND names a place for kern's data (one of
+/// [`DIR_KEYS`]), the sentence to refuse with: read, kern would put the data in the default place
+/// and stop treating the place the file names as its own (a `volumes_dir` elsewhere would become
+/// mountable). FAILS CLOSED where the file decides where data goes, and only there: a file that is
+/// unreadable for any other key keeps the defaults it always did. MEASURED by an external round: a
+/// duplicate `data_dir` line sent a box's data to `~/.local/share/kern` with no word about it.
+pub(crate) fn unread_data_place() -> Option<String> {
+    let err = load_cached(None).err()?;
+    let path = active_path()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let names_a_place = raw.lines().any(|l| {
+        let t = l.trim_start();
+        DIR_KEYS
+            .iter()
+            .any(|(k, _)| t.strip_prefix(k).is_some_and(|r| r.trim_start().starts_with('=')))
+    });
+    names_a_place.then(|| {
+        format!(
+            "{err}. That file sets where kern keeps its data, and unread kern would use the default \
+             place instead (and stop treating the one it names as kern's own); fix it first \
+             (`kern validate {}`)",
+            path.display()
+        )
+    })
+}
+
 /// One of the [`DIR_KEYS`] as the active config sets it; `None` when unset or unreadable.
 pub(crate) fn dir_setting(key: &str) -> Option<std::path::PathBuf> {
     let c = load_cached(None).ok()?;
@@ -3517,6 +3543,28 @@ mod tests {
             refused_parent.is_some(),
             "and so must a directory that contains it"
         );
+    }
+
+    /// AN UNREAD CONFIG THAT SAYS WHERE THE DATA GOES FAILS CLOSED; one unread for another key does not.
+    #[test]
+    fn an_unreadable_config_naming_a_data_place_is_named_and_others_are_not() {
+        let _g = crate::env_guard();
+        let d = std::env::temp_dir().join(format!("kern-unread-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let f = d.join("kern.toml");
+        crate::set_global_env("KERN_CONFIG", &f);
+        let mut check = |body: &str| {
+            std::fs::write(&f, body).expect("write");
+            forget_cached();
+            unread_data_place()
+        };
+        assert!(check("[kern]\ndata_dir = \"/a\"\ndata_dir = \"/b\"\n").is_some());
+        assert!(check("[kern]\nlogs_dir = \"/a\"\nlog_max_size = \"zz\"\n").is_some());
+        assert!(check("[kern]\nlog_max_size = \"zz\"\n").is_none(), "no place named: defaults as before");
+        assert!(check("[kern]\ndata_dir = \"/a\"\n").is_none(), "read fine: nothing to refuse");
+        crate::unset_global_env("KERN_CONFIG");
+        forget_cached();
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Every key that places a part of kern's data takes an absolute plain path, as data_dir does.

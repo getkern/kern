@@ -724,6 +724,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
 /// `volume create`: the volume made, its name returned for the caller to print (the CLI does, as
 /// Docker does; `compose up` does not, its own output says what it brought up).
 fn create(args: &[String]) -> Result<String, Error> {
+    if let Some(why) = crate::config::unread_data_place() {
+        return Err(Error::Volume(why));
+    }
     let (mut name, mut size): (Option<&str>, Option<u64>) = (None, None);
     let mut path: Option<String> = None;
     // The `--name=` form owns its string (it is a slice of one argument, not an argument), so it is
