@@ -442,6 +442,24 @@ refused by name before the box starts. `/dev/net/tun` maps to `--tun` instead.
 **Secrets are delivered at `/run/secrets/<source>`**, mode `0444` or the `mode:` declared. `target:`,
 `uid:` and `gid:` are read and named as not applied.
 
+**A box's gateway is not the host.** Under Docker `172.17.0.1` reaches a service the host serves on
+every interface; a kern box's gateway (`10.0.2.2`) reaches nothing on the host. The host is reached
+at its own address, or by `host-gateway` (see [Reaching the host](#reaching-the-host-from-inside-a-box-hostdockerinternal)).
+Measured with canaries: a service on every interface answered on the host's LAN address and on
+`host-gateway` under both engines; one on `127.0.0.1` answered neither.
+
+**A hard `ulimit` above what the host allows is applied at that ceiling, and said.** A rootless box
+cannot raise a hard limit, so `ulimits: nofile: 9999999` runs with the most the host gives (1048576
+here) and kern prints a warning, through its socket too (`docker run` prints it). Docker refuses the
+value and the container does not start.
+
+**`ptrace` stays denied.** `strace` and `gdb` inside a box fail with `Operation not permitted`, where
+Docker allows ptrace on kernels from 4.8.
+
+**Through kern's socket a container is on one network.** A `docker compose` service on two networks
+is refused by name; `kern compose` runs the same file. `docker pull --platform` keeps one entry per
+platform where Docker moves the tag, so `docker run` without `--platform` runs this machine's image.
+
 ## What is refused rather than dropped
 
 **A relative path that leaves the compose file's own directory.** Docker accepts `build:
