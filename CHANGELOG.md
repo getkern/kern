@@ -59,6 +59,10 @@ the first time, from the manifest and a config of a few KB, 2 ms after). `kern h
 which dropped the name and printed the last boxes run, refuses the name and points at
 `kern image history`; `kern history [-n N]` is unchanged.
 
+**`kern build -q` is quiet on a terminal.** It drew the whole live view and printed every
+`RUN`'s output; it is now `--progress quiet`, as without a terminal: the `built` line, and on a
+failure the build's last lines and the error.
+
 **`kern ps` no longer calls a renamed box lost.** After `kern rename r r2`, `ps` warned that a box
 `r` was running with no record, about the box it listed as `r2`: the cgroup directory and the
 supervisor's command line keep the name a box started with. A box is now recognised by the cgroup

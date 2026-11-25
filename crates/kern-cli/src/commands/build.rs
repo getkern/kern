@@ -526,6 +526,14 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
     let tag = args.tag.unwrap_or_default().to_string();
     let started = std::time::Instant::now();
     step_clock::begin(&tag);
+    // `-q` IS `--progress quiet`, one rule and not a second copy of it: the result line, and on a
+    // failure the build's last lines. MEASURED in the field (kern 0.56.0): `kern build -q` on a
+    // terminal drew the whole live view and printed every RUN's output. Not over `json`, the
+    // stream `compose` reads.
+    if args.quiet && kern_common::progress_mode() != kern_common::ProgressMode::Json {
+        kern_common::set_progress_mode(kern_common::ProgressMode::Quiet);
+        crate::set_global_env("KERN_PROGRESS", kern_common::ProgressMode::Quiet.word());
+    }
     // THE SAME LIVE VIEW `compose up` DRAWS, for a build on its own on a terminal: one row for the
     // image, the step it is on and how long that step took last time; what the RUNs print goes above
     // it. Not under `compose`, which starts its builds with `--progress json` and draws them itself.
