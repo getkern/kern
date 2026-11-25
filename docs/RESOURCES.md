@@ -175,7 +175,20 @@ kern box w --image alpine -v data:/out -- sh -c 'echo hello > /out/note.txt'
 kern box r --image alpine -v data:/out -- cat /out/note.txt      # → hello
 ```
 
-They live under `~/.local/share/kern/volumes/`, and `kern top` → Storage tab manages them.
+They live under `~/.local/share/kern/volumes/` (or where `volumes_dir` says, see
+[CONFIG.md](CONFIG.md#where-kern-keeps-its-data-and-each-part)), and `kern top` → Storage tab
+manages them.
+
+One volume can keep its files in a directory of your choosing, on any disk:
+
+```sh
+kern volume create media --path /mnt/ssd2/media
+kern volume create media --driver local --opt type=none --opt o=bind --opt device=/mnt/ssd2/media  # Docker's spelling
+```
+
+The box mounts that directory, checked at every mount as a `-v` path is (never inside kern's own state);
+`kern volume ls` shows `at <dir>`, and `kern volume rm` removes the volume and leaves the files where they
+are, as Docker does. Such a volume has no kern quota.
 
 `kern volume create cache --size 2g` gives one a quota. The quota is **enforced** only when a
 **privileged, foreground** box mounts it, where kern backs the volume with a real ext4-on-loop image.

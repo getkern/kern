@@ -117,7 +117,7 @@ code, outcome, GPU; never the output), which `kern sandbox history` and the Sand
 | value | where | kept |
 |---|---|---|
 | `"memory"` (the default) | `$XDG_RUNTIME_DIR/kern/history/` | until reboot |
-| `"disk"` | `$XDG_DATA_HOME/kern/history/` | across reboots |
+| `"disk"` | `$XDG_DATA_HOME/kern/history/` (or `history_dir`) | across reboots |
 | `"off"` | nothing new is written | |
 
 `kern sandbox keep disk` (or `m` in the Sandboxes tab) writes this key and moves the lines already
@@ -125,7 +125,7 @@ kept to the new place; `kern sandbox keep` and `kern info` say where they are an
 and `kern sandbox clear` removes them. Each place holds about 33,000 lines, after which the oldest go.
 Neither directory can be mounted into a box.
 
-### Where kern keeps its data: `data_dir`
+### Where kern keeps its data, and each part
 
 ```sh
 kern config set data_dir /media/sd/kern
@@ -133,18 +133,39 @@ kern config set data_dir /media/sd/kern
 
 Volumes, kept boxes, builds, the sandbox history kept on disk, the local CA and bench results go in
 that directory, and the images in its `cache/`, instead of `~/.local/share/kern` and `~/.cache/kern`.
-For a second disk, an SD card, a larger partition. `kern info` says where they are (`data dir`), and
-`kern config unset data_dir` puts them back.
+For a second disk, an SD card, a larger partition. `kern config unset data_dir` puts them back.
+
+A part can have a disk of its own, ahead of `data_dir`:
+
+| Key | What | Default |
+|---|---|---|
+| `images_dir` | images and their layers | `data_dir`'s `cache/`, or `~/.cache/kern` |
+| `volumes_dir` | named volumes | `data_dir`'s `volumes/` |
+| `logs_dir` | box logs, then kept across reboots | the runtime directory, in memory |
+| `history_dir` | the sandbox history kept on disk | `data_dir`'s `history/` |
+
+```sh
+kern config set images_dir  /mnt/nvme2/kern-images
+kern config set volumes_dir /mnt/ssd3/kern-volumes
+kern config set logs_dir    /mnt/hdd/kern-logs
+```
+
+`kern info` says where each part is and why (`data dir`, `images`, `volumes`, `box logs`, `sandbox
+history`). In `kern top`, the Storage tab shows the same, and `m` moves a part: choose which, then the
+disk (the mounted disks are listed with their free space and what a disk would need, a FAT or exFAT
+card to be formatted, a mount you cannot write to its `sudo mkdir`), or type a path. One volume can
+also be put anywhere with `kern volume create <name> --path <dir>` ([RESOURCES.md](RESOURCES.md)).
 
 `set` makes the directory private (0700) and checks it before it writes the key: it must be yours and
 writable by nobody else, and it must keep file modes and symlinks, which image layers and kept boxes
 need. It tries both on the directory itself, so a card formatted FAT or exFAT, as most arrive, is
-refused with what failed; format it ext4. It is refused while a box runs, because that box keeps
-writing to the old place.
+refused with what failed; format it ext4. A place inside kern's runtime directory or its config is
+refused before anything is made. A change is refused while a box runs, because that box keeps writing
+to the old place.
 
-What is at the old place stays there: `set` says what it holds and prints the `mv` that moves it,
-with no box running. kern does not move it on its own, as Docker does not move its `data-root`. The
-new directory, like the old, cannot be mounted into a box.
+What is at the old place stays there: `set` (and `kern top`) says what it holds and prints the `mv`
+that moves it, with no box running. kern does not move it on its own, as Docker does not move its
+`data-root`. The volumes and the history, wherever they are, cannot be mounted into a box.
 
 ### Local names for compose services
 
