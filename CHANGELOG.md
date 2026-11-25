@@ -87,7 +87,8 @@ was installed but didn't start": systemd holds such a unit in `activating` betwe
 check read as a failure, and it left the unit behind, so the box came back after every `kern rm
 -f`. The start is judged by systemd's state, a unit that did not come up is removed, `kern rm` of a
 restarting box refuses without `-f` as Docker's does, and `kern rm -f` stops it for good. Between
-two runs it lists as `restarting`, with systemd's count of its restarts. A kept one (every container
+two runs it lists as `restarting`, with systemd's count of its restarts, and `kern ps --filter
+status=restarting` finds it. A kept one (every container
 made through kern's socket) starts at once: the launcher held its layer, so the unit's first run
 failed and ran a second later, and `docker run -d --restart always` took 1.4 s with a restart counted
 that never happened (now about 190 ms and 0).
