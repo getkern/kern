@@ -2709,6 +2709,302 @@ pub(crate) fn image_load(
     }
 }
 
+/// A build's context directory under kern's CACHE (on disk: a context can be large, and the runtime
+/// directory is RAM), removed when the build is done whatever it did.
+struct BuildDir(std::path::PathBuf);
+
+impl Drop for BuildDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A `dockerfile` the API names, as a path INSIDE the context: relative, and never climbing out.
+fn dockerfile_in_context(p: &str) -> Option<&str> {
+    let p = p.trim_start_matches("./");
+    let ok = !p.is_empty()
+        && !p.starts_with('/')
+        && std::path::Path::new(p)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    ok.then_some(p)
+}
+
+/// The `kern build` argv of a `POST /build`'s query, or the refusal a client reads. PURE.
+fn build_argv(req: &Request, ctx: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let tags: Vec<String> = req
+        .query
+        .iter()
+        .filter(|(k, v)| k == "t" && !v.is_empty())
+        .map(|(_, v)| v.clone())
+        .collect();
+    if tags.is_empty() {
+        return Err("kern builds a named image: give it one (`docker build -t <name>`)".into());
+    }
+    if req.param("remote").is_some_and(|r| !r.is_empty()) {
+        return Err("a remote build context (a URL) is not fetched by kern's Docker API:                     clone it and build the directory"
+            .into());
+    }
+    let file = req
+        .param("dockerfile")
+        .filter(|f| !f.is_empty())
+        .unwrap_or("Dockerfile");
+    let Some(file) = dockerfile_in_context(file) else {
+        return Err(format!(
+            "dockerfile {file:?}: a path inside the build context"
+        ));
+    };
+    let mut argv = vec!["build".to_string(), "--progress".into(), "plain".into()];
+    for t in &tags {
+        argv.extend(["-t".to_string(), t.clone()]);
+    }
+    argv.extend(["-f".to_string(), format!("{ctx}/{file}")]);
+    if let Some(raw) = req.param("buildargs").filter(|b| !b.is_empty()) {
+        let parsed = json::parse(raw).map_err(|e| format!("buildargs: {e}"))?;
+        if let Some(obj) = parsed.as_object() {
+            for (k, v) in obj {
+                let arg = match v.as_str() {
+                    Some(v) => format!("{k}={v}"),
+                    None => k.clone(),
+                };
+                argv.extend(["--build-arg".to_string(), arg]);
+            }
+        }
+    }
+    if let Some(t) = req.param("target").filter(|t| !t.is_empty()) {
+        argv.extend(["--target".to_string(), t.to_string()]);
+    }
+    if let Some(p) = req.param("platform").filter(|p| !p.is_empty()) {
+        argv.extend(["--platform".to_string(), p.to_string()]);
+    }
+    if req.flag("nocache") {
+        argv.push("--no-cache".into());
+    }
+    argv.push(ctx.to_string());
+    Ok((argv, tags))
+}
+
+/// `POST /build` (`docker build` with the classic builder, `docker compose build` without buildx,
+/// Testcontainers' image from a Dockerfile): the context the client sends, streamed to a directory
+/// on disk and unpacked by the system `tar` as `kern build -` unpacks one, then `kern build`, its
+/// lines sent as Docker's `{"stream": ...}`, the image's id as its `aux`. MEASURED before: every
+/// such build answered 501.
+pub(crate) fn image_build(
+    req: &Request,
+    bin: &Path,
+    r: &mut std::io::BufReader<UnixStream>,
+    framing: crate::Framing,
+) -> Response {
+    use std::os::unix::fs::DirBuilderExt;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(cache) = kern_common::xdg_cache_dir() else {
+        return error(500, "no cache directory for the build context");
+    };
+    let root = cache.join("kern").join("compat-build");
+    if let Err(e) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root)
+    {
+        return error(500, &format!("build context: {}: {e}", root.display()));
+    }
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = BuildDir(root.join(format!("{}-{n}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    let ctx = dir.0.join("context");
+    if let Err(e) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&ctx)
+    {
+        return error(500, &format!("build context: {}: {e}", ctx.display()));
+    }
+    let tar = dir.0.join("context.tar");
+    let copied = std::fs::File::create(&tar)
+        .map_err(|_| "the build context could not be written")
+        .and_then(|mut f| crate::copy_body(r, framing, &mut f));
+    match copied {
+        Err(why) => return error(400, why),
+        Ok(Err(e)) => return error(500, &format!("build context: {e}")),
+        Ok(Ok(_)) => {}
+    }
+    let (argv, tags) = match build_argv(req, &ctx.to_string_lossy()) {
+        Ok(a) => a,
+        Err(why) => return error(400, &why),
+    };
+    let head = {
+        let mut h = [0u8; 2];
+        std::fs::File::open(&tar)
+            .and_then(|mut f| f.read_exact(&mut h))
+            .map(|()| h)
+            .unwrap_or_default()
+    };
+    // Unpacked without the archive's owners and permissions, as `kern build -` unpacks one.
+    let unpacked = Command::new("tar")
+        .arg(if head == [0x1f, 0x8b] { "-xzf" } else { "-xf" })
+        .arg(&tar)
+        .args(["--no-same-owner", "--no-same-permissions", "-C"])
+        .arg(&ctx)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    let _ = std::fs::remove_file(&tar);
+    if !unpacked {
+        return error(400, "the build context is not a tar archive tar can unpack");
+    }
+    // ONE PIPE FOR BOTH STREAMS, so the client reads kern's lines in the order they were written.
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return error(
+            500,
+            &format!("build: a pipe: {}", std::io::Error::last_os_error()),
+        );
+    }
+    // SAFETY: `pipe2` returned these two descriptors, owned by nothing else from here on.
+    let (rd, wr) = unsafe {
+        use std::os::fd::FromRawFd;
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    };
+    let child = wr.try_clone().and_then(|wr2| {
+        Command::new(bin)
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(wr)
+            .stderr(wr2)
+            .spawn()
+    });
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return error(500, &format!("cannot run {}: {e}", bin.display())),
+    };
+    let bin = bin.to_path_buf();
+    let labels = req
+        .param("labels")
+        .is_some_and(|l| !matches!(l.trim(), "" | "{}" | "null"));
+    // `docker build -q`: the id alone, as Docker's daemon sends no step output for it.
+    let quiet = req.flag("q");
+    Response::Stream {
+        status: 200,
+        content_type: "application/json",
+        upgrade: false,
+        extra: Vec::new(),
+        writer: Box::new(move |w: &mut crate::Out| {
+            let _dir = dir;
+            let send = |w: &mut crate::Out, line: &str| {
+                let _ = w.write_all(format!("{{\"stream\":{}}}\r\n", json_str(line)).as_bytes());
+            };
+            if labels {
+                send(
+                    w,
+                    "kern: the build's labels are not applied (kern build sets none)\n",
+                );
+            }
+            let mut last = String::new();
+            for line in std::io::BufRead::lines(std::io::BufReader::new(rd)) {
+                let Ok(line) = line else { break };
+                if !quiet {
+                    send(w, &format!("{line}\n"));
+                }
+                if !line.trim().is_empty() {
+                    last = line;
+                }
+            }
+            let ok = child.wait().is_ok_and(|s| s.success());
+            // The id `docker images` and `docker inspect` give the image, from the same function.
+            let id = cached_image(&bin, &tags[0])
+                .and_then(|i| image_entry_id(&i))
+                .map(|id| format!("sha256:{id}"));
+            match (ok, id) {
+                (true, Some(id)) => {
+                    let _ = w.write_all(
+                        format!("{{\"aux\":{{\"ID\":{}}}}}\r\n", json_str(&id)).as_bytes(),
+                    );
+                    let short = id
+                        .trim_start_matches("sha256:")
+                        .chars()
+                        .take(12)
+                        .collect::<String>();
+                    // Quiet, Docker's daemon sends the id as the one stream line, and the client
+                    // prints that line.
+                    if quiet {
+                        send(w, &format!("{id}\n"));
+                    } else {
+                        send(w, &format!("Successfully built {short}\n"));
+                        for t in &tags {
+                            send(w, &format!("Successfully tagged {t}\n"));
+                        }
+                    }
+                }
+                _ => {
+                    let msg = if last.is_empty() {
+                        "the build failed".to_string()
+                    } else {
+                        last
+                    };
+                    let _ = w.write_all(
+                        format!(
+                            "{{\"errorDetail\":{{\"message\":{m}}},\"error\":{m}}}\r\n",
+                            m = json_str(&msg)
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+        }),
+    }
+}
+
+/// `GET /images/get?names=` and `GET /images/{name}/get` (`docker save`): `kern save`, its archive
+/// streamed as it is written, so an image of any size is not held here. One image an archive: `kern
+/// save` writes one, and more are refused by name rather than saved in part. MEASURED before: `docker
+/// save` through kern's socket answered "not served by kern's Docker API".
+fn image_save(bin: &Path, names: &[String]) -> Response {
+    let [name] = names else {
+        return error(
+            501,
+            &format!(
+                "docker save of {} images in one archive: kern's Docker API saves one an archive                  (`docker save <image> -o <file>` once per image)",
+                names.len()
+            ),
+        );
+    };
+    if cached_image(bin, name).is_none() {
+        return error(404, &format!("reference does not exist: {name}"));
+    }
+    let child = Command::new(bin)
+        .args(["save", name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return error(500, &format!("cannot run {}: {e}", bin.display())),
+    };
+    Response::Stream {
+        status: 200,
+        content_type: "application/x-tar",
+        upgrade: false,
+        extra: Vec::new(),
+        writer: Box::new(move |w: &mut crate::Out| {
+            let copied = child
+                .stdout
+                .take()
+                .map(|mut out| std::io::copy(&mut out, w).is_ok())
+                .unwrap_or(false);
+            // A save that failed is cut, not ended: see `archive_get`.
+            if !(copied && child.wait().is_ok_and(|s| s.success())) {
+                let _ = w.socket().shutdown(std::net::Shutdown::Both);
+            }
+        }),
+    }
+}
+
 /// `DELETE /images/{name}`: `kern rmi`, `force` as `-f`. Docker's answer lists what went: the tag,
 /// then the image. An image a container uses is 409 without `force`, as Docker answers it.
 fn image_remove(bin: &Path, name: &str, req: &Request) -> Response {
@@ -4592,8 +4888,6 @@ fn labelled_prune(kind: &str, req: &Request) -> Response {
 fn not_translated(what: &str) -> Response {
     let instead = if what.starts_with("networks") || what.starts_with("the volumes") {
         "; a compose file runs with `kern compose -f <file> up`, which makes its networks and volumes"
-    } else if what == "build" {
-        "; `kern build` builds the same Dockerfile"
     } else {
         ""
     };
@@ -4940,6 +5234,18 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             no_content()
         }
         ("POST", ["images", "create"]) => pull(bin, req),
+        ("GET", ["images", "get"]) => {
+            let names: Vec<String> = req
+                .query
+                .iter()
+                .filter(|(k, _)| k == "names")
+                .map(|(_, v)| v.clone())
+                .collect();
+            image_save(bin, &names)
+        }
+        ("GET", ["images", rest @ .., "get"]) if !rest.is_empty() => {
+            image_save(bin, &[rest.join("/")])
+        }
         ("GET", ["images", "json"]) => image_list(bin, req),
         ("GET", ["images", rest @ .., "json"]) if !rest.is_empty() => {
             image_inspect(bin, &rest.join("/"))
@@ -4991,7 +5297,6 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             watch_unwatched(bin);
             crate::events::events(req)
         }
-        ("POST", ["build"]) => not_translated("build"),
         (m, _) => not_translated(&format!("{m} {}", req.path)),
     }
 }
@@ -5516,6 +5821,58 @@ mod tests {
             buf[..n].copy_from_slice(&self.data[..n]);
             self.data = &self.data[n..];
             Ok(n)
+        }
+    }
+
+    /// A `POST /build`'s query becomes `kern build`'s argv: every tag, the Dockerfile as a path inside
+    /// the context, the build args (a `null` value is the bare name, taken from the environment),
+    /// the target, the platform, `--no-cache`. A build with no tag, a remote context and a
+    /// Dockerfile outside the context are refused.
+    #[test]
+    fn a_build_query_becomes_kern_builds_argv() {
+        let q = |pairs: &[(&str, &str)]| Request {
+            method: "POST".into(),
+            path: "/build".into(),
+            query: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            body: Vec::new(),
+            upgrade: false,
+            peer: None,
+            close: false,
+        };
+        let (argv, tags) = build_argv(
+            &q(&[
+                ("t", "a:1"),
+                ("t", "b"),
+                ("dockerfile", "./sub/Containerfile"),
+                ("buildargs", r#"{"V":"1","FROM_ENV":null}"#),
+                ("target", "run"),
+                ("platform", "linux/arm64"),
+                ("nocache", "1"),
+            ]),
+            "/c",
+        )
+        .expect("argv");
+        assert_eq!(tags, ["a:1", "b"]);
+        assert_eq!(
+            argv.join(" "),
+            "build --progress plain -t a:1 -t b -f /c/sub/Containerfile --build-arg V=1 \
+             --build-arg FROM_ENV --target run --platform linux/arm64 --no-cache /c"
+        );
+        let (plain, _) = build_argv(&q(&[("t", "x")]), "/c").expect("argv");
+        assert_eq!(
+            plain.join(" "),
+            "build --progress plain -t x -f /c/Dockerfile /c"
+        );
+        assert!(build_argv(&q(&[]), "/c").is_err(), "no tag");
+        assert!(build_argv(&q(&[("t", "x"), ("remote", "https://x/y.git")]), "/c").is_err());
+        for bad in ["../Dockerfile", "/etc/Dockerfile", "a/../../b"] {
+            assert!(
+                build_argv(&q(&[("t", "x"), ("dockerfile", bad)]), "/c").is_err(),
+                "{bad}"
+            );
         }
     }
 
@@ -6062,13 +6419,14 @@ mod tests {
         assert!(!a.contains("--health"), "{a}");
     }
 
-    /// An endpoint this API does not serve answers 501 saying what does the job (here `kern build`),
-    /// and names no internal server. `/networks` used to be one; it is served now (see `netvol`).
+    /// An endpoint this API does not serve answers 501 naming it and saying the API hands nothing to
+    /// a Docker engine, and names no internal server. `/networks` and `/build` used to be such
+    /// endpoints; both are served now (see `netvol` and `image_build`).
     #[test]
     fn an_unserved_call_is_refused_naming_what_does_it() {
         let req = Request {
-            method: "POST".into(),
-            path: "/build".into(),
+            method: "GET".into(),
+            path: "/swarm".into(),
             query: Vec::new(),
             body: Vec::new(),
             upgrade: false,
@@ -6081,7 +6439,10 @@ mod tests {
         };
         let text = String::from_utf8_lossy(&body);
         assert_eq!(status, 501, "{text}");
-        assert!(text.contains("kern build"), "{text}");
+        assert!(
+            text.contains("GET /swarm: not served by kern's Docker API"),
+            "{text}"
+        );
         assert!(!text.contains("kern-serve"), "{text}");
     }
 

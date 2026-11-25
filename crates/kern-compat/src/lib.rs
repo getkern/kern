@@ -255,8 +255,10 @@ fn read_request(r: &mut BufReader<UnixStream>) -> Read1 {
     }
     let (raw_path, raw_query) = target.split_once('?').unwrap_or((target, ""));
     // A body as large as what it carries goes to its handler on the connection, not into memory:
-    // an image archive to `kern load`, a `docker cp` archive to `kern cp - <box>:<dir>`.
-    let streamed = (method == "POST" && strip_version(raw_path) == "/images/load")
+    // an image archive to `kern load`, a build context to `kern build`, a `docker cp` archive to
+    // `kern cp - <box>:<dir>`.
+    let streamed = (method == "POST"
+        && matches!(strip_version(raw_path), "/images/load" | "/build"))
         || (method == "PUT" && is_archive_path(strip_version(raw_path)));
     let body = if streamed {
         Vec::new()
@@ -558,6 +560,8 @@ fn serve_connection(stream: UnixStream, kern: &Path) {
             Read1::Load(req, framing) => {
                 let resp = if req.method == "PUT" {
                     api::archive_put(&req, kern, &mut r, framing)
+                } else if req.path == "/build" {
+                    api::image_build(&req, kern, &mut r, framing)
                 } else {
                     api::image_load(&req, kern, &mut r, framing)
                 };
