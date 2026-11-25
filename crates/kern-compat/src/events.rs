@@ -4,7 +4,7 @@
 //! This server does not need to watch: it is the one creating and starting these containers, so it
 //! publishes each event at the moment it happens, and a client waiting for one (Dev Containers
 //! waits for `start` before it goes on) is not made to wait a poll interval for it. A box started
-//! with kern directly makes no event here.
+//! with kern directly makes only its `die`, watched once a stream is open.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Mutex;
@@ -54,6 +54,16 @@ pub(crate) fn exec_event(kind: &str, name: &str, cmd: &[String], exec_id: &str, 
         labels,
         exit,
     });
+}
+
+/// What the events of `name` carry, for a box this server made no event for yet (one running
+/// when it started, or started with kern directly). What a create recorded is kept.
+pub(crate) fn remember(name: &str, image: &str, labels: Vec<(String, String)>) {
+    if let Ok(mut g) = META.lock() {
+        g.get_or_insert_with(Default::default)
+            .entry(name.to_string())
+            .or_insert_with(|| (image.to_string(), labels));
+    }
 }
 
 /// Docker's `action` for `name` (`die` with its `exit`, `kill`, `stop`, `restart`), described by

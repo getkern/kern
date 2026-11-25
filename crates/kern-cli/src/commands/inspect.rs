@@ -1501,27 +1501,8 @@ fn mem_cap_row(
 /// reader templating `.Id` gets nothing instead of a fabricated value.
 fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
     let cache = crate::commands::imagecache::cache_dir();
-    let plain = crate::commands::imagecache::sanitize_ref(name);
-    // `--platform`: that platform's own cache entry, the one `run --platform` and `pull --platform`
-    // use; a flat image built here for it is under its plain name and says so in its config.
-    let safe = match crate::commands::imagecache::image_platform() {
-        Some(p) => {
-            let stem = crate::commands::imagecache::platform_stem(&plain, &p);
-            let built_for_it = !crate::commands::imagecache::image_present(&cache, &stem)
-                && crate::commands::imagecache::read_image_config(
-                    &cache.join(format!("{plain}.image")),
-                )
-                .architecture
-                .as_deref()
-                    == Some(p.arch.as_str());
-            if built_for_it {
-                plain
-            } else {
-                stem
-            }
-        }
-        None => plain,
-    };
+    // `--platform`: that platform's entry, by the rule the pull uses.
+    let safe = crate::commands::imagecache::cache_entry_for(&cache, name);
     let present = crate::commands::imagecache::image_present(&cache, &safe);
     if !present {
         // THREE SUBJECTS, NOT TWO. A reader who reaches here has usually just watched a box run,

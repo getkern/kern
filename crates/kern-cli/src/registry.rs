@@ -396,71 +396,9 @@ fn attempt_dir() -> io::Result<PathBuf> {
     runtime_subdir("attempt")
 }
 
-/// A box's current attempt, as its supervisor last recorded it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Attempt {
-    /// A run started at this time (Unix milliseconds), after `restarts` restarts.
-    Running { since_ms: u64, restarts: u32 },
-    /// The last run exited with `code` at this time, and the next one (restart number `restarts`)
-    /// has not started yet.
-    Restarting {
-        since_ms: u64,
-        code: i32,
-        restarts: u32,
-    },
-}
-
-impl Attempt {
-    fn render(self) -> String {
-        match self {
-            Attempt::Running { since_ms, restarts } => format!("run {since_ms} {restarts}\n"),
-            Attempt::Restarting {
-                since_ms,
-                code,
-                restarts,
-            } => format!("restarting {since_ms} {code} {restarts}\n"),
-        }
-    }
-
-    fn parse(text: &str) -> Option<Attempt> {
-        let mut f = text.split_whitespace();
-        let kind = f.next()?;
-        let since_ms: u64 = f.next()?.parse().ok()?;
-        // THE RESTART COUNT IS THE LAST FIELD AND OPTIONAL: a record from before it reads as 0.
-        let a = match kind {
-            "run" => Attempt::Running {
-                since_ms,
-                restarts: 0,
-            },
-            "restarting" => Attempt::Restarting {
-                since_ms,
-                code: f.next()?.parse().ok()?,
-                restarts: 0,
-            },
-            _ => return None,
-        };
-        let restarts = match f.next() {
-            Some(n) => n.parse().ok()?,
-            None => 0,
-        };
-        let a = match a {
-            Attempt::Running { since_ms, .. } => Attempt::Running { since_ms, restarts },
-            Attempt::Restarting { since_ms, code, .. } => Attempt::Restarting {
-                since_ms,
-                code,
-                restarts,
-            },
-        };
-        f.next().is_none().then_some(a)
-    }
-
-    /// How many times the box has been restarted, as Docker's `RestartCount` counts them.
-    pub fn restarts(self) -> u32 {
-        match self {
-            Attempt::Running { restarts, .. } | Attempt::Restarting { restarts, .. } => restarts,
-        }
-    }
-}
+/// A box's current attempt, as its supervisor last recorded it: one definition in `kern-common`,
+/// which kern's Docker API reads too, for the `die`/`start` of each restart.
+pub use kern_common::attempt::Attempt;
 
 /// Record a box's current attempt (best effort: a box without the record reads as before).
 pub fn set_box_attempt(name: &str, pid: i32, a: Attempt) {

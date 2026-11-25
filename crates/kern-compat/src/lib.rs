@@ -633,8 +633,17 @@ fn monotonic_secs() -> u64 {
 
 /// Serve the Docker API until killed, or, with `idle`, until no connection has been open for that
 /// long (systemd starts it again at the next one). Every request is run by the `kern` binary at
-/// `kern`. `Err` says why it could not serve.
-pub fn serve(listen: Listen, kern: PathBuf, idle: Option<Duration>) -> Result<(), String> {
+/// `kern`; `attempts` is kern's `attempt/` directory, for the restarts `/events` reports. `Err` says
+/// why it could not serve.
+pub fn serve(
+    listen: Listen,
+    kern: PathBuf,
+    idle: Option<Duration>,
+    attempts: Option<PathBuf>,
+) -> Result<(), String> {
+    if let Some(d) = attempts {
+        api::set_attempt_dir(d);
+    }
     // ⛔ A PIPE WHOSE READER ENDED IS AN ERROR HERE, NOT THE SERVER'S DEATH. kern's `main` restores
     // SIGPIPE's default, which suits a command in a pipeline and kills a server: MEASURED,
     // `head -c 20M /dev/zero | docker exec -i c true` ended this process with SIGPIPE (exit 141) as

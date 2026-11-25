@@ -1161,7 +1161,8 @@ fn serve(args: &[String]) -> Result<(), Error> {
         // parent; a socket in any other directory could be handed to a box with that directory.
         _ => return Err(Error::Usage("compat docker serve")),
     };
-    kern_compat::serve(listen, kern, idle)
+    let attempts = crate::registry::runtime_subdir_public("attempt").ok();
+    kern_compat::serve(listen, kern, idle, attempts)
         .map_err(|e| Error::Cli(format!("compat docker serve: {e}")))
 }
 

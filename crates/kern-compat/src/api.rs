@@ -1870,7 +1870,13 @@ fn image_history(bin: &Path, name: &str) -> Response {
         return error(404, &format!("No such image: {name}"));
     };
     let n = i.get("image").and_then(Value::as_str).unwrap_or(name);
-    let (code, out, err) = kern(bin, &["image", "history", "--json", n]);
+    // Another platform's entry is asked for by that platform, or kern answers this machine's.
+    let mut args = vec!["image", "history", "--json"];
+    if let Some(p) = image_entry_platform(&i) {
+        args.extend(["--platform", p]);
+    }
+    args.push(n);
+    let (code, out, err) = kern(bin, &args);
     if code != 0 {
         return error(500, &kern_error(&err));
     }
@@ -3013,6 +3019,15 @@ pub(crate) fn runs_alive() -> bool {
     })
 }
 
+/// Is `name` a box this server started for an attach, still running?
+fn run_attached(name: &str) -> bool {
+    RUNS.lock().ok().is_some_and(|g| {
+        g.as_ref()
+            .and_then(|m| m.get(name))
+            .is_some_and(|r| r.exit.is_none())
+    })
+}
+
 fn run_forget(name: &str) {
     if let Ok(mut g) = RUNS.lock() {
         if let Some(m) = g.as_mut() {
@@ -3480,29 +3495,51 @@ static DIE_PUBLISHED: Condvar = Condvar::new();
 /// How long a removal or a restart waits for the `die` of the box it stopped.
 const DIE_FIRST: Duration = Duration::from_secs(3);
 
+/// kern's `attempt/` directory, where a detached box's supervisor records each run and each exit
+/// it restarts after. Given by the CLI (`serve`), which resolves kern's runtime root; without it
+/// no restart is reported, and the end of the box still is.
+static ATTEMPTS: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub(crate) fn set_attempt_dir(dir: std::path::PathBuf) {
+    let _ = ATTEMPTS.set(dir);
+}
+
 /// A thread pinned by a pidfd to the box's supervisor, which exits with the box and leaves its exit
 /// record: woken at the exit, it reads the code and publishes `die`. No `kern wait` stays resident
 /// for the box's life. MEASURED before: `docker events` on kern's socket printed no `die` for a
 /// `docker run -d`, not at its exit, not at a `stop`, not at an `rm -f`.
-fn watch_die(bin: &Path, name: &str, auto_remove: bool) {
-    if let Ok(mut g) = DIE_PENDING.lock() {
+///
+/// AND EACH RESTART IN BETWEEN: a `--restart` box is run again by the same supervisor, which
+/// records the exit and the next run in its attempt file; the thread wakes on that file too
+/// (inotify) and publishes the run's `die` and the next `start`, as Docker does. MEASURED against
+/// Docker 29, `on-failure:2` exiting 3: `create start die 3 start die 3 start die 3 destroy`, where
+/// kern's socket printed `create start die 3 destroy`.
+///
+/// One watch per box: a second call for a box already watched does nothing. `supervisor` when the
+/// caller has it, else it is looked up.
+fn watch_die(bin: &Path, name: &str, auto_remove: bool, supervisor: Option<libc::pid_t>) {
+    let fresh = DIE_PENDING.lock().is_ok_and(|mut g| {
         g.get_or_insert_with(Default::default)
-            .insert(name.to_string());
+            .insert(name.to_string())
+    });
+    if !fresh {
+        return;
     }
     let (bin, watched) = (bin.to_path_buf(), name.to_string());
     let spawned = std::thread::Builder::new()
         .name("kern-serve-die".into())
         .stack_size(256 << 10)
         .spawn(move || {
-            let supervisor = kern_boxes(&bin)
-                .into_iter()
-                .find(|(n, v)| *n == watched && box_running(v))
-                .and_then(|(_, v)| v.get("pid").and_then(Value::as_i64))
-                .and_then(|p| libc::pid_t::try_from(p).ok());
+            let supervisor = supervisor.or_else(|| {
+                kern_boxes(&bin)
+                    .into_iter()
+                    .find(|(n, v)| *n == watched && box_running(v))
+                    .and_then(|(_, v)| supervisor_of(&v))
+            });
             // A box already down has its record; without a pidfd (a kernel before 5.3, or the
             // supervisor gone) `kern wait` below is the wait.
-            if let Some(fd) = supervisor.and_then(pidfd_open) {
-                wait_readable(&fd);
+            if let Some((pid, fd)) = supervisor.and_then(|p| pidfd_open(p).map(|fd| (p, fd))) {
+                follow_restarts(&watched, pid, &fd);
             }
             let code = if auto_remove {
                 kern_wait_code_with(&bin, "__wait-removed", &watched)
@@ -3514,6 +3551,132 @@ fn watch_die(bin: &Path, name: &str, auto_remove: bool) {
         });
     if spawned.is_err() {
         die_settled(name);
+    }
+}
+
+/// The supervisor's pid of a box as `kern ps --json` lists it.
+fn supervisor_of(v: &Value) -> Option<libc::pid_t> {
+    v.get("pid")
+        .and_then(Value::as_i64)
+        .and_then(|p| libc::pid_t::try_from(p).ok())
+}
+
+/// Until the supervisor exits: each change of its attempt record publishes what it means.
+fn follow_restarts(name: &str, pid: libc::pid_t, pidfd: &std::os::fd::OwnedFd) {
+    use std::os::fd::AsRawFd;
+    let file = ATTEMPTS.get().map(|d| d.join(format!("{name}-{pid}")));
+    // Watched BEFORE the first read, so a change between the read and the wait is queued.
+    let inotify = ATTEMPTS.get().and_then(|d| attempt_inotify(d));
+    let mut seen = Published::default();
+    loop {
+        if let Some(a) = file
+            .as_ref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|t| kern_common::attempt::Attempt::parse(&t))
+        {
+            if let Some((action, exit)) = seen.next(a) {
+                crate::events::publish_named(action, name, exit);
+            }
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: inotify.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two pollfds owned here (a negative fd is ignored), no timeout.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if fds[0].revents != 0 {
+            return;
+        }
+        if let Some(fd) = &inotify {
+            let mut buf = [0u8; 4096];
+            // SAFETY: a nonblocking inotify descriptor owned here and a buffer of that length.
+            while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        }
+    }
+}
+
+/// An inotify on the attempt directory, for the supervisor's atomic replace of a record.
+fn attempt_inotify(dir: &std::path::Path) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: `inotify_init1` takes flags and returns a new descriptor or -1.
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a descriptor just returned to this process and owned by nothing else.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a live inotify descriptor and a NUL-terminated path.
+    let w = unsafe {
+        libc::inotify_add_watch(
+            fd.as_raw_fd(),
+            c.as_ptr(),
+            libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_ONLYDIR,
+        )
+    };
+    (w >= 0).then_some(fd)
+}
+
+/// What a box's restarts have published so far: the restart whose exit was reported, and the
+/// restart count of the last run whose start was (0, the first run's, by the start itself).
+#[derive(Default)]
+struct Published {
+    died_for: Option<u32>,
+    started: u32,
+}
+
+impl Published {
+    /// The event a record now means, once: `die` with the code of a run that ended for a restart,
+    /// `start` of a run after one.
+    fn next(&mut self, a: kern_common::attempt::Attempt) -> Option<(&'static str, Option<i32>)> {
+        use kern_common::attempt::Attempt;
+        match a {
+            Attempt::Restarting { code, restarts, .. } if self.died_for != Some(restarts) => {
+                self.died_for = Some(restarts);
+                Some(("die", Some(code)))
+            }
+            Attempt::Running { restarts, .. } if restarts > self.started => {
+                self.started = restarts;
+                Some(("start", None))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The running boxes whose `die` nothing watches, armed when a client opens `/events`. A server
+/// started again (idle, or a new binary) has lost the watches the one before it armed, and a box
+/// started with kern directly never had one: Docker's stream reports every container's end, so
+/// this one does, with the image and labels `kern ps` lists. Only while someone listens: a box
+/// nobody follows costs nothing.
+pub(crate) fn watch_unwatched(bin: &Path) {
+    for (n, v) in kern_boxes(bin) {
+        // An attached run's box has its reaper, which publishes its `die`.
+        if !box_running(&v) || die_pending(&n) || run_attached(&n) {
+            continue;
+        }
+        crate::events::remember(
+            &n,
+            v.get("image").and_then(Value::as_str).unwrap_or_default(),
+            labels_of(&v),
+        );
+        // `__wait-removed` also answers for a `--rm` box, which `ps` does not mark.
+        watch_die(bin, &n, true, supervisor_of(&v));
     }
 }
 
@@ -3561,23 +3724,6 @@ fn pidfd_open(pid: libc::pid_t) -> Option<std::os::fd::OwnedFd> {
     let fd = std::os::fd::RawFd::try_from(fd).ok().filter(|f| *f >= 0)?;
     // SAFETY: a descriptor the kernel just returned to this process, owned by nothing else.
     Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
-}
-
-/// Block until `fd` is readable (a pidfd: its process exited), across signals.
-fn wait_readable(fd: &std::os::fd::OwnedFd) {
-    use std::os::fd::AsRawFd;
-    let mut pfd = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        // SAFETY: one pollfd owned here, count 1, no timeout.
-        let n = unsafe { libc::poll(&mut pfd, 1, -1) };
-        if n >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return;
-        }
-    }
 }
 
 /// A `kern box` argv without the valueless flags `drop`, which stand among the flags (before the
@@ -3650,7 +3796,7 @@ fn start_again(bin: &Path, name: &str, running: Response) -> Response {
         labels: labels_of(&v),
         exit: None,
     });
-    watch_die(bin, name, false);
+    watch_die(bin, name, false, None);
     no_content()
 }
 
@@ -4177,7 +4323,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                     let argv: Vec<&str> = c.argv.iter().map(String::as_str).collect();
                     match start_detached(bin, &name, &c, &argv) {
                         Ok(()) => {
-                            watch_die(bin, &name, c.auto_remove);
+                            watch_die(bin, &name, c.auto_remove, None);
                             no_content()
                         }
                         Err(e) => e,
@@ -4317,7 +4463,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                     if *verb == "restart" {
                         crate::events::publish_named("start", &name, None);
                         crate::events::publish_named("restart", &name, None);
-                        watch_die(bin, &name, false);
+                        watch_die(bin, &name, false, None);
                     } else {
                         crate::events::publish_named("stop", &name, None);
                     }
@@ -4398,7 +4544,10 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             Some(r) => r,
             None => not_translated(&format!("{} {}", req.method, req.path)),
         },
-        ("GET", ["events"]) => crate::events::events(req),
+        ("GET", ["events"]) => {
+            watch_unwatched(bin);
+            crate::events::events(req)
+        }
         ("POST", ["build"]) => not_translated("build"),
         (m, _) => not_translated(&format!("{m} {}", req.path)),
     }
@@ -5212,6 +5361,47 @@ mod tests {
         let p = c.argv.iter().position(|x| x == "--platform").unwrap();
         assert_eq!(c.argv[p + 1], "linux/arm64");
         assert!(p < at, "--platform before the image");
+    }
+
+    /// Each restart's record publishes its `die` and the next run's `start` once, whatever else
+    /// wakes the watch; the first run's start is the start itself.
+    #[test]
+    fn a_restarting_box_publishes_die_and_start_once_per_restart() {
+        use kern_common::attempt::Attempt;
+        let mut p = Published::default();
+        let run = |restarts| Attempt::Running {
+            since_ms: 1,
+            restarts,
+        };
+        let restarting = |code, restarts| Attempt::Restarting {
+            since_ms: 2,
+            code,
+            restarts,
+        };
+        let mut out = Vec::new();
+        for a in [
+            run(0),
+            run(0),
+            restarting(3, 1),
+            restarting(3, 1),
+            run(1),
+            run(1),
+            restarting(3, 2),
+            run(2),
+        ] {
+            if let Some(e) = p.next(a) {
+                out.push(e);
+            }
+        }
+        assert_eq!(
+            out,
+            [
+                ("die", Some(3)),
+                ("start", None),
+                ("die", Some(3)),
+                ("start", None)
+            ]
+        );
     }
 
     /// A removal or a restart waits for the pending `die`, so it is published first; with none

@@ -274,7 +274,8 @@ pub(crate) fn repo_digest_of(name: &str) -> Option<String> {
 /// that declares no history (or was pulled before kern kept it) says so instead of an empty table.
 pub fn image_history(name: &str, json: bool, no_trunc: bool, quiet: bool) -> Result<(), Error> {
     let cache = cache_dir();
-    let safe = sanitize_ref(name);
+    // `--platform`: that platform's entry, by the rule the pull uses.
+    let safe = super::imagecache::cache_entry_for(&cache, name);
     if !image_present(&cache, &safe) {
         return Err(Error::NotRunning(format!(
             "no image '{name}' in the local cache: `kern images` lists them and `kern pull {name}` fetches one"

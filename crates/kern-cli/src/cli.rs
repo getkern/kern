@@ -601,6 +601,8 @@ pub enum Command {
         json: bool,
         no_trunc: bool,
         quiet: bool,
+        /// `--platform <os/arch>`: that platform's entry of the image, as `docker history --platform`.
+        platform: Option<kern_oci::Platform>,
     },
     /// `kern rmi <image>...`: remove cached images by ref (or sanitized stem), reclaiming any layers
     /// left referenced by no other image.
@@ -1323,10 +1325,26 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 // So it is its own command, not a rewrite to a verb.
                 "history" => {
                     let hrest: Vec<&str> = rest.iter().skip(1).copied().collect();
-                    reject_unknown_flags("image history", &hrest, &["--json", "--no-trunc", "-q", "--quiet"])?;
-                    let mut names = hrest.iter().skip(1).filter(|a| !a.starts_with('-'));
+                    reject_unknown_flags("image history", &hrest, &["--json", "--no-trunc", "-q", "--quiet", "--platform"])?;
+                    let platform = match flag_value(&hrest, "--platform") {
+                        Some(want) => Some(
+                            kern_oci::Platform::parse(&want)
+                                .map_err(|e| Error::Oci(format!("--platform {want}: {e}")))?,
+                        ),
+                        None => None,
+                    };
+                    let value_of_platform = hrest
+                        .iter()
+                        .position(|a| *a == "--platform")
+                        .map(|i| i + 1);
+                    let mut names = hrest
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .filter(|(i, a)| !a.starts_with('-') && Some(*i) != value_of_platform)
+                        .map(|(_, a)| a);
                     let (Some(image), None) = (names.next(), names.next()) else {
-                        return Err(Error::Usage("image history <image> [--json] [--no-trunc] [-q]"));
+                        return Err(Error::Usage("image history <image> [--json] [--no-trunc] [-q] [--platform <os/arch>]"));
                     };
                     return Ok((
                         opts,
@@ -1335,6 +1353,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                             json: hrest.contains(&"--json"),
                             no_trunc: hrest.contains(&"--no-trunc"),
                             quiet: hrest.iter().any(|a| *a == "-q" || *a == "--quiet"),
+                            platform,
                         },
                     ));
                 }
@@ -7623,7 +7642,10 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             json,
             no_trunc,
             quiet,
-        } => commands::image_history(&image, json, no_trunc, quiet),
+            platform,
+        } => commands::with_image_platform(platform, || {
+            commands::image_history(&image, json, no_trunc, quiet)
+        }),
         Command::Rmi { images, force } => commands::image_rm_with(&images, force),
         Command::Save { image, out } => commands::save(&image, out.as_deref()),
         Command::Load { input } => commands::load(input.as_deref()),
@@ -11023,8 +11045,14 @@ mod tests {
         };
         assert!(matches!(
             cmd(&["image", "history", "--no-trunc", "alpine:3.20", "--json"]),
-            Ok(Command::ImageHistory { image, json: true, no_trunc: true, quiet: false })
+            Ok(Command::ImageHistory { image, json: true, no_trunc: true, quiet: false, platform: None })
                 if image == "alpine:3.20"
+        ));
+        // `--platform`'s value is not the image.
+        assert!(matches!(
+            cmd(&["image", "history", "--platform", "linux/arm64", "alpine:3.20"]),
+            Ok(Command::ImageHistory { image, platform: Some(p), .. })
+                if image == "alpine:3.20" && p.arch == "arm64"
         ));
         assert!(matches!(
             cmd(&["image", "history", "-q", "a"]),

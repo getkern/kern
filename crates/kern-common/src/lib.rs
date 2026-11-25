@@ -28,6 +28,7 @@ pub const VERSION: &str = env!("KERN_VERSION");
 /// line; this is the part that fits.
 pub const TAGLINE: &str = "a fast, rootless container runtime and sandbox, no daemon";
 
+pub mod attempt;
 pub mod httphead;
 pub mod json;
 /// Registry credentials shared by `kern login`/`logout` and the OCI pull path.

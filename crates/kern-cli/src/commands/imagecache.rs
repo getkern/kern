@@ -1630,6 +1630,30 @@ pub(crate) fn with_image_platform<T>(p: Option<kern_oci::Platform>, f: impl FnOn
     out
 }
 
+/// The cache entry `image` resolves to for the platform images resolve for now
+/// ([`image_platform`]): its plain entry for this machine; for another platform that platform's own
+/// entry, except a FLAT image built here for it, which lives under its plain name and says which
+/// architecture it is. ONE rule for the pull, `inspect` and `image history`, so the three cannot
+/// answer about different entries.
+pub(crate) fn cache_entry_for(cache: &std::path::Path, image: &str) -> String {
+    let plain = sanitize_ref(image);
+    let Some(p) = image_platform() else {
+        return plain;
+    };
+    let stem = platform_stem(&plain, &p);
+    let built_for_it = !cache_entry_complete(cache, &stem)
+        && cache_entry_complete(cache, &plain)
+        && read_image_config(&cache.join(format!("{plain}.image")))
+            .architecture
+            .as_deref()
+            == Some(p.arch.as_str());
+    if built_for_it {
+        plain
+    } else {
+        stem
+    }
+}
+
 /// The cache name of `safe` for another platform: its own entry, in the cache's `[A-Za-z0-9_-]`.
 pub(crate) fn platform_stem(safe: &str, p: &kern_oci::Platform) -> String {
     format!("{safe}{}", platform_suffix(p))
@@ -1916,26 +1940,7 @@ pub(crate) fn pull_to_cache(
     // ANOTHER PLATFORM IS ANOTHER IMAGE: its own cache entry and its own download, so an arm64
     // `alpine` fetched for a `--platform linux/arm64` build never replaces the amd64 one a box runs.
     let platform = image_platform();
-    let safe = match &platform {
-        Some(p) => {
-            let plain = sanitize_ref(image);
-            let stem = platform_stem(&plain, p);
-            // A FLAT image built here for that platform lives under its plain name, as every built
-            // image does, and says which architecture it is.
-            let built_for_it = !cache_entry_complete(&cache, &stem)
-                && cache_entry_complete(&cache, &plain)
-                && read_image_config(&cache.join(format!("{plain}.image")))
-                    .architecture
-                    .as_deref()
-                    == Some(p.arch.as_str());
-            if built_for_it {
-                plain
-            } else {
-                stem
-            }
-        }
-        None => sanitize_ref(image),
-    };
+    let safe = cache_entry_for(&cache, image);
     let dir = cache.join(&safe);
     let sentinel = cache.join(format!("{safe}.ok"));
     let cfgfile = cache.join(format!("{safe}.image"));

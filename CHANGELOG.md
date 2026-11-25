@@ -175,15 +175,19 @@ supervisor go while a stop is under way waits for that stop's code.
 detached made no `die` at all, not at its exit, a `stop` or an `rm -f`; `rm` made no `destroy`, and
 `stop`, `kill` and `restart` made no event. Each is published now in Docker's order (`kill`, `die`
 with the exit code, then `stop`, or `start` and `restart`, and `destroy` last), watched through a
-pidfd on the box's supervisor, so no process stays resident per container. A `docker rm` refused
-with 409 no longer forgets the running container's id and network on the way.
+pidfd on the box's supervisor, so no process stays resident per container. A `--restart` container's
+every run is reported (`die` with its code, then `start`), as Docker reports it; a container running
+when the server started again, or started with kern directly, has its end reported once a stream is
+open. A `docker rm` refused with 409 no longer forgets the running container's id and network on the
+way.
 
 **A compose service with `platform:` runs through kern's socket.** The `docker compose` client
 inspects a service's image and creates the container by the image's id, which kern's socket did not
 resolve ("No such image: sha256:..."), and both platforms' entries of one tag had the same id. Each
 entry has its own id now, an id resolves wherever an image name does (inspect, history, remove,
 create), and `docker rmi` of the arm64 id removes that entry and not this machine's. `kern inspect
---platform <os/arch>` shows an image's entry for that platform, `Architecture` is the image's own
+--platform <os/arch>` and `kern image history --platform <os/arch>` show an image's entry for that
+platform, `Architecture` is the image's own
 (it was the host's for every image), and `kern images --json` carries each entry's `cache` name.
 
 **An archive copied into a box resolves `..` as Docker does.** kern refused every member with a
