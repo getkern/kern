@@ -18,7 +18,7 @@ daemon and no socket: one process, as `kern` is.
 | How | What changes |
 |---|---|
 | `ln -s "$(command -v kern)" ~/.local/bin/kern-docker` | `kern-docker <docker command>` works; nothing else |
-| `kern compat docker -- npm run dev` | inside that command, and every process it starts, `docker` and `docker-compose` are kern; nothing outside it |
+| `kern compat docker -- npm run dev` | inside that command, and every process it starts, `docker` and `docker-compose` are kern, and a program that speaks the Docker API (Testcontainers, docker-py, the real `docker` by its full path) is pointed at kern's API: `DOCKER_HOST` names its socket (a server is started for the command when none listens), `DOCKER_CONTEXT` is removed, and `DOCKER_BUILDKIT=0` and `TESTCONTAINERS_RYUK_DISABLED=true` are set unless already set; nothing outside it |
 | `kern compat docker link <dir>` | a `docker` link in `<dir>`, recorded; `kern compat docker status` and `kern doctor` show it and say which `docker` comes first in PATH; `kern compat docker unlink <dir>` removes it |
 | `kern compat docker -- npm run dev` in Windows | the same for a Windows command: its PATH starts with a folder holding kern's `docker.exe` and `docker-compose.exe`, which forward to kern in the distro with `C:\` paths translated; the folder goes when the command ends |
 

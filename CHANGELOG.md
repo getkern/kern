@@ -105,6 +105,13 @@ made through kern's socket) starts at once: the launcher held its layer, so the 
 failed and ran a second later, and `docker run -d --restart always` took 1.4 s with a restart counted
 that never happened (now about 190 ms and 0).
 
+**`kern compat docker -- <command>` points programs that use the Docker API at kern.** It put kern's
+`docker` first in PATH and nothing else, so Testcontainers, docker-py or the real `docker` by its full
+path reached whatever Docker the machine had, or nothing. The command now gets `DOCKER_HOST` on kern's
+API socket (a server is started for it when none listens), no `DOCKER_CONTEXT`, and the classic
+builder (`DOCKER_BUILDKIT=0`) and Ryuk off unless already set: with buildx installed, the real `docker
+build` builds through kern.
+
 **`docker compose up --build` recreates a rebuilt service.** Through kern's socket an image's id was
 derived from its name, so an image rebuilt under the same tag kept its id and compose left the old
 container running the old build. The id is the image's content now (its config and layers), and a
