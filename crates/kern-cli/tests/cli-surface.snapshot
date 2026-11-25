@@ -56,6 +56,7 @@ COMMANDS:
     compat docker (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
     unshare [--] [CMD...]                                          Run CMD (default: your shell) with the ids a box's files carry on disk
     compat docker (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
+    proxy (trust|untrust|status)                                   HTTPS for the .localhost names: trust adds kern's local CA (localhost names
     events                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     prune                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code
     gc [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image

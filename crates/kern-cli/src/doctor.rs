@@ -2807,8 +2807,9 @@ fn read_int(path: &str) -> Option<i64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Is `bin` on `PATH`? (No spawn - just a path probe.)
-fn which(bin: &str) -> bool {
+/// Is `bin` on `PATH`? (No spawn - just a path probe.) Also read by `localtls`, which looks for a
+/// Chrome-family browser before making its certificate store.
+pub(crate) fn which(bin: &str) -> bool {
     crate::global_env("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).exists()))
         .unwrap_or(false)

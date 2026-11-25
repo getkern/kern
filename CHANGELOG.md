@@ -33,6 +33,15 @@ On Windows, `kern compat docker pipe` serves the same API on `\\.\pipe\kern-dock
 account only, with no TCP endpoint. Testcontainers' Redis and Postgres modules pass. See
 [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
 
+**`kern proxy trust`: the `.localhost` names over HTTPS, once you ask for it.** It makes a
+certificate authority of your own that can sign `localhost` names only, adds it to your user's
+Chrome and Firefox stores (and, typed in Windows' PowerShell, to your Windows user's store, which
+Windows asks you to confirm), and the router then answers `https://<service>.<project>.localhost:8443/`
+(443 where an ordinary user may bind it). `kern proxy untrust` takes it out of every store and
+deletes it; `kern proxy status` says where things are. Without `trust` nothing changes. Measured: a
+certificate this kind of authority signs for another name is refused by OpenSSL, curl, Chrome 157,
+Firefox 157 and Windows' verifier. See [docs/CONFIG.md](docs/CONFIG.md).
+
 **`docker logs` through kern's socket keeps stdout and stderr apart.** A container made through
 the socket logs its two streams on two pipes and its log records which stretch came from which;
 `docker logs` and an `attach` after the start answer them as Docker does, with `--tail`, `-f`, `-t`,

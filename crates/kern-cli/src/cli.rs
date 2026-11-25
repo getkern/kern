@@ -10,6 +10,14 @@ use crate::error::Error;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct GlobalOpts;
 
+/// What `kern proxy` does: see [`Command::Proxy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyAction {
+    Trust,
+    Untrust,
+    Status,
+}
+
 /// The parsed subcommand.
 // `BoxRun` carries every `kern box` flag, so it dwarfs the unit variants - but a `Command` is built
 // exactly once per process on the cold parse path, so boxing it would only add indirection for no
@@ -489,6 +497,12 @@ pub enum Command {
     LocalRouter,
     /// Hidden: the port of those names, for `kern.exe doctor` (`crate::localrouter::port_verb`).
     RouterPort,
+    /// `proxy trust|untrust|status`: HTTPS for the `.localhost` names (`crate::localtls`).
+    Proxy {
+        action: ProxyAction,
+    },
+    /// Hidden: the local CA's name and certificate, for `kern.exe` (`crate::localtls::print_authority`).
+    LocalCa,
     /// `compat docker ...`: run a command with `docker` answered by kern, or manage the `docker`
     /// links kern made (`crate::dockershim`).
     Compat {
@@ -1301,6 +1315,15 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // Hidden: the local router (spawned by `compose up`).
         Some("__local-router") => Command::LocalRouter,
         Some("__router-port") => Command::RouterPort,
+        Some("__local-ca") => Command::LocalCa,
+        Some("proxy") => Command::Proxy {
+            action: match (rest.get(1).copied(), rest.len()) {
+                (Some("trust"), 2) => ProxyAction::Trust,
+                (Some("untrust"), 2) => ProxyAction::Untrust,
+                (Some("status"), 2) | (None, 1) => ProxyAction::Status,
+                _ => return Err(Error::Usage("proxy trust|untrust|status")),
+            },
+        },
         Some("unshare") => {
             let tail = rest.get(1..).unwrap_or_default();
             let cmd: &[&str] = match tail.split_first() {
@@ -6951,6 +6974,12 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
         Command::LocalRouter => crate::localrouter::run(),
         Command::RouterPort => std::process::exit(crate::localrouter::port_verb()),
+        Command::LocalCa => std::process::exit(crate::localtls::print_authority()),
+        Command::Proxy { action } => match action {
+            ProxyAction::Trust => crate::localtls::trust(),
+            ProxyAction::Untrust => crate::localtls::untrust(),
+            ProxyAction::Status => crate::localtls::status(),
+        },
         Command::Compat { args } => crate::dockershim::compat(&args),
         Command::Unshare { cmd } => crate::unshare::run(&cmd),
         Command::WatchDir {

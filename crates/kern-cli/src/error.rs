@@ -247,6 +247,9 @@ impl Error {
             Error::Config(_) => {
                 Some("profiles live in ~/.config/kern/kern.toml - see docs/CONFIG.md".into())
             }
+            // `kern proxy` speaks about this machine (a tool to install, a store it could not write),
+            // never about how the command was typed: its own sentence says what to do.
+            Error::Cli(msg) if msg.starts_with("proxy ") => None,
             Error::Cli(_) | Error::Usage(_) => Some("run `kern --help` for full usage".into()),
             Error::SelfUpdate(_) => None,
         }

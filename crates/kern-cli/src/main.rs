@@ -314,6 +314,7 @@ mod history;
 mod keepbox;
 mod listing;
 mod localrouter;
+mod localtls;
 mod logview;
 /// Peer addressing and hosts files for a `--no-pod` stack.
 mod network;

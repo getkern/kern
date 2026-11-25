@@ -5,7 +5,9 @@ yanked = "deny"
 [licenses]
 # Permissive set we accept in the dependency tree. `unused-allowed-license = "allow"` keeps
 # the check quiet while the tree is tiny (these cover the common deps we'll pull in later).
-allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0"]
+# ISC (owner decision 2026-11-21): permissive, MIT-equivalent; `rustls`'s required dependencies
+# (`ring`, `rustls-webpki`, `untrusted`) carry it, for the `.localhost` HTTPS router.
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0", "ISC"]
 confidence-threshold = 0.9
 unused-allowed-license = "allow"
 

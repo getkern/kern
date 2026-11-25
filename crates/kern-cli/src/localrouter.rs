@@ -22,8 +22,9 @@
 //! MEASURED on 2026-11-20, a router on 8080 refused a second project publishing 8080 ("held by kern"),
 //! and 8080 is the port the most apps publish (Airflow, Jenkins, Keycloak). kern has no
 //! daemon, and this is not one: `compose up` starts it when a service publishes a port, and it leaves
-//! by itself about 3 s after the last box with a published port is gone. HTTP only: HTTPS would need
-//! a TLS stack in kern and a certificate authority in the user's trust store.
+//! by itself about 3 s after the last box with a published port is gone. HTTPS too, after
+//! `kern proxy trust` and only then: see `localtls`, which ends the TLS and hands the request to this
+//! same router, on 443 where an ordinary user may bind it and 8443 (or the next free port) elsewhere.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -38,14 +39,52 @@ fn lock_path() -> std::io::Result<PathBuf> {
     Ok(crate::registry::runtime_subdir("router")?.join("lock"))
 }
 
-/// The port of the router running now, if one is.
-pub fn running_port() -> Option<u16> {
+/// The router running now: `(pid, plain port, HTTPS port)`, the last `None` when it does not answer
+/// HTTPS. A state whose process is gone, or another process under that pid, is no router.
+fn running() -> Option<(i32, u16, Option<u16>)> {
     let text = std::fs::read_to_string(state_path().ok()?).ok()?;
     let mut f = text.split_whitespace();
     let pid: i32 = f.next()?.parse().ok()?;
     let start: u64 = f.next()?.parse().ok()?;
     let port: u16 = f.next()?.parse().ok()?;
-    (pid > 0 && start != 0 && crate::registry::proc_starttime(pid) == start).then_some(port)
+    // The fourth field arrived with HTTPS; a state written before it has none.
+    let tls = f
+        .next()
+        .and_then(|t| t.parse::<u16>().ok())
+        .filter(|t| *t != 0);
+    (pid > 0 && start != 0 && crate::registry::proc_starttime(pid) == start)
+        .then_some((pid, port, tls))
+}
+
+/// The port of the router running now, if one is.
+pub fn running_port() -> Option<u16> {
+    running().map(|(_, port, _)| port)
+}
+
+/// The HTTPS port of the router running now, when it answers HTTPS (`kern proxy trust`).
+pub fn running_tls_port() -> Option<u16> {
+    running().and_then(|(_, _, tls)| tls)
+}
+
+/// Stop the router running now and start a new one when a box still publishes a port, so a change
+/// of `kern proxy trust` takes effect at once. A connection open now is cut; the next one is answered.
+pub fn restart() {
+    if let Some((pid, _, _)) = running() {
+        // SAFETY: a pid whose start time `running` has just checked against the recorded one.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        for _ in 0..50 {
+            if crate::registry::proc_starttime(pid) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    if crate::registry::list()
+        .iter()
+        .any(|b| has_tcp_port(&b.ports))
+    {
+        let _ = ensure();
+    }
 }
 
 /// Whether `[kern] local_domains` is on (the default).
@@ -199,6 +238,37 @@ fn candidate_ports() -> Vec<u16> {
     v
 }
 
+/// The HTTPS ports to try, in order: 443 where an ordinary user may bind it, then 8443 to 8452.
+fn tls_candidate_ports() -> Vec<u16> {
+    let unprivileged = std::fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(1024);
+    let mut v = Vec::new();
+    if unprivileged <= 443 {
+        v.push(443);
+    }
+    v.extend(8443..8453);
+    v
+}
+
+/// Bind `127.0.0.1` and `::1` on the first of `ports` either answers: `(port, listeners)`.
+fn bind_loopback(ports: &[u16]) -> Option<(u16, Vec<TcpListener>)> {
+    for &port in ports {
+        let mut ls = Vec::new();
+        if let Ok(l) = TcpListener::bind(("127.0.0.1", port)) {
+            ls.push(l);
+        }
+        if let Ok(l) = TcpListener::bind(("::1", port)) {
+            ls.push(l);
+        }
+        if !ls.is_empty() {
+            return Some((port, ls));
+        }
+    }
+    None
+}
+
 /// `kern __local-router`: serve until no box publishes a port. Never returns.
 pub fn run() -> ! {
     use std::os::unix::fs::OpenOptionsExt;
@@ -223,30 +293,21 @@ pub fn run() -> ! {
     {
         std::process::exit(0);
     }
-    let mut bound: Option<(u16, Vec<TcpListener>)> = None;
-    for port in candidate_ports() {
-        let v4 = TcpListener::bind(("127.0.0.1", port));
-        let v6 = TcpListener::bind(("::1", port));
-        let mut ls = Vec::new();
-        if let Ok(l) = v4 {
-            ls.push(l);
-        }
-        if let Ok(l) = v6 {
-            ls.push(l);
-        }
-        if !ls.is_empty() {
-            bound = Some((port, ls));
-            break;
-        }
-    }
-    let Some((port, listeners)) = bound else {
+    let Some((port, listeners)) = bind_loopback(&candidate_ports()) else {
         std::process::exit(1);
     };
+    // HTTPS ONLY AFTER `kern proxy trust`: without it there is no authority, and no port is opened.
+    let tls = crate::localtls::server_config()
+        .and_then(|config| bind_loopback(&tls_candidate_ports()).map(|b| (config, b)));
+    let tls_port = tls.as_ref().map_or(0, |(_, (p, _))| *p);
     // SAFETY: getpid takes no arguments.
     let me = unsafe { libc::getpid() };
     if let Ok(p) = state_path() {
         let tmp = p.with_extension("tmp");
-        let line = format!("{me} {} {port}\n", crate::registry::proc_starttime(me));
+        let line = format!(
+            "{me} {} {port} {tls_port}\n",
+            crate::registry::proc_starttime(me)
+        );
         if std::fs::write(&tmp, line).is_ok() {
             let _ = std::fs::rename(&tmp, &p);
         }
@@ -269,6 +330,17 @@ pub fn run() -> ! {
                 std::thread::spawn(move || serve(conn));
             }
         });
+    }
+    if let Some((config, (_, tls_listeners))) = tls {
+        for l in tls_listeners {
+            let config = std::sync::Arc::clone(&config);
+            std::thread::spawn(move || {
+                for conn in l.incoming().flatten() {
+                    let config = std::sync::Arc::clone(&config);
+                    std::thread::spawn(move || crate::localtls::serve(conn, config, port));
+                }
+            });
+        }
     }
     // IT LIVES AS LONG AS THERE IS A NAME TO SERVE: any box of this user with a published TCP port,
     // from compose or `kern box -p`. Checked every second; with none for three checks in a row it
@@ -535,7 +607,7 @@ pub fn box_url(name: &str) -> Option<String> {
     if !has_tcp_port(&inst.ports) || !enabled() {
         return None;
     }
-    ensure().map(|port| url(name, "kern", port))
+    ensure().map(|port| url_now(name, "kern", port))
 }
 
 /// The host-name label a box is reached by: in a stack (`pod` set and the box named
@@ -568,12 +640,22 @@ pub fn url_of(name: &str, pod: &str, ports: &str) -> Option<String> {
         return None;
     }
     let port = running_port()?;
-    Some(url(&label, &project, port))
+    Some(url_now(&label, &project, port))
+}
+
+/// The URL to print for a name now: `https://` on the router's HTTPS port when it answers HTTPS (the
+/// user ran `kern proxy trust`), else `http://` on `port`. The plain URL keeps working either way.
+pub fn url_now(service: &str, project: &str, port: u16) -> String {
+    match running_tls_port() {
+        Some(443) => format!("https://{service}.{project}.localhost/"),
+        Some(tls) => format!("https://{service}.{project}.localhost:{tls}/"),
+        None => url(service, project, port),
+    }
 }
 
 /// A host-name label the router answers for: 1 to 63 bytes (DNS's bound) of letters, digits, `-`
 /// and `_`. ONE rule for `route`, `box_url` and `url_of`, so a printed URL is one that routes.
-fn label_ok(l: &str) -> bool {
+pub(crate) fn label_ok(l: &str) -> bool {
     !l.is_empty()
         && l.len() <= 63
         && l.bytes()

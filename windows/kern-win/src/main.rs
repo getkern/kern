@@ -978,6 +978,117 @@ fn doctor_windows_rows(target: &Target) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// `kern proxy trust | untrust` in Windows: HTTPS for the `.localhost` names in Windows' browsers.
+//
+// The distro's kern makes the local CA (it signs `localhost` names only) and runs the router that
+// answers them; the browsers are Windows'. So after the distro's half this bridge adds the CA to
+// the certificate store of the WINDOWS USER (`certutil -user -addstore Root`), never the machine's.
+// MEASURED on Windows 10 (2026-11-21): Windows' own verifier (CryptoAPI) refuses a certificate this
+// kind of CA signs for a non-`localhost` name (`HasNotPermittedNameConstraint`), and adding a root
+// to the user's store needs the user's click: Windows shows a confirmation, and in a session with no
+// desktop (over ssh) it refuses the add outright (`0x80070032`), which is said here with the way to
+// do it by hand.
+
+/// What `kern proxy` asks of this bridge, beyond forwarding.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum ProxyAction {
+    Trust,
+    Untrust,
+}
+
+/// `proxy trust` / `proxy untrust`, exactly; anything else is forwarded as it is.
+fn parse_proxy(args: &[String]) -> Option<ProxyAction> {
+    match args {
+        [p, a] if p == "proxy" && a == "trust" => Some(ProxyAction::Trust),
+        [p, a] if p == "proxy" && a == "untrust" => Some(ProxyAction::Untrust),
+        _ => None,
+    }
+}
+
+/// The CA's name and certificate from the distro (`kern __local-ca`): `(name, PEM)`.
+fn local_ca(target: &Target) -> Option<(String, String)> {
+    let argv = forward_argv(target, &["__local-ca".to_string()]);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = wsl_query(&refs)?;
+    let (name, pem) = out.split_once('\n')?;
+    let name = name.trim().to_string();
+    (!name.is_empty() && pem.contains("BEGIN CERTIFICATE")).then(|| (name, pem.to_string()))
+}
+
+/// `certutil` with the user's own store: its exit status, its words shown (the confirmation and
+/// its outcome are the user's to see).
+fn certutil_user(args: &[&str]) -> bool {
+    Command::new("certutil")
+        .arg("-user")
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn run_proxy(args: &[String], action: ProxyAction) -> i32 {
+    let target = match resolve_target() {
+        Ok(t) => t,
+        // Not resolvable: the plain forward says why, in the words every command uses.
+        Err(_) => return forward_to_kern(args, false),
+    };
+    match action {
+        ProxyAction::Trust => {
+            let code = forward_to_kern(args, false);
+            if code != 0 {
+                return code;
+            }
+            let Some((name, pem)) = local_ca(&target) else {
+                eprintln!("kern: the distro made no local CA to add to Windows' store");
+                return 1;
+            };
+            let file = env::temp_dir().join("kern-local-ca.crt");
+            if let Err(e) = fs::write(&file, pem.as_bytes()) {
+                eprintln!("kern: cannot write {}: {e}", file.display());
+                return 1;
+            }
+            let path = file.to_string_lossy().into_owned();
+            // Again, replacing an earlier copy under the same name.
+            let _ = Command::new("certutil")
+                .args(["-user", "-delstore", "Root", &name])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            eprintln!(
+                "kern: Windows asks you to confirm adding \"{name}\" (it can sign localhost names only)"
+            );
+            if certutil_user(&["-addstore", "Root", &path]) {
+                println!("kern: {name} is trusted in Windows' store of your user too.");
+                let _ = fs::remove_file(&file);
+                0
+            } else {
+                eprintln!(
+                    "kern: Windows did not add it (a session with no desktop cannot confirm it). In a \
+                     PowerShell on your desktop: certutil -user -addstore Root \"{path}\""
+                );
+                1
+            }
+        }
+        ProxyAction::Untrust => {
+            // The name first: after the distro's half there is no CA left to ask about.
+            if let Some((name, _)) = local_ca(&target) {
+                if certutil_user(&["-delstore", "Root", &name]) {
+                    println!("kern: {name} is out of Windows' store of your user.");
+                } else {
+                    eprintln!(
+                        "kern: Windows did not remove \"{name}\"; by hand: certutil -user -delstore Root \"{name}\""
+                    );
+                }
+            }
+            forward_to_kern(args, false)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The docker command line on Windows: `kern compat docker -- CMD` and `docker.exe`.
 //
 // LEVEL 1 IS THE WINDOWS FORM. `kern compat docker -- npm run dev` runs that Windows command with a
@@ -1327,6 +1438,10 @@ fn main() {
     if args.first().map(String::as_str) == Some("self-update") {
         exit(selfupdate::run(&args));
     }
+    // `kern proxy trust|untrust`: the distro's half, and the Windows store of this user.
+    if let Some(action) = parse_proxy(&args) {
+        exit(run_proxy(&args, action));
+    }
     exit(forward_to_kern(&args, is_plain_doctor(&args)));
 }
 
@@ -1404,6 +1519,16 @@ fn forward_to_kern(args: &[String], doctor: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_proxy_trust_and_untrust_are_taken_here() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_proxy(&a(&["proxy", "trust"])), Some(ProxyAction::Trust));
+        assert_eq!(parse_proxy(&a(&["proxy", "untrust"])), Some(ProxyAction::Untrust));
+        assert_eq!(parse_proxy(&a(&["proxy", "status"])), None);
+        assert_eq!(parse_proxy(&a(&["proxy"])), None);
+        assert_eq!(parse_proxy(&a(&["proxy", "trust", "x"])), None);
+    }
 
     #[test]
     fn the_docker_names_are_read_from_the_file_name_in_any_case() {

@@ -149,7 +149,7 @@ resolves to this machine with nothing to install (curl, browsers, systemd-resolv
 The router listens on port 80 where the system lets an ordinary user bind it
 (`net.ipv4.ip_unprivileged_port_start` at 80 or below), otherwise on the first free port from 8780 to
 8789, away from 8080, which many apps publish; `local_domains_port` fixes it. It reaches only ports your boxes already published, and leaves by
-itself within a few seconds of the last box with a published port. HTTP only. `local_domains = false` starts no router.
+itself within a few seconds of the last box with a published port. `local_domains = false` starts no router.
 
 On Windows, with kern in its WSL distro, the router is reached from Windows too, through WSL's
 `localhost` forwarding: `curl.exe http://web.shop.localhost:8780/` answers. Windows' own name
@@ -158,6 +158,42 @@ resolver does not resolve `<name>.localhost` (`ping`, PowerShell's `Invoke-WebRe
 `kern doctor` typed in Windows adds a row checked from the Windows side: a Windows program on the
 same port takes the names from Windows while the distro sees nothing wrong, and the row says so,
 as it says when Windows refuses to open that port, with the fix.
+
+#### HTTPS for the local names: `kern proxy trust`
+
+```
+kern proxy trust     # once: https://<service>.<project>.localhost:8443/ answers, trusted by your browsers
+kern proxy status
+kern proxy untrust   # takes it out of every store it was put in, and deletes it
+```
+
+Without `kern proxy trust` nothing changes and nothing is made: the names answer `http://` as above.
+`http://<name>.localhost` is already a secure context in Chrome and Firefox (service workers and the
+APIs reserved to secure pages work over it; measured with Chrome 157 and Firefox 157), so HTTPS is
+for what asks for it by name: an app configured with an `https://` URL, an OAuth provider that
+requires one.
+
+`trust` makes a certificate authority of your own, in `~/.local/share/kern/local-ca/` (the directory
+0700, its key 0600), that can sign names under `localhost` only, and adds it to the certificate stores
+of your user that Chrome (`~/.pki/nssdb`) and Firefox (each profile, the snap's and Flatpak's
+included) read. The system's store is not touched. Then the router also answers HTTPS: on 443 where
+an ordinary user may bind it, otherwise on the first free port from 8443 to 8452, and `kern box -d -p`,
+`compose up` and `kern ps` print the `https://` URL. Each name gets its certificate when a browser
+first asks for it, valid 30 days and replaced after 20; a name that is not a local name gets none.
+
+Measured (2026-11-21) with an authority made the same way and a control authority without the
+`localhost` limit: a certificate signed for another name is refused by OpenSSL 3.0.13, curl, Chrome
+157 and Firefox 157 on Linux and by Windows' verifier, while the control's is accepted by each. On
+Ubuntu 24.04 and in both WSL distros measured, an ordinary user cannot bind 443, so the port is 8443.
+
+Writing those stores needs NSS's `certutil`, which a stock Ubuntu desktop does not have: without it
+`kern proxy trust` says what to install (`libnss3-tools`, `nss-tools`, `nss`) and makes nothing.
+
+On Windows, `kern proxy trust` in PowerShell also adds the authority to the certificate store of your
+Windows user, which Windows asks you to confirm; in a session with no desktop (over ssh) Windows
+refuses the add, and kern prints the `certutil -user -addstore Root` line to run on the desktop.
+`curl.exe -k https://web.shop.localhost:8443/` and a .NET client trusting that authority were
+measured to reach a box in the distro over HTTPS.
 
 ### Logs and retention
 

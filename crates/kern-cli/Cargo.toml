@@ -28,6 +28,13 @@ libc = "0.2"
 # author, with no dependencies of its own. Pinned exactly: a signature check is not code to take
 # new versions of without reading them.
 minisign-verify = "=0.3.0"
+# HTTPS for the `.localhost` names, only after `kern proxy trust` (see `localtls`): the TLS stack and
+# the certificates of the user's own local CA. `ring` as the crypto provider (no C toolchain beyond
+# what `ring` brings, and the same provider for every target kern ships); TLS 1.3 and 1.2. Pinned
+# exactly, for the reason the signature check above is.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # The tests SIGN fake releases with a throwaway key, which a verifier cannot do. Test builds only:
