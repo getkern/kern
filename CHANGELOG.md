@@ -149,6 +149,12 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
   answered 501 while `kern update` existed. A field kern does not change is refused by name.
 - **`kern-mcp` honours `notifications/cancelled`.** A call cancelled while it waits behind another
   is not run and not answered; a running one finishes, but its answer is not sent.
+- **A deeply nested compose value is refused.** A flow collection nested past 64 levels
+  (`labels: [[[[...]]]]`) made `kern compose` allocate until it aborted, past 4 GiB in under a
+  second. It is now refused by name, with its line.
+- **A failed archive entry is named.** `kern cp -` and `docker cp` into a box name the archive entry
+  that failed. The API answered 404 "Could not find the file" for a destination that exists; 404 is
+  now only for a missing destination.
 
 **`kern cp` and `docker cp` reach a kept box that is not running, and a kept box keeps its image.**
 A box that is stopped, never started, or between two runs of its `--restart` policy was refused as
