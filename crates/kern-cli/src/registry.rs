@@ -673,7 +673,12 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 20] = [
+const AUTHORITATIVE_DIRS: [&str; 21] = [
+    // `netpool/` holds the networks prepared ahead for boxes (see `netpool`): each slot's holder pid,
+    // whose user and network namespaces the next box ENTERS, and the pid of its pasta. A box able to
+    // write a slot would hand the next box a namespace of its own choosing, or aim the release's
+    // signal at a process of its choosing: `outbound/`'s reason, and a direct route into a peer.
+    "netpool",
     // `outbound/` holds the state of a box's OWN NAT (Docker's default network): the pid of its pasta,
     // which kern signals when the box ends. A box able to rewrite it would aim that signal at a
     // process of its choosing, `relays/`'s reason.

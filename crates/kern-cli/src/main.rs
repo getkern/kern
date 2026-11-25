@@ -317,6 +317,8 @@ mod localrouter;
 mod localtls;
 mod logview;
 /// Peer addressing and hosts files for a `--no-pod` stack.
+/// Networks prepared ahead for boxes on the default NAT.
+mod netpool;
 mod network;
 mod nopod;
 mod openat2;

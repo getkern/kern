@@ -182,6 +182,11 @@ pub struct SandboxSpec {
     /// still gets its own mount/pid/uts/ipc namespaces. Pod members are co-trusted (they share the
     /// pod's user+net ns) - the pod is the network trust unit, like a Kubernetes pod.
     pub pod_holder: Option<i32>,
+    /// The holder in `pod_holder` is a NETWORK PREPARED AHEAD for this box alone (kern's pool of
+    /// NATs, see the CLI's `netpool`): its user and network namespaces are entered as a pod's are,
+    /// and nothing else of a pod applies. In particular the box keeps its OWN `/etc/hosts`, as a box
+    /// with its own NAT does, where a pod member has the pod's shared file bound over it.
+    pub net_slot: bool,
     /// `--ipc container:<box>`: the PID 1 of a box in the SAME pod whose IPC namespace this box
     /// enters instead of creating its own (Docker's `ipc: service:X`). Only on the pod path: the
     /// target's IPC namespace is owned by the pod's user namespace, which is the one this box joins,
@@ -2036,7 +2041,7 @@ fn child_setup_and_exec(
     setup_copy_in(&spec.root, &spec.copy_in)?;
     // A pod member in the SHARED namespace has the pod's hosts file bound over its own, and its
     // entry there is written by the CLI; writing it here would race the other members on one file.
-    let shared_hosts = spec.pod_holder.is_some() && spec.pod_bridges.is_empty();
+    let shared_hosts = spec.pod_holder.is_some() && !spec.net_slot && spec.pod_bridges.is_empty();
     let self_ip = box_own_ip(spec).unwrap_or(std::net::Ipv4Addr::LOCALHOST);
     // Bound from the box's own directory where the image has the file; written into the root for a
     // file it does not have (the debian family ships no `/etc/hosts`), as before.

@@ -176,7 +176,7 @@ fn network_sentence(alive: bool, resolv: bool, installed: bool) -> &'static str 
 
 /// The inode of `/proc/<pid>/ns/<kind>` - a namespace's stable identity. Used to detect PID reuse:
 /// a recorded holder PID is only trusted if its net ns inode still matches the one from create time.
-fn ns_inode(pid: i32, kind: &str) -> Option<u64> {
+pub(crate) fn ns_inode(pid: i32, kind: &str) -> Option<u64> {
     std::fs::metadata(format!("/proc/{pid}/ns/{kind}"))
         .ok()
         .map(|m| std::os::unix::fs::MetadataExt::ino(&m))

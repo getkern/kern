@@ -1789,6 +1789,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         workdir: b.workdir,
         share_net: b.share_net,
         pod_holder: b.pod_holder,
+        // Set by the caller once a prepared network is claimed for this box (see `netpool`).
+        net_slot: false,
         ipc_from: b.ipc_from,
         shm_dir: b.shm_dir,
         etc_dir: b.etc_dir,

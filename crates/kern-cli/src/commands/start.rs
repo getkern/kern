@@ -3046,7 +3046,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             );
         }
     }
-    let (spec, scratch) = build_spec(BuildSpec {
+    let (mut spec, scratch) = build_spec(BuildSpec {
         name: &name,
         lower,
         cmd,
@@ -3190,6 +3190,22 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         crate::keepbox::release_held_layer();
         return install_persistent_box(&name, &args, cpus);
     }
+    // A NETWORK PREPARED AHEAD for a box on the default NAT, when one fits it (see `netpool`): the box
+    // enters a namespace whose pasta is already up instead of waiting for its own at the gate. Decided
+    // from the spec the in-place path would run, after the systemd hand-off (that box never runs here).
+    let mut net_slot = crate::netpool::kind_for(
+        &spec,
+        args.own_outbound,
+        args.privileged,
+        restart || restart_always || args.restart != RestartPolicy::No || args.tty,
+    )
+    .and_then(crate::netpool::claim);
+    if let Some(slot) = &net_slot {
+        spec.pod_holder = Some(slot.holder());
+        spec.net_slot = true;
+    }
+    // The box's own NAT is started at its gate only when no prepared one was taken.
+    let own_nat = args.own_outbound && net_slot.is_none();
     // Each box records the named volumes it mounts (below, in the registry) BEFORE it mounts them, so
     // `kern volume rm` sees an in-use volume and refuses - race-free without holding an fd open on the
     // volume dir (which would disturb the sandbox's mount setup).
@@ -3341,8 +3357,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             args.gpus.unwrap_or(""),
             args.pod
                 .filter(|_| args.stack_outbound)
-                .or(args.own_outbound.then_some("")),
+                .or(own_nat.then_some("")),
             egress_plan,
+            net_slot.as_mut(),
         );
     }
     // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
@@ -3525,7 +3542,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let mut held_nat = args
         .pod
         .filter(|_| args.stack_outbound)
-        .or(args.own_outbound.then_some(""))
+        .or(own_nat.then_some(""))
         .and_then(|p| HeldNat::arm(p, name.as_str()));
     // THE WORKLOAD WAITS FOR ITS FILTER: armed after `HeldNat`, which `--egress-allow` never meets
     // (it refuses `--pod`), so the two never compete for the one gate a box has.
@@ -3578,6 +3595,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     );
     drop(held_nat);
     drop(egress_gate);
+    // The box is over: its prepared network goes now, not at the end of the teardown.
+    if let Some(slot) = net_slot.as_mut() {
+        slot.release();
+    }
     pt.mark("box lifetime (spawn->exit)");
     // THE EGRESS PUMP NEVER CAME UP, so the box we just ran had no outbound access at all, not
     // even to the domains the caller allowed. PID 1 was SIGKILLed in the callback; report the
@@ -6431,6 +6452,9 @@ fn run_detached(
     outbound_pod: Option<&str>,
     // `--egress-allow` / `--egress-secret`, armed by the runner before every attempt.
     egress: Option<EgressPlan>,
+    // The network prepared ahead that this box entered (see `netpool`): released by the supervisor
+    // once the box is over, and handed over by this launcher, which returns while the box runs.
+    mut net_slot: Option<&mut crate::netpool::NetSlot>,
 ) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
@@ -6478,6 +6502,11 @@ fn run_detached(
         return Err(Error::Sandbox("fork for detach failed".to_string()));
     }
     if child > 0 {
+        // The supervisor just forked holds the prepared network for the box's life; this launcher
+        // returns while the box runs and must not release it.
+        if let Some(slot) = net_slot.as_deref_mut() {
+            slot.hand_over();
+        }
         // The launcher reads the notices and never writes them, so its write end goes now: the
         // supervisor's copy is the only one that matters, and one fewer descriptor is one fewer way
         // for this process to hold anything open.
@@ -6605,6 +6634,9 @@ fn run_detached(
     let timeout_pid = (timeout > 0)
         .then(|| spawn_timeout_stop(name.as_str().to_string(), pid, timeout))
         .flatten();
+    if let Some(slot) = net_slot.as_deref() {
+        slot.adopt();
+    }
     // Run the box (re-registering with its PID 1 so `kern exec` can find it), restarting it per
     // `--restart`. Blocks for the box's whole lifetime.
     supervise_box(
@@ -6623,6 +6655,9 @@ fn run_detached(
         outbound_pod,
         egress.as_ref(),
     );
+    if let Some(slot) = net_slot {
+        slot.release();
+    }
     // The box has ended: its log pump drains and exits while the rest of the teardown runs.
     crate::commands::boxlog::release_log_pump();
     // Box is gone - cancel the sidecars and reap them (they're our children; setsid doesn't change

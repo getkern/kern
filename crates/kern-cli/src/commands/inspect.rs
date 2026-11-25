@@ -3527,6 +3527,8 @@ pub fn stop_with_grace(
             println!("removed pod '{pod}'");
         }
     }
+    // The prepared networks of boxes whose supervisor this stop ended before it could release them.
+    crate::netpool::release_orphans();
     // Don't silently ignore refs that matched no running box (and no managed unit). A ref matched a
     // target by NAME, by its PID, or by its POD name (same rule as the selection above), so check all
     // three - else `kern stop <pid|pod>` acts AND then wrongly warns the ref "isn't a box".

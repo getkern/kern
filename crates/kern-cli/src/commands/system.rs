@@ -1273,7 +1273,6 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
             names.join(", ")
         )));
     }
-
     let mut items: Vec<Removable> = Vec::new();
     let mut push = |path: PathBuf, what: &'static str, is_user_data: bool| {
         if path.exists() {
@@ -1491,6 +1490,9 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
         return Ok(());
     }
 
+    // The networks prepared ahead for the next box: nothing will claim them now, and their holders
+    // run this binary. Here, once the removal is decided, not before the question.
+    crate::netpool::discard_ready();
     // Remove the binary LAST: on Linux an unlinked running executable keeps working, but doing it
     // first would leave the rest behind if anything after it failed.
     items.sort_by_key(|i| i.what == "the kern binary");

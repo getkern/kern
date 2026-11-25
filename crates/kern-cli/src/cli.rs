@@ -526,6 +526,11 @@ pub enum Command {
     },
     /// Hidden: the pod namespace holder process (spawned by `pod create`, not user-facing).
     PodHolder,
+    /// Hidden: make the prepared networks of one kind (`single`/`range`), started in the background
+    /// by a box that took one (see `netpool`).
+    NetpoolFill {
+        kind: String,
+    },
     /// Hidden: every volume's size, for `kern top`, which measures in a child so the walk never
     /// blocks a frame (see `tui::VolumeSizer`).
     VolumeSizes,
@@ -1405,6 +1410,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // Hidden: the pod namespace holder (spawned by `pod create`).
         Some("__pod-holder") => Command::PodHolder,
+        Some("__netpool-fill") => Command::NetpoolFill {
+            kind: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
+        },
         // Hidden: volume sizes for `kern top` (see `tui::VolumeSizer`).
         Some("__volume-sizes") => Command::VolumeSizes,
         Some("__pasta-probe") => Command::PastaProbe,
@@ -7745,6 +7753,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         }
         Command::NetworkRemove { names } => crate::network::remove_many(&names),
         Command::PodHolder => crate::pod::run_holder(),
+        Command::NetpoolFill { kind } => std::process::exit(crate::netpool::fill_verb(&kind)),
         Command::VolumeSizes => crate::volume::print_sizes(),
         // A hidden verb whose exit status IS its answer, and which has already cleaned up after itself.
         Command::PastaProbe => std::process::exit(crate::pod::pasta_probe_verb()),

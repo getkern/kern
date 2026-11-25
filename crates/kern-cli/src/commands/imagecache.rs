@@ -2825,7 +2825,7 @@ pub(crate) fn pin_in_background(image: &str, id: &str) {
 }
 
 /// The grandchild's stdio on `/dev/null` and every other inherited descriptor closed.
-fn detach_from_the_caller() {
+pub(crate) fn detach_from_the_caller() {
     // SAFETY: plain syscalls on descriptors this process owns; a failure leaves the default.
     unsafe {
         let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);

@@ -437,6 +437,20 @@ pub fn info() -> Result<(), Error> {
             "loopback only: pasta (passt) is not installed, which a box's NAT needs"
         },
     );
+    // THE NETWORKS PREPARED AHEAD (see `netpool`): a box on the default NAT enters one whose pasta is
+    // already up. Said with the count, so a reader who sees idle `__pod-holder` and `pasta` processes
+    // knows what they are and how to turn them off.
+    if which("pasta") {
+        let (single, range, used) = crate::netpool::counts();
+        row(
+            "net pool",
+            &format!(
+                "{} ready, {used} in use: a box's NAT made ahead of it, so it starts without waiting \
+                 for pasta (`KERN_NET_POOL=0` turns this off)",
+                single + range
+            ),
+        );
+    }
     // WHETHER THE TCP RULES FOR PASTA HOLD HERE (see `kern_isolation::nft`): without them, under the
     // pasta Ubuntu 24.04 ships, a closed port hangs a client until its timeout. One fork and a
     // namespace made for the question.
