@@ -81,6 +81,9 @@ per-pair differences with a 95% interval. `--json` prints one object. See [BENCH
 `https://` URL to the proxy instead of a `CONNECT`; the proxy now makes that HTTPS request itself, over
 the vetted and pinned leg `--egress-secret` uses, where it used to dial port 80 and fail.
 
+- `kern pod create` refuses where `kernel.apparmor_restrict_unprivileged_userns=1` applies to kern
+  (kern outside its AppArmor profile), with the words `kern box` uses there; a pod member used to start
+  on such a host while a plain box was refused.
 - `kern doctor` typed in Windows: the row checked from Windows is one of the table's rows, counted in
   the tally, where it was printed after it.
 - `install.ps1` resolves the latest version once, with a timeout, and downloads every file from that

@@ -1811,15 +1811,7 @@ fn child_setup_and_exec(
         if std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
             .is_ok_and(|v| v.trim() == "1")
         {
-            return Err(Error::Unsupported(concat!(
-                userns_restricted!(),
-                " - this host allows the namespace \
-                 and refuses its rootless uid map (Ubuntu 23.10+ ships \
-                 kernel.apparmor_restrict_unprivileged_userns=1), so no box can start. \
-                 `kern doctor` prints the AppArmor profile to install; \
-                 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts it for the \
-                 whole machine until reboot",
-            )));
+            return Err(Error::Unsupported(USERNS_RESTRICTED_BY_APPARMOR));
         }
         return Err(Error::last("unshare(CLONE_NEWNS)"));
     }
@@ -6328,6 +6320,17 @@ pub fn single_threaded() -> bool {
     })
 }
 
+/// Ubuntu's restriction, in the words a box and a pod holder both refuse with.
+const USERNS_RESTRICTED_BY_APPARMOR: &str = concat!(
+    userns_restricted!(),
+    " - this host allows the namespace \
+     and refuses its rootless uid map (Ubuntu 23.10+ ships \
+     kernel.apparmor_restrict_unprivileged_userns=1), so no box can start. \
+     `kern doctor` prints the AppArmor profile to install; \
+     `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts it for the \
+     whole machine until reboot",
+);
+
 /// Write the dependency-free single-uid identity map (box uid/gid 0 → caller) for the CURRENT,
 /// already-unshared user namespace: deny `setgroups` first (the kernel requires this before an
 /// unprivileged `gid_map`), then the one-row uid/gid maps. Shared by the no-range default and the
@@ -9461,6 +9464,24 @@ pub fn run_pod_holder() -> ! {
                 unsafe { libc::_exit(1) };
             }
         }
+    }
+    // ⛔ A HOLDER WITHOUT ITS CAPABILITIES IS NOT A POD. Members `setns` into this namespace and
+    // receive every capability in it, whatever the host's policy did to the holder that made it.
+    // Ubuntu's `apparmor_restrict_unprivileged_userns=1` strips exactly the creator: MEASURED on
+    // Ubuntu 24.04 with kern outside its profile, `kern box` refused (exit 125) while `pod create`
+    // succeeded and a `--pod` member started with the full range, so the pod was a way around the
+    // policy the plain box obeys. The holder now exercises a capability first (`CLONE_NEWUTS` needs
+    // CAP_SYS_ADMIN in its own namespace) and refuses in the box's words when it is denied.
+    if unsafe { libc::unshare(libc::CLONE_NEWUTS) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .is_ok_and(|v| v.trim() == "1")
+        {
+            eprintln!("kern: pod: {USERNS_RESTRICTED_BY_APPARMOR}");
+        } else {
+            eprintln!("kern: pod: no capability in the pod's user namespace ({e}), so its members would hold more than it does: not started");
+        }
+        unsafe { libc::_exit(1) };
     }
     bring_loopback_up();
     // `KERN_POD_BRIDGE=<cidr>`: this pod gives every member its own network namespace on a bridge
