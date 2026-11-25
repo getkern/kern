@@ -193,6 +193,15 @@ prints one JSON line per box (it printed the word `json`), and `--format` says `
   build cache inside it is still what `RUN --mount=type=cache` mounts. The SDKs refused it already.
 - **A `kern.toml` that is not text stops a box from starting**, as one that does not parse and names a
   data place does, instead of a warning and the default place.
+- **The Node SDK runs from an ES-module parent** (code piped to `node --input-type=module`,
+  `--experimental-default-type=module`): it ended the caller's process with `require is not defined`.
+- **The SDKs no longer warn about a Python bytecode cache on an image without Python** (`node:22-alpine`
+  quoted node's crash trailer as the reason), and a change anywhere in an image's config, not only its
+  first 4 KB, rebuilds the cache.
+- **SDK metrics say why a box field is missing** (`unavailable`: a one-shot sandbox, a resident box not
+  running, a host that does not account the box).
+- **Bare `kern` shows `kern run`**, in `docker run`'s shape, without a resource profile or the removed
+  `kern limit`.
 - **The SDKs refuse a mount target with a `:` and two mounts on one target**, with `MountRefused`
   before anything starts: `"/m:ro"` was mounted at a directory named `/m:ro`, read-only nowhere; the
   message names the tuple (`("/m", "ro")`, Node `["/m", "ro"]`).

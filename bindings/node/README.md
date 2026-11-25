@@ -182,8 +182,15 @@ r.success;      // false
 r.fault.type;   // "timeout"
 ```
 
-A box that fails to **start** is **thrown** as a `SandboxError`, not returned as a fault, because the
-code never ran.
+**What resolves, and what rejects.** A run resolves to a result whenever there is something to report
+about it, `fault` included. Three things reject instead, each a `SandboxError`, because no code ran:
+
+- a mount refused before any box starts, by this package or by kern (`MountRefused`);
+- a box that kern began and that failed to start (kern's exit 125);
+- an option the sandbox cannot take (`persist: true` without `name`, a bad `tmpfs` size).
+
+kern refusing an image or a GPU before any box exists resolves with `fault.type` `startup_failed`, and
+kern's reason in `stderr`.
 
 `stderr` is one stream shared by kern and your code, so a note about an undelegated cgroup arrives
 interleaved with the program's own output. Right for a human at a terminal, wrong for anything that puts
@@ -194,6 +201,9 @@ interleaved with the program's own output. Right for a human at a terminal, wron
 
 Every relaxing option says so in its name or docs:
 
+- **Each call's code and output are kept** for `kern sandbox show` and `kern sandbox history`, until
+  reboot by default (`kern sandbox keep disk` keeps them across reboots). `{ transcripts: false }`
+  keeps none for that sandbox, `[kern] sandbox_transcripts = false` none for every one.
 - **network off** unless `network: true` (session-level, explicit).
 - **hard caps**: `memoryMb` (512), `pids` (256), optional `cpus`. Enforced by cgroup v2.
 - **timeout owned by the binding**: `timeoutS` (30) is a real deadline; the binding kills the box (and

@@ -58,7 +58,9 @@ To pin a release, run the script with `KERN_VERSION=vX.Y.Z`. To build from sourc
 
 ## Windows
 
-In PowerShell:
+Open **Windows PowerShell** (Start menu, `PowerShell`): its prompt starts with `PS`, as in
+`PS C:\Users\you>`. The command is PowerShell's own (`irm` downloads, `iex` runs), so in a Command
+Prompt (`C:\>`) or a WSL shell (`$`) it fails before kern is involved.
 
 ```powershell
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex

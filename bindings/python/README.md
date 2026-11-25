@@ -163,6 +163,16 @@ writes, not from stdout, so code that prints `[exit 0]` can't fake it. Also `kil
 correct an outcome reported wrong, and that release's
 [CHANGELOG](https://github.com/getkern/kern/blob/main/CHANGELOG.md) entry says so first.
 
+**What comes back, and what raises.** A run returns a result whenever there is something to report
+about it, `fault` included. Three things raise instead, each a `SandboxError`, because no code ran:
+
+- a mount refused before any box starts, by this package or by kern (`MountRefused`);
+- a box that kern began and that failed to start (kern's exit 125);
+- an argument the sandbox cannot take (`persist=True` without `name=`, a bad `tmpfs` size).
+
+kern refusing an image or a GPU before any box exists comes back as `startup_failed` in `fault`,
+with kern's reason in `stderr`.
+
 ## Works with
 
 - **Any MCP client**: Claude Code, Cursor, Claude Desktop, LM Studio, Zed. The package ships
@@ -206,6 +216,9 @@ relaxation is a named argument.
   10 s is refused unchecked; if it is a network or FUSE filesystem that never answers, the scan's
   thread stays in the kernel's uninterruptible wait, and the process cannot exit until that
   filesystem answers or is unmounted.
+- **Each call's code and output are kept** for `kern sandbox show` and `kern sandbox history`, until
+  reboot by default (`kern sandbox keep disk` keeps them across reboots). `Sandbox(transcripts=False)`
+  keeps none for that sandbox, `[kern] sandbox_transcripts = false` none for every one.
 - **`network=True` includes the host's loopback**, where unauthenticated services live: a test read
   the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the route-level middle setting.
 - **No network means no interface, not no channel**: a mount is one. A sandbox with `network=False`
