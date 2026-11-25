@@ -157,6 +157,17 @@ through, that would leave the destination is refused. The Docker API serves
 container that has been created and not started (how Testcontainers copies its files) is in place
 when its command starts.
 
+**`kern cp` copies the box's files as the box's root.** A file of mode 000, or one that belongs to
+another user of the box (a service's data), could not be read from the host: `kern cp` failed with
+"Permission denied", and `docker cp` through kern's socket exited 0 with an empty directory. The copy
+now runs in the box's user namespace, so it reads and writes what the box's root can; what it writes
+on the host is still yours. A copy that fails part-way is now an error for the Docker client too.
+
+**`docker compose up` twice, and `--force-recreate`, through kern's socket.** The second `up` crashed
+the compose client (the container list carried no networks), and a recreate failed, because the new
+container is renamed before its start and a created container could not be renamed. A renamed
+container keeps its id, as under Docker.
+
 **`docker compose` works through kern's socket.** Its first network call answered 501 and it
 stopped there. Networks are served now as kern pods (a service is reached by its name from every
 member, the ones already running included) and volumes as kern volumes, with the labels compose finds

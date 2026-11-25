@@ -251,6 +251,41 @@ fn top_name(sp: &Split) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------------------------
 // The copies.
 
+/// Enter the user namespace of the box whose PID 1 is `pid1`, for the whole copy.
+///
+/// AS THE BOX'S ROOT, NOT AS THIS USER. The box's files belong to the ids of its own namespace: a
+/// file of mode 000 is its root's, a service's data is its user's (postgres 70, an image's `app`
+/// user), and from the host this user may read neither. MEASURED before: `kern cp` of such a
+/// directory failed with "Permission denied", and `docker cp` through kern's socket printed nothing
+/// and exited 0 with an EMPTY directory, where Docker copied both files.
+///
+/// The process stays this user (its kernel uid is unchanged, so what it writes on the host is this
+/// user's, and a host file it could not read it still cannot): it gains the box root's capabilities
+/// over the files whose ids that namespace maps, the box's own, which is what Docker's daemon has.
+/// Only a single-threaded process may join a user namespace; one that cannot (`kern compose cp`
+/// runs inside a threaded driver, or the box shares this namespace) copies as this user, as before.
+///
+/// Returns the id map an archive written from here needs: once inside, `stat` already answers in
+/// the box's ids, so they are written as they are; outside, the host's are mapped through the box's
+/// `uid_map` (mapping them twice wrote 65534 for every owner, measured).
+fn enter_box_userns(pid1: i32) -> IdMap {
+    let Ok(path) = cstr(format!("/proc/{pid1}/ns/user").as_bytes()) else {
+        return IdMap::of_box(pid1);
+    };
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return IdMap::of_box(pid1);
+    }
+    let fd = owned(fd);
+    // EINVAL: already in it, or not single-threaded; EPERM: not ours to enter. Either way the copy
+    // goes on with this user's rights, which is what it had before.
+    if unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWUSER) } == 0 {
+        IdMap::default()
+    } else {
+        IdMap::of_box(pid1)
+    }
+}
+
 /// Run the writer into a pipe on one thread and the reader from it on this one.
 fn pipe_through(src: &Source, top: Option<&[u8]>, ids: IdMap, dest: &Dest) -> Result<u64, Error> {
     let mut fds = [0 as RawFd; 2];
@@ -312,6 +347,7 @@ fn landing(
 
 /// box → host path.
 fn copy_out(pid1: i32, box_src: &str, host_dst: &str, follow: bool) -> Result<(), Error> {
+    let ids = enter_box_userns(pid1);
     let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
     let (src, sp) = box_source(root.as_raw_fd(), box_src.as_bytes(), follow)?;
     let kind = std::fs::metadata(host_dst).ok().map(|m| m.is_dir());
@@ -338,7 +374,7 @@ fn copy_out(pid1: i32, box_src: &str, host_dst: &str, follow: bool) -> Result<()
             )
         })),
     };
-    let n = pipe_through(&src, top.as_deref(), IdMap::of_box(pid1), &dest)?;
+    let n = pipe_through(&src, top.as_deref(), ids, &dest)?;
     println!("copied box:{box_src} → {} ({n} bytes)", target.display());
     Ok(())
 }
@@ -369,6 +405,8 @@ fn copy_in(host_src: &str, pid1: i32, box_dst: &str, follow: bool) -> Result<(),
     // the same way, since the registry may lie below it.
     crate::secret::guard_host_path(host_src, "cp")?;
     let (src, sp) = host_source(host_src, follow)?;
+    // The host source is open (as this user); the box side is written as the box's root.
+    let _ = enter_box_userns(pid1);
     let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
     let kind = box_kind(root.as_raw_fd(), box_dst.as_bytes())?;
     let (dir, top) = landing(&src, &sp, box_dst.as_bytes(), kind)?;
@@ -396,6 +434,7 @@ fn copy_in(host_src: &str, pid1: i32, box_dst: &str, follow: bool) -> Result<(),
 
 /// box → an archive on stdout (`kern cp <box>:<src> -`).
 fn archive_out(pid1: i32, box_src: &str, follow: bool) -> Result<(), Error> {
+    let ids = enter_box_userns(pid1);
     let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
     let (src, sp) = box_source(root.as_raw_fd(), box_src.as_bytes(), follow)?;
     let top = top_name(&sp);
@@ -405,7 +444,7 @@ fn archive_out(pid1: i32, box_src: &str, follow: bool) -> Result<(), Error> {
         &src.name,
         &src.st,
         top.as_deref(),
-        IdMap::of_box(pid1),
+        ids,
         out,
     )
     .map_err(|e| Error::Sandbox(format!("kern cp: {e}")))?;
@@ -414,6 +453,7 @@ fn archive_out(pid1: i32, box_src: &str, follow: bool) -> Result<(), Error> {
 
 /// An archive on stdin → the box directory `box_dst` (`kern cp - <box>:<dst>`), which must exist.
 fn archive_in(pid1: i32, box_dst: &str) -> Result<(), Error> {
+    let _ = enter_box_userns(pid1);
     let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
     match box_kind(root.as_raw_fd(), box_dst.as_bytes())? {
         Some(true) => {}
@@ -467,6 +507,7 @@ fn go_file_mode(mode: u32) -> u64 {
 
 /// The stat Docker's API puts in `X-Docker-Container-Path-Stat`, for `KERN_CP_STAT=1`.
 fn print_stat(pid1: i32, box_src: &str, follow: bool) -> Result<(), Error> {
+    let _ = enter_box_userns(pid1);
     let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
     let (src, sp) = box_source(root.as_raw_fd(), box_src.as_bytes(), follow)?;
     let mut link = String::new();

@@ -85,6 +85,14 @@ pub(crate) fn kern_error(stderr: &str) -> String {
 /// A container's 64-hex id, derived from its box name, so the mapping needs no state: the same
 /// name always has the same id, and any client's short prefix of it finds it.
 pub(crate) fn id_of(name: &str) -> String {
+    if let Some(id) = renamed_id(name) {
+        return id;
+    }
+    hashed_id(name)
+}
+
+/// The id a name hashes to: a container's id unless it was renamed (see [`renamed_id`]).
+fn hashed_id(name: &str) -> String {
     let mut out = String::with_capacity(64);
     for round in 0u8..4 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ u64::from(round);
@@ -95,6 +103,114 @@ pub(crate) fn id_of(name: &str) -> String {
         out.push_str(&format!("{h:016x}"));
     }
     out
+}
+
+/// THE ID SURVIVES A RENAME, as Docker's does: `docker compose up --force-recreate` creates the new
+/// container under a temporary name, removes the old one, renames the new one to the service's name
+/// and then STARTS IT BY ITS ID. An id derived from the name changed with the rename, and the start
+/// found nothing. So a renamed container keeps the id it had, here, and the name it left is given a
+/// fresh one, so a later container under that name is not taken for it. Kept on disk beside the
+/// labels (`compat-meta/ids/<name>`): this server exits when idle and the ids must outlive it.
+static IDS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+fn ids_dir() -> Option<std::path::PathBuf> {
+    Some(
+        kern_common::xdg_cache_dir()?
+            .join("kern")
+            .join("compat-meta")
+            .join("ids"),
+    )
+}
+
+fn with_ids<T>(f: impl FnOnce(&mut HashMap<String, String>) -> T) -> Option<T> {
+    let mut g = IDS.lock().ok()?;
+    let m = g.get_or_insert_with(|| {
+        let mut m = HashMap::new();
+        if let Some(rd) = ids_dir().and_then(|d| std::fs::read_dir(d).ok()) {
+            for e in rd.flatten() {
+                if let (Some(n), Ok(id)) = (
+                    e.file_name().to_str().map(str::to_string),
+                    std::fs::read_to_string(e.path()),
+                ) {
+                    let id = id.trim().to_string();
+                    if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        m.insert(n, id);
+                    }
+                }
+            }
+        }
+        m
+    });
+    Some(f(m))
+}
+
+fn renamed_id(name: &str) -> Option<String> {
+    with_ids(|m| m.get(name).cloned()).flatten()
+}
+
+fn id_set(name: &str, id: &str) {
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = with_ids(|m| m.insert(name.to_string(), id.to_string()));
+    if let Some(d) = ids_dir() {
+        if std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&d)
+            .is_ok()
+        {
+            let _ = std::fs::write(d.join(name), id);
+        }
+    }
+}
+
+/// `old` became `new`: `new` keeps `old`'s id, and `old` gets one nobody had.
+fn id_rename(old: &str, new: &str) {
+    let id = id_of(old);
+    id_set(new, &id);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    id_set(old, &hashed_id(&format!("{old}#{nanos}")));
+}
+
+/// The container is removed: a later one under its name hashes again.
+fn id_forget(name: &str) {
+    let _ = with_ids(|m| m.remove(name));
+    if let Some(d) = ids_dir() {
+        let _ = std::fs::remove_file(d.join(name));
+    }
+}
+
+/// Rename a container that is CREATED and not started: there is no box yet, so `kern rename` has
+/// nothing to act on; what this server keeps for it moves to the new name instead (its argv, the
+/// archives copied into it, its aliases).
+fn rename_created(name: &str, new: &str) -> Option<Response> {
+    let mut c = created_take(name)?;
+    if let Some(slot) = c.argv.get_mut(1).filter(|a| a.as_str() == name) {
+        *slot = new.to_string();
+    }
+    if let (Some(from), Some(to)) = (stage_dir(name), stage_dir(new)) {
+        if from.is_dir() && std::fs::rename(&from, &to).is_ok() {
+            let (f, t) = (
+                from.to_string_lossy().into_owned(),
+                to.to_string_lossy().into_owned(),
+            );
+            for a in c.argv.iter_mut() {
+                if let Some(rest) = a.strip_prefix(f.as_str()) {
+                    *a = format!("{t}{rest}");
+                }
+            }
+        }
+    }
+    if let Ok(mut g) = NET_ALIASES.lock() {
+        if let Some(m) = g.as_mut() {
+            if let Some(v) = m.remove(name) {
+                m.insert(new.to_string(), v);
+            }
+        }
+    }
+    created_put(new, c);
+    Some(no_content())
 }
 
 /// `n` random bytes from the kernel, as hex.
@@ -1076,6 +1192,7 @@ fn list(bin: &Path, req: &Request) -> Response {
         }
         // A frozen box (`kern pause`) is Docker's `paused`, in the list as in `inspect`.
         let paused = running && v.get("status").and_then(Value::as_str) == Some("paused");
+        let pod = v.get("pod").and_then(Value::as_str).unwrap_or_default();
         let labels = labels_of(&v);
         let state = if paused {
             "paused"
@@ -1111,7 +1228,11 @@ fn list(bin: &Path, req: &Request) -> Response {
         items.push(format!(
             // The image kern recorded, running or exited: it was an empty string for every row, so
             // `docker ps` showed `<no image>` for every container.
-            "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"Command\":{},\"Created\":{},\"State\":{},\"Status\":{},\"Ports\":[{}],\"Labels\":{}}}",
+            // `NetworkSettings.Networks`, `HostConfig` and `Mounts`, as Docker's summary carries them:
+            // compose's second `up` reads the networks from THIS list to decide whether a container
+            // must be recreated. MEASURED before: the field was absent and the docker compose v5
+            // client crashed with a nil pointer (`checkExpectedNetworks`).
+            "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":\"\",\"Command\":{},\"Created\":{},\"State\":{},\"Status\":{},\"Ports\":[{}],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":[]}}",
             json_str(&id_of(&name)),
             json_str(&format!("/{name}")),
             json_str(v.get("image").and_then(Value::as_str).unwrap_or_default()),
@@ -1136,7 +1257,9 @@ fn list(bin: &Path, req: &Request) -> Response {
                 "Exited"
             }),
             ports.join(","),
-            labels_json(&labels)
+            labels_json(&labels),
+            json_str(if pod.is_empty() { "default" } else { pod }),
+            crate::netvol::networks_json(Some(pod), &net_aliases(&name))
         ));
     }
     if all {
@@ -1147,14 +1270,17 @@ fn list(bin: &Path, req: &Request) -> Response {
             if !filters.keeps(name, "created", &c.labels) {
                 continue;
             }
+            let (net, aliases) = crate::netvol::created_network(&c.argv);
             items.push(format!(
-                "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"Command\":{},\"Created\":{},\"State\":\"created\",\"Status\":\"Created\",\"Ports\":[],\"Labels\":{}}}",
+                "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":\"\",\"Command\":{},\"Created\":{},\"State\":\"created\",\"Status\":\"Created\",\"Ports\":[],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":[]}}",
                 json_str(&id_of(name)),
                 json_str(&format!("/{name}")),
                 json_str(&c.image),
                 json_str(&c.cmd.join(" ")),
                 c.created,
-                labels_json(&c.labels)
+                labels_json(&c.labels),
+                json_str(net.as_deref().unwrap_or("default")),
+                crate::netvol::networks_json(net.as_deref(), &aliases)
             ));
         }
     }
@@ -1882,11 +2008,19 @@ fn archive_get(bin: &Path, req: &Request, id: &str, head: bool) -> Response {
         upgrade: false,
         extra: vec![header],
         writer: Box::new(move |w: &mut crate::Out| {
-            if let Some(mut out) = child.stdout.take() {
-                let _ = std::io::copy(&mut out, w);
+            let copied = child
+                .stdout
+                .take()
+                .map(|mut out| std::io::copy(&mut out, w).is_ok())
+                .unwrap_or(false);
+            let ended_well = child.wait().is_ok_and(|s| s.success());
+            // A COPY THAT FAILED IS NOT ANSWERED AS ONE THAT ENDED. The body is chunked: closing
+            // the connection before its last chunk is how the client learns the archive is cut.
+            // MEASURED before: a copy kern could not read answered a complete empty stream, and
+            // `docker cp` exited 0 with an empty directory.
+            if !(copied && ended_well) {
+                let _ = w.socket().shutdown(std::net::Shutdown::Both);
             }
-            let _ = child.kill();
-            let _ = child.wait();
         }),
     }
 }
@@ -2409,6 +2543,7 @@ fn remove_container(bin: &Path, name: &str) {
     stage_forget(name);
     crate::events::forget(name);
     net_forget(name);
+    id_forget(name);
     if created_take(name).is_some() {
         drop(attached_take(name));
         return;
@@ -3622,9 +3757,18 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             }
             match resolve(bin, id) {
                 None => error(404, &format!("No such container: {id}")),
+                Some(_) if resolve(bin, new).is_some() => error(
+                    409,
+                    &format!("Conflict. The container name \"/{new}\" is already in use"),
+                ),
                 Some(name) => {
+                    if created_get(&name).is_some() {
+                        id_rename(&name, new);
+                        return rename_created(&name, new).unwrap_or_else(no_content);
+                    }
                     let (code, _, err) = kern(bin, &["rename", &name, new]);
                     if code == 0 {
+                        id_rename(&name, new);
                         no_content()
                     } else if err.contains("in use") || err.contains("exists") {
                         error(
@@ -3698,6 +3842,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             stage_forget(&name);
             crate::events::forget(&name);
             net_forget(&name);
+            id_forget(&name);
             if created_take(&name).is_some() {
                 // A pending attach ends with the container.
                 drop(attached_take(&name));

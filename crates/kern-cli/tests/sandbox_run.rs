@@ -20280,6 +20280,7 @@ fn cp_copies_trees_with_links_and_copy_in_lands_before_the_workload() {
         .arg(
             "/bin/busybox mkdir -p /d/sub /in && echo dati > /d/f && \
              /bin/busybox ln -s /etc/passwd /d/l && /bin/busybox ln /d/f /d/hard && \
+             echo chiuso > /d/zero && /bin/busybox chmod 000 /d/zero && \
              exec /bin/busybox sleep 60",
         )
         .output()
@@ -20347,6 +20348,9 @@ fn cp_copies_trees_with_links_and_copy_in_lands_before_the_workload() {
             == fs::metadata(out.join("hard")).map(|m| m.ino()).ok()
     };
     let got_f = fs::read_to_string(out.join("f")).unwrap_or_default();
+    // Mode 000, readable only as the box's root: the copy enters the box's user namespace. MEASURED
+    // before: "Permission denied", and through the Docker API an empty directory with exit 0.
+    let zero_len = fs::metadata(out.join("zero")).map(|m| m.len()).ok();
     let _ = fs::remove_dir_all(&base);
     assert!(
         cp_out.status.success(),
@@ -20354,6 +20358,7 @@ fn cp_copies_trees_with_links_and_copy_in_lands_before_the_workload() {
         String::from_utf8_lossy(&cp_out.stderr)
     );
     assert_eq!(got_f, "dati\n", "the directory's file arrives");
+    assert_eq!(zero_len, Some(7), "a mode-000 file of the box arrives");
     assert_eq!(
         host_link,
         Some(PathBuf::from("/etc/passwd")),
