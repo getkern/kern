@@ -20,7 +20,8 @@
 //! layer's writes, so the cross-layer escape class is closed structurally, not by trusting tar.
 
 use crate::json::{
-    all_str_values, array_after, first_str, object_after, split_objects, str_array_after, u64_field,
+    all_str_values, array_after, bool_field, first_str, object_after, split_objects,
+    str_array_after, u64_field,
 };
 use crate::net::curl;
 use crate::whiteout_dir_symlink_free;
@@ -119,6 +120,10 @@ pub struct ImageConfig {
     /// what `name@<it>` pulls the very same image again by. `None` for a build, or an entry pulled
     /// before it was recorded.
     pub repo_digest: Option<String>,
+    /// The image's `history`, oldest first: what made each layer, as `docker history` lists it
+    /// (see [`HistoryEntry`]). Empty where the image declares none, or for an entry cached before
+    /// it was kept.
+    pub history: Vec<HistoryEntry>,
     /// The config's `architecture` (`amd64`, `arm64`, ...). Read from what was pulled, carried by a
     /// build from its base, stamped by a `--platform` build: what a push writes and what a build for
     /// another platform checks before it reuses an image.
@@ -371,13 +376,39 @@ pub fn remote_digests_for(
     platform: Option<&Platform>,
 ) -> Result<RemoteDigests, OciError> {
     let r = resolve_manifest(image, platform, false)?;
-    let config = object_after(&r.manifest, "config")
-        .and_then(|d| first_str(d, "digest"))
-        .ok_or_else(|| manifest_error(&r.manifest, &r.registry, &r.repo))?;
+    let config = config_digest_of(&r)?;
     Ok(RemoteDigests {
         config,
         repo: r.repo_digest,
     })
+}
+
+fn config_digest_of(r: &Resolved) -> Result<String, OciError> {
+    object_after(&r.manifest, "config")
+        .and_then(|d| first_str(d, "digest"))
+        .ok_or_else(|| manifest_error(&r.manifest, &r.registry, &r.repo))
+}
+
+/// [`RemoteDigests`] and the image's history (with the manifest's layer sizes), for a cached image
+/// kept from before kern recorded either: the manifest and the config blob, a few KB, size-capped
+/// and sha256-verified exactly as a pull's; no layer. `scratch` is a directory of the caller's own
+/// for the blob while it is checked. The history is empty when the blob could not be had.
+pub fn remote_record_for(
+    image: &str,
+    platform: Option<&Platform>,
+    scratch: &Path,
+) -> Result<(RemoteDigests, Vec<HistoryEntry>), OciError> {
+    let r = resolve_manifest(image, platform, false)?;
+    let config = config_digest_of(&r)?;
+    let mut history = fetch_config(&r.registry, &r.repo, &r.manifest, &r.auth, scratch).history;
+    attach_layer_sizes(&mut history, &r.manifest);
+    Ok((
+        RemoteDigests {
+            config,
+            repo: r.repo_digest,
+        },
+        history,
+    ))
 }
 
 /// What an extraction does with an image file's setuid/setgid bit.
@@ -453,6 +484,7 @@ pub fn pull(
     // reuses the pre-downloaded tmp when present. Best-effort: a missing/odd config yields defaults.
     let mut config = fetch_config(&registry, &repo, &manifest, &auth, dest);
     config.repo_digest = repo_digest;
+    attach_layer_sizes(&mut config.history, &manifest);
     // PREFETCH: download layer K+1 concurrently while layer K is verified + extracted + merged. The
     // per-layer download command is UNCHANGED (same TLS pin, auth, timeouts) - only the SCHEDULING
     // overlaps the next layer's network with the current layer's CPU (decompress/extract). Extract +
@@ -624,7 +656,57 @@ fn parse_image_config(blob: &str) -> ImageConfig {
         digest: None,
         // Set by the pull, which holds the manifest the reference resolved to.
         repo_digest: None,
+        history: history_after(blob),
         architecture: first_str(blob, "architecture").and_then(nonempty),
+    }
+}
+
+/// One step of an image's `history`: when it ran, what ran (`created_by`), its comment, whether it
+/// made a layer, and that layer's COMPRESSED size from the manifest (the bytes a pull downloads:
+/// kern extracts the layers into one tree, so a layer's own unpacked size is not known here).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub created: Option<String>,
+    pub created_by: String,
+    pub comment: Option<String>,
+    pub empty_layer: bool,
+    pub layer_size: Option<u64>,
+}
+
+/// The `history` array of an image config blob, oldest first, as the image declares it.
+pub(crate) fn history_after(blob: &str) -> Vec<HistoryEntry> {
+    let Some(arr) = array_after(blob, "history") else {
+        return Vec::new();
+    };
+    split_objects(arr)
+        .into_iter()
+        .map(|o| HistoryEntry {
+            created: first_str(o, "created").filter(|c| !c.is_empty()),
+            created_by: first_str(o, "created_by").unwrap_or_default(),
+            comment: first_str(o, "comment").filter(|c| !c.is_empty()),
+            empty_layer: bool_field(o, "empty_layer").unwrap_or(false),
+            layer_size: None,
+        })
+        .collect()
+}
+
+/// Give each history entry that made a layer the size the manifest lists for that layer, in order:
+/// the n-th non-empty entry is the n-th layer. Left unknown when the counts disagree.
+pub(crate) fn attach_layer_sizes(history: &mut [HistoryEntry], manifest: &str) {
+    let sizes: Vec<u64> = array_after(manifest, "layers")
+        .map(|l| {
+            split_objects(l)
+                .into_iter()
+                .filter_map(|o| u64_field(o, "size"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let made: Vec<&mut HistoryEntry> = history.iter_mut().filter(|h| !h.empty_layer).collect();
+    if made.len() != sizes.len() {
+        return;
+    }
+    for (h, size) in made.into_iter().zip(sizes) {
+        h.layer_size = Some(size);
     }
 }
 
@@ -4340,6 +4422,33 @@ mod token_error_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The config's `history`, oldest first, and each step that made a layer given that layer's
+    /// size from the manifest, in order; sizes left unknown when the counts disagree.
+    #[test]
+    fn history_reads_the_config_and_takes_layer_sizes_from_the_manifest() {
+        let blob = r#"{"architecture":"amd64","history":[{"created":"2025-01-02T03:04:05Z","created_by":"/bin/sh -c #(nop) ADD file:x in / "},{"created":"2025-01-02T03:04:06Z","created_by":"CMD [\"/bin/sh\"]","comment":"buildkit.dockerfile.v0","empty_layer":true},{"created_by":"RUN a\tb"}]}"#;
+        let mut h = super::history_after(blob);
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0].created.as_deref(), Some("2025-01-02T03:04:05Z"));
+        assert_eq!(h[1].created_by, "CMD [\"/bin/sh\"]");
+        assert_eq!(h[1].comment.as_deref(), Some("buildkit.dockerfile.v0"));
+        assert!(h[1].empty_layer && !h[0].empty_layer && !h[2].empty_layer);
+        assert_eq!(h[2].created, None);
+        let manifest =
+            r#"{"layers":[{"digest":"sha256:a","size":100},{"digest":"sha256:b","size":7}]}"#;
+        let mut short = h.clone();
+        super::attach_layer_sizes(&mut h, manifest);
+        assert_eq!(
+            h.iter().map(|e| e.layer_size).collect::<Vec<_>>(),
+            vec![Some(100), None, Some(7)]
+        );
+        super::attach_layer_sizes(&mut short, r#"{"layers":[{"size":1}]}"#);
+        assert!(
+            short.iter().all(|e| e.layer_size.is_none()),
+            "counts disagree"
+        );
+        assert!(super::history_after(r#"{"architecture":"amd64"}"#).is_empty());
+    }
 
     /// A blob under a path with a BACKSLASH verifies like any other.
     ///

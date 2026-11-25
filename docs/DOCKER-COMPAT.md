@@ -107,7 +107,7 @@ set TESTCONTAINERS_RYUK_DISABLED=true
 | `logs` (`stdout`, `stderr`, `follow`, `tail`, `since`, `timestamps`) | `kern logs`: stdout and stderr apart for a container made through the socket |
 | `json` (list and inspect), `wait`, `stop`, `kill`, `restart`, `DELETE` | `kern ps`, `inspect --json`, `wait`, `stop`, `kill`, `restart`, `rm`; the list's `label`, `name` (a substring, `^`/`$` anchors), `id` and `status` filters, and any other filter refused by name rather than ignored |
 | `events` (`type`, `event`, `container`, `label`, `image` filters) | the `create`, `start` and `die` of the containers this socket makes, sent when they happen; a box started with kern directly makes none, and `since`/`until` are refused |
-| `images/create`, `images/json` (`reference`, `dangling` filters), `images/{name}/json` | `kern pull`, `kern images --json`; `RepoDigests` is the repository digest the pull recorded |
+| `images/create`, `images/json` (`reference`, `dangling` filters), `images/{name}/json`, `images/{name}/history` | `kern pull`, `kern images --json`, `kern image history --json`; `RepoDigests` is the repository digest the pull recorded; a history step's `Size` is its layer's compressed size (what a pull downloads; kern does not keep a layer's unpacked size) and 0 where kern has none |
 | `networks/prune`, `volumes/prune`, `images/prune` with a `label` filter | nothing removed, Docker's empty answer: this API makes no network, volume or image, and that is how a Testcontainers session ends with Ryuk off; without a label filter, 501 |
 | `_ping`, `version`, `info` | kern and kern's version in `Platform` and `Components`; `Version` and `ServerVersion` are `24.0.0`, the Docker Engine whose API is 1.43, since clients gate on that number (Testcontainers for Java refuses one below 1.6.0) |
 
@@ -519,6 +519,7 @@ manual on purpose.
 | `pause` / `unpause` / `attach` | same | cgroup v2 freezer; Ctrl-C detaches and the box keeps running |
 | `cp` | `cp` | host↔box; symlinks cannot escape the box root |
 | `images` / `rename` / `wait` | same | `images --digests` and `{{.Digest}}` show the repository digest a pull recorded (`<none>` for a build, a commit, a load); rename is in place, pid unchanged, and a kept box's layer moves with it; `wait` blocks and prints the status |
+| `history` | `image history` | the image's steps, newest first, with `--no-trunc`, `-q`, `--json`: a pulled or loaded image's own history with each layer's compressed size, a built image's Dockerfile steps over its base's, a commit's step; `-` where kern has no size. `kern history` is something else, the boxes run lately |
 | `top` (box processes) | `exec <box> ps` | plus `kern top` |
 | `update` / `diff` / `events` | same | live cgroup caps with no restart, and a kept box's record for its next start; overlay-upper `C`/`D`, a kept box's too; a poll-based, best-effort event stream |
 | `commit` | `commit` | box → reusable image |

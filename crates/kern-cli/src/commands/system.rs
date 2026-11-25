@@ -170,6 +170,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}images{z} [<repo>] [--json] [--digests] [--filter K=V] [--format T]  List pulled (cached) images (<repo> = --filter reference=<repo>)
                                                                      --filter: reference=PAT (`*` allowed; no tag = any tag), dangling=BOOL, label=K or K=V, before=REF, since=REF
     {c}image{z} ls|inspect|rm|pull|push|tag|save|load|build             The same verbs grouped under `image` (one parser each, not a second)
+    {c}image history{z} <image> [--json] [--no-trunc] [-q]              The image's steps, newest first, with each layer's compressed size
     {c}rmi{z} [-f] <image>...                                            Remove cached images (frees unshared layers); -f also one a box uses
     {c}save{z} <image> [-o file]                                         Export an image to a tar (the common image-archive format)
     {c}load{z} [-i file]                                                 Import an image from a tar (the common image-archive format)

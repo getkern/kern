@@ -261,8 +261,13 @@ const RM: &[Flag] = &[b(&["-f", "--force"], "--force")];
 const STOP: &[Flag] = &[v(&["-t", "--time", "--timeout"], "--time")];
 const START: &[Flag] = &[b(&["-a", "--attach"], "--attach")];
 const IMAGES: &[Flag] = &[
+    b(&["--digests"], "--digests"),
     v(&["--format"], "--format"),
     v(&["-f", "--filter"], "--filter"),
+];
+const HISTORY: &[Flag] = &[
+    b(&["--no-trunc"], "--no-trunc"),
+    b(&["-q", "--quiet"], "-q"),
 ];
 const RMI: &[Flag] = &[b(&["-f", "--force"], "--force")];
 const PULL: &[Flag] = &[
@@ -692,13 +697,9 @@ fn verb(name: &str, args: &[String]) -> Result<Plan, Refused> {
         "tag" => simple("tag", &["tag"], NONE, args),
         "save" => simple("save", &["save"], SAVE, args),
         "load" => simple("load", &["load"], LOAD, args),
-        // `docker history <image>` is an image's layers; `kern history` is the boxes run lately.
-        // Translated, it answered one question with the other.
-        "history" => Err(Refused(
-            "docker history: not translated (an image's layer history is not kept by kern; \
-             `kern history` lists recently run boxes)"
-                .to_string(),
-        )),
+        // `docker history <image>` is an image's layers, `kern image history`; NOT `kern history`,
+        // which is the boxes run lately (translated to it, it answered one question with the other).
+        "history" => simple("history", &["image", "history"], HISTORY, args),
         "cp" => simple("cp", &["cp"], CP, args),
         "stats" => simple("stats", &["stats"], STATS, args),
         "wait" => simple("wait", &["wait"], NONE, args),
@@ -1609,6 +1610,24 @@ mod tests {
             Ok(p) => format!("NOT REFUSED: {:?}", p.argv),
             Err(Refused(r)) => r,
         }
+    }
+
+    /// `docker history` is the image's steps (`kern image history`), never `kern history`, the
+    /// boxes run lately; `docker images --digests` keeps its flag.
+    #[test]
+    fn history_is_the_images_steps_and_images_keeps_digests() {
+        assert_eq!(
+            argv(
+                Mode::Docker,
+                &["history", "--no-trunc", "-q", "alpine:3.20"]
+            ),
+            s(&["image", "history", "--no-trunc", "-q", "alpine:3.20"])
+        );
+        assert!(refused(&["history", "--format", "{{.ID}}", "alpine"]).contains("--format"));
+        assert_eq!(
+            argv(Mode::Docker, &["images", "--digests"]),
+            s(&["images", "--digests"])
+        );
     }
 
     #[test]

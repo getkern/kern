@@ -48,11 +48,16 @@ printed the stream's frame headers; such a run is now a foreground box with the 
 with `-t`, a terminal. `docker ps -a` lists created containers, and those whose start failed, as
 `Created`, so Testcontainers' cleanup finds them.
 
-**`history` answers only what it is: the boxes run lately.** `kern history <image>` dropped the
-name and printed the last boxes run, and `kern image history` and the shim's `docker history` ran
-the same verb, where Docker means an image's layers, which kern does not keep. A name is now
-refused with that sentence, `image history` and `docker history` are not translated, and
-`kern history [-n N]` is unchanged.
+**`kern image history` and `docker history` list an image's steps.** Newest first, as Docker
+lists them: a pulled or loaded image's own history, each step that made a layer with that layer's
+compressed size from the manifest (what a pull downloads; kern unpacks the layers into one tree and
+does not keep a layer's own size); a built image's Dockerfile steps over its base's, recomputed at
+each build so a cached rebuild does not list them twice; a commit's step. `--no-trunc`, `-q` and
+`--json`, and kern's Docker API answers `GET /images/{name}/history`, which the `docker` CLI prints
+as its own. An image cached before gets its history at the next `kern pull` of it (measured: 1910 ms
+the first time, from the manifest and a config of a few KB, 2 ms after). `kern history <image>`,
+which dropped the name and printed the last boxes run, refuses the name and points at
+`kern image history`; `kern history [-n N]` is unchanged.
 
 **`kern ps` no longer calls a renamed box lost.** After `kern rename r r2`, `ps` warned that a box
 `r` was running with no record, about the box it listed as `r2`: the cgroup directory and the

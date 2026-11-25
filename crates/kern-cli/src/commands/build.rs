@@ -726,6 +726,84 @@ fn emulation_problem(arch: &str, entry: &str, body: &str) -> Option<String> {
     })
 }
 
+/// Give a built image its history, as `docker history` lists it: the history of the image its final
+/// stage starts from (through any stages it starts from in turn; none for `scratch`), then one
+/// step per instruction of those stages, the instruction as written. RECOMPUTED WHOLE at every
+/// build, so a build answered from the layer cache, which may not rewrite the image's config,
+/// cannot list its steps twice. `RUN`, `COPY`, `ADD` and `WORKDIR` make a layer; the others
+/// (`ENV`, `CMD`, `LABEL`, ...) are metadata, as Docker marks them.
+fn record_build_history(
+    tag: &str,
+    text: &str,
+    instrs: &[crate::dockerfile::Instr],
+    target: Option<&str>,
+) {
+    let stages = crate::dockerfile::stage_lines(text);
+    let froms: Vec<(&str, Option<&str>)> = instrs
+        .iter()
+        .filter_map(|i| match i {
+            crate::dockerfile::Instr::From { image, as_name } => {
+                Some((image.as_str(), as_name.as_deref()))
+            }
+            _ => None,
+        })
+        .collect();
+    if froms.is_empty() || stages.len() != froms.len() {
+        return;
+    }
+    let stage_named = |name: &str, before: usize| {
+        froms[..before]
+            .iter()
+            .position(|(_, n)| n.is_some_and(|n| n.eq_ignore_ascii_case(name)))
+    };
+    let last = froms.len() - 1;
+    let final_ix = target
+        .and_then(|t| stage_named(t, froms.len()))
+        .unwrap_or(last);
+    // The chain of stages, final first, back to the one that starts from an image or scratch.
+    let mut chain = vec![final_ix];
+    while let Some(parent) = chain.last().and_then(|&ix| stage_named(froms[ix].0, ix)) {
+        chain.push(parent);
+    }
+    chain.reverse();
+    let root = froms[chain[0]].0;
+    let mut history = if root.eq_ignore_ascii_case("scratch") {
+        Vec::new()
+    } else {
+        let cache = cache_dir();
+        [kern_oci::normalize_ref(root), root.to_string()]
+            .iter()
+            .map(|r| cache.join(format!("{}.image", sanitize_ref(r))))
+            .find(|f| f.exists())
+            .map(|f| read_image_config(&f).history)
+            .unwrap_or_default()
+    };
+    let created = kern_common::rfc3339(registry::now_unix());
+    for ix in chain {
+        for line in &stages[ix] {
+            let kw = line.split_whitespace().next().unwrap_or_default();
+            history.push(kern_oci::HistoryEntry {
+                created: Some(created.clone()),
+                created_by: line.clone(),
+                comment: Some("kern build".to_string()),
+                empty_layer: !["RUN", "COPY", "ADD", "WORKDIR"]
+                    .iter()
+                    .any(|k| kw.eq_ignore_ascii_case(k)),
+                layer_size: None,
+            });
+        }
+    }
+    let cache = cache_dir();
+    let safe = sanitize_ref(tag);
+    let cfgfile = cache.join(format!("{safe}.image"));
+    if !cfgfile.exists() {
+        return;
+    }
+    let mut cfg = read_image_config(&cfgfile);
+    cfg.history = history;
+    super::imagecache::replace_image_config(&cache, &safe, &cfgfile, &cfg);
+}
+
 fn build_one(args: BuildArgs) -> Result<(), Error> {
     let tag = args
         .tag
@@ -803,6 +881,9 @@ fn build_one(args: BuildArgs) -> Result<(), Error> {
     } else {
         build_run(args.quiet, tag, &ctx, &work, &instrs)
     };
+    if result.is_ok() {
+        record_build_history(tag, &text, &instrs, args.target);
+    }
     super::buildmounts::finish_build(); // the key agents `--ssh id=<key>` started
     remove_build_tree(&work); // overlay leaves mode-000 workdirs; force-clean so nothing leaks
                               // Finalize the record: outcome from `result`, size read back the way `images()` computes it. Drop

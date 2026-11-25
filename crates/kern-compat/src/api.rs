@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use kern_common::json::{self, Value};
 use kern_common::json_str;
+use kern_common::rfc3339;
 
 use crate::{percent_decode, Request, Response};
 
@@ -664,24 +665,6 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Unix seconds as RFC 3339 UTC, which Docker clients parse.
-fn rfc3339(secs: u64) -> String {
-    let days = secs / 86_400;
-    let rem = secs % 86_400;
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(mo <= 2);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1338,19 +1321,70 @@ fn image_list(bin: &Path, req: &Request) -> Response {
     json_response(200, format!("[{}]", items.join(",")))
 }
 
-/// `GET /images/{name}/json`.
-fn image_inspect(bin: &Path, name: &str) -> Response {
+/// The cached image an API path names, as `kern images --json` lists it: the name itself, a bare
+/// name as `:latest`, or a repository pulled by digest.
+fn cached_image(bin: &Path, name: &str) -> Option<Value> {
     let want_latest = if name.contains(':') || name.contains('@') {
         name.to_string()
     } else {
         format!("{name}:latest")
     };
-    let found = kern_images(bin, false).into_iter().find(|i| {
+    kern_images(bin, false).into_iter().find(|i| {
         i.get("image")
             .and_then(Value::as_str)
             .is_some_and(|n| n == name || n == want_latest || n.split('@').next() == Some(name))
-    });
-    let Some(i) = found else {
+    })
+}
+
+/// `GET /images/{name}/history`: `kern image history --json`, in Docker's shape, newest first.
+/// Docker gives the top step the image's id and tags and the others `<missing>`, as it does for a
+/// pulled image. `Size` is the layer's COMPRESSED size where kern knows it (the manifest's, what a
+/// pull downloads; kern does not keep a layer's unpacked size) and 0 where it does not.
+fn image_history(bin: &Path, name: &str) -> Response {
+    let Some(i) = cached_image(bin, name) else {
+        return error(404, &format!("No such image: {name}"));
+    };
+    let n = i.get("image").and_then(Value::as_str).unwrap_or(name);
+    let (code, out, err) = kern(bin, &["image", "history", "--json", n]);
+    if code != 0 {
+        return error(500, &kern_error(&err));
+    }
+    let Ok(steps) = json::parse(out.trim()) else {
+        return error(500, "kern image history --json printed no JSON array");
+    };
+    let rows: Vec<String> = steps
+        .as_array()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(ix, h)| {
+            let text = |k: &str| h.get(k).and_then(Value::as_str).unwrap_or_default();
+            let int = |k: &str| h.get(k).and_then(Value::as_i64).unwrap_or(0).max(0);
+            format!(
+                "{{\"Id\":{},\"Created\":{},\"CreatedBy\":{},\"Tags\":{},\"Size\":{},\"Comment\":{}}}",
+                if ix == 0 {
+                    json_str(&format!("sha256:{}", id_of(n)))
+                } else {
+                    json_str("<missing>")
+                },
+                int("Created"),
+                json_str(text("CreatedBy")),
+                if ix == 0 {
+                    format!("[{}]", json_str(n))
+                } else {
+                    "null".to_string()
+                },
+                int("CompressedSize"),
+                json_str(text("Comment")),
+            )
+        })
+        .collect();
+    json_response(200, format!("[{}]", rows.join(",")))
+}
+
+/// `GET /images/{name}/json`.
+fn image_inspect(bin: &Path, name: &str) -> Response {
+    let Some(i) = cached_image(bin, name) else {
         return error(404, &format!("No such image: {name}"));
     };
     let n = i.get("image").and_then(Value::as_str).unwrap_or(name);
@@ -2647,6 +2681,9 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
         ("GET", ["images", "json"]) => image_list(bin, req),
         ("GET", ["images", rest @ .., "json"]) if !rest.is_empty() => {
             image_inspect(bin, &rest.join("/"))
+        }
+        ("GET", ["images", rest @ .., "history"]) if !rest.is_empty() => {
+            image_history(bin, &rest.join("/"))
         }
         ("POST", ["containers", id, "exec"]) => {
             let Some(name) = resolve(bin, id) else {

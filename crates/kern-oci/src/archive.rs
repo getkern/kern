@@ -378,6 +378,8 @@ fn parse_image_config(json: &str) -> ImageConfig {
         digest: None,
         // A loaded archive came from no registry, as Docker leaves its `RepoDigests` empty.
         repo_digest: None,
+        // A `docker save`d image keeps its history in the same config, so it loads with it.
+        history: crate::pull::history_after(json),
         architecture: str_field(json, "architecture").filter(|s| !s.is_empty()),
     }
 }

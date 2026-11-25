@@ -2864,7 +2864,7 @@ pub(crate) fn parse_log_time(v: &str, now_nanos: u64) -> Option<u64> {
 
 /// `YYYY-MM-DDThh:mm:ss[.frac][Z]` to unix nanoseconds. Only UTC is accepted: a numeric offset would
 /// need a second field of arithmetic for a form no kern surface ever prints.
-fn parse_rfc3339(v: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339(v: &str) -> Option<u64> {
     let b = v.as_bytes();
     if b.len() < 19
         || b[10] != b'T'

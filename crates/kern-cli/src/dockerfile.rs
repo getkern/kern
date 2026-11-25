@@ -513,6 +513,27 @@ fn heredoc_run_argv(rest: &str, heredocs: &[Heredoc]) -> Result<Vec<String>, Str
     Ok(argv)
 }
 
+/// The instruction lines of each stage, as written (one logical line each, comments dropped), the
+/// `FROM` itself left out: what an image's history names for each step. A line before the first
+/// `FROM` (a global `ARG`) belongs to no stage. Stage `n` here is the `n`-th `FROM` of [`parse`].
+pub fn stage_lines(text: &str) -> Vec<Vec<String>> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut stages: Vec<Vec<String>> = Vec::new();
+    for ll in logical_lines(text, escape_directive(text)) {
+        let line = ll.text.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let kw = line.split_whitespace().next().unwrap_or_default();
+        if kw.eq_ignore_ascii_case("FROM") {
+            stages.push(Vec::new());
+        } else if let Some(stage) = stages.last_mut() {
+            stage.push(line.to_string());
+        }
+    }
+    stages
+}
+
 /// Parse Dockerfile `text` into an ordered instruction list. `build_args` seed the substitution
 /// table (they override any in-file `ARG` default). Returns a human-readable error on the first
 /// malformed or unsupported line, tagged with the 1-based line number.
@@ -1672,6 +1693,24 @@ fn modifier(name: &str) -> Option<(&str, &'static str, &str)> {
 
 #[cfg(test)]
 mod tests {
+    /// Each stage's lines as written, `FROM` left out, comments dropped, a continuation one line,
+    /// and a global `ARG` before the first `FROM` in no stage.
+    #[test]
+    fn stage_lines_are_each_stages_instructions_as_written() {
+        let text = "ARG V=1\nFROM alpine AS a\n# note\nRUN echo a \\\n  && echo b\nENV X=1\n\nfrom a\nCMD [\"sh\"]\n";
+        assert_eq!(
+            super::stage_lines(text),
+            vec![
+                vec!["RUN echo a    && echo b".to_string(), "ENV X=1".to_string()],
+                vec!["CMD [\"sh\"]".to_string()],
+            ]
+        );
+        assert!(
+            super::stage_lines("RUN x\n").is_empty(),
+            "no FROM, no stage"
+        );
+    }
+
     /// Docker's `${VAR:-word}` family, in FROM and the other hard-substituted instructions, and left
     /// alone for the shell in RUN when the variable is not known.
     #[test]

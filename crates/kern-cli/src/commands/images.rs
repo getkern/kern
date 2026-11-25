@@ -258,6 +258,106 @@ pub(crate) fn repo_digest_of(name: &str) -> Option<String> {
     read_image_config(&cache_dir().join(format!("{}.image", sanitize_ref(name)))).repo_digest
 }
 
+/// `kern image history <image>`: the steps the image was made of, newest first, as `docker history`
+/// lists them. From the image's own record: a pulled or loaded image's config `history` (with each
+/// layer's COMPRESSED size from the manifest, the bytes a pull downloads: kern unpacks the layers
+/// into one tree, so a layer's unpacked size is not known), a built image's Dockerfile steps over
+/// its base's, a commit's one step. Where kern has no size it prints `-`, not a number; an image
+/// that declares no history (or was pulled before kern kept it) says so instead of an empty table.
+pub fn image_history(name: &str, json: bool, no_trunc: bool, quiet: bool) -> Result<(), Error> {
+    let cache = cache_dir();
+    let safe = sanitize_ref(name);
+    if !image_present(&cache, &safe) {
+        return Err(Error::NotRunning(format!(
+            "no image '{name}' in the local cache: `kern images` lists them and `kern pull {name}` fetches one"
+        )));
+    }
+    let cfg = read_image_config(&cache.join(format!("{safe}.image")));
+    let steps: Vec<&kern_oci::HistoryEntry> = cfg.history.iter().rev().collect();
+    let created = |h: &kern_oci::HistoryEntry| {
+        h.created
+            .as_deref()
+            .and_then(boxlog::parse_rfc3339)
+            .map(|n| n / 1_000_000_000)
+    };
+    if json {
+        let rows: Vec<String> = steps
+            .iter()
+            .map(|h| {
+                format!(
+                    "{{\"Created\":{},\"CreatedBy\":{},\"Comment\":{},\"EmptyLayer\":{},\"CompressedSize\":{}}}",
+                    created(h).map_or_else(|| "null".to_string(), |c| c.to_string()),
+                    json_str(&h.created_by),
+                    json_str(h.comment.as_deref().unwrap_or_default()),
+                    h.empty_layer,
+                    match (h.empty_layer, h.layer_size) {
+                        (true, _) => "0".to_string(),
+                        (false, Some(n)) => n.to_string(),
+                        (false, None) => "null".to_string(),
+                    },
+                )
+            })
+            .collect();
+        println!("[{}]", rows.join(","));
+        return Ok(());
+    }
+    if steps.is_empty() {
+        eprintln!(
+            "kern: image '{name}' declares no history (an image pulled before kern 0.57.0 has \
+             none recorded: `kern pull {name}` records it)"
+        );
+        return Ok(());
+    }
+    if quiet {
+        // Docker prints each step's image id, `<missing>` for all but the top; kern has one id per
+        // image, so the one line is the image's own.
+        println!("{name}");
+        return Ok(());
+    }
+    let now = crate::registry::now_unix();
+    let rows: Vec<[String; 4]> = steps
+        .iter()
+        .map(|h| {
+            let when = created(h).map_or_else(
+                || "-".to_string(),
+                |c| format!("{} ago", human_duration(now.saturating_sub(c))),
+            );
+            // Docker's `/bin/sh -c #(nop) ` before a metadata step says nothing a reader needs.
+            let by = h
+                .created_by
+                .strip_prefix("/bin/sh -c #(nop) ")
+                .unwrap_or(&h.created_by)
+                .trim();
+            let by = if no_trunc {
+                crate::ui::scrub(by)
+            } else {
+                truncate(by, 45)
+            };
+            let size = match (h.empty_layer, h.layer_size) {
+                (true, _) => "0B".to_string(),
+                (false, Some(n)) => human_bytes(n),
+                (false, None) => "-".to_string(),
+            };
+            let comment = crate::ui::scrub(h.comment.as_deref().unwrap_or_default());
+            [when, by, size, comment]
+        })
+        .collect();
+    // Each column as wide as its widest cell, as Docker's tabwriter sizes them.
+    let head = ["CREATED", "CREATED BY", "COMPRESSED", "COMMENT"];
+    let width = |c: usize| {
+        rows.iter()
+            .map(|r| r[c].chars().count())
+            .chain([head[c].len()])
+            .max()
+            .unwrap_or(0)
+    };
+    let (w0, w1, w2) = (width(0), width(1), width(2));
+    for r in std::iter::once(head.map(str::to_string)).chain(rows) {
+        println!("{:<w0$}   {:<w1$}   {:<w2$}   {}", r[0], r[1], r[2], r[3]);
+    }
+    Ok(())
+}
+
 pub fn images(
     json: bool,
     digests: bool,
@@ -658,24 +758,36 @@ pub fn pull(
 /// transfers). Re-fetching bytes already on disk is the wrong default for a tool whose argument is
 /// that it does not waste anything, and "make sure it is cached" is what a pull is for. A deliberate
 /// refresh is `kern box --image <ref> --pull always`, which the message points at.
-/// An image cached before its repository digest was recorded gets it at an explicit `kern pull`:
-/// the manifest alone is read (no layer), and when the config digest it names is the one the cache
-/// holds, it is the same image and its digest is written beside it. A tag that has moved names
-/// another image, whose digest would be a lie about this one, so nothing is written and the note
-/// says how to fetch the new one. Offline, or for an image the registry no longer has, the entry is
-/// left as it is; a pull of a cached image never fails for this.
+/// An image cached before its repository digest and history were recorded (kern before 0.57.0)
+/// gets both at an explicit `kern pull`: the manifest and the config blob are read (no layer), and
+/// when the config digest the manifest names is the one the cache holds, it is the same image and
+/// what was missing is written beside it. An image whose config declares no history at all is asked
+/// again at each explicit pull (one manifest and a few KB; never a box start). A tag that has moved names another image, whose digest would be a lie about this
+/// one, so nothing is written and the note says how to fetch the new one. Offline, or for an image
+/// the registry no longer has, the entry is left as it is; a pull of a cached image never fails for
+/// this.
 fn record_repo_digest(image: &str, key: &str, held: &kern_oci::ImageConfig, quiet: bool) {
     let Some(local) = held.digest.as_deref() else {
         return; // a build or a commit: no registry names it
     };
-    let remote = match kern_oci::remote_digests_for(
+    let cache = cache_dir();
+    // The config blob's scratch room, this process's own: two pulls of one image do not share it.
+    let scratch = cache.join(format!(".record-{}-{key}", std::process::id()));
+    if std::fs::create_dir(&scratch).is_err() {
+        return;
+    }
+    let asked = kern_oci::remote_record_for(
         image,
         super::imagecache::image_platform().as_ref(),
-    ) {
+        &scratch,
+    );
+    // Empty by now (the blob is removed after its check), so the plain, non-recursive removal.
+    let _ = std::fs::remove_dir(&scratch);
+    let (remote, history) = match asked {
         Ok(r) => r,
         Err(e) => {
             if !quiet {
-                eprintln!("kern: note: '{image}' has no recorded repository digest, and the registry could not be asked for it ({e})");
+                eprintln!("kern: note: '{image}' has no recorded repository digest or history, and the registry could not be asked for them ({e})");
             }
             return;
         }
@@ -683,8 +795,12 @@ fn record_repo_digest(image: &str, key: &str, held: &kern_oci::ImageConfig, quie
     match remote.repo {
         Some(repo) if remote.config == local => {
             let mut cfg = held.clone();
-            cfg.repo_digest = Some(repo);
-            let cache = cache_dir();
+            if cfg.repo_digest.is_none() {
+                cfg.repo_digest = Some(repo);
+            }
+            if cfg.history.is_empty() {
+                cfg.history = history;
+            }
             let cfgfile = cache.join(format!("{key}.image"));
             super::imagecache::replace_image_config(&cache, key, &cfgfile, &cfg);
         }
@@ -711,7 +827,7 @@ fn pull_into_cache(image: &str, quiet: bool) -> Result<(), Error> {
     // the pull itself uses, so the message cannot claim a hit the resolver treated as a miss.
     let had = cache_entry_complete(&cache_dir(), &key);
     let (layers, cfg) = resolve_image_depth(image, 0, PullPolicy::Missing)?;
-    if had && cfg.repo_digest.is_none() {
+    if had && (cfg.repo_digest.is_none() || cfg.history.is_empty()) {
         record_repo_digest(image, &key, &cfg, quiet);
     }
     // Where the image lives: its own directory, which is the TOP layer. A locally built image rests
@@ -1144,6 +1260,24 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
 /// middle of `echo … > big` may yield a shorter `big`). It is never a torn mix of old+new bytes; for a
 /// structured file (a DB, a tar) that truncation still means "quiesce the box, or use --memory-backed
 /// scratch, before committing under heavy write load". Freeze support is what the boards/prod provide.
+/// The history a committed image has: the box's image's own (empty for a `--rootfs` box, or an image
+/// cached before history was kept), and one step for the commit.
+fn committed_history(box_image: &str, box_ref: &str) -> Vec<kern_oci::HistoryEntry> {
+    let mut h = if box_image.is_empty() {
+        Vec::new()
+    } else {
+        read_image_config(&cache_dir().join(format!("{}.image", sanitize_ref(box_image)))).history
+    };
+    h.push(kern_oci::HistoryEntry {
+        created: Some(kern_common::rfc3339(registry::now_unix())),
+        created_by: format!("kern commit {box_ref}"),
+        comment: None,
+        empty_layer: false,
+        layer_size: None,
+    });
+    h
+}
+
 pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     let inst = registry::find_ref(box_ref).ok_or_else(|| {
         Error::Sandbox(format!("no running box '{box_ref}'; `kern ps` lists them"))
@@ -1205,6 +1339,9 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         digest: None,
         // Nor a repository digest: `docker commit` leaves `RepoDigests` empty too.
         repo_digest: None,
+        // The image the box ran, then this commit, as `docker commit` appends one step to its
+        // image's history.
+        history: committed_history(&inst.image, box_ref),
         // The box ran on this machine, so its filesystem is this machine's architecture.
         architecture: Some(kern_oci::Platform::host().as_oci_arch().to_string()),
     };

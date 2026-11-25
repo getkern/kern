@@ -2558,6 +2558,24 @@ mod net_resource_tests {
             repo_digest: Some(
                 "sha256:4bc453b53cb3d914b45f4b250294236adba2c0e09ff6f03793949e7e39fd4cc1".into(),
             ),
+            // A `created_by` with tabs, newlines and backslashes, and a step with no time,
+            // comment or size: each field escaped so a step stays one line.
+            history: vec![
+                kern_oci::HistoryEntry {
+                    created: Some("2025-01-02T03:04:05Z".into()),
+                    created_by: "RUN a\tb \\\n  c\r".into(),
+                    comment: Some("buildkit.dockerfile.v0".into()),
+                    empty_layer: false,
+                    layer_size: Some(3_630_321),
+                },
+                kern_oci::HistoryEntry {
+                    created: None,
+                    created_by: "CMD [\"sh\"]".into(),
+                    comment: None,
+                    empty_layer: true,
+                    layer_size: None,
+                },
+            ],
             architecture: Some("arm64".into()),
         };
         let path =
@@ -2978,6 +2996,7 @@ mod net_resource_tests {
             repo_digest: Some(
                 "sha256:4bc453b53cb3d914b45f4b250294236adba2c0e09ff6f03793949e7e39fd4cc1".into(),
             ),
+            history: Vec::new(),
             architecture: Some("arm64".into()),
         };
         let dir = std::env::temp_dir().join(format!("kern-imgcfg-{}", std::process::id()));

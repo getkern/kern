@@ -562,6 +562,14 @@ pub enum Command {
         /// holds and no others; an unknown token is refused rather than rendered empty.
         format: Option<String>,
     },
+    /// `kern image history <image> [--json] [--no-trunc] [-q]`: the steps an image was made of,
+    /// newest first, as `docker history` lists them.
+    ImageHistory {
+        image: String,
+        json: bool,
+        no_trunc: bool,
+        quiet: bool,
+    },
     /// `kern rmi <image>...`: remove cached images by ref (or sanitized stem), reclaiming any layers
     /// left referenced by no other image.
     Rmi {
@@ -1282,12 +1290,23 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 // NOT `history`, which is kern's list of recently run BOXES: `docker image history`
                 // shows an image's layers, a different answer under the same words. MEASURED:
                 // `kern image history alpine:3.21` printed the last boxes run, as if they were it.
+                // So it is its own command, not a rewrite to a verb.
                 "history" => {
-                    return Err(Error::Cli(
-                        "image history: kern keeps no layer history of an image (`kern history` \
-                         lists recently run boxes, `kern inspect <image>` shows its config)"
-                            .to_string(),
-                    ))
+                    let hrest: Vec<&str> = rest.iter().skip(1).copied().collect();
+                    reject_unknown_flags("image history", &hrest, &["--json", "--no-trunc", "-q", "--quiet"])?;
+                    let mut names = hrest.iter().skip(1).filter(|a| !a.starts_with('-'));
+                    let (Some(image), None) = (names.next(), names.next()) else {
+                        return Err(Error::Usage("image history <image> [--json] [--no-trunc] [-q]"));
+                    };
+                    return Ok((
+                        opts,
+                        Command::ImageHistory {
+                            image: (*image).to_string(),
+                            json: hrest.contains(&"--json"),
+                            no_trunc: hrest.contains(&"--no-trunc"),
+                            quiet: hrest.iter().any(|a| *a == "-q" || *a == "--quiet"),
+                        },
+                    ));
                 }
                 "save" => "save",
                 "load" => "load",
@@ -1303,10 +1322,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                          Run it deliberately, or `kern rmi <image>` for one",
                     ))
                 }
-                "" => return Err(Error::Usage("image ls|inspect|rm|pull|push|tag|save|load|build")),
+                "" => return Err(Error::Usage("image ls|inspect|history|rm|pull|push|tag|save|load|build")),
                 other => {
                     return Err(Error::Cli(format!(
-                        "image {other}: not a kern verb (image ls|inspect|rm|pull|push|tag|save|load|build)"
+                        "image {other}: not a kern verb (image ls|inspect|history|rm|pull|push|tag|save|load|build)"
                     )))
                 }
             };
@@ -2482,7 +2501,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             {
                 return Err(Error::Cli(format!(
                     "history takes no name ('{extra}'): it lists recently run boxes, all of them; \
-                     kern keeps no layer history of an image (`kern inspect <image>` shows its config)"
+                     an image's layer history is `kern image history {extra}`"
                 )));
             }
             Command::History {
@@ -7041,6 +7060,12 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             filters,
             format,
         } => commands::images(json, digests, &filters, format.as_deref()),
+        Command::ImageHistory {
+            image,
+            json,
+            no_trunc,
+            quiet,
+        } => commands::image_history(&image, json, no_trunc, quiet),
         Command::Rmi { images, force } => commands::image_rm_with(&images, force),
         Command::Save { image, out } => commands::save(&image, out.as_deref()),
         Command::Load { input } => commands::load(input.as_deref()),
@@ -10163,6 +10188,36 @@ mod tests {
         assert!(cmd(&["image", "prune"]).is_err());
         assert!(cmd(&["image", "frobnicate"]).is_err());
         assert!(cmd(&["image"]).is_err());
+    }
+
+    /// `image history` is the image's own steps, its own command; `history <name>` (kern's recently
+    /// run boxes) refuses the name and points at it.
+    #[test]
+    fn image_history_is_its_own_command_and_history_points_at_it() {
+        let cmd = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            parse(&owned).map(|(_, c)| c)
+        };
+        assert!(matches!(
+            cmd(&["image", "history", "--no-trunc", "alpine:3.20", "--json"]),
+            Ok(Command::ImageHistory { image, json: true, no_trunc: true, quiet: false })
+                if image == "alpine:3.20"
+        ));
+        assert!(matches!(
+            cmd(&["image", "history", "-q", "a"]),
+            Ok(Command::ImageHistory {
+                quiet: true,
+                json: false,
+                ..
+            })
+        ));
+        assert!(cmd(&["image", "history"]).is_err(), "no image");
+        assert!(cmd(&["image", "history", "a", "b"]).is_err(), "two images");
+        assert!(cmd(&["image", "history", "--format", "x", "a"]).is_err());
+        match cmd(&["history", "alpine:3.20"]) {
+            Err(Error::Cli(m)) => assert!(m.contains("kern image history alpine:3.20"), "{m}"),
+            other => panic!("history <name> must be refused: {other:?}"),
+        }
     }
 
     // `--rm` must reach the command as a FACT, because everything it does happens far from here:

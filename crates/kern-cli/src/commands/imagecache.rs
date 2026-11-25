@@ -311,6 +311,22 @@ pub(crate) fn write_image_config(
     if let Some(a) = &c.architecture {
         line("arch", a);
     }
+    // One `history` line per step, its five fields tab-separated and escaped (a `created_by` holds
+    // tabs and newlines as a matter of course): created, made-a-layer, compressed size, created_by,
+    // comment. ADDITIVE like `repodigest`: an older entry has none and lists no history.
+    for h in &c.history {
+        line(
+            "history",
+            &format!(
+                "{}\t{}\t{}\t{}\t{}",
+                history_escape(h.created.as_deref().unwrap_or_default()),
+                if h.empty_layer { 0 } else { 1 },
+                h.layer_size.map_or_else(String::new, |n| n.to_string()),
+                history_escape(&h.created_by),
+                history_escape(h.comment.as_deref().unwrap_or_default()),
+            ),
+        );
+    }
     if let Some(sig) = &c.stop_signal {
         line("stopsignal", sig);
     }
@@ -336,6 +352,40 @@ pub(crate) fn write_image_config(
         }
     }
     std::fs::write(path, s)
+}
+
+/// A history field on one sidecar line: `\\`, tab, newline and CR escaped, so a line stays a line.
+fn history_escape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for ch in v.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn history_unescape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut it = v.chars();
+    while let Some(ch) = it.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match it.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Read back a [`write_image_config`] sidecar. A missing/garbled file yields the default config.
@@ -366,6 +416,19 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
             "stopsignal" => c.stop_signal = Some(v.to_string()),
             "digest" => c.digest = Some(v.to_string()),
             "repodigest" => c.repo_digest = Some(v.to_string()),
+            "history" => {
+                let f: Vec<&str> = v.split('\t').collect();
+                if let [created, layer, size, by, comment] = f.as_slice() {
+                    let opt = |x: &str| (!x.is_empty()).then(|| history_unescape(x));
+                    c.history.push(kern_oci::HistoryEntry {
+                        created: opt(created),
+                        created_by: history_unescape(by),
+                        comment: opt(comment),
+                        empty_layer: *layer == "0",
+                        layer_size: size.parse().ok(),
+                    });
+                }
+            }
             "arch" => c.architecture = Some(v.to_string()),
             "hctest" => c
                 .healthcheck
@@ -1768,6 +1831,25 @@ fn owners_match_for(want: &str, cache: &std::path::Path, safe: &str) -> bool {
     want == "caller"
         || std::fs::read_to_string(cache.join(format!("{safe}.owners")))
             .is_ok_and(|got| got.trim() == want)
+}
+/// Image `safe` (a [`sanitize_ref`] stem) is in the cache whole, pulled or built.
+///
+/// A BUILT IMAGE HAS NO `<ref>/` DIRECTORY. `cache_entry_complete` describes a PULLED image, whose
+/// rootfs is that directory; a layered build is a `.layers` manifest over `L/` (and a legacy one a
+/// `.diff`), so it always read as absent. MEASURED with kern 0.30.0: `kern inspect` of a built
+/// image answered "nothing named ... `kern pull` fetches one" while `kern images` listed it on the
+/// line above. Present here means what `kern images` already means: the sentinel and the config
+/// sidecar exist and no layer it references is missing.
+pub(crate) fn image_present(cache: &std::path::Path, safe: &str) -> bool {
+    let built = cache.join(format!("{safe}.layers")).exists()
+        || cache.join(format!("{safe}.diff")).is_dir();
+    if built {
+        cache.join(format!("{safe}.ok")).exists()
+            && cache.join(format!("{safe}.image")).exists()
+            && !image_stat(cache, safe).1
+    } else {
+        cache_entry_complete(cache, safe)
+    }
 }
 
 pub(crate) fn cache_entry_complete(cache: &std::path::Path, safe: &str) -> bool {
