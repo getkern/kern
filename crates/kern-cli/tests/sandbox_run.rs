@@ -20020,6 +20020,73 @@ fn a_rm_box_stopped_or_killed_leaves_no_row() {
 
 /// A `--net` box gets the host's resolver through its own `/etc` directory, a bind, so a
 /// `kern commit` of it carries neither the host's resolver nor what the box wrote into the file.
+/// A secret is READ-ONLY in the box, for its root too, as Docker's bind of a secret file is.
+/// MEASURED before: the write bit was dropped, which binds every user but root, and `echo x >>
+/// /run/secrets/s` from a compose service succeeded under kern where Docker said "Read-only file
+/// system". The content still arrives, and nothing can be added next to it.
+#[test]
+fn a_secret_is_read_only_for_the_boxs_root_too() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "secro");
+    let base = std::env::temp_dir().join(format!("kern-it-secro-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::create_dir_all(base.join("run"));
+    let src = base.join("tok");
+    fs::write(&src, "hunter2\n").unwrap();
+    let spec = format!("{}:tok", src.display());
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", base.join("run"))
+        .args([
+            "box",
+            "secro",
+            "--rootfs",
+            root.to_str().unwrap(),
+            "--secret",
+            &spec,
+            "--",
+        ])
+        .args(["/bin/busybox", "sh", "-c"])
+        .arg(
+            "/bin/busybox cat /run/secrets/tok; \
+             echo x >> /run/secrets/tok && echo APPENDED; \
+             /bin/busybox touch /run/secrets/new && echo CREATED; \
+             /bin/busybox grep ' /run/secrets ' /proc/mounts",
+        )
+        .output()
+        .expect("run kern");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let host = fs::read_to_string(&src).unwrap_or_default();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&base);
+    if stderr.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    assert!(
+        stdout.contains("hunter2"),
+        "the secret arrives: {stdout} {stderr}"
+    );
+    assert!(
+        !stdout.contains("APPENDED") && !stdout.contains("CREATED"),
+        "the box's root wrote into /run/secrets: {stdout} {stderr}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains(" /run/secrets ") && l.contains(" ro,")),
+        "/run/secrets is not a read-only mount: {stdout}"
+    );
+    assert_eq!(host, "hunter2\n", "the host's file is never touched");
+}
+
 /// MEASURED before: the host's `resolv.conf` was copied into the box's upper and a commit of a
 /// `--net host` box baked the host's systemd-resolved stub into the image.
 #[test]

@@ -104,6 +104,11 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**A secret is read-only in the box, for its root too.** The write bit of `/run/secrets/<name>` was
+dropped, which binds every user but the box's root: `echo x >> /run/secrets/s` from a compose service
+succeeded, where Docker answers "Read-only file system". `/run/secrets` is a read-only mount once the
+secrets are written, with `--ssh` as without it; the host's file was never touched either way.
+
 **`kern run --platform os/arch`, as `docker run --platform`.** `kern run --platform linux/arm64
 alpine uname -m` was refused as an unknown flag, while Docker prints `aarch64` on the same amd64
 machine. It runs that platform's image now, through the kernel's qemu-user handler, from the cache

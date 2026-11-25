@@ -5890,6 +5890,30 @@ fn setup_secrets(root: &str, secrets: &[Secret], run_tmpfs: bool) -> Result<(), 
         }
         unsafe { libc::close(fd) };
     }
+    // READ-ONLY ONCE WRITTEN, as Docker's bind of each secret file is. The dropped write bit above
+    // binds every user but the box's root, who ignores modes: MEASURED, `echo x >> /run/secrets/s`
+    // from a compose service succeeded under kern and failed with "Read-only file system" under
+    // Docker. Under `--ssh` the secrets are a directory on the wide `/run` tmpfs, so it is bound
+    // onto itself first to have a mount of its own to make read-only.
+    let none = std::ptr::null::<libc::c_char>();
+    if run_tmpfs
+        && unsafe {
+            libc::mount(
+                dp.as_ptr(),
+                dp.as_ptr(),
+                none,
+                libc::MS_BIND as libc::c_ulong,
+                std::ptr::null(),
+            )
+        } != 0
+    {
+        return Err(Error::last("mount(/run/secrets bind)"));
+    }
+    let ro = (libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV)
+        as libc::c_ulong;
+    if unsafe { libc::mount(none, dp.as_ptr(), none, ro, std::ptr::null()) } != 0 {
+        return Err(Error::last("mount(/run/secrets read-only)"));
+    }
     Ok(())
 }
 
