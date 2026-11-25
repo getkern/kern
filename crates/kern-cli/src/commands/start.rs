@@ -682,7 +682,11 @@ fn point_the_box_at_the_egress_proxy(
                 .to_string(),
         ));
     }
-    eprintln!(
+    // FOR A PERSON AT A TERMINAL, as the rest of kern's narration: an SDK runs a box per call, and this
+    // paragraph landed in the stderr of every cell and every transcript (MEASURED, kern-sandbox 0.3.0
+    // with `egress_allow`). A script and an SDK read it in docs/EGRESS.md, which it names.
+    if kern_common::progress_wanted() {
+        eprintln!(
         "kern: note: --egress-allow gives the box outbound to the listed domains, addresses and ranges \
          only, minus --egress-deny (over an HTTP CONNECT/forward proxy; the box's isolated netns has no \
          other route). It resolves and pins the dialed host, refuses a resolved address the rules do \
@@ -695,6 +699,7 @@ fn point_the_box_at_the_egress_proxy(
          only origins you know are not shared; see docs/EGRESS.md. For a fully hostile workload prefer \
          a microVM with a real firewall."
     );
+    }
     let proxy = format!("http://127.0.0.1:{EGRESS_PROXY_PORT}");
     for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
         env.push((k.to_string(), proxy.clone()));
