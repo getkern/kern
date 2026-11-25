@@ -1,7 +1,12 @@
 # Introducing kern: a container runtime that does less, on purpose
 
+> Updated for v0.57.0: `kern run` now runs an image, as `docker run` does, and a governed host
+> command is `kern limit`; the commands below are written that way. kern's Rust dependencies have
+> grown past `libc` since this post (local HTTPS, signed updates): each release's `kern.spdx.json`
+> lists them with their licenses.
+
 *A fast, rootless container runtime and sandbox, built on virtual resources. Run workloads in a
-real container, including untrusted and AI-generated code. One static binary, one Rust dependency (`libc`), no daemon. It starts a
+real container, including untrusted and AI-generated code. One static binary, no daemon. It starts a
 real, kernel-enforced box in 2.3 ms, embeds from Python or Rust, and runs the same on a laptop, in
 CI, or on a Raspberry Pi.*
 
@@ -31,8 +36,8 @@ two verbs:
 
 - **`kern box`**: *isolate this workload.* Its own namespaces, an overlay or read-only root, a
   private process tree, seccomp. The container.
-- **`kern run`**: *give this workload a governed slice of resources.* A CPU / memory / I/O quota on a
-  host command, no sandbox, just the governor.
+- **`kern limit`**: *give this workload a governed slice of resources.* A CPU / memory / I/O quota on
+  a host command, no sandbox, just the governor.
 
 They compose: `run` inside `box`. Both ship today.
 
@@ -109,13 +114,13 @@ that's cooperative or opt-in, and says exactly when to use kern versus a microVM
 cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
-It builds the one static binary for your arch from source (kern's only Rust dependency is `libc`; the
-image path shells out to the system `curl`/`tar`), no Docker, no daemon. Then:
+It builds the one static binary for your arch from source (a few Rust crates, listed in each
+release's SBOM; the image path shells out to the system `curl`/`tar`), no Docker, no daemon. Then:
 
 ```sh
-kern box dev --image alpine -it -- sh          # a throwaway shell in a real image
-kern run --memory 256M --cpus 0.5 -- ./crunch  # govern a host command, no sandbox
-kern doctor                                    # will boxes even run on this host? preflight it
+kern box dev --image alpine -it -- sh            # a throwaway shell in a real image
+kern limit --memory 256M --cpus 0.5 -- ./crunch  # govern a host command, no sandbox
+kern doctor                                      # will boxes even run on this host? preflight it
 ```
 
 kern deliberately skips a lot that Docker has, overlay networks, a plugin ecosystem, because the
