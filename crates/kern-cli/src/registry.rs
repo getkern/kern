@@ -1012,6 +1012,14 @@ fn waitexit_dir() -> io::Result<PathBuf> {
 /// detached supervisor as its LAST act (before it unregisters) and by `stop`/`kill` (which SIGKILL the
 /// supervisor before it can record its own). Best-effort.
 pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance) {
+    // ONE RECORD PER NAME, THE LAST RUN'S: a box that ends under a name takes the place of the
+    // runs that ended under it before, with their logs, as `kern rm` removes them. MEASURED: three
+    // runs of `kern run -d --name l19 ...` left three `l19` rows in `ps -a` (0.56.0 the same), where
+    // Docker has one container per name. Done here, at the exit, and not at the start, which is
+    // the path a box's latency is measured on.
+    for old in clear_exited_named(&b.name) {
+        crate::commands::boxlog::remove_run_logs(&format!("{}-{old}", b.name));
+    }
     if let Ok(d) = waitexit_dir() {
         // Multi-line so `kern ps -a` can render the box that exited (its name, pod, command), not only
         // the code `kern wait` needs. Line 1 stays the BARE code, so `box_exit` - and any pre-existing

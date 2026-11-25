@@ -84,6 +84,10 @@ The image's steps are kept too, as metadata under the one layer kern writes, whi
 buildah still take as the base of a build. A rebuild answered entirely from the cache keeps its
 steps' times, so the same image saves and pushes under the same digest.
 
+**`kern ps -a` lists a name once, its last run.** Each run of `kern box -d --name x` that ended left
+its own exit record, so three runs listed `x` three times; a box that ends now takes the place of
+the earlier runs under its name, and their logs go with them, as `kern rm` removes them.
+
 **An exited box keeps its image and labels, and kern's Docker API reads them from kern.** A box's
 exit record held its name, pod and command, so `kern ps -a --filter label=` matched no exited box
 (kern said so) and kern's API kept what it knew of an ended `docker run` in its own memory, which a
