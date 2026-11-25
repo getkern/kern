@@ -5492,6 +5492,17 @@ fn should_restart(
 /// re-run in place (the second `unshare` would `EINVAL`); the supervisor stays un-namespaced and
 /// just waits. Readiness is signalled only on the first attempt (the launcher already returned by
 /// the time a restart happens). `inst` is re-registered with each attempt's box PID 1.
+/// A box renamed while it ran is recorded under its NEW name: its exit record, its history line,
+/// its kept layer's last exit and its `--rm` log removal. MEASURED before this: `kern rename a b`
+/// on a running box, then its exit was listed by `ps -a` as `a`, `kern rm b` found nothing, and
+/// a `--rm` box renamed so left its logs (which the rename had moved to `b`) in the store. The
+/// registry entry, which `rename` rewrites, is still there at this point and names it.
+fn adopt_current_name(inst: &mut registry::Instance) {
+    if let Some(current) = registry::name_for_pid(inst.pid) {
+        inst.name = current;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn supervise_box(
     // `--rm`: skip the exit breadcrumb entirely. See `run_detached`.
@@ -5983,6 +5994,7 @@ fn supervise_box(
             // `up --abort-on-container-exit` on an `on-failure:3` service that exits 1 stops the
             // stack at the first exit, and the service's status is 1.
             if !rm && !never_started {
+                adopt_current_name(inst);
                 registry::set_box_exit(
                     std::process::id() as i32,
                     inst.starttime,
@@ -6009,6 +6021,8 @@ fn supervise_box(
         }
         break code;
     };
+    // Every record below is about the box as it is called NOW.
+    adopt_current_name(inst);
     // The box has finished for good (no restart left). Record the final exit code for `kern wait`,
     // keyed `<name>-<pid>` (our own pid = the registered pid). Written LAST here, and this whole call
     // returns BEFORE the caller unregisters the instance file, so a `wait` that sees the box leave
@@ -6058,11 +6072,7 @@ fn supervise_box(
     // NOT FOR A BOX THAT NEVER STARTED: its launcher quotes the log's tail as the reason, after
     // this supervisor has exited, and taking it would leave "box failed to start" with no why.
     if rm && ran_once {
-        crate::commands::boxlog::remove_run_logs(&format!(
-            "{}-{}",
-            name.as_str(),
-            std::process::id()
-        ));
+        crate::commands::boxlog::remove_run_logs(&format!("{}-{}", inst.name, std::process::id()));
     }
     // A KEPT BOX REMEMBERS HOW ITS LAST RUN ENDED WHATEVER SHAPE THAT RUN HAD. The foreground arm
     // records it; this is the DETACHED one, and `-d` is the shape a kept box is most likely to have

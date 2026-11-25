@@ -16666,6 +16666,83 @@ fn ps_does_not_call_a_renamed_box_lost() {
     assert!(String::from_utf8_lossy(&ps.stdout).contains(&new));
 }
 
+/// A BOX RENAMED WHILE IT RUNS ENDS UNDER ITS NEW NAME. MEASURED before: after `rename a b` on a
+/// running box, its exit was listed by `ps -a` as `a`, `kern rm b` found nothing, and `kern wait b`
+/// after the exit had no record to answer from.
+#[test]
+fn a_box_renamed_while_running_ends_under_its_new_name() {
+    if !a_box_can_start("renameexit") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    if !kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull")
+        .status
+        .success()
+    {
+        eprintln!("skip: the base image is not available here");
+        return;
+    }
+    let old = format!("itre{}", std::process::id());
+    let new = format!("{old}b");
+    let out = kern()
+        .args([
+            "box",
+            &old,
+            "-d",
+            "--image",
+            "alpine:3.19",
+            "--",
+            "sh",
+            "-c",
+            "sleep 1; exit 4",
+        ])
+        .output()
+        .expect("run kern box");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let renamed = kern()
+        .args(["rename", &old, &new])
+        .output()
+        .expect("run kern rename");
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    let waited = kern().args(["wait", &new]).output().expect("run kern wait");
+    // After the exit: answered from the record, which must carry the new name.
+    let again = kern()
+        .args(["wait", &new])
+        .output()
+        .expect("run kern wait again");
+    let listed = kern().args(["ps", "-a"]).output().expect("run kern ps -a");
+    let removed = kern().args(["rm", &new]).output().expect("run kern rm");
+    let _ = kern().args(["rm", "-f", &old, &new]).output();
+    assert_eq!(String::from_utf8_lossy(&waited.stdout).trim(), "4");
+    assert_eq!(
+        String::from_utf8_lossy(&again.stdout).trim(),
+        "4",
+        "a wait after the exit, by the new name: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.lines().any(|l| l.starts_with(&format!("{new} "))),
+        "the exited box is listed under its new name:\n{listed}"
+    );
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+}
+
 #[test]
 fn twenty_concurrent_starts_of_one_kept_box_run_exactly_one() {
     if !a_box_can_start("keeprace") {

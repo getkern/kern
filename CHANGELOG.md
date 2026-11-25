@@ -47,7 +47,9 @@ refused with that sentence, `image history` and `docker history` are not transla
 `r` was running with no record, about the box it listed as `r2`: the cgroup directory and the
 supervisor's command line keep the name a box started with. A box is now recognised by the cgroup
 directory or the supervisor pid its record names; a box whose record really is gone is still
-reported.
+reported. And a box renamed while it runs ends under its new name: its exit was recorded under
+the old one, so `ps -a` listed `a` after `rename a b`, `kern rm b` and a later `kern wait b` found
+nothing, and a renamed `--rm` box left its logs in the store.
 
 **A pull records the image's repository digest, and `kern images --digests` shows it.** It is the
 digest of the manifest the registry answered for the reference (the index of a multi-arch image),
