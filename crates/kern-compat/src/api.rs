@@ -268,7 +268,7 @@ fn refuse_socket_bind(bind: &str) -> Result<(), String> {
         .is_some_and(|n| n == "docker.sock");
     if is_socket || docker_socket {
         return Err(format!(
-            "Binds {bind:?}: the source is a socket, and kern mounts no socket into a box (a box \
+            "the bind {bind:?}: the source is a socket, and kern mounts no socket into a box (a box \
              holding this API's socket could ask it for any box). For Testcontainers, whose reaper \
              Ryuk asks for it: set TESTCONTAINERS_RYUK_DISABLED=true; kern removes a test session's \
              containers itself when the process that made them ends"
@@ -277,16 +277,115 @@ fn refuse_socket_bind(bind: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn refuse_if_set(host: Option<&Value>, field: &str) -> Result<(), String> {
-    let set = match host.and_then(|h| h.get(field)) {
+/// A field set to anything but its empty value (`null`, `false`, `0`, `""`, `[]`, `{}`).
+fn is_set(v: Option<&Value>) -> bool {
+    match v {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
         Some(Value::Arr(a)) => !a.is_empty(),
         Some(Value::Obj(o)) => !o.is_empty(),
         Some(Value::Str(s)) => !s.is_empty(),
         Some(Value::Num(n)) => n != "0",
-    };
-    if set {
+    }
+}
+
+/// `HostConfig.Mounts` (`--mount`) as kern's own `--mount` values, which take the same three types.
+/// Dev Containers mounts the workspace this way, always. An option kern's mount does not have is
+/// refused by name rather than dropped: a mount quietly made another way is a test reading other
+/// data. `Consistency` is accepted and has no effect, as with Docker on Linux.
+fn translate_mounts(host: Option<&Value>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for m in host
+        .and_then(|h| h.get("Mounts"))
+        .and_then(Value::as_array)
+        .unwrap_or_default()
+    {
+        let field = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or_default();
+        let (kind, source, target) = (field("Type"), field("Source"), field("Target"));
+        let refuse = |what: &str| {
+            Err(format!(
+                "HostConfig.Mounts {kind} {target:?}: {what} is not translated by kern"
+            ))
+        };
+        if target.is_empty() {
+            return refuse("a mount without a Target");
+        }
+        if source.contains(',') || target.contains(',') {
+            return refuse("a path with a comma");
+        }
+        let opts = |o: &str, keys: &[&str]| {
+            keys.iter()
+                .find(|k| is_set(m.get(o).and_then(|v| v.get(k))))
+                .map(|k| format!("{o}.{k}"))
+        };
+        let mut spec = format!("type={kind},");
+        match kind {
+            "bind" => {
+                if !source.starts_with('/') {
+                    return refuse("a bind whose Source is not an absolute path");
+                }
+                let propagation = m
+                    .get("BindOptions")
+                    .and_then(|b| b.get("Propagation"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !matches!(propagation, "" | "rprivate") {
+                    return refuse(&format!("BindOptions.Propagation {propagation:?}"));
+                }
+                if let Some(o) = opts(
+                    "BindOptions",
+                    &[
+                        "NonRecursive",
+                        "CreateMountpoint",
+                        "ReadOnlyNonRecursive",
+                        "ReadOnlyForceRecursive",
+                    ],
+                ) {
+                    return refuse(&o);
+                }
+                refuse_socket_bind(source)?;
+                spec.push_str(&format!("src={source},"));
+            }
+            "volume" => {
+                if let Some(o) = opts(
+                    "VolumeOptions",
+                    &["NoCopy", "Labels", "DriverConfig", "Subpath"],
+                ) {
+                    return refuse(&o);
+                }
+                if !source.is_empty() {
+                    spec.push_str(&format!("src={source},"));
+                }
+            }
+            "tmpfs" => {
+                if !source.is_empty() {
+                    return refuse("a tmpfs with a Source");
+                }
+                if let Some(o) = opts("TmpfsOptions", &["Mode", "Options"]) {
+                    return refuse(&o);
+                }
+                if let Some(size) = m
+                    .get("TmpfsOptions")
+                    .and_then(|t| t.get("SizeBytes"))
+                    .and_then(Value::as_i64)
+                    .filter(|n| *n > 0)
+                {
+                    spec.push_str(&format!("tmpfs-size={size},"));
+                }
+            }
+            _ => return refuse("this Type"),
+        }
+        spec.push_str(&format!("dst={target}"));
+        if m.get("ReadOnly").and_then(Value::as_bool) == Some(true) {
+            spec.push_str(",ro");
+        }
+        out.push(spec);
+    }
+    Ok(out)
+}
+
+fn refuse_if_set(host: Option<&Value>, field: &str) -> Result<(), String> {
+    if is_set(host.and_then(|h| h.get(field))) {
         Err(format!(
             "HostConfig.{field}: kern does not grant it over the socket; run that container with \
              kern directly, where the flag is explicit"
@@ -316,17 +415,7 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
     ] {
         refuse_if_set(host, f)?;
     }
-    // `--mount` is not translated, and a mount dropped in silence is a test reading other data.
-    if host
-        .and_then(|h| h.get("Mounts"))
-        .and_then(Value::as_array)
-        .is_some_and(|m| !m.is_empty())
-    {
-        return Err(
-            "HostConfig.Mounts (`--mount`): not translated by kern; use a bind (`-v src:dst`, Binds)"
-                .into(),
-        );
-    }
+    let mounts = translate_mounts(host)?;
     for (f, refused) in [
         ("PidMode", "host"),
         ("IpcMode", "host"),
@@ -447,6 +536,10 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
         refuse_socket_bind(&b)?;
         argv.push("-v".into());
         argv.push(b);
+    }
+    for m in mounts {
+        argv.push("--mount".into());
+        argv.push(m);
     }
     if let Some(m) = host
         .and_then(|h| h.get("Memory"))
@@ -731,13 +824,114 @@ fn inspect_ended(name: &str, r: &Run) -> Response {
     )
 }
 
+/// The filters of `GET /containers/json` kern translates. A filter is how a client finds ITS
+/// container among the user's boxes (Dev Containers looks its own up by label, then `exec`s into
+/// it), so one that is not understood is refused by name: ignored, the list came back whole and the
+/// client took another box for its own.
+struct ListFilters {
+    labels: Vec<String>,
+    names: Vec<String>,
+    ids: Vec<String>,
+    statuses: Vec<String>,
+}
+
+impl ListFilters {
+    fn parse(req: &Request) -> Result<Self, String> {
+        let f = match req.param("filters").filter(|f| !f.is_empty()) {
+            Some(f) => json::parse(f).map_err(|e| format!("invalid filters: {e}"))?,
+            None => Value::Null,
+        };
+        if let Some((k, _)) = f
+            .as_object()
+            .unwrap_or_default()
+            .iter()
+            .find(|(k, _)| !matches!(k.as_str(), "label" | "name" | "id" | "status"))
+        {
+            return Err(format!(
+                "containers filter {k:?}: not translated by kern-serve"
+            ));
+        }
+        let names = filter_values(&f, "name");
+        if let Some(n) = names.iter().find(|n| name_pattern(n).is_none()) {
+            return Err(format!(
+                "containers filter name={n:?}: a regular expression beyond ^ and $ is not translated"
+            ));
+        }
+        Ok(Self {
+            labels: filter_values(&f, "label"),
+            names,
+            ids: filter_values(&f, "id"),
+            statuses: filter_values(&f, "status"),
+        })
+    }
+
+    /// Docker lists exited containers for `status=exited`, as for `all=1`.
+    fn wants_exited(&self) -> bool {
+        self.statuses.iter().any(|s| s != "running")
+    }
+
+    fn keeps(&self, name: &str, running: bool, labels: &[(String, String)]) -> bool {
+        let state = if running { "running" } else { "exited" };
+        let id = id_of(name);
+        self.labels.iter().all(|w| match w.split_once('=') {
+            Some((k, val)) => labels.iter().any(|(lk, lv)| lk == k && lv == val),
+            None => labels.iter().any(|(lk, _)| lk == w),
+        }) && (self.names.is_empty()
+            || self
+                .names
+                .iter()
+                .any(|n| name_pattern(n).is_some_and(|p| p.matches(name))))
+            && (self.ids.is_empty()
+                || self
+                    .ids
+                    .iter()
+                    .any(|i| !i.is_empty() && id.starts_with(i.as_str())))
+            && (self.statuses.is_empty() || self.statuses.iter().any(|s| s == state))
+    }
+}
+
+/// A `name` filter: Docker matches a regular expression against the name with its leading `/`;
+/// the forms clients send are a plain substring and `^`/`$` anchors, which is what is translated.
+/// A `.` is taken as itself: names contain it, and the regular expression matches that too.
+struct NamePattern<'a> {
+    text: &'a str,
+    start: bool,
+    end: bool,
+}
+
+impl NamePattern<'_> {
+    fn matches(&self, name: &str) -> bool {
+        let full = format!("/{name}");
+        // `^name` and `^/name` both anchor at the name's first character.
+        let needle = if self.start && !self.text.starts_with('/') {
+            format!("/{}", self.text)
+        } else {
+            self.text.to_string()
+        };
+        match (self.start, self.end) {
+            (true, true) => full == needle,
+            (true, false) => full.starts_with(&needle),
+            (false, true) => full.ends_with(&needle),
+            (false, false) => full.contains(&needle),
+        }
+    }
+}
+
+fn name_pattern(p: &str) -> Option<NamePattern<'_>> {
+    let (start, rest) = p.strip_prefix('^').map_or((false, p), |r| (true, r));
+    let (end, text) = rest.strip_suffix('$').map_or((false, rest), |r| (true, r));
+    if text.chars().any(|c| "*+?[](){}|\\^$".contains(c)) {
+        return None;
+    }
+    Some(NamePattern { text, start, end })
+}
+
 fn list(bin: &Path, req: &Request) -> Response {
-    let all = req.flag("all");
-    let wanted: Vec<String> = req
-        .param("filters")
-        .and_then(|f| json::parse(f).ok())
-        .map(|f| strings(f.get("label")))
-        .unwrap_or_default();
+    let filters = match ListFilters::parse(req) {
+        Ok(f) => f,
+        Err(e) => return error(400, &e),
+    };
+    let all = req.flag("all") || filters.wants_exited();
     let mut items = Vec::new();
     for (name, v) in kern_boxes(bin) {
         let running = v.get("status").and_then(Value::as_str) != Some("exited");
@@ -745,11 +939,7 @@ fn list(bin: &Path, req: &Request) -> Response {
             continue;
         }
         let labels = labels_of(&v);
-        let keep = wanted.iter().all(|w| match w.split_once('=') {
-            Some((k, val)) => labels.iter().any(|(lk, lv)| lk == k && lv == val),
-            None => labels.iter().any(|(lk, _)| lk == w),
-        });
-        if !keep {
+        if !filters.keeps(&name, running, &labels) {
             continue;
         }
         let ports: Vec<String> = v
@@ -790,11 +980,7 @@ fn list(bin: &Path, req: &Request) -> Response {
             if listed.iter().any(|i| i.contains(&id)) {
                 continue;
             }
-            let keep = wanted.iter().all(|w| match w.split_once('=') {
-                Some((k, val)) => r.created.labels.iter().any(|(lk, lv)| lk == k && lv == val),
-                None => r.created.labels.iter().any(|(lk, _)| lk == w),
-            });
-            if !keep {
+            if !filters.keeps(&name, false, &r.created.labels) {
                 continue;
             }
             items.push(format!(
@@ -990,7 +1176,7 @@ fn kern_images(bin: &Path) -> Vec<Value> {
 
 /// The values of one key of a Docker `filters` parameter, in either of its two spellings:
 /// `{"reference":["alpine"]}` and the older `{"reference":{"alpine":true}}`.
-fn filter_values(filters: &Value, key: &str) -> Vec<String> {
+pub(crate) fn filter_values(filters: &Value, key: &str) -> Vec<String> {
     let v = filters.get(key);
     match v.and_then(Value::as_object) {
         Some(set) => set
@@ -1083,23 +1269,46 @@ fn image_inspect(bin: &Path, name: &str) -> Response {
             .and_then(Value::as_str)
             .is_some_and(|n| n == name || n == want_latest || n.split('@').next() == Some(name))
     });
-    match found {
-        Some(i) => {
-            let n = i.get("image").and_then(Value::as_str).unwrap_or(name);
-            json_response(
-                200,
-                format!(
-                    "{{\"Id\":{},\"RepoTags\":[{}],\"RepoDigests\":[],\"Size\":{},\"Created\":{},\"Os\":\"linux\",\"Architecture\":{}}}",
-                    json_str(&format!("sha256:{}", id_of(n))),
-                    json_str(n),
-                    i.get("size_bytes").and_then(Value::as_i64).unwrap_or(0),
-                    json_str(&rfc3339(i.get("pulled").and_then(Value::as_i64).unwrap_or(0).max(0) as u64)),
-                    json_str(arch())
-                ),
-            )
-        }
-        None => error(404, &format!("No such image: {name}")),
+    let Some(i) = found else {
+        return error(404, &format!("No such image: {name}"));
+    };
+    let n = i.get("image").and_then(Value::as_str).unwrap_or(name);
+    // `kern inspect --json` of the image is already Docker's shape (`RepoTags`, `Os`,
+    // `Architecture`, `Size`, and the `Config` Dev Containers reads its `User` from); this adds what
+    // the API has besides. Asked by the cache's own name, which always carries a `:tag` or an
+    // `@digest`, so a running box with the image's bare name is never the one answered.
+    let (code, out, err) = kern(bin, &["inspect", "--json", n]);
+    match image_object_members(&out) {
+        Some(members) if code == 0 => json_response(
+            200,
+            format!(
+                "{{\"Id\":{},\"RepoDigests\":[],\"Created\":{},{members}}}",
+                json_str(&format!("sha256:{}", id_of(n))),
+                json_str(&rfc3339(
+                    i.get("pulled").and_then(Value::as_i64).unwrap_or(0).max(0) as u64
+                )),
+            ),
+        ),
+        _ => error(500, &kern_error(&err)),
     }
+}
+
+/// The members of the one object `kern inspect --json <image>` prints (`[{...}]`), as text to
+/// splice into the API's object, after checking that the whole is that shape and nothing else.
+fn image_object_members(out: &str) -> Option<&str> {
+    let out = out.trim();
+    let one = json::parse(out).ok()?;
+    let [obj] = one.as_array()? else {
+        return None;
+    };
+    obj.as_object()?;
+    out.strip_prefix('[')?
+        .strip_suffix(']')?
+        .trim()
+        .strip_prefix('{')?
+        .strip_suffix('}')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
 }
 
 fn arch() -> &'static str {
@@ -1605,17 +1814,36 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
 /// Start a created container in the foreground and hand its pipes to the attach waiting for it, so
 /// the box's stdout and stderr stay apart and its exit code is the process's.
 fn start_attached(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Pipes>) -> Response {
+    use std::os::unix::process::CommandExt;
     let mut argv = c.argv.clone();
     if argv.get(2).map(String::as_str) == Some("-d") {
         argv.remove(2);
     }
-    let mut child = match Command::new(bin)
-        .args(&argv)
+    // The box says when it has started on a pipe of its own (`KERN_READY_FD`): its stdout and
+    // stderr are the container's. Without the pipe it still runs, and the start answers at once.
+    let ready = ReadyPipe::new();
+    let mut cmd = Command::new(bin);
+    cmd.args(&argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    if let Some(r) = &ready {
+        let wr = std::os::fd::AsRawFd::as_raw_fd(&r.write_end);
+        cmd.env("KERN_READY_FD", wr.to_string());
+        // SAFETY: between fork and exec only `fcntl`, async-signal-safe, on a descriptor this
+        // process owns: the write end, made inheritable in this child alone (it is close-on-exec
+        // everywhere else, so no other child of this server holds it).
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(wr, libc::F_SETFD, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             run_end(name, 125);
@@ -1625,14 +1853,104 @@ fn start_attached(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Pipes>) 
     // The attach may have gone: then the pipes close and the box's writes fail, as a closed
     // terminal's do.
     let _ = to.send((child.stdout.take(), child.stderr.take()));
+    // Answered once the box runs, as Docker answers a start: a client that inspects the container
+    // next finds it running, and the `start` event goes out when it is true.
+    if ready.is_some_and(|r| r.started(&mut child)) {
+        crate::events::publish(&event_of("start", name, c, None));
+    }
     let watched = name.to_string();
+    let created = c.clone();
     let reaper = std::thread::Builder::new()
         .name("kern-serve-run".into())
-        .spawn(move || run_end(&watched, exit_code(&mut child)));
+        .spawn(move || {
+            let code = exit_code(&mut child);
+            run_end(&watched, code);
+            crate::events::publish(&event_of("die", &watched, &created, Some(code)));
+        });
     if reaper.is_err() {
         run_end(name, -1);
     }
     no_content()
+}
+
+/// The event of a container this server made.
+fn event_of(
+    action: &'static str,
+    name: &str,
+    c: &Created,
+    exit: Option<i32>,
+) -> crate::events::Event {
+    crate::events::Event {
+        action,
+        name: name.to_string(),
+        image: c.image.clone(),
+        labels: c.labels.clone(),
+        exit,
+    }
+}
+
+/// The readiness pipe of a foreground box (`KERN_READY_FD`): kern writes one byte on it once the
+/// box is registered with its PID 1 and its gates are released.
+struct ReadyPipe {
+    read_end: std::os::fd::OwnedFd,
+    write_end: std::os::fd::OwnedFd,
+}
+
+impl ReadyPipe {
+    fn new() -> Option<Self> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2` writes two descriptors into the local array; both close-on-exec.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return None;
+        }
+        // SAFETY: both were just returned by `pipe2` and are owned by nothing else.
+        let (read_end, write_end) = unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        };
+        Some(Self {
+            read_end,
+            write_end,
+        })
+    }
+
+    /// Wait for the byte, or for the box to end without it. The write end is closed here first, so
+    /// only the box holds it. No time limit: the start of a box whose image is being fetched takes
+    /// what the fetch takes, as Docker's start does.
+    fn started(self, child: &mut std::process::Child) -> bool {
+        use std::os::fd::AsRawFd;
+        let Self {
+            read_end,
+            write_end,
+        } = self;
+        drop(write_end);
+        let fd = read_end.as_raw_fd();
+        loop {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd owned here, count 1, 50 ms: a byte wakes it at once, and between
+            // wakes the child's exit is looked at.
+            let n = unsafe { libc::poll(&mut pfd, 1, 50) };
+            if n > 0 {
+                let mut b = [0u8; 1];
+                // SAFETY: one byte into a local buffer from the pipe's read end.
+                let got = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
+                return got == 1 && b[0] == b'1';
+            }
+            if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return false;
+            }
+            if !matches!(child.try_wait(), Ok(None)) {
+                return false;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1645,6 +1963,8 @@ struct Exec {
     argv: Vec<String>,
     cmd: Vec<String>,
     tty: bool,
+    /// `AttachStdin`: the client's bytes on the hijacked connection are the command's stdin.
+    stdin: bool,
     started: bool,
     running: bool,
     exit: Option<i32>,
@@ -1693,9 +2013,13 @@ fn exec_create(name: &str, body: &Value) -> Response {
         );
     }
     let tty = body.get("Tty").and_then(Value::as_bool) == Some(true);
+    let stdin = body.get("AttachStdin").and_then(Value::as_bool) == Some(true);
     let mut argv: Vec<String> = vec!["exec".into()];
     if tty {
         argv.push("-t".into());
+    }
+    if stdin {
+        argv.push("-i".into());
     }
     if let Some(u) = body
         .get("User")
@@ -1732,6 +2056,7 @@ fn exec_create(name: &str, body: &Value) -> Response {
                     argv,
                     cmd,
                     tty,
+                    stdin,
                     started: false,
                     running: false,
                     exit: None,
@@ -1786,6 +2111,12 @@ fn exec_start(bin: &Path, id: &str, req: &Request) -> Response {
         };
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Stdin travels only on a hijacked connection: on a plain HTTP answer the client has no way to
+    // send it, and the command gets none, as before.
+    let stdin = e.stdin && req.upgrade;
+    if stdin {
+        cmd.stdin(Stdio::piped());
+    }
     let tty = e.tty;
     Response::Stream {
         status: 200,
@@ -1807,10 +2138,57 @@ fn exec_start(bin: &Path, id: &str, req: &Request) -> Response {
             };
             let out = child.stdout.take();
             let err = child.stderr.take();
+            let feeder = child.stdin.take().and_then(|sin| feed_stdin(w, sin));
             pump(w, out, err, tty);
-            exec_finish(&id, exit_code(&mut child));
+            let code = exit_code(&mut child);
+            // The command is done: a feeder still reading the client is woken by this end of the
+            // connection closing for reading, which only this server's reads see.
+            if let Some(f) = feeder {
+                let _ = w.socket().shutdown(std::net::Shutdown::Read);
+                let _ = f.join();
+            }
+            exec_finish(&id, code);
         }),
     }
+}
+
+/// Copy the client's bytes on the hijacked connection to the command's stdin until the client
+/// closes its sending side (`CloseWrite`), which is the command's end of input. The connection's
+/// read timeout is for requests: an interactive shell's stdin may stay quiet for hours, so a
+/// timeout here is waiting, not an end.
+fn feed_stdin(
+    w: &mut crate::Out,
+    mut sin: std::process::ChildStdin,
+) -> Option<std::thread::JoinHandle<()>> {
+    let mut sock = w.socket().try_clone().ok()?;
+    let early = w.take_input();
+    std::thread::Builder::new()
+        .name("kern-serve-stdin".into())
+        .spawn(move || {
+            if !early.is_empty() && sin.write_all(&early).is_err() {
+                return;
+            }
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        if sin.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
+        })
+        .ok()
 }
 
 /// `GET /exec/{id}/json`.
@@ -1827,13 +2205,14 @@ fn exec_inspect(id: &str) -> Response {
     json_response(
         200,
         format!(
-            "{{\"ID\":{},\"Running\":{},\"ExitCode\":{},\"ProcessConfig\":{{\"tty\":{},\"entrypoint\":{},\"arguments\":{},\"privileged\":false}},\"OpenStdin\":false,\"OpenStderr\":true,\"OpenStdout\":true,\"CanRemove\":false,\"ContainerID\":{},\"Pid\":0}}",
+            "{{\"ID\":{},\"Running\":{},\"ExitCode\":{},\"ProcessConfig\":{{\"tty\":{},\"entrypoint\":{},\"arguments\":{},\"privileged\":false}},\"OpenStdin\":{},\"OpenStderr\":true,\"OpenStdout\":true,\"CanRemove\":false,\"ContainerID\":{},\"Pid\":0}}",
             json_str(id),
             e.running,
             e.exit.map_or_else(|| "null".to_string(), |c| c.to_string()),
             e.tty,
             json_str(&entry),
             str_array(&args),
+            e.stdin,
             json_str(&id_of(&e.name))
         ),
     )
@@ -1915,6 +2294,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             match create_argv(&name, &body) {
                 Ok(c) => {
                     let session = c.labels.iter().any(|(k, _)| k == SESSION_LABEL);
+                    crate::events::publish(&event_of("create", &name, &c, None));
                     created_put(&name, c);
                     if let (true, Some(owner)) = (session, req.peer.clone()) {
                         session_track(bin, &name, owner);
@@ -1953,6 +2333,8 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                     let argv: Vec<&str> = c.argv.iter().map(String::as_str).collect();
                     let (code, _, err) = kern(bin, &argv);
                     if code == 0 {
+                        // `kern box -d` returns once the box has started.
+                        crate::events::publish(&event_of("start", &name, &c, None));
                         no_content()
                     } else {
                         error(500, &kern_error(&err))
@@ -2073,6 +2455,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
         }
         (_, ["networks", ..]) => not_translated("networks"),
         (_, ["volumes", ..]) => not_translated("the volumes API"),
+        ("GET", ["events"]) => crate::events::events(req),
         ("POST", ["build"]) => not_translated("build"),
         (m, _) => not_translated(&format!("{m} {}", req.path)),
     }
@@ -2281,6 +2664,137 @@ mod tests {
         }
     }
 
+    fn list_req(filters: &str) -> Request {
+        Request {
+            method: "GET".into(),
+            path: "/containers/json".into(),
+            query: vec![("filters".into(), filters.into())],
+            body: Vec::new(),
+            upgrade: false,
+            peer: None,
+            close: false,
+        }
+    }
+
+    /// The container list's filters. The label filter in its map form (`docker ps --filter`,
+    /// Dev Containers) is applied, not dropped: dropped, every box came back and a client took
+    /// another user box for its own. A filter not translated, or filters that do not parse, are
+    /// refused, never read as "no filter".
+    #[test]
+    fn list_filters_apply_both_label_forms_and_refuse_what_they_do_not_know() {
+        let mine = vec![("devcontainer.local_folder".to_string(), "/w".to_string())];
+        let other: Vec<(String, String)> = Vec::new();
+        for f in [
+            r#"{"label":{"devcontainer.local_folder=/w":true}}"#,
+            r#"{"label":["devcontainer.local_folder=/w"]}"#,
+        ] {
+            let lf = ListFilters::parse(&list_req(f)).unwrap();
+            assert!(lf.keeps("mine", true, &mine), "{f}");
+            assert!(!lf.keeps("other", true, &other), "{f}");
+        }
+        for bad in [
+            r#"{"ancestor":["alpine"]}"#,
+            "{not json",
+            r#"{"name":["a.*b"]}"#,
+        ] {
+            assert!(ListFilters::parse(&list_req(bad)).is_err(), "{bad}");
+        }
+        let by_name = ListFilters::parse(&list_req(r#"{"name":["^web"]}"#)).unwrap();
+        assert!(by_name.keeps("web-1", true, &other));
+        assert!(!by_name.keeps("my-web", true, &other));
+        let exact = ListFilters::parse(&list_req(r#"{"name":{"^/web$":true}}"#)).unwrap();
+        assert!(exact.keeps("web", true, &other) && !exact.keeps("web-1", true, &other));
+        let sub = ListFilters::parse(&list_req(r#"{"name":["app.v2"]}"#)).unwrap();
+        assert!(sub.keeps("my-app.v2-1", true, &other));
+        let id = id_of("web");
+        let by_id =
+            ListFilters::parse(&list_req(&format!(r#"{{"id":["{}"]}}"#, &id[..12]))).unwrap();
+        assert!(by_id.keeps("web", true, &other) && !by_id.keeps("db", true, &other));
+        let exited = ListFilters::parse(&list_req(r#"{"status":["exited"]}"#)).unwrap();
+        assert!(exited.wants_exited());
+        assert!(exited.keeps("x", false, &other) && !exited.keeps("x", true, &other));
+    }
+
+    /// `HostConfig.Mounts` as kern's `--mount`: the workspace bind Dev Containers always sends, a
+    /// read-only bind, a named volume, a sized tmpfs; what kern's mount lacks is refused by name.
+    #[test]
+    fn host_mounts_translate_to_kern_mounts_and_unknown_options_are_refused() {
+        let host = |mounts: &str| json::parse(&format!(r#"{{"Mounts":{mounts}}}"#)).unwrap();
+        let ok = host(
+            r#"[{"Type":"bind","Source":"/tmp","Target":"/workspaces/w","Consistency":"cached"},
+                {"Type":"bind","Source":"/etc/hostname","Target":"/h","ReadOnly":true,"BindOptions":{"Propagation":"rprivate"}},
+                {"Type":"volume","Source":"cache","Target":"/c"},
+                {"Type":"tmpfs","Target":"/t","TmpfsOptions":{"SizeBytes":1048576}}]"#,
+        );
+        assert_eq!(
+            translate_mounts(Some(&ok)).unwrap(),
+            vec![
+                "type=bind,src=/tmp,dst=/workspaces/w".to_string(),
+                "type=bind,src=/etc/hostname,dst=/h,ro".to_string(),
+                "type=volume,src=cache,dst=/c".to_string(),
+                "type=tmpfs,tmpfs-size=1048576,dst=/t".to_string(),
+            ]
+        );
+        for (bad, says) in [
+            (
+                r#"[{"Type":"bind","Source":"/tmp","Target":"/w","BindOptions":{"Propagation":"rshared"}}]"#,
+                "Propagation",
+            ),
+            (
+                r#"[{"Type":"bind","Source":"/tmp","Target":"/w","BindOptions":{"NonRecursive":true}}]"#,
+                "NonRecursive",
+            ),
+            (
+                r#"[{"Type":"bind","Source":"rel","Target":"/w"}]"#,
+                "absolute",
+            ),
+            (
+                r#"[{"Type":"bind","Source":"/a,b","Target":"/w"}]"#,
+                "comma",
+            ),
+            (
+                r#"[{"Type":"volume","Source":"v","Target":"/w","VolumeOptions":{"DriverConfig":{"Name":"nfs"}}}]"#,
+                "DriverConfig",
+            ),
+            (
+                r#"[{"Type":"tmpfs","Target":"/t","TmpfsOptions":{"Mode":448}}]"#,
+                "Mode",
+            ),
+            (r#"[{"Type":"npipe","Source":"x","Target":"/w"}]"#, "Type"),
+            (r#"[{"Type":"bind","Source":"/tmp"}]"#, "Target"),
+        ] {
+            let e = translate_mounts(Some(&host(bad))).unwrap_err();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+        let defaults = host(
+            r#"[{"Type":"bind","Source":"/tmp","Target":"/w","BindOptions":{"NonRecursive":false},"ReadOnly":false}]"#,
+        );
+        assert_eq!(
+            translate_mounts(Some(&defaults)).unwrap(),
+            vec!["type=bind,src=/tmp,dst=/w".to_string()]
+        );
+    }
+
+    /// The image object `kern inspect --json` prints is spliced only when it is exactly one object.
+    #[test]
+    fn image_object_members_take_one_object_only() {
+        let one = r#"[{"RepoTags":["alpine:3.19"],"Config":{"User":null,"Cmd":["/bin/sh"]}}]"#;
+        let m = image_object_members(one).unwrap();
+        let v = json::parse(&format!(r#"{{"Id":"sha256:x",{m}}}"#)).unwrap();
+        assert!(v.get("Config").and_then(|c| c.get("Cmd")).is_some());
+        for bad in [
+            "",
+            "[]",
+            "[{}]",
+            r#"[{"a":1},{"b":2}]"#,
+            r#"{"a":1}"#,
+            "[1]",
+            "error: x",
+        ] {
+            assert!(image_object_members(bad).is_none(), "{bad:?}");
+        }
+    }
+
     /// A prune filtered by label (Testcontainers' reaper with Ryuk off) answers Docker's empty
     /// result for networks, volumes and images; one without a label filter is still refused.
     #[test]
@@ -2308,7 +2822,10 @@ mod tests {
             };
             assert_eq!(status, 200, "{kind}");
             let v = json::parse(std::str::from_utf8(&body).unwrap()).unwrap();
-            assert_eq!(v.get(key).and_then(Value::as_array).map(<[Value]>::len), Some(0));
+            assert_eq!(
+                v.get(key).and_then(Value::as_array).map(<[Value]>::len),
+                Some(0)
+            );
         }
         let Response::Full { status, .. } = labelled_prune("volumes", &req(Vec::new())) else {
             panic!("a whole body");

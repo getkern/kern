@@ -19,6 +19,7 @@
 //! runtime root, which no box may mount; kern refuses to replace a path that is not a socket.
 
 mod api;
+mod events;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -275,6 +276,10 @@ pub(crate) enum Response {
 pub(crate) struct Out {
     stream: UnixStream,
     chunked: bool,
+    /// What the client sent past its request before this answer, already read off the
+    /// connection: the first bytes of a hijacked exec's stdin, for a client that does not wait
+    /// for the `101`.
+    input: Vec<u8>,
 }
 
 impl Out {
@@ -283,7 +288,13 @@ impl Out {
         Ok(Out {
             stream: self.stream.try_clone()?,
             chunked: self.chunked,
+            input: Vec::new(),
         })
+    }
+
+    /// The bytes already read past the request (see `input`), once.
+    pub(crate) fn take_input(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.input)
     }
 
     /// The connection, for a handler that watches it (a client hanging up) rather than writes.
@@ -355,7 +366,7 @@ fn reason(status: u16) -> &'static str {
 
 /// Write `resp`. `false` when the connection must end after it.
 /// `head_only` for a HEAD request: the head says how long the body is, and the body is not sent.
-fn write_response(w: &mut UnixStream, resp: Response, head_only: bool) -> bool {
+fn write_response(w: &mut UnixStream, resp: Response, head_only: bool, input: &[u8]) -> bool {
     match resp {
         Response::Full {
             status,
@@ -410,6 +421,7 @@ fn write_response(w: &mut UnixStream, resp: Response, head_only: bool) -> bool {
             let mut out = Out {
                 stream,
                 chunked: !upgrade,
+                input: if upgrade { input.to_vec() } else { Vec::new() },
             };
             if w.write_all(head.as_bytes()).is_ok() {
                 writer(&mut out);
@@ -438,13 +450,13 @@ fn serve_connection(stream: UnixStream, kern: &Path) {
         match read_request(&mut r) {
             Read1::Closed => return,
             Read1::Bad(why) => {
-                let _ = write_response(&mut w, api::error(400, why), false);
+                let _ = write_response(&mut w, api::error(400, why), false, &[]);
                 return;
             }
             Read1::Request(mut req) => {
                 req.peer = peer.clone();
                 let resp = api::handle(&req, kern);
-                if !write_response(&mut w, resp, req.method == "HEAD") || req.close {
+                if !write_response(&mut w, resp, req.method == "HEAD", r.buffer()) || req.close {
                     return;
                 }
             }
@@ -656,7 +668,11 @@ mod tests {
             let Ok((a, mut b)) = UnixStream::pair() else {
                 panic!("socketpair");
             };
-            let mut out = Out { stream: a, chunked };
+            let mut out = Out {
+                stream: a,
+                chunked,
+                input: Vec::new(),
+            };
             assert!(out.write_all(b"hello").is_ok());
             assert!(matches!(out.write(b""), Ok(0)));
             let Ok(mut second) = out.try_clone() else {

@@ -102,9 +102,10 @@ set TESTCONTAINERS_RYUK_DISABLED=true
 |---|---|
 | `containers/create`, `start` | `kern box <name> -d ...`, run at the start; the image, command, entrypoint, env, labels, workdir, user, hostname, published ports (`PortBindings`, `PublishAllPorts`), binds, memory, CPUs, `AutoRemove`, `NetworkMode` default, bridge, host or none |
 | `attach`, then `start` (`docker run` without `-d`) | `kern box` in the foreground: stdout and stderr come back apart, and the box's exit code is the run's |
-| `exec`, `exec/{id}/start`, `exec/{id}/json` | `kern exec`, stdout and stderr apart, the exit code, `-t`, `-u`, `-w`, env, detached |
+| `exec`, `exec/{id}/start`, `exec/{id}/json` | `kern exec`, stdout and stderr apart, the exit code, `-t`, `-u`, `-w`, env, detached, and stdin (`-i`) on a hijacked connection, ending when the client closes its side |
 | `logs` (`stdout`, `stderr`, `follow`, `tail`, `since`, `timestamps`) | `kern logs`: stdout and stderr apart for a container made through the socket |
-| `json` (list and inspect), `wait`, `stop`, `kill`, `restart`, `DELETE` | `kern ps`, `inspect --json`, `wait`, `stop`, `kill`, `restart`, `rm` |
+| `json` (list and inspect), `wait`, `stop`, `kill`, `restart`, `DELETE` | `kern ps`, `inspect --json`, `wait`, `stop`, `kill`, `restart`, `rm`; the list's `label`, `name` (a substring, `^`/`$` anchors), `id` and `status` filters, and any other filter refused by name rather than ignored |
+| `events` (`type`, `event`, `container`, `label`, `image` filters) | the `create`, `start` and `die` of the containers this socket makes, sent when they happen; a box started with kern directly makes none, and `since`/`until` are refused |
 | `images/create`, `images/json` (`reference`, `dangling` filters), `images/{name}/json` | `kern pull`, `kern images --json` |
 | `networks/prune`, `volumes/prune`, `images/prune` with a `label` filter | nothing removed, Docker's empty answer: this API makes no network, volume or image, and that is how a Testcontainers session ends with Ryuk off; without a label filter, 501 |
 | `_ping`, `version`, `info` | kern and kern's version in `Platform` and `Components`; `Version` and `ServerVersion` are `24.0.0`, the Docker Engine whose API is 1.43, since clients gate on that number (Testcontainers for Java refuses one below 1.6.0) |
@@ -117,13 +118,17 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
 | Testcontainers for Python 4.15.0 | Redis module (`GET` answers), Postgres module with SQLAlchemy (`select version()`, its readiness check is an `exec` of `psql`), nginx with a log wait | Redis 136 ms, Postgres 1181 ms, nginx 1048 ms, images cached |
 | Testcontainers for Java 1.21.3 (`TESTCONTAINERS_RYUK_DISABLED=true`) | a log wait on a stderr line, `exec` stdout, stderr and exit code, logs by stream, an HTTP wait on a published port, a container that exits failing its start, the session's prune at exit | log wait 361 ms, HTTP wait 123 ms, exited container refused in 54 ms, image cached |
 | Testcontainers for Node 12.2.2 | a log wait on a stderr line (it asks `tail=-1`), `exec` exit code, a published port reached by `fetch` | started to ready 7 ms, port 69 ms |
+| Dev Containers CLI 0.91.0 (what VS Code runs) | `devcontainer up` from an image: the workspace mounted with `--mount`, the `start` event, the shell server on `exec -i`, `postCreateCommand`, `remoteEnv`; a second `up` finds and reuses the container; `devcontainer exec` | `up` 373 ms, reuse 360 ms, `exec` 277 ms, image cached |
 | docker-py 7.2.0 | 9 of 9 exec cases: stdout and stderr apart, exit codes, env, workdir, user, 200 kB of output, tty, detached, a second start refused with 409, privileged refused | one `exec_run` 6 ms |
 
 **What differs, and is said.**
 
 - Testcontainers' reaper (Ryuk) is refused, as above; with `TESTCONTAINERS_RYUK_DISABLED=true` each
   test removes its own containers, as the `with` block does.
-- `--mount` (`HostConfig.Mounts`) is refused by name; a bind (`-v src:dst`) is translated.
+- `--mount` (`HostConfig.Mounts`) becomes kern's `--mount`, of type `bind`, `volume` or `tmpfs`, read-only
+  or not, with a tmpfs size; Dev Containers mounts its workspace this way. An option kern's mount does
+  not have (a propagation other than `rprivate`, a non-recursive bind, volume driver options, a tmpfs
+  mode) is refused by name. A bind (`-v src:dst`) is translated too.
 - `logs` keeps stdout and stderr apart for the containers made through the socket: their box's log
   records which stretch came from which stream. When the two are written within microseconds of each
   other the order BETWEEN them can differ from the order they were written in, as with Docker's own

@@ -32,7 +32,8 @@ socket as a bind source (Testcontainers' Ryuk) is refused, and an endpoint not t
 On Windows, `kern compat docker pipe` serves the same API on `\\.\pipe\kern-docker`, for this
 account only, with no TCP endpoint. Testcontainers for Python (Redis and Postgres modules), Java
 1.21.3 and Node 12.2.2 pass: log waits, `exec` exit codes, published ports, and an exited container
-failing its start at once. See [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
+failing its start at once. The Dev Containers CLI, which VS Code runs, brings a container up from an
+image and execs into it: `--mount`, `exec -i`, and `docker events` for the containers it makes. See [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
 
 **`kern proxy trust`: the `.localhost` names over HTTPS, once you ask for it.** It makes a
 certificate authority of your own that can sign `localhost` names only, adds it to your user's
