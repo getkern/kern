@@ -170,6 +170,8 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern top`: a box's log is live, and `s`, `p`, `u` act on that box from it.** Enter on the Boxes
   tab showed the log as it was when pressed, and any key closed it, so `s` pressed to stop the box
   only closed the log. It follows the output now, `s` asks to stop that box, Esc goes back.
+- **`kern run` prints nothing of its own for a box isolated as expected**, as `docker run`. A line
+  still says so when a boundary is open (`--net host`, a shared rootfs); `--verbose` shows the panel.
 - **Each part of kern's data can have a disk of its own.** `images_dir`, `volumes_dir`, `logs_dir`
   (logs then kept across reboots) and `history_dir`, set with `kern config set` or from `kern top`
   (Storage, `m`: what, then where), and one volume anywhere with `kern volume create <n> --path <dir>`
