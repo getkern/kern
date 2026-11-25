@@ -172,6 +172,8 @@ prints one JSON line per box (it printed the word `json`), and `--format` says `
   flag: a box gets every volume, anonymous volume, bind and `--mount` of another box, running or kept,
   read-only with `:ro`. A name that is neither is refused, and a box's own `-v`, `--mount` or `--tmpfs`
   on the same destination wins over the copy.
+- **`kern volume ls --json`, `kern top --json` and top's volume pane say where a `--path` volume's
+  data is** (`path`, `null` for one kern keeps), as the table's `at <dir>` did.
 - **An empty volume keeps the mode it is given** where the image has nothing at its mount point: a
   `chmod 777` from one box was undone by the next, so a `--user` box could not write the volume.
 - **Two of a box's own mounts on one path are refused** (`-v a:/data -v b:/data`, `--tmpfs /data` with
