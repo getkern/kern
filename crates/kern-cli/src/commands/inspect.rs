@@ -3136,6 +3136,41 @@ pub fn stop_with_grace(
             }
         }
     }
+    // A BOX THAT IS ALREADY STOPPED IS STOPPED. Docker and Podman print its name and exit 0, and so
+    // does kern's own socket; `kern stop` answered "no running box" and exit 1. MEASURED: `kern run
+    // -d --keep --name prova alpine true`, then `kern stop prova`, exit 1, where `docker stop` of the
+    // same exited container prints `prova` and exits 0. A box that exists stopped is a kept one or
+    // one with an exit record; a name that is neither is still an error, as Docker's "No such
+    // container". Only names nothing running, no managed unit and no unrecorded process answered.
+    let already: Vec<String> = if all {
+        Vec::new()
+    } else {
+        let live_names = live_name_set(&running);
+        let exited = registry::list_exited();
+        names
+            .iter()
+            .filter(|n| {
+                !targets.iter().any(|b| ref_matches(b, n, &live_names))
+                    && !managed_only.contains(n)
+                    && !stopped_unrecorded.contains(n)
+                    && (crate::keepbox::dir_of(n).is_some_and(|d| d.exists())
+                        || exited.iter().any(|e| &e.name == *n))
+            })
+            .cloned()
+            .collect()
+    };
+    for n in &already {
+        println!("{n}");
+    }
+    let names_left: Vec<String> = names
+        .iter()
+        .filter(|n| !already.contains(n))
+        .cloned()
+        .collect();
+    let names: &[String] = &names_left;
+    if !all && names.is_empty() {
+        return Ok(());
+    }
     if targets.is_empty() && managed_only.is_empty() && !stopped_unrecorded.is_empty() {
         let rest: Vec<&String> = names
             .iter()
