@@ -84,6 +84,14 @@ The image's steps are kept too, as metadata under the one layer kern writes, whi
 buildah still take as the base of a build. A rebuild answered entirely from the cache keeps its
 steps' times, so the same image saves and pushes under the same digest.
 
+**A box started from an ssh login or a WSL shell starts 2.1 ms sooner.** From a session outside the
+user's systemd subtree a box needs a scope of its own, and kern asked for it through `systemd-run`,
+then started again inside it. It now asks systemd itself, over D-Bus (the manager's private socket,
+or the session bus where that refuses), from its own process, and goes on in the scope with the same
+properties. Measured on WSL Ubuntu with systemd, paired: 9.46 ms against 11.67 ms per box, interval
+[+1.83, +2.31] ms; from a desktop terminal, where boxes join the delegated cgroup, unchanged.
+`KERN_SCOPE_VIA_SYSTEMD_RUN=1` takes `systemd-run` as before.
+
 **`-q` is quiet on a terminal: `kern build -q`, `kern pull -q`, `kern box -q`.** On a terminal,
 `build -q` drew the whole live view and printed every `RUN`'s output, and `pull -q`, and `box -q`
 for an image not yet cached, printed each layer's progress; without a terminal they were quiet.

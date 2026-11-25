@@ -6598,6 +6598,52 @@ fn fork_workload_under_caps(
     std::process::exit(code);
 }
 
+/// Put this process in the transient scope `unit` with the `-p Key=Value` properties `props` (the
+/// list built for `systemd-run`, `-p` included), asked of the manager over D-Bus from here
+/// (`kern_isolation::sdbus`). `true` once this process runs in it: kern then goes on as the
+/// re-executed kern would, `KERN_SCOPE` set and the scope's supervisor leaf prepared.
+///
+/// MEASURED on WSL Ubuntu with systemd, from a session outside the user's subtree, medians of 30:
+/// `systemd-run --user --scope` 5.94 ms and then kern started again inside it, against 2.87 ms for
+/// the same `StartTransientUnit` asked from the process. `false`, with nothing changed, on any
+/// failure or any property it cannot type, and the caller takes `systemd-run` as before: the worst
+/// this costs is the time the attempt took.
+fn scope_natively(unit: &str, props: &[String]) -> bool {
+    // The way back to `systemd-run` for every scope, for a host where this misbehaves and for an
+    // A/B of the two with the same binary.
+    if kern_common::env_flag("KERN_SCOPE_VIA_SYSTEMD_RUN") {
+        return false;
+    }
+    let typed: Option<Vec<kern_isolation::sdbus::Prop>> = props
+        .iter()
+        .filter(|p| p.as_str() != "-p")
+        .map(|p| kern_isolation::sdbus::prop_of(p))
+        .collect();
+    let Some(typed) = typed else {
+        return false;
+    };
+    let runtime = kern_isolation::manager_env()
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| crate::global_env("XDG_RUNTIME_DIR").map(std::path::PathBuf::from));
+    let system = kern_isolation::systemd_scope_mode() == "--system";
+    match kern_isolation::sdbus::start_scope_for_self(system, runtime.as_deref(), unit, &typed) {
+        Ok(()) => {
+            crate::set_global_env("KERN_SCOPE", "1");
+            kern_isolation::prepare_delegated_scope();
+            true
+        }
+        Err(e) => {
+            if kern_common::env_flag("KERN_DEBUG_SCOPE") {
+                eprintln!(
+                    "kern: debug: scope over D-Bus not made ({}); systemd-run instead",
+                    e.0
+                );
+            }
+            false
+        }
+    }
+}
+
 /// Re-run this invocation inside a BARE transient user scope, so the command it is about to run can
 /// be placed in the box's cgroup. Returns only if that could not be arranged, leaving the caller on
 /// the path it was already taking.
@@ -6621,6 +6667,10 @@ fn fork_workload_under_caps(
 fn reexec_exec_in_bare_scope() {
     use std::os::unix::process::CommandExt;
 
+    // Asked from this process first: no `systemd-run`, no second start (see `scope_natively`).
+    if scope_natively(&format!("kern-exec-{}.scope", std::process::id()), &[]) {
+        return;
+    }
     let Ok(self_exe) = std::env::current_exe() else {
         return;
     };
@@ -6826,6 +6876,15 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     if kern_isolation::scope_accepts_oom_policy() {
         props.push("-p".into());
         props.push("OOMPolicy=continue".into());
+    }
+    // The same scope, the same properties, asked from this process: kern goes on in it with no
+    // `systemd-run` and no second start. A foreground box keeps its die-with-parent cascade with
+    // nothing in between (launcher -> kern -> box), armed on this process as it was on the exec.
+    if scope_natively(&format!("kern-box-{}.scope", std::process::id()), &props) {
+        if die_with_parent {
+            arm_pdeathsig();
+        }
+        return;
     }
     // Resolve `systemd-run` by trusted absolute path, NOT via `$PATH`: on a box start this spawn is on
     // the critical path, and a long user `$PATH` (cargo/nvm/local/…) makes the kernel try execve in each

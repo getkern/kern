@@ -3629,11 +3629,14 @@ static DELEGATED_SCOPE: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// layout (back to the scope root, leaf removed), where systemd's `MemoryMax` on the scope remains the
 /// enforcer. It can lose the improvement; it cannot lose the cap.
 pub fn prepare_delegated_scope() -> bool {
+    // NOT CACHED while outside a scope: a process that asks systemd for its scope itself (see
+    // `sdbus`) is outside at `main`'s call and inside at the second, and must be prepared then, as a
+    // re-executed kern is at its first.
+    if !env_flag("KERN_SCOPE") {
+        return false;
+    }
     DELEGATED_SCOPE
         .get_or_init(|| {
-            if !env_flag("KERN_SCOPE") {
-                return None;
-            }
             let scope = current_v2_cgroup()?;
             // ONLY a scope kern created and named (`kern-box-<pid>.scope`), never an ambient one: a user
             // running `systemd-run --user --scope bash` (which `kern doctor` itself suggests) would

@@ -57,6 +57,7 @@ mod cgroup;
 mod landlock;
 /// RTNETLINK: the link operations that have no ioctl form (veth, bridge, master, netns move).
 pub mod netlink;
+pub mod sdbus;
 
 /// The kernel's Landlock ABI version, or `None` when Landlock is unavailable (not compiled in, or
 /// disabled at boot). Exposed so `kern doctor` can SAY SO up front: `--landlock-rw` degrades to

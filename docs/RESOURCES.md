@@ -113,6 +113,10 @@ Two ways to change the default ceiling, and they are not the same: `--memory <si
 it, which is the one you want; `KERN_NO_SCOPE=1` removes the scope and with it all three ceilings,
 leaving the command in your shell's cgroup.
 
+From a session outside your systemd user subtree (an ssh login on a server, a `wsl.exe -u` shell),
+a box cannot join kern's delegated cgroup, so it gets a scope of its own, which kern asks systemd for
+over D-Bus from its own process. `KERN_SCOPE_VIA_SYSTEMD_RUN=1` asks through `systemd-run` instead.
+
 ## Profiles
 
 Name a slice once, attach it by name, and stop repeating flags. Profiles live in
