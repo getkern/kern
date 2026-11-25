@@ -170,6 +170,9 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern top`: a box's log is live, and `s`, `p`, `u` act on that box from it.** Enter on the Boxes
   tab showed the log as it was when pressed, and any key closed it, so `s` pressed to stop the box
   only closed the log. It follows the output now, `s` asks to stop that box, Esc goes back.
+- **`kern top`: pasted text no longer answers a (y/n) prompt.** A command line pasted into top was
+  read as keys, and `systemd` in it was `s` then `y`: the selected box was stopped. A `y` now confirms
+  only when typed on its own, after the prompt.
 - **A box starts as fast where kern's runtime directory is on a disk.** Ending a box synced its
   scratch layer's filesystem, a journal commit on ext4: a default box took 14 ms there against 3 ms
   on tmpfs. The scratch layer, thrown away with the box, no longer asks for that sync; a kept box's
