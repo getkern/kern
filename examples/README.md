@@ -57,7 +57,7 @@ by folder:
 | [untrusted-code.sh](agents/untrusted-code.sh) | Run code you don't trust: read-only root + seccomp + no network + caps |
 | [services-and-ps.sh](basics/services-and-ps.sh) | Detached boxes, `kern ps`, `kern stop`, lifecycle without a daemon |
 | [serve-with-port.sh](edge/serve-with-port.sh) | Publish a box port to the host (`-p`), keep it up + health-checked (`--restart` / `--health-cmd`) |
-| [governed-run.sh](resources/governed-run.sh) | Govern CPU + memory, `kern limit` (no sandbox) and `--memory`/`--cpus` caps (OOM-enforced) |
+| [governed-run.sh](resources/governed-run.sh) | Govern CPU + memory on a box: `--memory`/`--cpus` caps (OOM-enforced) |
 | [mounts-and-exec.sh](basics/mounts-and-exec.sh) | Data in/out with `-v` (+ `--env`/`--workdir`), and `kern exec` into a running box |
 | [with-network.sh](basics/with-network.sh) | Outbound by default, as Docker's (DNS + fetch/install); `--network none` isolates |
 | [observe.sh](basics/observe.sh) | Daemonless observability: `kern logs` / `stats` / `top` |
@@ -204,7 +204,6 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 | Example | What it shows |
 |---|---|
 | [familiar-commands.sh](basics/familiar-commands.sh) | Coming from Docker / AWS / GCP? The same verbs and building blocks, mapped to kern |
-| [limit-vs-box.sh](basics/limit-vs-box.sh) | `kern run` (a box) and `kern limit` (a capped host process) side by side. Prints uid, hostname, pid 1 and whether `$HOME` is reachable, bare / under `kern limit` / under `kern run`, so the difference stops being an argument about names |
 | [benchmark.py](benchmark.py) | Reproduce the whole **Performance** table, kern vs bubblewrap / crun / runc / podman / docker (auto-detects what's installed) |
 | [compare-vs-docker.sh](resources/compare-vs-docker.sh) | Same isolated `/bin/true`, kern vs `docker run`, timed, and kern needs no daemon |
 | [compare-vs-bwrap.sh](resources/compare-vs-bwrap.sh) | Same speed class as bubblewrap, but kern adds OCI images, overlay, and lifecycle |

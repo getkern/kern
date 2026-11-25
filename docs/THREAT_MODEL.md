@@ -64,7 +64,7 @@ network.
 
 | Governor | Why it is not a boundary | Honest handling |
 |---|---|---|
-| Resource caps on a **non-delegated** host | with no cgroup delegation kern cannot enforce a cap | `kern box` warns once and `--require-limits` makes it fatal; `kern limit --memory` refuses unless a ceiling at or below the one named can be proven |
+| Resource caps on a **non-delegated** host | with no cgroup delegation kern cannot enforce a cap | `kern box` warns once and `--require-limits` makes it fatal |
 | Egress allowlist (`--egress-allow`) | over HTTPS any domain on a SHARED CDN with an allowed one is reachable, chosen by the HTTP `Host` header inside TLS, where a matching SNI does not help. Over plain HTTP that header is visible and a head naming another host is refused | an application-layer allowlist for a semi-trusted workload, SSRF-guarded, documented in [EGRESS.md](EGRESS.md) as not a hard exfiltration boundary |
 | vGPIO pin list | GPIO is chip-granular: the character device exposes every line via ioctl | `pins = [...]` is cooperative metadata; grant `vgpio:` only to a workload you trust with that hardware |
 | The `--ssh` subtree | sshd and its shells fork before seccomp and the cap drop, running the image's own binaries pre-filter | for interactive access, not a hardened bastion |

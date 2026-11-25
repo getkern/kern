@@ -44,9 +44,7 @@ identically. A kill by the box's own cap always carries kern's OOM message on st
 
 **Enforce, or refuse to start.** Where the controllers are not delegated, a `kern box` warns once and
 runs uncapped; `--require-limits` (or `KERN_REQUIRE_LIMITS`) makes that fatal, reading the caps back
-from the cgroup before starting. `kern limit --memory` does not wait to be asked: since v0.31.0 it
-refuses on its own when no ceiling at or below the one you named can be proven, because that verb
-governs resources and nothing else. `--allow-uncapped` (`KERN_ALLOW_UNCAPPED`) is the explicit inverse;
+from the cgroup before starting. `--allow-uncapped` (`KERN_ALLOW_UNCAPPED`) is the explicit inverse;
 the two are mutually exclusive. cpu and cpuset stay best-effort under both.
 
 `cpu.max` reads directly: `50000 100000` is half a core, `200000 100000` is two.
@@ -56,16 +54,15 @@ the limit minus what is already there. That baseline depends on whether the comm
 exec'd binary and on whether the box is detached: measured at 2 on one box, so `--pids-limit 30` allowed
 28 forks. It is a fork-bomb ceiling, not an exact budget.
 
-## The model, in two verbs
+## The model
 
-| Verb | Question it answers | What it does |
-|---|---|---|
-| **`kern box`** | *"Isolate this workload, and slice its resources."* | Its own namespaces, overlay or read-only fs, private process tree, seccomp, **plus** the resource slices |
-| **`kern limit`** | *"Just slice resources, no sandbox."* | The same caps with no namespaces, **plus** `--landlock-rw` to confine writes |
+A box (`kern run`, or `kern box` with the name first) isolates a workload and slices its resources:
+its own namespaces, overlay or read-only fs, private process tree, seccomp, **plus** the caps below. It
+follows Docker: with no `--memory` it is bounded by the machine, and `--memory M` alone allows as much
+swap as memory.
 
-They compose: `limit` inside `box`. `kern limit` carries a default memory cap of **512 MiB** where the
-host can hold one, plus no swap and a ceiling of 512 tasks. A box follows Docker: with no `--memory`
-it is bounded by the machine, and `--memory M` alone allows as much swap as memory.
+Capping a program of this host WITHOUT a container is not something kern does since 0.57.0 (Docker
+has no such verb either). systemd does it: `systemd-run --user --scope -p MemoryMax=1G -p CPUQuota=200% -- ./job`.
 
 ### What memory ceiling you get
 
@@ -73,7 +70,6 @@ it is bounded by the machine, and `--memory M` alone allows as much swap as memo
 |---|---|---|
 | `kern box`, `kern run`, `docker run` through kern's socket | **the host's RAM**, the host's swap; `--memory M` alone: M and M of swap | Docker parity: Docker does not cap a container, and its `--memory` alone allows an equal swap. `--memory-swap-max` sets the swap |
 | a `kern compose` service with no `mem_limit:` | **the host's RAM**, the host's swap; `mem_limit` alone: an equal swap | compose parity, the same rule |
-| `kern limit` | **512 MiB**, no swap | kern's own default for a process it caps outside a box |
 | a sandbox of the Python or Node SDK, or the Rust `Sandbox` builder | **512 MiB**, no swap | the sandbox's default; the cap is the whole budget, which is what its `oom` verdict reports |
 
 Measured on a host with 33464963072 bytes of RAM and 25322409984 of swap: `kern run alpine` reads
@@ -85,7 +81,7 @@ ceiling back on compose services ([CONFIG.md](CONFIG.md), [DOCKER-COMPAT.md](DOC
 
 **No mechanism at all.** A host with no systemd user manager, whose own cgroup cannot take
 a capped child, has neither path, so NO cap is in force, default or asked-for. A `kern box` warns at
-start, a `kern limit --memory` refuses outright, and `kern doctor` names the directories it probed. For a
+start, and `kern doctor` names the directories it probed. For a
 running box it is a fact you can read:
 
 ```console
@@ -128,7 +124,7 @@ Name a slice once, attach it by name, and stop repeating flags. Profiles live in
 ```sh
 kern config add vcpu:slim --cpus 0.5 --memory 256m       # or edit the file by hand
 kern box app --image alpine vcpu:slim -- ./app           # no flag: the profile is just there
-kern limit vcpu:slim -- ./train.sh                       # the same slice, no sandbox
+kern run vcpu:slim python:3.12-slim python train.py      # the same slice on `kern run`
 ```
 
 That writes both the profile and the physical resource it slices:
@@ -150,22 +146,12 @@ per-project file, or `KERN_CONFIG` to make that the file every command reads. Th
 7-layer precedence and `extends` are in **[CONFIG.md](CONFIG.md)**; a runnable walk-through is
 [resource-profiles.sh](../examples/resources/resource-profiles.sh).
 
-## Confining writes without a sandbox
+## Confining writes
 
-`--landlock-rw <path>` works on `run` as well as on `box`, because Landlock restricts the calling
-process rather than needing a mount namespace. So `kern limit --landlock-rw ~/project -- ./agent` runs a
-host binary with its writes confined by the kernel to that directory. Two differences from the same
-flag on `box`:
-
-- It grants **only what you name**, plus `/dev/null` and the other character devices a program opens
-  for writing. Inside a box `/tmp`, `/run` and `/proc` are the box's own and are granted automatically;
-  on the host they are real and persistent, so they are not.
-- It **refuses to run** where the kernel has no Landlock, rather than warning and continuing as a
-  resource cap does. A cap that cannot be applied leaves the command running without a limit, which
-  `run` says out loud; a confinement that cannot be applied would leave your files reachable while you
-  believed otherwise.
-
-It also implies `no_new_privs`, which Landlock requires, so `sudo` inside it stops working.
+`--landlock-rw <path>` confines a box's writes with the Landlock LSM: the root stays readable and
+executable, and writes go only under the paths named (repeatable), plus the box's own `/dev`, `/tmp`,
+`/run` and `/proc`. It refuses to start where the kernel has no Landlock, and implies `no_new_privs`,
+which Landlock requires, so `sudo` inside the box stops working.
 
 ## Storage: volumes and vdisks
 

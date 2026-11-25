@@ -21,15 +21,17 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
-**Breaking: `kern run` runs an image, as `docker run` does; what it did before is `kern limit`.**
+**Breaking: `kern run` runs an image, as `docker run` does; what it did before is gone.**
 `kern run [options] <image> [command...]` is `kern box` in `docker run`'s shape: the options are
 `box`'s, the first other word is the image and everything after it the command, the name is
-`--name` or one kern picks, and `kern container run` is the same verb. Capping a process on this
-host with no sandbox (`--memory`, `--cpus`, `--cpuset-cpus`, `--landlock-rw`, `vcpu:` profiles) is
-`kern limit [options] -- <command...>`, unchanged but for its name. `kern run`'s old forms are
-answered with the new verb and the command written for it: `kern run [options] -- <command>` and a
-path where the image goes are refused naming `kern limit`, and a `kern run <word>` whose image does
-not exist while `<word>` is a program of this host says `kern limit -- <word> ...` would run it.
+`--name` or one kern picks, and `kern container run` is the same verb. Capping a program of this
+host with no container, what `kern run [options] -- <command>` did, is no longer kern's: it is not a
+container and Docker has no such verb. systemd does it, and kern says so with the command written
+for it: `kern run [options] -- <command>`, a path where the image goes, and a `kern run <word>` whose
+image does not exist while `<word>` is a program of this host all answer `systemd-run --user
+--scope -p MemoryMax=1G -p CPUQuota=200% -- <command>`. `--landlock-rw`, `--memory`, `--cpus`,
+`--cpuset-cpus` and `vcpu:` profiles stay, on boxes. `kern top --json` is schema 2: its `runs`
+object, the counters of that verb, went with it.
 
 **Breaking: A box reaches the internet by default, as a Docker container does.** `kern run alpine wget
 example.com` had no interface but `lo` and no `/etc/resolv.conf`; a box that names no network now
@@ -61,7 +63,7 @@ Docker sets no cap, and `kern compose` already gave the host's RAM: a database, 
 runs under Docker was OOM-killed at a number written nowhere. A box with no `--memory` now has the
 host's RAM as its ceiling and the host's swap; `--memory M` alone allows M of swap, Docker's pairing
 (measured: `memory.swap.max` 268435456 under `--memory 256m` on both engines); `--memory-swap-max`
-sets it. `kern limit` keeps its 512 MiB. The Python and Node sandboxes and the Rust `Sandbox` builder
+sets it. The Python and Node sandboxes and the Rust `Sandbox` builder
 pass `--memory-swap-max 0` and keep 512 MiB as their whole budget.
 
 **A box resolves the host's search domains, as a Docker container does.** A box on the default
@@ -165,13 +167,13 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
   it answered "no running box". A name that is no box at all is still an error.
 - **`kern doctor` says when kern is not where the AppArmor profile looks**, and to copy it to
   `~/.local/bin/kern` first; it said "if that path is not in its attachment line".
-- **`kern top` names the `kern limit` tab "Limits".** It was "Runs", from when that verb was
-  `kern run`; every box, `run` or `box`, is on the Boxes tab. `--tab runs` still works, and the JSON
-  key `runs` is unchanged.
+- **`kern top` has one tab for boxes.** Its "Runs" tab counted the capped host processes of the
+  old `kern run`, and beside "Boxes" it read as a second kind of box; it went with that verb. The tab
+  bar falls back to the names with two spaces between them before it wraps.
 - **`kern doctor` and the box panel say the network a box has.** The pasta row said a plain box is
   loopback-only, and `--verbose` showed "isolated (loopback-only)" for a box with a NAT; both now
   follow the default, as `kern info` already did. The config `kern config setup` writes shows
-  `kern limit vcpu:heavy -- ./train.sh` and `kern run vcpu:heavy <image>`.
+  `kern run vcpu:heavy <image>`.
 - **A failed archive entry is named.** `kern cp -` and `docker cp` into a box name the archive entry
   that failed. The API answered 404 "Could not find the file" for a destination that exists; 404 is
   now only for a missing destination.

@@ -45,8 +45,6 @@ agent's code runs in, called from Python, Node or any MCP client. kern calls a c
 - **Your `docker-compose.yml`, unchanged**, or kern's own `stack.toml`.
 - **Full NVIDIA GPU support**: `--gpus all`, `--gpus 2`, `--gpus device=0,1`,
   and compose's `deploy.resources.reservations.devices`, on Linux and WSL2.
-- **Limits without a sandbox.** `kern limit` puts the same caps on a plain process on the host.
-  [docs/RESOURCES.md](docs/RESOURCES.md)
 - **The tools you expect**: `ps`, `logs`, `exec`, `stats`, `inspect`, `top`, `doctor`.
 
 ## Install
@@ -87,7 +85,7 @@ first: [docs/INSTALL.md](docs/INSTALL.md#linux).
 | What is running (`--json` too) | `kern ps` |
 
 `--security-profile untrusted` is the seccomp allowlist, `--cap-drop ALL` and `--read-only` in one
-flag. [examples/](examples/) holds 96 runnable scripts, one per thing kern does.
+flag. [examples/](examples/) holds 95 runnable scripts, one per thing kern does.
 
 ## Kern Sandbox: run an agent's code from Python or Node
 
