@@ -8508,6 +8508,15 @@ fn warn_once(msg: &str) {
     }
     // Thread-local rather than global: kern is one process per invocation, and a test that parses
     // several documents on its own thread still sees each first occurrence.
+    //
+    // A SILENT PASS SAYS NOTHING AND MARKS NOTHING. `config` and the service hash parse the file a
+    // second time with warnings off (see `document_val_uncached`); when that pass came FIRST it
+    // marked the sentence as said, and the pass that speaks then skipped it, so no warning came out
+    // at all. MEASURED (Grok's round 7, case 7): `${n}` unset in a command, Docker "The "n" variable
+    // is not set", kern nothing, in `config` and in `up`.
+    if SILENT_WARNINGS.with(std::cell::Cell::get) {
+        return;
+    }
     let fresh = SEEN.with(|s| s.borrow_mut().insert(msg.to_string()));
     if fresh {
         warn(msg);
@@ -10216,6 +10225,22 @@ mod tests {
     /// `-1` is read by the grammar, where every other count is read; `0` is answered HERE, because
     /// the ambiguity that makes the flag refuse a bare `0` (docker's "no gpus" against this
     /// project's "card 0") does not exist in a key called `count`.
+    /// THE WARNING FOR AN UNSET VARIABLE SURVIVES A SILENT PASS. `config` reads the tree with
+    /// warnings off before the parse that speaks; the silent pass used to mark the sentence as said,
+    /// so `${G13_NEVER_SET}` produced no warning at all, where Docker says "variable is not set".
+    #[test]
+    fn an_unset_variable_is_warned_after_a_silent_pass() {
+        let text = "services:\n  a:\n    image: alpine\n    command: [\"sh\", \"-c\", \"echo ${G13_NEVER_SET_K7}\"]\n";
+        let _ = take_warnings();
+        let _ = document_val(text, &crate::DotEnv::default(), None, true);
+        let _ = parse(text);
+        let w = take_warnings();
+        assert!(
+            w.iter().any(|m| m.contains("G13_NEVER_SET_K7") && m.contains("not set")),
+            "no warning for the unset variable: {w:?}"
+        );
+    }
+
     #[test]
     fn the_counts_docker_accepts_are_the_counts_this_reads() {
         let res = |count: &str| {
