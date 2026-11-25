@@ -125,6 +125,27 @@ kept to the new place; `kern sandbox keep` and `kern info` say where they are an
 and `kern sandbox clear` removes them. Each place holds about 33,000 lines, after which the oldest go.
 Neither directory can be mounted into a box.
 
+### Where kern keeps its data: `data_dir`
+
+```sh
+kern config set data_dir /media/sd/kern
+```
+
+Volumes, kept boxes, builds, the sandbox history kept on disk, the local CA and bench results go in
+that directory, and the images in its `cache/`, instead of `~/.local/share/kern` and `~/.cache/kern`.
+For a second disk, an SD card, a larger partition. `kern info` says where they are (`data dir`), and
+`kern config unset data_dir` puts them back.
+
+`set` makes the directory private (0700) and checks it before it writes the key: it must be yours and
+writable by nobody else, and it must keep file modes and symlinks, which image layers and kept boxes
+need. It tries both on the directory itself, so a card formatted FAT or exFAT, as most arrive, is
+refused with what failed; format it ext4. It is refused while a box runs, because that box keeps
+writing to the old place.
+
+What is at the old place stays there: `set` says what it holds and prints the `mv` that moves it,
+with no box running. kern does not move it on its own, as Docker does not move its `data-root`. The
+new directory, like the old, cannot be mounted into a box.
+
 ### Local names for compose services
 
 ```toml

@@ -157,6 +157,11 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern cp` of a stopped box, twice in a row, on WSL.** The second copy waited 20 s and failed "in
   use by another box": the box kern starts on the layer for a copy was not removed in kern's WSL
   distro. Five copies in a row now take 16-21 ms each there, and a copy is about 3 ms faster here.
+- **`kern config set data_dir <path>` puts kern's data on another disk.** Volumes, kept boxes,
+  builds, the history and the images (in its `cache/`) go there; `kern info` shows where. The
+  directory is checked first, on the disk itself: yours, private, and keeping file modes and symlinks
+  (a FAT or exFAT card is refused with what failed). Not while a box runs; what stays at the old
+  place is said with the `mv` that moves it.
 - **A box on the default network starts without waiting for its NAT.** A box that names no network
   now enters a network namespace kern prepared ahead, with pasta already up; it serves that box alone
   and goes with it. Measured, `kern run --rm alpine true`: 14.7 ms to 4.3-5.0 ms here (when boxes
