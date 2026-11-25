@@ -255,6 +255,16 @@ pub struct KernSettings {
     /// `local_domains_port` - the port that router listens on, on the loopback addresses only.
     /// Absent means 80 where an ordinary user may bind it, else the first free of 8080-8089.
     pub local_domains_port: Option<u16>,
+    /// `data_dir` - where kern keeps its data, for a second disk, an SD card or a larger partition:
+    /// volumes, kept boxes, builds, the sandbox history kept on disk, the local CA and bench results
+    /// go in it, and the image and layer cache in its `cache/`. Absent means the XDG locations,
+    /// `$XDG_DATA_HOME/kern` and `$XDG_CACHE_HOME/kern`.
+    ///
+    /// ONE RESOLVER READS IT ([`crate::kern_xdg_root`]), the one every one of those paths already
+    /// came from, so nothing can keep writing to the old place by computing its own path, and the
+    /// refusal to mount kern's own state into a box follows it, because it is built from the same
+    /// resolver. Absolute and free of `..`, checked where the file is read.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 /// The `[kern]` keys `kern config set|get|unset` reads and writes, with the shape of each value.
@@ -315,6 +325,11 @@ pub(crate) const SETTABLE_KERN_KEYS: &[(&str, SettingKind, &str)] = &[
         "the port of those names (default 80 if allowed, else 8080)",
     ),
     (
+        "data_dir",
+        SettingKind::Path,
+        "where kern keeps volumes, kept boxes, builds and history, and images in its cache/ (default ~/.local/share/kern, ~/.cache/kern)",
+    ),
+    (
         "publish_bind",
         SettingKind::Word(&["0.0.0.0", "127.0.0.1"]),
         "the address a port with no address binds",
@@ -364,6 +379,8 @@ pub(crate) enum SettingKind {
     Bool,
     /// One of a fixed set of words, written as a TOML string.
     Word(&'static [&'static str]),
+    /// An absolute path, written as a TOML string.
+    Path,
 }
 
 /// The TOML text `kern config set <key> <value>` writes for `value`, or why it is refused.
@@ -406,7 +423,37 @@ pub(crate) fn kern_value_toml(kind: SettingKind, value: &str) -> Result<String, 
                 Err(format!("{v:?}: expected one of {}", words.join(", ")))
             }
         }
+        SettingKind::Path => check_data_dir(v).map(|_| format!("\"{v}\"")),
     }
+}
+
+/// `data_dir`'s value: an absolute path with no `..` and not `/` itself. A relative one would put
+/// kern's data wherever the next command is started from.
+pub(crate) fn check_data_dir(v: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::PathBuf::from(v.trim());
+    if !p.is_absolute() {
+        return Err(format!(
+            "{v:?}: expected an absolute path, like /media/sd/kern"
+        ));
+    }
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("{v:?}: `..` is not allowed in it"));
+    }
+    if p.parent().is_none() {
+        return Err(format!(
+            "{v:?}: not the root directory itself; name a directory for kern"
+        ));
+    }
+    Ok(p)
+}
+
+/// [`KernSettings::data_dir`] as the active config sets it, read once per process with the rest of
+/// the config ([`load_cached`]). `None` when it is not set or the config does not parse (kern then
+/// runs on its defaults, as every other key does).
+pub(crate) fn data_dir() -> Option<std::path::PathBuf> {
+    load_cached(None).ok()?.kern.data_dir.clone()
 }
 
 /// A retention period: `<n>d`, or a Go duration (`90s`, `30m`, `24h`, `1h30m`), in whole seconds,
@@ -1160,6 +1207,10 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
         }
         "sandbox_transcripts" => k.sandbox_transcripts = Some(value_bool(v)?),
         "local_domains" => k.local_domains = Some(value_bool(v)?),
+        "data_dir" => {
+            let raw = value_string(v)?;
+            k.data_dir = Some(check_data_dir(&raw).map_err(|e| format!("[kern] data_dir = {e}"))?);
+        }
         "local_domains_port" => {
             let n = value_u32(v)?;
             k.local_domains_port =
@@ -3347,6 +3398,58 @@ pub(crate) fn check_kern_value(key: &str, value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// `[kern] data_dir` moves the data AND the image cache, through the one resolver every path of
+    /// kern comes from, and the refusal to mount kern's own state into a box follows it there.
+    #[test]
+    fn data_dir_moves_the_data_and_the_image_cache_and_the_mount_refusal_follows() {
+        let _g = crate::env_guard();
+        let tmp = std::env::temp_dir().join(format!("kern-datadir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let data = tmp.join("disk/kern");
+        std::fs::create_dir_all(&data).expect("data");
+        let cfg = tmp.join("kern.toml");
+        std::fs::write(&cfg, format!("[kern]\ndata_dir = \"{}\"\n", data.display())).expect("cfg");
+        let old = crate::global_env("KERN_CONFIG");
+        crate::set_global_env("KERN_CONFIG", &cfg);
+        let got_data = crate::kern_xdg_root("XDG_DATA_HOME", ".local/share");
+        let got_cache = crate::kern_xdg_root("XDG_CACHE_HOME", ".cache");
+        let got_config = crate::kern_xdg_root("XDG_CONFIG_HOME", ".config");
+        let refused = crate::registry::trusted_state_overlap(&data);
+        let refused_parent = crate::registry::trusted_state_overlap(&tmp.join("disk"));
+        match old {
+            Some(v) => crate::set_global_env("KERN_CONFIG", v),
+            None => crate::unset_global_env("KERN_CONFIG"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(got_data.as_deref(), Some(data.as_path()));
+        assert_eq!(got_cache, Some(data.join("cache")));
+        assert!(
+            got_config.is_some_and(|c| !c.starts_with(&data)),
+            "the config stays where it is"
+        );
+        assert!(
+            refused.is_some(),
+            "the new data root must be refused as a mount source"
+        );
+        assert!(
+            refused_parent.is_some(),
+            "and so must a directory that contains it"
+        );
+    }
+
+    #[test]
+    fn a_data_dir_is_absolute_and_plain() {
+        assert!(check_data_dir("/media/sd/kern").is_ok());
+        for bad in ["rel/path", "./kern", "/media/../etc", "/", ""] {
+            assert!(check_data_dir(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(kern_value_toml(SettingKind::Path, "/media/sd/kern").is_ok());
+        assert!(kern_value_toml(SettingKind::Path, "sd/kern").is_err());
+        assert!(check_kern_value("data_dir", "\"/media/sd/kern\"").is_ok());
+        assert!(check_kern_value("data_dir", "\"media\"").is_err());
+    }
+
     /// The writers and the readers must resolve the SAME file. `load` honoured `KERN_CONFIG` while
     /// `config add`/`rm`/`setup`/`edit`, `validate` and `doctor` went straight to the default
     /// location: with `KERN_CONFIG` pointing at a project file, `config list` showed that file and
@@ -4614,6 +4717,7 @@ mod retention_settings_tests {
                 SettingKind::Duration => "24h",
                 SettingKind::Bool => "true",
                 SettingKind::Word(w) => w[0],
+                SettingKind::Path => "/media/sd/kern",
             };
             let toml = kern_value_toml(*kind, sample).expect("a sample value is accepted");
             let text = crate::toml_surgery::set_table_key(
@@ -4654,6 +4758,7 @@ mod retention_settings_tests {
                 SettingKind::Duration => "\"24h\"".to_string(),
                 SettingKind::Bool => "true".to_string(),
                 SettingKind::Word(w) => format!("\"{}\"", w[0]),
+                SettingKind::Path => "\"/media/sd/kern\"".to_string(),
             };
             let mut k = KernSettings::default();
             apply_kern(&mut k, key, &sample).expect("the sample value applies");

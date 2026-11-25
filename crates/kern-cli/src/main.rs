@@ -231,6 +231,18 @@ pub(crate) fn global_env_str(name: &str) -> Result<String, std::env::VarError> {
 /// `XDG_DATA_HOME=` exported empty, a named volume landed in `./kern/volumes` under whatever
 /// directory kern was started from, while the SDKs' mount refusal guarded `~/.local/share/kern`.
 pub(crate) fn kern_xdg_root(var: &str, home_rel: &str) -> Option<std::path::PathBuf> {
+    // `[kern] data_dir` MOVES BOTH TREES: the data to the directory, the image cache to its `cache/`.
+    // Here, the one resolver every data and cache path comes from, so no caller can keep the old
+    // place by computing its own (see `config::KernSettings::data_dir`).
+    if var == "XDG_DATA_HOME" || var == "XDG_CACHE_HOME" {
+        if let Some(dir) = config::data_dir() {
+            return Some(if var == "XDG_CACHE_HOME" {
+                dir.join("cache")
+            } else {
+                dir
+            });
+        }
+    }
     xdg_base(var, home_rel).map(|b| b.join("kern"))
 }
 

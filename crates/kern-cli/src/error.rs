@@ -244,6 +244,9 @@ impl Error {
                  stay inside the image"
                     .into(),
             ),
+            // `data_dir`'s refusals name the directory and what to do with it; a pointer to the
+            // profiles would send the reader to the wrong part of the file.
+            Error::Config(msg) if msg.starts_with("data_dir:") => None,
             Error::Config(_) => {
                 Some("profiles live in ~/.config/kern/kern.toml - see docs/CONFIG.md".into())
             }

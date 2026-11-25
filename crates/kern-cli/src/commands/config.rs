@@ -77,6 +77,14 @@ pub fn config_set(args: &[String]) -> Result<(), Error> {
     // below 4k is a size, and is still refused): the value is judged alone, so its refusal names
     // the value and not the file.
     crate::config::check_kern_value(key, &toml).map_err(Error::Config)?;
+    // Where kern keeps its data: refused while a box runs (it writes to the old place), made and
+    // checked before the key is written, and what stays at the old place is said with the command
+    // that moves it. Read BEFORE the write, while the resolver still answers the old place.
+    let moved_from = if key == "data_dir" {
+        Some(prepare_data_dir(value)?)
+    } else {
+        None
+    };
     if key == "sandbox_history" {
         let keep = crate::history::Keep::parse(value.trim()).ok_or_else(|| {
             Error::Config(format!("{key}: {value:?}: expected memory, disk or off"))
@@ -97,7 +105,139 @@ pub fn config_set(args: &[String]) -> Result<(), Error> {
         applies_when(key),
         p.z
     );
+    if let Some(old) = moved_from {
+        say_what_stays(&old, value.trim());
+    }
     Ok(())
+}
+
+/// The data and cache roots in force, `(data, cache)`, as every path of kern resolves them now.
+fn data_roots() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    (
+        crate::kern_xdg_root("XDG_DATA_HOME", ".local/share"),
+        crate::kern_xdg_root("XDG_CACHE_HOME", ".cache"),
+    )
+}
+
+/// Refuse a `data_dir` change while a box runs, make the directory (private) and prove it can hold
+/// kern's data: owned by this user, writable by nobody else, and keeping file modes and symlinks,
+/// which image layers and kept boxes need. Returns the roots in force BEFORE the change.
+///
+/// MEASURED, NOT NAMED: what the directory can keep is tried on it (a mode set and read back, a
+/// symlink made and read), rather than judged from a filesystem name, so the answer is about the
+/// disk the operator picked. A FAT or exFAT card, which is how most SD cards arrive, keeps neither.
+fn prepare_data_dir(
+    value: &str,
+) -> Result<(Option<std::path::PathBuf>, Option<std::path::PathBuf>), Error> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let running = crate::registry::list();
+    if !running.is_empty() {
+        return Err(Error::Config(format!(
+            "data_dir: {} box(es) are running and keep writing where kern's data is now; stop them \
+             first (kern stop --all), then set it",
+            running.len()
+        )));
+    }
+    let dir = crate::config::check_data_dir(value)
+        .map_err(|e| Error::Config(format!("data_dir: {e}")))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| Error::Config(format!("data_dir: cannot create {}: {e}", dir.display())))?;
+    let meta = std::fs::metadata(&dir)
+        .map_err(|e| Error::Config(format!("data_dir: {}: {e}", dir.display())))?;
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    if !meta.is_dir() || meta.uid() != me {
+        return Err(Error::Config(format!(
+            "data_dir: {} is not a directory of yours (owner uid {}); kern keeps its data only in \
+             one it owns",
+            dir.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(Error::Config(format!(
+            "data_dir: {} can be written by other users (mode {:o}); another account could replace \
+             what kern runs from it. `chmod 700 {}` and set it again",
+            dir.display(),
+            meta.mode() & 0o777,
+            dir.display()
+        )));
+    }
+    let probe = dir.join(format!(".kern-probe-{}", std::process::id()));
+    let link = dir.join(format!(".kern-probe-{}-link", std::process::id()));
+    let kept = (|| -> Result<(), String> {
+        std::fs::write(&probe, b"").map_err(|e| format!("cannot write a file there ({e})"))?;
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o640))
+            .map_err(|e| format!("cannot set a file's mode there ({e})"))?;
+        let mode = std::fs::metadata(&probe)
+            .map_err(|e| format!("cannot read a file back ({e})"))?
+            .mode()
+            & 0o777;
+        if mode != 0o640 {
+            return Err(format!(
+                "it does not keep file modes (set 640, read back {mode:o})"
+            ));
+        }
+        std::os::unix::fs::symlink(&probe, &link)
+            .map_err(|e| format!("it cannot hold a symlink ({e})"))?;
+        std::fs::read_link(&link).map_err(|e| format!("a symlink there cannot be read ({e})"))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_file(&probe);
+    kept.map_err(|why| {
+        Error::Config(format!(
+            "data_dir: {}: {why}. Images and kept boxes need both; a FAT or exFAT card keeps \
+             neither. Format it ext4 (or btrfs, xfs) and set it again",
+            dir.display()
+        ))
+    })?;
+    Ok(data_roots())
+}
+
+/// After a `data_dir` change: what is at the old place stays there, said with the command that
+/// moves it. kern does not move it itself, as Docker does not move its `data-root`: copying
+/// gigabytes of images between disks is the operator's call, and a half-finished move is worse
+/// than none.
+fn say_what_stays(old: &(Option<std::path::PathBuf>, Option<std::path::PathBuf>), new: &str) {
+    let p = crate::ui::Palette::detect();
+    let count = |d: &std::path::Path, sub: &str| -> usize {
+        std::fs::read_dir(d.join(sub))
+            .map(|r| r.flatten().count())
+            .unwrap_or(0)
+    };
+    let new = std::path::Path::new(new);
+    if let Some(data) = old.0.as_deref().filter(|d| d.is_dir() && *d != new) {
+        println!(
+            "{}kern's data now lives in {}, its images in {}. What is at {} stays there ({} kept \
+             boxes, {} volumes); with no box running, move it with:{}",
+            p.d,
+            new.display(),
+            new.join("cache").display(),
+            data.display(),
+            count(data, "boxes"),
+            count(data, "volumes"),
+            p.z
+        );
+        println!("  mv {}/* {}/", data.display(), new.display());
+    }
+    if let Some(cache) = old
+        .1
+        .as_deref()
+        .filter(|c| c.is_dir() && *c != new.join("cache").as_path())
+    {
+        println!(
+            "{}and the images (or pull them again):{}\n  mkdir -p {} && mv {}/* {}/",
+            p.d,
+            p.z,
+            new.join("cache").display(),
+            cache.display(),
+            new.join("cache").display()
+        );
+    }
 }
 
 /// `kern config unset <key>`: remove one `[kern]` key, so kern's default is in force again. A key
@@ -114,6 +254,16 @@ pub fn config_unset(args: &[String]) -> Result<(), Error> {
     if crate::toml_surgery::get_table_key(&raw, "kern", key).is_none() {
         println!("{}{key} is not set{}", p.d, p.z);
         return Ok(());
+    }
+    if key == "data_dir" {
+        let running = crate::registry::list();
+        if !running.is_empty() {
+            return Err(Error::Config(format!(
+                "data_dir: {} box(es) are running and keep writing where kern's data is now; stop \
+                 them first (kern stop --all), then unset it",
+                running.len()
+            )));
+        }
     }
     if key == "sandbox_history" {
         // Back to the default place FIRST, so the rows move with the setting.

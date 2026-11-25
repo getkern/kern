@@ -478,6 +478,21 @@ pub fn info() -> Result<(), Error> {
             row("runtime dir", &parent.to_string_lossy());
         }
     }
+    // WHERE THE DATA AND THE IMAGES ARE, from the resolver every path of kern uses, and why: the
+    // XDG default or `[kern] data_dir` (a second disk, an SD card).
+    let data = crate::kern_xdg_root("XDG_DATA_HOME", ".local/share");
+    let cache = crate::kern_xdg_root("XDG_CACHE_HOME", ".cache");
+    if let (Some(data), Some(cache)) = (data, cache) {
+        let why = if crate::config::data_dir().is_some() {
+            "[kern] data_dir"
+        } else {
+            "default; `kern config set data_dir <path>` moves both"
+        };
+        row(
+            "data dir",
+            &format!("{}, images in {} ({why})", data.display(), cache.display()),
+        );
+    }
     row("sandbox history", &crate::history::keep_line());
     // THE RETENTION SETTINGS, each with where its value comes from, so `kern config set` has a
     // place to be seen working. Facts only, like every other row: one cached config load and one
