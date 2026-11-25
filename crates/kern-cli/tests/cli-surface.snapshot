@@ -55,7 +55,7 @@ COMMANDS:
     diff <box> [--json]                                            List filesystem changes vs the image (C/D); a kept box's too, running or not
     export <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
     container <verb> ...                                           The box verbs under one name (container ls = ps; not top/prune)
-    compat docker (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
+    compat docker (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker) and DOCKER_HOST on kern's API, or a recorded `docker` link
     unshare [--] [CMD...]                                          Run CMD (default: your shell) with the ids a box's files carry on disk
     compat docker (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
     proxy (trust|untrust|status)                                   HTTPS for the .localhost names, with kern's own local CA

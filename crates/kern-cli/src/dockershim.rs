@@ -1520,6 +1520,57 @@ pub(crate) fn socket_status() -> String {
     )
 }
 
+/// The API socket a wrapped command is given, when a server answers on it: the one that is
+/// listening (the socket unit, a `serve` in the foreground), or one started for the command, which
+/// exits once idle, as the WSL bridge starts one. `None`, said once, when neither answers.
+fn api_answers() -> Option<PathBuf> {
+    match connect_api(true) {
+        Ok(_) => socket_path().ok(),
+        Err(e) => {
+            eprintln!(
+                "kern: compat docker: no Docker API for this command ({e}); `docker` and \
+                 `docker-compose` are kern's, programs that use the API directly are not pointed at it"
+            );
+            None
+        }
+    }
+}
+
+/// The environment a wrapped command gets beside its PATH, as `(name, value)` (`None`: removed).
+/// PURE: `is_set` says which names the caller's environment already has.
+///
+/// - `DOCKER_HOST`: kern's API socket, so a program that speaks the Docker API (Testcontainers,
+///   docker-py, an IDE, the real `docker` by its full path) reaches kern's boxes like the `docker`
+///   on PATH does. MEASURED before: the wrapper set none, so such a program reached whatever
+///   Docker the machine had, or nothing.
+/// - `DOCKER_CONTEXT` removed: a context names another daemon and would win over the first.
+/// - `DOCKER_BUILDKIT=0` unless set: with buildx installed the docker CLI hands every build to it
+///   (on Linux whatever the daemon says), and buildx needs a BuildKit kern's API does not run;
+///   the classic builder is served (`POST /build`).
+/// - `TESTCONTAINERS_RYUK_DISABLED=true` unless set: Ryuk asks for the socket inside a container,
+///   which this API refuses; each test removes its own containers.
+fn wrapped_api_env(
+    api: Option<PathBuf>,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, Option<String>)> {
+    let Some(sock) = api else {
+        return Vec::new();
+    };
+    let mut env = vec![
+        ("DOCKER_HOST", Some(format!("unix://{}", sock.display()))),
+        ("DOCKER_CONTEXT", None),
+    ];
+    for (k, v) in [
+        ("DOCKER_BUILDKIT", "0"),
+        ("TESTCONTAINERS_RYUK_DISABLED", "true"),
+    ] {
+        if !is_set(k) {
+            env.push((k, Some(v.to_string())));
+        }
+    }
+    env
+}
+
 fn run_wrapped(cmd: &[String]) -> Result<(), Error> {
     use std::os::unix::process::ExitStatusExt;
     let Some((prog, rest)) = cmd.split_first() else {
@@ -1562,11 +1613,15 @@ fn run_wrapped(cmd: &[String]) -> Result<(), Error> {
         path.push(":");
         path.push(old);
     }
-    let child = std::process::Command::new(prog)
-        .args(rest)
-        .env("PATH", &path)
-        .env(SHIM_ENV, "1")
-        .spawn();
+    let mut command = std::process::Command::new(prog);
+    command.args(rest).env("PATH", &path).env(SHIM_ENV, "1");
+    for (k, v) in wrapped_api_env(api_answers(), |k| crate::global_env(k).is_some()) {
+        match v {
+            Some(v) => command.env(k, v),
+            None => command.env_remove(k),
+        };
+    }
+    let child = command.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
@@ -1644,6 +1699,33 @@ pub(crate) fn compat(args: &[String]) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    /// A wrapped command gets kern's API socket and no other daemon's context, the classic builder
+    /// and Ryuk off unless the caller chose otherwise, and nothing at all when no API answers.
+    #[test]
+    fn a_wrapped_command_is_pointed_at_kerns_api() {
+        let sock = Some(PathBuf::from("/run/user/1/kern/compat-docker.sock"));
+        let env = wrapped_api_env(sock.clone(), |_| false);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        assert_eq!(
+            get("DOCKER_HOST"),
+            Some(Some(
+                "unix:///run/user/1/kern/compat-docker.sock".to_string()
+            ))
+        );
+        assert_eq!(get("DOCKER_CONTEXT"), Some(None), "removed");
+        assert_eq!(get("DOCKER_BUILDKIT"), Some(Some("0".to_string())));
+        assert_eq!(
+            get("TESTCONTAINERS_RYUK_DISABLED"),
+            Some(Some("true".to_string()))
+        );
+        let chosen = wrapped_api_env(sock, |k| k == "DOCKER_BUILDKIT");
+        assert!(
+            !chosen.iter().any(|(n, _)| *n == "DOCKER_BUILDKIT"),
+            "a value the caller set is theirs"
+        );
+        assert!(wrapped_api_env(None, |_| false).is_empty());
+    }
+
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {

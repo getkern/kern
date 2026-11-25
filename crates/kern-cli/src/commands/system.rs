@@ -206,7 +206,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}diff{z} <box> [--json]                                            List filesystem changes vs the image (C/D); a kept box's too, running or not
     {c}export{z} <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
     {c}container{z} <verb> ...                                           The box verbs under one name (container ls = ps; not top/prune)
-    {c}compat docker{z} (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
+    {c}compat docker{z} (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker) and DOCKER_HOST on kern's API, or a recorded `docker` link
     {c}unshare{z} [--] [CMD...]                                          Run CMD (default: your shell) with the ids a box's files carry on disk
                                                                      (chown/rm what a box's non-root users wrote in a bind), as podman unshare
     {c}compat docker{z} (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
