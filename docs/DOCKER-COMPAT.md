@@ -45,7 +45,8 @@ no flag with the same meaning, so the command is not run`.
 - `docker run -d` and `docker create` print the box's name where docker prints an id (`kd-` and 8
   hex digits when no `--name` is given), so `id=$(docker run -d ...)` feeds `docker logs "$id"`.
 - `DOCKER_HOST` or `DOCKER_CONTEXT` set, or `-H`/`--context` given, is refused: the command asked
-  for a particular engine.
+  for a particular engine. `DOCKER_HOST` naming kern's own API socket (what `kern compat docker
+  enable` prints to export) names kern, and is not refused.
 - A script that calls `docker` by its full path (`/usr/bin/docker`) does not go through PATH, so
   `kern compat docker` does not reach it.
 

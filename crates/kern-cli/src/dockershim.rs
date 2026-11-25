@@ -107,9 +107,16 @@ pub(crate) fn mode_for(
 }
 
 /// `DOCKER_HOST` / `DOCKER_CONTEXT`: a script that sets either asked for a particular engine.
+///
+/// EXCEPT KERN'S OWN: `DOCKER_HOST=unix://<kern's Docker API socket>` names kern, which is what
+/// `kern compat docker enable` tells a shell to export, and a `kern compat docker -- docker ...`
+/// run from that shell was refused for asking for "an engine kern is not".
 pub(crate) fn engine_variable(get: impl Fn(&str) -> Option<OsString>) -> Option<Refused> {
     for var in ["DOCKER_HOST", "DOCKER_CONTEXT"] {
         if let Some(v) = get(var).filter(|v| !v.is_empty()) {
+            if var == "DOCKER_HOST" && names_kerns_socket(&v) {
+                continue;
+            }
             return Some(Refused(format!(
                 "{var} is set ({}): the command asks for a particular docker engine, and kern is \
                  not one. Unset {var} to run it with kern",
@@ -118,6 +125,14 @@ pub(crate) fn engine_variable(get: impl Fn(&str) -> Option<OsString>) -> Option<
         }
     }
     None
+}
+
+/// Is `host` (a `DOCKER_HOST` value) `unix://` and kern's own Docker API socket?
+fn names_kerns_socket(host: &std::ffi::OsStr) -> bool {
+    let Some(path) = host.to_str().and_then(|h| h.strip_prefix("unix://")) else {
+        return false;
+    };
+    socket_path().is_ok_and(|own| std::path::Path::new(path) == own)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1622,6 +1637,8 @@ mod tests {
 
     #[test]
     fn an_engine_variable_is_refused_by_name() {
+        // `socket_path` reads the process environment (`XDG_RUNTIME_DIR`).
+        let _g = crate::env_guard();
         let r = engine_variable(|k| (k == "DOCKER_HOST").then(|| OsString::from("tcp://x:2375")));
         assert!(
             matches!(&r, Some(Refused(m)) if m.starts_with("DOCKER_HOST is set (tcp://x:2375)"))
@@ -1629,6 +1646,16 @@ mod tests {
         let r = engine_variable(|k| (k == "DOCKER_CONTEXT").then(|| OsString::from("remote")));
         assert!(matches!(&r, Some(Refused(m)) if m.starts_with("DOCKER_CONTEXT is set")));
         assert_eq!(engine_variable(|_| Some(OsString::new())), None);
+        // kern's own socket names kern: not a refusal. Another unix socket still is.
+        if let Ok(own) = socket_path() {
+            let host = OsString::from(format!("unix://{}", own.display()));
+            assert_eq!(
+                engine_variable(|k| (k == "DOCKER_HOST").then(|| host.clone())),
+                None
+            );
+        }
+        let other = OsString::from("unix:///var/run/docker.sock");
+        assert!(engine_variable(|k| (k == "DOCKER_HOST").then(|| other.clone())).is_some());
         assert_eq!(engine_variable(|_| None), None);
     }
 
