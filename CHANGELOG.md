@@ -170,6 +170,9 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern top`: a box's log is live, and `s`, `p`, `u` act on that box from it.** Enter on the Boxes
   tab showed the log as it was when pressed, and any key closed it, so `s` pressed to stop the box
   only closed the log. It follows the output now, `s` asks to stop that box, Esc goes back.
+- **An unreadable `kern.toml` that sets where data goes stops a box and `volume create`**, with the
+  parse error, instead of using the default place in silence; a detached box whose logs directory cannot
+  be used refuses to start instead of losing its output.
 - **`--log-driver journald`**, compose `logging: driver: journald`, the Docker API's `LogConfig` and
   `[kern] log_driver`: every line also goes to the systemd journal, tagged with the box's name, stdout
   as info and stderr as err; `kern logs` keeps working from the file. Refused where there is no journal.
