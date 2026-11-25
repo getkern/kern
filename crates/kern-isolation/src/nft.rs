@@ -86,6 +86,7 @@ const NFTA_RULE_EXPRESSIONS: u16 = 4;
 const NFTA_SET_TABLE: u16 = 1;
 const NFTA_SET_NAME: u16 = 2;
 const NFTA_SET_FLAGS: u16 = 3;
+const NFTA_SET_KEY_TYPE: u16 = 4;
 const NFTA_SET_KEY_LEN: u16 = 5;
 const NFTA_SET_ID: u16 = 10;
 const NFTA_SET_TIMEOUT: u16 = 11;
@@ -376,6 +377,18 @@ impl Batch {
     }
 }
 
+// The `nft` tool's datatype numbers (nftables `include/datatype.h`), and its concatenation of them:
+// six bits per element, the first in the highest place.
+const NFT_TYPE_INTEGER: u32 = 4;
+const NFT_TYPE_IPADDR: u32 = 7;
+const NFT_TYPE_IP6ADDR: u32 = 8;
+const NFT_TYPE_INET_SERVICE: u32 = 13;
+const NFT_TYPE_BITS: u32 = 6;
+
+fn concat_type(parts: &[u32]) -> u32 {
+    parts.iter().fold(0, |t, &p| (t << NFT_TYPE_BITS) | p)
+}
+
 fn set_name(base: &str, family: u8) -> String {
     format!("{base}{}", if family == NFPROTO_IPV4 { 4 } else { 6 })
 }
@@ -417,14 +430,31 @@ fn table_batch(ifname: &str) -> (Vec<u8>, u32) {
         let (pending, refused) = (set_name("pending", family), set_name("refused", family));
         let (pending_id, refused_id) = (id + 1, id + 2);
         id += 2;
-        for (name, sid, ms, len) in [
-            (&pending, pending_id, PENDING_MS, key_len + 4),
-            (&refused, refused_id, REFUSED_MS, key_len),
+        // THE KEY'S TYPE, as `nft` writes it for the same set: the kernel needs none, the `nft` tool
+        // does. MEASURED without it, in a `--privileged` box: `nft list ruleset` aborted with
+        // "Assertion failed: expr->right->dtype != &invalid_type" on the `out` chain, so any
+        // runtime or person listing the box's rules got a crash (Grok's round 6, case 37).
+        let addr = if family == NFPROTO_IPV4 {
+            NFT_TYPE_IPADDR
+        } else {
+            NFT_TYPE_IP6ADDR
+        };
+        let refused_type = concat_type(&[addr, NFT_TYPE_INET_SERVICE, NFT_TYPE_INET_SERVICE]);
+        let pending_type = concat_type(&[
+            addr,
+            NFT_TYPE_INET_SERVICE,
+            NFT_TYPE_INET_SERVICE,
+            NFT_TYPE_INTEGER,
+        ]);
+        for (name, sid, ms, len, ty) in [
+            (&pending, pending_id, PENDING_MS, key_len + 4, pending_type),
+            (&refused, refused_id, REFUSED_MS, key_len, refused_type),
         ] {
             b.msg(NFT_MSG_NEWSET, NLM_F_CREATE, |m| {
                 attr_str(m, NFTA_SET_TABLE, TABLE);
                 attr_str(m, NFTA_SET_NAME, name);
                 attr_u32(m, NFTA_SET_FLAGS, NFT_SET_TIMEOUT | NFT_SET_EVAL);
+                attr_u32(m, NFTA_SET_KEY_TYPE, ty);
                 attr_u32(m, NFTA_SET_KEY_LEN, len);
                 attr_u32(m, NFTA_SET_ID, sid);
                 attr(m, NFTA_SET_TIMEOUT, &ms.to_be_bytes());
@@ -1283,6 +1313,68 @@ mod against_a_stand_in {
         } else {
             Err(format!("the child said {out:?}"))
         }
+    }
+
+    /// THE `nft` TOOL CAN READ WHAT KERN WROTE. The kernel takes a set with no key type; `nft` aborts
+    /// printing a rule that looks it up (Grok's round 6, case 37). In a namespace of its own, with the
+    /// host's `nft`: the listing exits 0 and names the key's types.
+    #[test]
+    fn the_nft_tool_lists_the_rules_kern_writes() {
+        let Some(nft) = ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        else {
+            eprintln!("SKIP: no nft on this host to read the rules with");
+            return;
+        };
+        let (mut r, mut w) = pipe();
+        let c = unsafe { libc::fork() };
+        if c == 0 {
+            drop(r);
+            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+            let line = if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+                "skip: no user namespace".to_string()
+            } else {
+                let _ = std::fs::write("/proc/self/setgroups", b"deny");
+                let _ = std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"));
+                let _ = std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"));
+                match install_here("eth0") {
+                    Err(e) => format!("skip: install: {e}"),
+                    Ok(()) => match std::process::Command::new(nft)
+                        .args(["list", "ruleset"])
+                        .output()
+                    {
+                        Ok(o) => format!(
+                            "rc={} {}",
+                            o.status.code().unwrap_or(-1),
+                            String::from_utf8_lossy(&o.stdout).replace('\n', " ")
+                        ),
+                        Err(e) => format!("skip: run nft: {e}"),
+                    },
+                }
+            };
+            let _ = w.write_all(line.as_bytes());
+            unsafe { libc::_exit(0) };
+        }
+        drop(w);
+        let mut out = String::new();
+        let _ = r.read_to_string(&mut out);
+        unsafe { libc::waitpid(c, std::ptr::null_mut(), 0) };
+        if out.starts_with("skip") {
+            eprintln!("SKIP: {out}");
+            return;
+        }
+        assert!(
+            out.starts_with("rc=0 "),
+            "nft could not list the rules: {out}"
+        );
+        for want in [
+            "type ipv4_addr . inet_service . inet_service . integer",
+            "type ipv6_addr . inet_service . inet_service",
+        ] {
+            assert!(out.contains(want), "{want} missing: {out}");
+        }
+        assert!(!out.contains("invalid type"), "{out}");
     }
 
     /// WITHOUT the rules the stand-in reproduces the three defects, which is what makes the second
