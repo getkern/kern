@@ -686,8 +686,31 @@ pub(crate) fn read_platforms(tag: &str) -> Option<Vec<(kern_oci::Platform, Strin
 /// registered, so it works whatever the box's root holds). Asked once per RUN of such a build, and
 /// refused BEFORE the box starts with what to install, instead of an "exec format error" from inside.
 pub(crate) fn check_emulation(p: &kern_oci::Platform) -> Result<(), Error> {
+    match emulation_missing(p) {
+        None => Ok(()),
+        Some(why) => Err(Error::Build(format!(
+            "a RUN for {}/{}: {why}, or build on a {} machine",
+            p.os, p.arch, p.arch
+        ))),
+    }
+}
+
+/// The same question for `kern run --platform`, refused in the run's own words before anything is
+/// pulled: a RUN and a Dockerfile are not what the reader asked about.
+pub(crate) fn check_run_emulation(p: &kern_oci::Platform) -> Result<(), Error> {
+    match emulation_missing(p) {
+        None => Ok(()),
+        Some(why) => Err(Error::Cli(format!(
+            "--platform {}/{}: {why}, or run it on a {} machine",
+            p.os, p.arch, p.arch
+        ))),
+    }
+}
+
+/// Why this kernel cannot run `p`'s binaries in a box, with what to install; `None` when it can.
+fn emulation_missing(p: &kern_oci::Platform) -> Option<String> {
     if p.is_host() {
-        return Ok(());
+        return None;
     }
     let qemu = match p.arch.as_str() {
         "amd64" => "x86_64",
@@ -697,14 +720,11 @@ pub(crate) fn check_emulation(p: &kern_oci::Platform) -> Result<(), Error> {
     };
     let entry = format!("/proc/sys/fs/binfmt_misc/qemu-{qemu}");
     let body = std::fs::read_to_string(&entry).unwrap_or_default();
-    let Some(why) = emulation_problem(&p.arch, &entry, &body) else {
-        return Ok(());
-    };
-    Err(Error::Build(format!(
-        "a RUN for {}/{}: {why}. Install qemu-user with its binfmt registration (Debian/Ubuntu: \
-         apt install qemu-user-static, which registers it with the F flag), or build on a {} machine",
-        p.os, p.arch, p.arch
-    )))
+    let why = emulation_problem(&p.arch, &entry, &body)?;
+    Some(format!(
+        "{why}. Install qemu-user with its binfmt registration (Debian/Ubuntu: apt install \
+         qemu-user-static, which registers it with the F flag)"
+    ))
 }
 
 /// What is wrong with a binfmt_misc entry `body` (read from `entry`) for running `arch` in a box, or

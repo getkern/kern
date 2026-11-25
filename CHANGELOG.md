@@ -104,6 +104,16 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**`kern run --platform os/arch`, as `docker run --platform`.** `kern run --platform linux/arm64
+alpine uname -m` was refused as an unknown flag, while Docker prints `aarch64` on the same amd64
+machine. It runs that platform's image now, through the kernel's qemu-user handler, from the cache
+entry `kern pull --platform` and `kern build --platform` fill, so this machine's `alpine` is still
+this machine's afterwards. `kern box` takes it too, and the Docker API reads `?platform=` on a create
+and a pull. Without the handler the run is refused before any pull, saying what to install.
+`kern images` names the platform of an entry that is not this machine's (`alpine:3.20 (linux/arm64)`,
+`"platform"` in `--json`, `{{.Platform}}` in `--format`): three platforms of one tag were three
+identical rows.
+
 **An image's size counts a hardlinked file once.** busybox is one binary under some 400 names, and
 each name was added: `kern images` said 394.6M for an image of 4.2M (4417150 bytes, the 4.42MB
 Docker prints), and `kern rmi` reported freeing the inflated figure. A volume's size in `kern volume

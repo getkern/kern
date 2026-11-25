@@ -4077,6 +4077,22 @@ pub(crate) struct ImageEntry {
     /// dir that is GONE (swept/deleted), or a sentinel with no payload at all. It would FAIL to run, so
     /// callers show a distinct `dangling` marker rather than a misleading `0 B` (which reads as "empty").
     pub dangling: bool,
+    /// `os/arch` of an entry for ANOTHER platform (`run`/`pull`/`build --platform`), read from its
+    /// cache stem; `None` for this machine's. Without it `alpine:3.20` pulled for three platforms was
+    /// three identical rows.
+    pub platform: Option<String>,
+}
+
+/// The `os/arch` of a cache entry for another platform: its stem ends in `platform_suffix`
+/// (`__linux_arm64`) while its reference does not, since the reference is the one the user named.
+/// A `build --platform` variant TAG (`app:1__linux_arm64`) carries the suffix in its name already.
+fn other_platform_of(stem: &str, name: &str) -> Option<String> {
+    let (_, suffix) = stem.rsplit_once("__")?;
+    if name.contains("__") {
+        return None;
+    }
+    let (os, arch) = suffix.split_once('_')?;
+    (!os.is_empty() && !arch.is_empty()).then(|| format!("{os}/{arch}"))
 }
 
 /// [`image_entries`], with the per-image work under the caller's control.
@@ -4174,11 +4190,13 @@ pub(crate) fn image_entries_in(
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs());
+            let platform = other_platform_of(&stem, &name);
             rows.push(ImageEntry {
                 name,
                 size,
                 pulled,
                 dangling,
+                platform,
             });
         }
     }

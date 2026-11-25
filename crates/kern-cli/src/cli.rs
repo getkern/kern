@@ -67,6 +67,9 @@ pub enum Command {
         image: Option<String>,
         /// `--pull <missing|never|always>`: registry-image fetch policy (see [`commands::PullPolicy`]).
         pull: commands::PullPolicy,
+        /// `--platform <os/arch>`: run that platform's image, through the kernel's binfmt handler
+        /// when it is not this machine's (`docker run --platform`). `None`: this machine's.
+        platform: Option<kern_oci::Platform>,
         command: Vec<String>,
         /// `--entrypoint <arg>` (repeatable): REPLACE the image's `ENTRYPOINT`.
         ///
@@ -4118,6 +4121,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--overlay-lower",
     "--overlay-upper",
     "--pids-limit",
+    "--platform",
     "--pod",
     "--pod-bridge",
     "--publish",
@@ -4254,6 +4258,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut rootfs: Option<String> = None;
     let mut image: Option<String> = None;
     let mut pull = commands::PullPolicy::default();
+    let mut platform: Option<kern_oci::Platform> = None;
     let mut plan = false;
     let mut detached = false;
     let mut read_only = false;
@@ -4994,6 +4999,18 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // `--pull missing|never|always` (Docker parity). `missing` (default) = pull only if
                 // absent; `never` = fail if not already cached, never touch the network; `always` =
                 // force a fresh network pull with an atomic cache swap.
+                // `--platform <os/arch>` (Docker parity): the image of that platform, from its own
+                // cache entry, the one `kern pull --platform` and `kern build --platform` fill.
+                "--platform" => {
+                    i += 1;
+                    let want = rest
+                        .get(i)
+                        .ok_or(Error::Usage("--platform <os/arch> (e.g. linux/arm64)"))?;
+                    platform = Some(
+                        kern_oci::Platform::parse(want)
+                            .map_err(|e| Error::Oci(format!("--platform {want}: {e}")))?,
+                    );
+                }
                 "--pull" => {
                     i += 1;
                     pull = match rest.get(i).copied() {
@@ -5654,6 +5671,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             rootfs,
             image,
             pull,
+            platform,
             command,
             entrypoint,
             detached,
@@ -7071,6 +7089,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             rootfs,
             image,
             pull,
+            platform,
             command,
             entrypoint,
             detached,
@@ -7176,103 +7195,111 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             } else {
                 dns
             };
-            commands::box_run(commands::BoxRunArgs {
-                rm,
-                name: &name,
-                rootfs: rootfs.as_deref(),
-                image: image.as_deref(),
-                pull,
-                command: &command,
-                entrypoint: entrypoint.as_deref(),
-                detached,
-                read_only,
-                volumes: &volumes,
-                mounts: &mounts,
-                env: &env,
-                egress_allow: &egress_allow,
-                egress_deny: &egress_deny,
-                egress_secrets: &egress_secret,
-                landlock_rw: &landlock_rw,
-                net_ips: &net_ips,
-                pod_bridges: pod_bridges.clone(),
-                apparmor: apparmor.as_deref(),
-                workdir: workdir.as_deref(),
-                share_net,
-                pod: pod.as_deref(),
-                net_container: net_container.as_deref(),
-                ipc: ipc.as_deref(),
-                uid_range,
-                no_uid_range,
-                bind_rootfs,
-                privileged,
-                require_limits,
-                allow_uncapped,
-                security_profile,
-                overlay_lower: &overlay_lower,
-                overlay_upper: overlay_upper.as_deref(),
-                keep,
-                memory,
-                memory_swap_max,
-                cpus,
-                cpuset: cpuset.as_deref(),
-                tty,
-                ports: &ports,
-                secrets: &secrets,
-                secret_envs: &secret_envs,
-                secret_mode,
-                ssh_port,
-                ssh_key: ssh_key.as_deref(),
-                hostname: hostname.as_deref(),
-                tun,
-                gpus: gpus.as_deref(),
-                device: device.as_deref(),
-                runtime_nvidia,
-                build_ssh_agents: &build_ssh_agents,
-                no_new_privs,
-                init,
-                pids_limit,
-                tmpfs: &tmpfs,
-                shm_size,
-                ulimits: &ulimits,
-                sysctls: &sysctls,
-                labels: &labels,
-                restart_max,
-                def_hash: def_hash.as_deref().unwrap_or(""),
-                stop_signal,
-                stop_grace,
-                run_as: run_as.as_deref(),
-                group_add: &group_add,
-                cap_add: &cap_add,
-                cap_drop: &cap_drop,
-                restart,
-                health_cmd: health_cmd.as_deref(),
-                health_cmd_argv: &health_cmd_argv,
-                health_interval,
-                health_retries,
-                health_start_period,
-                health_start_interval,
-                health_timeout,
-                health_action: health_action.as_deref(),
-                env_file: &env_file,
-                timeout,
-                nice,
-                io_weight,
-                config: config.as_deref(),
-                show_config,
-                quiet,
-                verbose,
-                profiles: &profiles,
-                add_hosts: &add_hosts,
-                dns: &dns,
-                stack_outbound,
-                dns_search: &dns_search,
-                dns_options: &dns_options,
-                log_max_size,
-                log_max_file,
-                log_none,
-                log_streams,
-                memory_reservation,
-                cpu_weight,
+            // `--platform` of another machine: the kernel must run its binaries, asked BEFORE
+            // anything is pulled, and the image is that platform's own cache entry for the whole
+            // run, the way `kern build --platform` resolves it.
+            if let Some(p) = &platform {
+                commands::build::check_run_emulation(p)?;
+            }
+            commands::with_image_platform(platform, || {
+                commands::box_run(commands::BoxRunArgs {
+                    rm,
+                    name: &name,
+                    rootfs: rootfs.as_deref(),
+                    image: image.as_deref(),
+                    pull,
+                    command: &command,
+                    entrypoint: entrypoint.as_deref(),
+                    detached,
+                    read_only,
+                    volumes: &volumes,
+                    mounts: &mounts,
+                    env: &env,
+                    egress_allow: &egress_allow,
+                    egress_deny: &egress_deny,
+                    egress_secrets: &egress_secret,
+                    landlock_rw: &landlock_rw,
+                    net_ips: &net_ips,
+                    pod_bridges: pod_bridges.clone(),
+                    apparmor: apparmor.as_deref(),
+                    workdir: workdir.as_deref(),
+                    share_net,
+                    pod: pod.as_deref(),
+                    net_container: net_container.as_deref(),
+                    ipc: ipc.as_deref(),
+                    uid_range,
+                    no_uid_range,
+                    bind_rootfs,
+                    privileged,
+                    require_limits,
+                    allow_uncapped,
+                    security_profile,
+                    overlay_lower: &overlay_lower,
+                    overlay_upper: overlay_upper.as_deref(),
+                    keep,
+                    memory,
+                    memory_swap_max,
+                    cpus,
+                    cpuset: cpuset.as_deref(),
+                    tty,
+                    ports: &ports,
+                    secrets: &secrets,
+                    secret_envs: &secret_envs,
+                    secret_mode,
+                    ssh_port,
+                    ssh_key: ssh_key.as_deref(),
+                    hostname: hostname.as_deref(),
+                    tun,
+                    gpus: gpus.as_deref(),
+                    device: device.as_deref(),
+                    runtime_nvidia,
+                    build_ssh_agents: &build_ssh_agents,
+                    no_new_privs,
+                    init,
+                    pids_limit,
+                    tmpfs: &tmpfs,
+                    shm_size,
+                    ulimits: &ulimits,
+                    sysctls: &sysctls,
+                    labels: &labels,
+                    restart_max,
+                    def_hash: def_hash.as_deref().unwrap_or(""),
+                    stop_signal,
+                    stop_grace,
+                    run_as: run_as.as_deref(),
+                    group_add: &group_add,
+                    cap_add: &cap_add,
+                    cap_drop: &cap_drop,
+                    restart,
+                    health_cmd: health_cmd.as_deref(),
+                    health_cmd_argv: &health_cmd_argv,
+                    health_interval,
+                    health_retries,
+                    health_start_period,
+                    health_start_interval,
+                    health_timeout,
+                    health_action: health_action.as_deref(),
+                    env_file: &env_file,
+                    timeout,
+                    nice,
+                    io_weight,
+                    config: config.as_deref(),
+                    show_config,
+                    quiet,
+                    verbose,
+                    profiles: &profiles,
+                    add_hosts: &add_hosts,
+                    dns: &dns,
+                    stack_outbound,
+                    dns_search: &dns_search,
+                    dns_options: &dns_options,
+                    log_max_size,
+                    log_max_file,
+                    log_none,
+                    log_streams,
+                    memory_reservation,
+                    cpu_weight,
+                })
             })
         }
         Command::Limit {
@@ -8623,6 +8650,44 @@ mod tests {
                      if local == "myimg" && r == "ghcr.io/me/myimg:1"),
             "push's positional form must be unaffected: {cmd:?}"
         );
+    }
+
+    /// `kern run --platform linux/arm64 alpine uname -m` was "unknown flag", and Docker prints
+    /// `aarch64` there. Both spellings reach the box, `box` takes it too, and after the image it is
+    /// the command's word, as `docker run` reads it.
+    #[test]
+    fn run_and_box_take_dockers_platform() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let arm = |c: &Command| {
+            matches!(c, Command::BoxRun { platform: Some(pl), .. }
+                     if pl.os == "linux" && pl.arch == "arm64")
+        };
+        for argv in [
+            &["run", "--platform", "linux/arm64", "alpine", "uname", "-m"][..],
+            &["run", "--platform=linux/arm64", "alpine", "uname", "-m"],
+            &[
+                "box",
+                "b",
+                "--image",
+                "alpine",
+                "--platform",
+                "linux/arm64",
+                "--",
+                "uname",
+            ],
+        ] {
+            let cmd = p(argv).map(|(_, c)| c);
+            assert!(cmd.as_ref().is_ok_and(arm), "{argv:?}: {cmd:?}");
+        }
+        let cmd = p(&["run", "alpine", "echo", "--platform", "x"]).map(|(_, c)| c);
+        assert!(
+            matches!(&cmd, Ok(Command::BoxRun { platform: None, command, .. })
+                     if command.iter().any(|w| w == "--platform")),
+            "after the image it is the command's: {cmd:?}"
+        );
+        let cmd = p(&["run", "alpine", "true"]).map(|(_, c)| c);
+        assert!(matches!(cmd, Ok(Command::BoxRun { platform: None, .. })));
+        assert!(p(&["box", "b", "--image", "alpine", "--platform"]).is_err());
     }
 
     #[test]

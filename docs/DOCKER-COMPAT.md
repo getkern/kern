@@ -796,7 +796,10 @@ binaries through the kernel's qemu-user handler (registered with the F flag; ker
 install when it is missing). Several platforms, `--platform linux/amd64,linux/arm64`, build one variant
 each; the name is this machine's variant, and `kern push` publishes a manifest list, which docker
 pulls per platform (measured: `docker run --platform` ran both). `kern pull --platform` fetches into
-that platform's cache entry, and compose's `build: platforms:` is passed through.
+that platform's cache entry, and compose's `build: platforms:` is passed through. `kern run --platform
+linux/arm64` runs that entry (`uname -m` prints `aarch64` on an amd64 machine, as under Docker), the
+Docker API's `?platform=` on a create or a pull does the same, and `kern images` names the platform of
+every entry that is not this machine's.
 
 **A pull that breaks part-way continues where it stopped**: a transfer cut by the network (an HTTP/2
 stream reset, a timeout, a name that did not resolve) is retried up to five times, resuming the bytes

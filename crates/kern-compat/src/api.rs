@@ -417,6 +417,31 @@ fn refuse_if_set(host: Option<&Value>, field: &str) -> Result<(), String> {
 }
 
 /// The `kern box` argv for a create body (without the leading `kern`), and what `inspect` reports.
+/// A `platform` query parameter as Docker spells one: `os/arch[/variant]`, lowercase, nothing a
+/// flag or a path could be made of.
+fn valid_platform(p: &str) -> bool {
+    p.len() <= 64
+        && p.contains('/')
+        && !p.starts_with(['/', '-'])
+        && p.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'/' | b'_' | b'-' | b'.')
+        })
+}
+
+/// The create's `?platform=` as `kern box --platform`, before the image and its command.
+fn with_platform(mut c: Created, platform: Option<&str>) -> Created {
+    if let Some(p) = platform {
+        let at = c
+            .argv
+            .iter()
+            .position(|a| a == "--image")
+            .unwrap_or(c.argv.len());
+        c.argv
+            .splice(at..at, ["--platform".to_string(), p.to_string()]);
+    }
+    c
+}
+
 fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
     let image = body
         .get("Image")
@@ -1171,6 +1196,13 @@ fn pull(bin: &Path, req: &Request) -> Response {
         }
         _ => from.to_string(),
     };
+    // `docker pull --platform` / `docker run --platform`: that platform's own cache entry, the one
+    // the create's `--platform` then runs.
+    let platform = match req.param("platform").filter(|p| !p.is_empty()) {
+        Some(p) if valid_platform(p) => Some(p.to_string()),
+        Some(p) => return error(400, &format!("invalid platform: {p:?}")),
+        None => None,
+    };
     let bin = bin.to_path_buf();
     Response::Stream {
         status: 200,
@@ -1182,7 +1214,11 @@ fn pull(bin: &Path, req: &Request) -> Response {
                 "{{\"status\":{}}}",
                 json_str(&format!("Pulling {image} with kern"))
             );
-            let (code, _, err) = kern(&bin, &["pull", "-q", &image]);
+            let mut args = vec!["pull", "-q", image.as_str()];
+            if let Some(p) = &platform {
+                args.extend(["--platform", p.as_str()]);
+            }
+            let (code, _, err) = kern(&bin, &args);
             let line = if code == 0 {
                 format!(
                     "{{\"status\":{}}}",
@@ -2651,7 +2687,12 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 Ok(b) => b,
                 Err(e) => return error(400, &e.to_string()),
             };
-            match create_argv(&name, &body) {
+            let platform = match req.param("platform").filter(|p| !p.is_empty()) {
+                Some(p) if valid_platform(p) => Some(p.to_string()),
+                Some(p) => return error(400, &format!("invalid platform: {p:?}")),
+                None => None,
+            };
+            match create_argv(&name, &body).map(|c| with_platform(c, platform.as_deref())) {
                 Ok(c) => {
                     let session = in_session(&c.labels);
                     crate::events::publish(&event_of("create", &name, &c, None));
@@ -2953,6 +2994,38 @@ mod tests {
         let empty = exec_create("web", &body(r#"{"Cmd":[]}"#));
         assert!(matches!(empty, Response::Full { status: 400, .. }));
         assert_eq!(frame_of(2, b"ab"), [2, 0, 0, 0, 0, 0, 0, 2, b'a', b'b']);
+    }
+
+    /// `docker run --platform linux/arm64` sends `?platform=` to the create (and to the pull): it
+    /// was not read, so the container ran this machine's image and said nothing.
+    #[test]
+    fn a_create_platform_becomes_box_platform_before_the_image() {
+        let b = body(r#"{"Image":"alpine:3.20","Cmd":["uname","-m"]}"#);
+        let argv = create_argv("n", &b)
+            .map(|c| with_platform(c, Some("linux/arm64")).argv)
+            .unwrap_or_default();
+        let at = argv.iter().position(|a| a == "--platform");
+        let img = argv.iter().position(|a| a == "--image");
+        assert!(
+            matches!((at, img), (Some(a), Some(i)) if a < i && argv[a + 1] == "linux/arm64"),
+            "{argv:?}"
+        );
+        let plain = create_argv("n", &b).map(|c| with_platform(c, None).argv);
+        assert!(plain.is_ok_and(|a| !a.iter().any(|x| x == "--platform")));
+        for ok in ["linux/arm64", "linux/arm/v7", "linux/amd64"] {
+            assert!(valid_platform(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "arm64",
+            "-x/y",
+            "/x",
+            "linux/ARM64",
+            "linux/a b",
+            "linux/a;rm",
+        ] {
+            assert!(!valid_platform(bad), "{bad}");
+        }
     }
 
     #[test]

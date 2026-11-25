@@ -289,6 +289,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --pull missing|never|always  missing = default (pull only when absent); never = fail if not
                         already cached (no network pull); always = force a fresh pull (atomic swap;
                         a locally-built image is used as-is)
+    --platform os/arch  Run that platform's image (e.g. linux/arm64), through the kernel's
+                        qemu-user handler when it is not this machine's; cached apart from it
     -d, --detach        Run in the background (track with `kern ps`)
     --read-only         Read-only root (default is a writable overlay)
     -v, --volume S:D[:ro]   Mount into the box (repeatable). S = a host path, a named volume

@@ -18562,6 +18562,105 @@ fn build_ssh_mount_is_a_proxy_socket_with_buildkits_shape() {
 /// for this machine's variant plus a list `kern push` publishes. MEASURED first by hand: an arm64
 /// alpine ran in a box here, and docker ran both variants of the manifest list kern pushed to a
 /// `registry:2`. Needs the network (alpine for arm64) and the handler; says why when it skips.
+/// `kern run --platform linux/arm64 alpine uname -m` was "unknown flag" while Docker prints
+/// `aarch64` on the same machine. It runs that platform's image now, from its own cache entry, so
+/// the host's `alpine` is still this machine's afterwards and `kern images` says which is which.
+#[test]
+fn run_platform_runs_that_platforms_image_and_keeps_the_hosts() {
+    let handler = fs::read_to_string("/proc/sys/fs/binfmt_misc/qemu-aarch64").unwrap_or_default();
+    if !cfg!(target_arch = "x86_64")
+        || !handler.starts_with("enabled")
+        || !handler
+            .lines()
+            .any(|l| l.starts_with("flags:") && l.contains('F'))
+    {
+        eprintln!("skip: no aarch64 binfmt handler with the F flag on an amd64 host");
+        return;
+    }
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("kern-it-runplat-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let k = KernIn {
+        cache: base.join("cache"),
+        data: base.join("data"),
+    };
+    let (ok, arm) = k.run(
+        &[
+            "run",
+            "--rm",
+            "-q",
+            "--platform",
+            "linux/arm64",
+            "alpine:3.19",
+            "uname",
+            "-m",
+        ],
+        &[],
+    );
+    let (_, host) = k.run(&["run", "--rm", "-q", "alpine:3.19", "uname", "-m"], &[]);
+    let (_, listed) = k.run(&["images"], &[]);
+    let _ = fs::remove_dir_all(&base);
+    assert!(
+        ok && arm.contains("aarch64"),
+        "run --platform linux/arm64: {arm}"
+    );
+    assert!(
+        host.contains("x86_64"),
+        "the host's alpine is still the host's: {host}"
+    );
+    assert!(
+        listed.contains("alpine:3.19 (linux/arm64)")
+            && listed
+                .lines()
+                .any(|l| l.starts_with("alpine:3.19 ") && !l.contains('(')),
+        "one row per platform, the other one named: {listed}"
+    );
+}
+
+/// A platform this kernel cannot run is refused BEFORE any pull, in the run's words: no "RUN", no
+/// Dockerfile hint, what to install.
+#[test]
+fn run_platform_without_an_emulator_is_refused_in_the_runs_words() {
+    let base = std::env::temp_dir().join(format!("kern-it-runplat-no-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let k = KernIn {
+        cache: base.join("cache"),
+        data: base.join("data"),
+    };
+    let (ok, out) = k.run(
+        &[
+            "run",
+            "--rm",
+            "--platform",
+            "linux/kernnone",
+            "alpine:3.19",
+            "true",
+        ],
+        &[],
+    );
+    let pulled = base.join("cache").join("kern").join("images").exists()
+        && fs::read_dir(base.join("cache/kern/images"))
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains("alpine"))
+            })
+            .unwrap_or(false);
+    let _ = fs::remove_dir_all(&base);
+    assert!(!ok, "refused: {out}");
+    assert!(
+        out.contains("--platform linux/kernnone") && out.contains("qemu-user"),
+        "names the flag and the fix: {out}"
+    );
+    assert!(
+        !out.contains("a RUN") && !out.contains("Dockerfile"),
+        "a run's words: {out}"
+    );
+    assert!(!pulled, "nothing pulled for a platform that cannot run");
+}
+
 #[test]
 fn build_for_another_platform_runs_its_own_binaries_and_keeps_the_hosts() {
     let handler = fs::read_to_string("/proc/sys/fs/binfmt_misc/qemu-aarch64").unwrap_or_default();

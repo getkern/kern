@@ -1660,9 +1660,11 @@ fn refuse_other_platform(image: &str, config: &kern_oci::ImageConfig) -> Result<
     if have == p.arch {
         return Ok(());
     }
-    Err(Error::Build(format!(
-        "'{image}' is a local image for {have}, and this build is for {}/{}: build it for that \
-         platform first (kern build --platform {}/{} -t {image} ...)",
+    // Bare (`Cli`): the same refusal for a build's FROM and a `run --platform`, and a build's hint
+    // about FROM and COPY paths answered neither.
+    Err(Error::Cli(format!(
+        "'{image}' is a local image for {have}, not {}/{}: build it for that platform first \
+         (`kern build --platform {}/{} -t {image} ...`)",
         p.os, p.arch, p.os, p.arch
     )))
 }

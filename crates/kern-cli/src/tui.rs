@@ -5668,6 +5668,7 @@ mod tests {
                 size: 1024,
                 pulled: 0,
                 dangling: false,
+                platform: None,
             })
             .collect();
         for term_rows in [10usize, 20, 24, 30, 40, 50, 80] {
@@ -5735,6 +5736,7 @@ mod tests {
                 size: 1024,
                 pulled: 0,
                 dangling: false,
+                platform: None,
             })
             .collect();
         for term_rows in [24usize, 30, 40, 50, 80] {
@@ -6586,6 +6588,7 @@ mod tests {
                 size: 1,
                 pulled: 0,
                 dangling: false,
+                platform: None,
             })
             .collect();
         let mut mode = Mode::Nav;

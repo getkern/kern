@@ -45,6 +45,14 @@ fn render_image_format(tmpl: &str, e: &ImageEntry, digest: Option<&str>) -> Resu
             ".Reference" | ".ID" | ".Id" => out.push_str(&crate::ui::scrub(&e.name)),
             ".Size" => out.push_str(&kern_common::fmt_bytes(e.size)),
             ".Dangling" => out.push_str(&e.dangling.to_string()),
+            // Docker's `{{.Platform}}`: `os/arch`, this machine's for a host entry.
+            ".Platform" => match &e.platform {
+                Some(pl) => out.push_str(pl),
+                None => {
+                    let h = kern_oci::Platform::host();
+                    out.push_str(&format!("{}/{}", h.os, h.arch));
+                }
+            },
             // The repository digest recorded at the pull, `<none>` as Docker prints a missing one.
             ".Digest" => out.push_str(digest.unwrap_or("<none>")),
             _ => {
@@ -390,6 +398,7 @@ pub fn images(
             size: e.size,
             pulled: e.pulled,
             dangling: e.dangling,
+            platform: e.platform.clone(),
         })
         .collect();
 
@@ -427,8 +436,13 @@ pub fn images(
             } else {
                 String::new()
             };
+            // `platform` only on an entry for another platform: absent is this machine's.
+            let platform = e
+                .platform
+                .as_deref()
+                .map_or_else(String::new, |p| format!(",\"platform\":{}", json_str(p)));
             format!(
-                "{{\"image\":{},\"size_bytes\":{},\"pulled\":{},\"dangling\":{}{digest}}}",
+                "{{\"image\":{},\"size_bytes\":{},\"pulled\":{},\"dangling\":{}{digest}{platform}}}",
                 json_str(&e.name),
                 e.size,
                 e.pulled,
@@ -487,7 +501,13 @@ pub fn images(
         let mut dangling = 0usize;
         for (e, d) in rows.iter().zip(&digest_of) {
             // `truncate` also strips escapes - the `.ok` sentinel content is untrusted.
-            let repo = format!("{}{}{:<30}{}", p.b, p.c, truncate(&e.name, 30), p.z);
+            // Another platform's entry says which, after the reference: three `alpine:3.20` rows
+            // for three platforms read as one image listed three times.
+            let shown = match &e.platform {
+                Some(pl) => format!("{} ({pl})", e.name),
+                None => e.name.clone(),
+            };
+            let repo = format!("{}{}{:<30}{}", p.b, p.c, truncate(&shown, 30), p.z);
             let digest = if digests {
                 format!("{:<71} ", d.as_deref().unwrap_or("<none>"))
             } else {
@@ -1454,6 +1474,7 @@ mod glob_tests {
             size: 7_340_032,
             pulled: 0,
             dangling: false,
+            platform: None,
         };
         let r = |name: &str, t: &str| render_image_format(t, &row(name), None).unwrap();
         assert_eq!(r("alpine:3.19", "{{.Repository}}:{{.Tag}}"), "alpine:3.19");
