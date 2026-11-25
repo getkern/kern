@@ -3391,7 +3391,7 @@ pub(crate) fn strip_device_members_capped(
                 ));
             }
             // Every ordinary member (regular `0`/NUL/`7`, dir `5`, hardlink `1`, symlink `2`, and FIFO
-            // `6` - which the re-vet still refuses, unchanged): copy verbatim. Flush staged meta first.
+            // `6`): copy verbatim. Flush staged meta first.
             b'0' | 0 | b'7' | b'5' | b'1' | b'2' | b'6' => {
                 if !pending.is_empty() {
                     wr(w, &pending)?;
@@ -3699,25 +3699,20 @@ pub(crate) fn vet_tar_stream_capped(r: &mut impl std::io::Read, cap: u64) -> Res
                     "layer has a sparse or multivolume member (unsupported - refusing)",
                 ));
             }
-            // A FIFO ('6') is INERT toward the host (unlike a device node it reaches no hardware - it's
-            // just a filesystem object in the staging rootfs), so accepting it would be safe. We refuse
-            // it anyway, as a DELIBERATE, DOCUMENTED policy: an ephemeral sandbox rootfs has no
-            // legitimate use for a named pipe baked into an image layer, and refusing keeps the member
-            // set to the types kern actually models. This is an explicit choice with a clear message -
-            // not the accidental "unsupported type" fallthrough - so a maintainer can flip it to accept
-            // by moving `b'6'` into the allow-list on the line below.
-            b'6' => {
-                return Err(bad(
-                    "layer has a FIFO member - refused by policy (not needed in a sandbox rootfs)",
-                ));
-            }
+            // A FIFO ('6') is INERT toward the host: unlike a device node it reaches no hardware, it is
+            // a filesystem object in the staging rootfs, and it is vetted below as any entry is (its
+            // path, its place under a symlink). It used to be refused "by policy" on the ground that a
+            // sandbox rootfs has no use for one. MEASURED wrong: the official `mysql:8.0` ships one in a
+            // layer, and `kern pull mysql:8.0` failed where Docker pulls it (Grok round 3).
+            //
             // Known member typeflags that fall through to be vetted as a real entry below: regular
             // (`0`, NUL, and pre-POSIX `7` contiguous ≈ regular), directory (`5`), hardlink (`1`),
-            // symlink (`2`), and device (`3`/`4`, rejected just below). Anything else is a typeflag we
-            // don't model - fail CLOSED (don't silently treat an unknown vendor type as a regular file
-            // and skip `size` bytes on a possibly-different-meaning field). Every other divergence class
-            // in this vetter already fails closed; this keeps the last fallthrough consistent.
-            b'0' | 0 | b'7' | b'5' | b'1' | b'2' | b'3' | b'4' => {}
+            // symlink (`2`), FIFO (`6`), and device (`3`/`4`, rejected just below). Anything else is a
+            // typeflag we don't model - fail CLOSED (don't silently treat an unknown vendor type as a
+            // regular file and skip `size` bytes on a possibly-different-meaning field). Every other
+            // divergence class in this vetter already fails closed; this keeps the last fallthrough
+            // consistent.
+            b'0' | 0 | b'7' | b'5' | b'1' | b'2' | b'6' | b'3' | b'4' => {}
             other => {
                 return Err(bad(&format!(
                     "layer has an unsupported tar member type (0x{other:02x}) - refusing"
@@ -6179,20 +6174,21 @@ mod tests {
         );
     }
 
-    /// POLICY (documented): a FIFO ('6') is inert toward the host but refused by deliberate policy -
-    /// with a SPECIFIC message, not the generic "unsupported type" fallthrough. This test pins the
-    /// decision: flipping the policy to accept must be a conscious change that updates this test.
+    /// A FIFO ('6') is accepted, as Docker accepts it: the official `mysql:8.0` has one in a layer, and
+    /// refusing it "by policy" made that image unpullable (Grok round 3). It is still vetted as an
+    /// entry: a FIFO with an unsafe path is refused like any member.
     #[test]
-    fn rejects_fifo_by_policy() {
+    fn accepts_a_fifo_and_still_vets_its_path() {
         let mut stream = Vec::new();
         stream.extend_from_slice(&hdr(b"var/run/pipe", b'6', 0, b""));
         stream.extend(end_marker());
         let mut r: &[u8] = &stream;
-        let err = format!("{:?}", vet_tar_stream(&mut r).unwrap_err());
-        assert!(
-            err.contains("FIFO"),
-            "a FIFO must be refused with a specific policy message: {err}"
-        );
+        assert!(vet_tar_stream(&mut r).is_ok(), "a FIFO member is a member");
+        let mut bad_path = Vec::new();
+        bad_path.extend_from_slice(&hdr(b"../escape", b'6', 0, b""));
+        bad_path.extend(end_marker());
+        let mut r: &[u8] = &bad_path;
+        assert!(vet_tar_stream(&mut r).is_err(), "a FIFO with an unsafe path is refused");
     }
 
     /// The modelled member types (dir '5', regular '0', contiguous '7') still pass.

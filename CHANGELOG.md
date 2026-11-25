@@ -157,6 +157,13 @@ through, that would leave the destination is refused. The Docker API serves
 container that has been created and not started (how Testcontainers copies its files) is in place
 when its command starts.
 
+**`depends_on: condition: service_healthy` through kern's socket.** A container's `Healthcheck`
+was not read, so the box had no check and the `docker compose` client refused the stack ("has no
+healthcheck configured"); it is the box's `--health-*` now, durations rounded up to whole seconds.
+
+**Images with a named pipe in a layer pull.** A FIFO in a layer was refused "by policy", which made
+the official `mysql:8.0` unpullable; it is extracted, as Docker extracts it, and vetted as any member.
+
 **`kern cp` copies the box's files as the box's root.** A file of mode 000, or one that belongs to
 another user of the box (a service's data), could not be read from the host: `kern cp` failed with
 "Permission denied", and `docker cp` through kern's socket exited 0 with an empty directory. The copy
