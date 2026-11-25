@@ -688,6 +688,36 @@ jobs:
           grep -qF 'CALL [start] [--tty=false] [kern]' "$log" || { echo 'the shim did not start a stopped VM' >&2; exit 1; }
           grep -qF 'CALL [shell] [kern] [/usr/local/bin/kern] [ps]' "$log" || {
             echo 'outside HOME the shim must run without --workdir' >&2; exit 1; }
+
+          # The fast path: with Lima's host agent alive and its ssh.config present, the shim runs one
+          # ssh over Lima's open connection instead of `limactl list` + `limactl shell` (measured on a
+          # Mac: 16 ms a command against 77). ssh joins its arguments into one line, so the stub runs
+          # that line through a shell, with kern swapped for a printer, and every argument must survive.
+          mkdir -p "$home/.lima/kern"
+          printf 'Host lima-kern\n' > "$home/.lima/kern/ssh.config"
+          sleep 600 & agent=$!
+          echo "$agent" > "$home/.lima/kern/ha.pid"
+          cat > "$home/.kern/lima/bin/ssh" <<'STUB'
+          #!/bin/sh
+          for line; do :; done
+          printf '%s\n' "$line" > "$STUB_LOG.ssh"
+          exec sh -c "$(printf '%s' "$line" | sed 's|exec /usr/local/bin/kern|printf "[%s]\\n"|')"
+          STUB
+          chmod +x "$home/.kern/lima/bin/ssh"
+          : > "$log"
+          # A literal $HOME on purpose: it must reach kern unexpanded.
+          # shellcheck disable=SC2016
+          got=$(cd "$home/my proj" && HOME="$home" PATH="/usr/bin:/bin" "$home/.local/bin/kern" box -- echo "two words" "it's" '$HOME' "")
+          kill "$agent"
+          cat "$log.ssh"
+          printf '%s\n' "$got"
+          # A literal $HOME on purpose: it must reach kern unexpanded.
+          # shellcheck disable=SC2016
+          [ "$got" = "$(printf '[box]\n[--]\n[echo]\n[two words]\n[it'"'"'s]\n[$HOME]\n[]')" ] || {
+            echo 'the fast path does not pass the arguments through intact' >&2; exit 1; }
+          grep -qF "cd '$home/my proj' || exit 125;" "$log.ssh" || {
+            echo 'the fast path does not run kern in the same directory' >&2; exit 1; }
+          if [ -s "$log" ]; then echo 'the fast path still called limactl:' >&2; cat "$log" >&2; exit 1; fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

@@ -156,14 +156,32 @@ kern_macos() {
     printf '%s\n' "# Remove: rm ~/.local/bin/kern && limactl delete --force ${vm}"
     printf '%s\n' 'PATH="$HOME/.kern/lima/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"'
     printf "vm='%s'\n" "$vm"
-    printf '%s\n' 'if [ "$(limactl list --format "{{.Status}}" "$vm" 2>/dev/null)" != "Running" ]; then'
-    printf '%s\n' '  limactl start --tty=false "$vm" >/dev/null 2>&1 ||'
-    printf '%s\n' '    { echo "kern: could not start the Lima VM $vm (run: limactl start $vm)" >&2; exit 125; }'
-    printf '%s\n' 'fi'
-    printf '%s\n' 'case "$PWD" in'
-    printf '%s\n' '  "$HOME" | "$HOME"/*) exec limactl shell --workdir "$PWD" "$vm" /usr/local/bin/kern "$@" ;;'
-    printf '%s\n' '  *) exec limactl shell "$vm" /usr/local/bin/kern "$@" ;;'
-    printf '%s\n' 'esac'
+    sed 1d <<'SHIM'
+PATH="$HOME/.kern/lima/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+d="${LIMA_HOME:-$HOME/.lima}/$vm"
+# Running = Lima's host agent is alive. Reading its pid file costs nothing; `limactl list` cost 30 ms.
+p=$(cat "$d/ha.pid" 2>/dev/null)
+if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
+  limactl start --tty=false "$vm" >/dev/null 2>&1 ||
+    { echo "kern: could not start the Lima VM $vm (run: limactl start $vm)" >&2; exit 125; }
+fi
+case "$PWD" in
+  "$HOME" | "$HOME"/*) w=$PWD ;;
+  *) w= ;;
+esac
+# Fast path: ssh over the connection Lima keeps open (12 ms, against 40 ms for `limactl shell`).
+# ssh joins its arguments into one line for the remote shell, so each one is single-quoted here.
+if [ -r "$d/ssh.config" ] && grep -qx "Host lima-$vm" "$d/ssh.config" 2>/dev/null; then
+  q() { R=; s=$1; while :; do case $s in *"'"*) R="$R${s%%"'"*}'\\''"; s=${s#*"'"} ;; *) R="'$R$s'"; break ;; esac; done; }
+  c='exec /usr/local/bin/kern'
+  for a in "$@"; do q "$a"; c="$c $R"; done
+  if [ -n "$w" ]; then q "$w"; c="cd $R || exit 125; $c"; fi
+  t=-T; [ -t 0 ] && [ -t 1 ] && t=-t
+  exec ssh -F "$d/ssh.config" -q "$t" "lima-$vm" "$c"
+fi
+if [ -n "$w" ]; then exec limactl shell --workdir "$w" "$vm" /usr/local/bin/kern "$@"; fi
+exec limactl shell "$vm" /usr/local/bin/kern "$@"
+SHIM
   } > "${shimdir}/kern"
   chmod 755 "${shimdir}/kern"
   info "installed $("${shimdir}/kern" --version) in the Lima VM '${vm}', called through ${shimdir}/kern"
