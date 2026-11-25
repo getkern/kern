@@ -3841,13 +3841,22 @@ fn start_one_kept(self_exe: &std::path::Path, name: &str) -> Result<i32, Error> 
 /// `force` is `docker rm -f`, MEASURED with docker 29: a running container is stopped and removed
 /// (its name printed, exit 0), and a name that does not exist is said and still exits 0. kern had no
 /// `-f` and answered "unknown flag", so the line a docker user types first to clean up failed.
+/// `rm -f`'s stop, its "stopped" line on stderr: `rm`'s stdout is the removed names only, as
+/// Docker's. MEASURED before: `kern rm -f web` printed `stopped 'web' (pid N)` and then `web`.
+fn stop_for_rm(name: &str) -> Result<(), Error> {
+    STOP_NARRATES_TO_STDERR.store(true, std::sync::atomic::Ordering::Relaxed);
+    let r = stop(std::slice::from_ref(&name.to_string()), false);
+    STOP_NARRATES_TO_STDERR.store(false, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
 pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
-    let p = crate::ui::Palette::detect();
     let mut failures: Vec<String> = Vec::new();
     for name in names {
         // Asked BEFORE the stop below, which removes a restarting box's unit: whether its runs are
         // one container, whose earlier runs' logs (kept for `kern logs`) go with it.
         let one_container = crate::commands::boxlog::runs_are_one_container(name);
+        let mut stopped = false;
         if let Some(inst) = registry::find_ref(name) {
             if !force {
                 failures.push(format!(
@@ -3856,10 +3865,11 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
                 ));
                 continue;
             }
-            if let Err(e) = stop(std::slice::from_ref(&inst.name), false) {
+            if let Err(e) = stop_for_rm(&inst.name) {
                 failures.push(format!("'{name}': could not be stopped: {e}"));
                 continue;
             }
+            stopped = true;
         } else if managed_unit_path(name).is_some_and(|p| is_kern_managed_unit(&p)) {
             // A `--restart always` BOX BETWEEN TWO RUNS: not in the registry, and its systemd unit
             // starts it again in a second, and at every boot. Docker refuses `rm` of a restarting
@@ -3873,10 +3883,11 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
                 ));
                 continue;
             }
-            if let Err(e) = stop(std::slice::from_ref(name), false) {
+            if let Err(e) = stop_for_rm(name) {
                 failures.push(format!("'{name}': could not be stopped: {e}"));
                 continue;
             }
+            stopped = true;
         }
         // AN EXITED BOX'S RECORD GOES TOO, as `docker rm` takes a container out of `docker ps -a`;
         // and a box with no `--keep` layer is then removed by exactly that, stopped or exited.
@@ -3892,7 +3903,9 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
         if one_container {
             crate::commands::boxlog::remove_logs_of(name);
         }
-        if !kept && !records.is_empty() {
+        // THE NAME ALONE ON STDOUT for every box this removed, as `docker rm` prints it: a
+        // restarting box stopped here has no exit record left to clear.
+        if !kept && (stopped || !records.is_empty()) {
             println!("{name}");
             continue;
         }
@@ -3900,7 +3913,7 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
             Ok(()) => {
                 // Every run of a kept box left a log: none of them outlives the box.
                 crate::commands::boxlog::remove_logs_of(name);
-                println!("removed kept box '{}{name}{}'", p.c, p.z)
+                println!("{name}")
             }
             // `-f` on a name that is not there: said, and not a failure, as docker answers it.
             Err(e) if force => eprintln!("kern: '{name}': {e}"),

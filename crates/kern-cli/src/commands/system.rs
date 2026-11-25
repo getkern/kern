@@ -127,7 +127,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
   {d}Essentials{z}
     {c}box{z} <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     {c}box{z} <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
-    {c}run{z} [opts] <image> [CMD...]                                    Run CMD in a sandbox from <image>, docker run's shape (box's options)
+    {c}run{z} [opts] <image> [CMD...]                                    Run CMD in a sandbox from <image>, docker run's shape (box's options); -d prints the name
     {c}limit{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...       Run CMD on this host under CPU/mem caps (no sandbox)
     {c}limit{z} --landlock-rw <path> [--] CMD...                         Confine CMD's writes to <path> (kernel LSM, no sandbox)
     {c}exec{z} <name> [-i|-t|-it] [-u <user>] [--env K=V] [-w <dir>] [--] [CMD...]  Run CMD in a running box
@@ -198,7 +198,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}create{z} [OPTIONS] IMAGE [CMD...]                                A kept box recorded and not started (box's options, --name N); prints its name
     {c}start{z} [-a] <name>...                                           Run a `box --keep`/`create` box again, on the layer it left behind; -a follows its output
     {c}restart{z} [-t N] <name>...                                       Stop a kept box and start it again, or start it if stopped (N: seconds before the kill)
-    {c}rm{z} [-f] <name>...                                              Remove a stopped or exited box and its record (`--keep`: its layer too); -f stops a running one first
+    {c}rm{z} [-f] <name>...                                              Remove a stopped or exited box and its record (`--keep`: its layer too); -f stops a running one first. Prints each name removed
     {c}rename{z} <old> <new>                                             Give a box (running or kept) a new name
     {c}update{z} [--memory M] [--cpus N] [--pids-limit P] [--timeout S] <box>  Change a box's caps: live when running (needs delegated cgroup), and a kept box's record
                                                                      --timeout S: a running detached box ends S seconds from now (0: no deadline)

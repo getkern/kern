@@ -5410,7 +5410,15 @@ fn await_box_started(
         )
     };
     let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
+    print_run_name(n);
     Ok(())
+}
+
+/// The name of a box `kern run -d` started, alone on stdout (see [`crate::cli::run_verb`]).
+fn print_run_name(name: &str) {
+    if crate::cli::run_verb() {
+        println!("{name}");
+    }
 }
 
 /// Read whatever the supervisor put in the cap-notice pipe and close it. Never blocks and never waits
@@ -6554,17 +6562,17 @@ fn install_persistent_box(
              `journalctl --user -u {unit_name}` says why",
         )));
     }
-    println!(
-        "started '{}' (systemd-managed · restart={} · survives reboot)",
-        name.as_str(),
-        policy.as_str()
-    );
-    println!(
-        "  stop:   kern stop {name}\n  \
+    // stderr, as the detached start's line (`await_box_started` says why): stdout is for data.
+    eprintln!(
+        "started '{}' (systemd-managed · restart={} · survives reboot)\n  \
+           stop:   kern stop {name}\n  \
            status: systemctl --user status {unit_name}\n  \
            logs:   kern logs {name}",
+        name.as_str(),
+        policy.as_str(),
         name = name.as_str(),
     );
+    print_run_name(name.as_str());
     Ok(())
 }
 

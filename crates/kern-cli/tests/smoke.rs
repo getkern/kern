@@ -2787,6 +2787,80 @@ fn kern_docker_runs_a_script_shaped_session_on_real_boxes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `kern run -d` prints the box's name alone on stdout, as `docker run -d` prints the id it made: the
+/// name kern picked is otherwise in a sentence on stderr only, and `id=$(kern run -d nginx)` empty.
+/// `kern box -d` takes the name as an argument and keeps stdout empty. `kern rm -f` then prints the
+/// three names alone, its "stopped" lines on stderr.
+#[test]
+fn run_detached_prints_the_name_and_box_does_not() {
+    if let Some(why) = no_box_here() {
+        eprintln!("skip: {why}");
+        return;
+    }
+    let named = format!("rdn-{}", std::process::id());
+    let o = kern()
+        .args([
+            "run",
+            "-d",
+            "--name",
+            &named,
+            "alpine:latest",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("kern run -d --name");
+    let (out, err) = out_err(&o);
+    assert!(o.status.success(), "{err}");
+    assert_eq!(out, format!("{named}\n"), "{err}");
+    assert!(
+        err.contains("started"),
+        "the narration stays on stderr: {err}"
+    );
+    let o = kern()
+        .args(["run", "-d", "alpine:latest", "sleep", "30"])
+        .output()
+        .expect("kern run -d");
+    let (out, err) = out_err(&o);
+    assert!(o.status.success(), "{err}");
+    let picked = out.trim().to_string();
+    assert!(
+        !picked.is_empty() && out.lines().count() == 1,
+        "{out:?} {err}"
+    );
+    let boxed = format!("rdb-{}", std::process::id());
+    let o = kern()
+        .args([
+            "box",
+            &boxed,
+            "-d",
+            "--image",
+            "alpine:latest",
+            "--",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("kern box -d");
+    let (out, err) = out_err(&o);
+    let rm = kern()
+        .args(["rm", "-f", &named, &picked, &boxed])
+        .output()
+        .expect("kern rm -f");
+    assert!(o.status.success(), "{err}");
+    assert_eq!(out, "", "box -d keeps stdout empty");
+    let (rm_out, rm_err) = out_err(&rm);
+    assert!(
+        rm.status.success(),
+        "the printed name is one rm takes: {rm_err}"
+    );
+    assert_eq!(
+        rm_out,
+        format!("{named}\n{picked}\n{boxed}\n"),
+        "rm prints the names it removed and nothing else, as `docker rm`: {rm_err}"
+    );
+}
+
 /// `-d` with `--egress-allow`: the detached box gets its filter (refused before 2026-11-20). Checked
 /// with no internet: inside the box the pump answers on the proxy port, which only happens once the
 /// filter was delivered the box's PID 1; after `stop` the box is gone with it.

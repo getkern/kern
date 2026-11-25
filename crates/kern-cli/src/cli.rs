@@ -6088,8 +6088,19 @@ pub(crate) fn run_to_box(rest: &[&str]) -> Result<Vec<String>, Error> {
     Ok(argv.iter().map(|a| (*a).to_string()).collect())
 }
 
+/// Set by `kern run`. See [`run_verb`].
+static RUN_VERB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Was this `kern run`? Then a detached box's name goes to stdout, as `docker run -d` prints the id
+/// it made: `kern run` may pick the name itself, so `id=$(kern run -d nginx)` is the only way a
+/// script learns it. `kern box` takes the name as an argument and keeps its stdout empty.
+pub(crate) fn run_verb() -> bool {
+    RUN_VERB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// [`run_to_box`], parsed as the `box` it is.
 fn parse_run(rest: &[&str]) -> Result<Command, Error> {
+    RUN_VERB.store(true, std::sync::atomic::Ordering::Relaxed);
     let argv = run_to_box(rest)?;
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     parse_box(&refs)
