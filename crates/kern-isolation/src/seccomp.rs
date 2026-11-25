@@ -897,6 +897,89 @@ pub fn install_relay_filter() -> Result<(), Error> {
     Ok(())
 }
 
+/// The 32-bit x86 ABI an x86_64 kernel also runs, and its two ways to open a socket.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+#[cfg(target_arch = "x86_64")]
+const I386_SOCKETCALL: u32 = 102;
+#[cfg(target_arch = "x86_64")]
+const I386_SOCKET: u32 = 359;
+
+/// The program [`install_no_vsock_filter`] loads. Split out so its layout is tested without
+/// loading it into the test process.
+#[cfg(target_arch = "x86_64")]
+fn no_vsock_program() -> Vec<libc::sock_filter> {
+    let eafnosupport = SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32 & SECCOMP_RET_DATA);
+    let enosys = SECCOMP_RET_ERRNO | (libc::ENOSYS as u32 & SECCOMP_RET_DATA);
+    let mut p = vec![
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH),               //  0
+        jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH, 9, 0),      //  1: native → 11
+        jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_I386, 0, 7), //  2: not i386 → 10 (allow)
+        // i386: `socketcall` carries its arguments in memory, where no filter can read them, so it
+        // is refused (a libc of this decade uses the direct calls); `socket` is checked by family.
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR), //  3
+        jump(BPF_JMP | BPF_JEQ | BPF_K, I386_SOCKETCALL, 0, 1), //  4
+        stmt(BPF_RET | BPF_K, enosys),          //  5
+        jump(BPF_JMP | BPF_JEQ | BPF_K, I386_SOCKET, 0, 3), //  6: not socket → 10
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0), //  7
+        jump(BPF_JMP | BPF_JEQ | BPF_K, AF_VSOCK, 0, 1), //  8
+        stmt(BPF_RET | BPF_K, eafnosupport),    //  9
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW), // 10
+        // native: the x32 ABI reaches the same handlers with a bit set and is refused, then the
+        // SAME family rule every box carries.
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR), // 11
+        jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1), // 12
+        stmt(BPF_RET | BPF_K, enosys),          // 13
+    ];
+    emit_socket_family_rule(&mut p);
+    p.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    p
+}
+
+/// The filter kern puts on ITSELF in its own WSL distro, while it is still root and before it becomes
+/// the distro's user, so every process kern starts from there (supervisors, runners, helpers, boxes)
+/// inherits it and none can take it off: `socket(AF_VSOCK)` (and `AF_XDP`) answer `EAFNOSUPPORT`, as
+/// they already do inside every box.
+///
+/// WHY. MEASURED on WSL2 (Windows 10 19045, 2026-11-20): as the distro's user, `AF_VSOCK` opened, the
+/// host's ports 50000, 50001 and 50003 accepted, and 50003 answered the 9P version handshake: Windows'
+/// own file server, reachable without any mount. A box already cannot open the family; this closes it
+/// for kern's processes OUTSIDE the box, which is where an escape lands. It does not reach a process of
+/// that user started without kern (`wsl -u kern`).
+///
+/// INSTALLED BY ROOT, WITHOUT `no_new_privs`: root holds `CAP_SYS_ADMIN`, so the kernel takes the
+/// filter as is, and the setuid id-map helpers a box start runs keep working. kern itself opens no
+/// vsock socket; a VM tier on WSL that drives `/dev/vhost-vsock` will have to revisit this.
+///
+/// # Errors
+///
+/// The failing `prctl`. A no-op returning `Ok` on an architecture other than x86_64, which is the only
+/// one kern's WSL distro is built for.
+pub fn install_no_vsock_filter() -> Result<(), Error> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let prog = no_vsock_program();
+        let fprog = libc::sock_fprog {
+            len: prog.len() as u16,
+            filter: prog.as_ptr() as *mut libc::sock_filter,
+        };
+        // SAFETY: the kernel copies the program; `fprog` and `prog` outlive the call.
+        let r = unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                std::ptr::addr_of!(fprog) as libc::c_ulong,
+                0,
+                0,
+            )
+        };
+        if r != 0 {
+            return Err(Error::last("prctl(SET_SECCOMP)"));
+        }
+    }
+    Ok(())
+}
+
 pub fn is_installed() -> bool {
     SECCOMP_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -988,6 +1071,84 @@ mod tests {
         SECCOMP_RET_DATA, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_LOG, SOL_PACKET,
         TIOCLINUX, TIOCSTI,
     };
+    #[cfg(target_arch = "x86_64")]
+    use super::{install_no_vsock_filter, no_vsock_program};
+
+    /// The no-vsock program: every jump lands inside it, and it ends in a return.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_no_vsock_program_is_well_formed() {
+        let p = no_vsock_program();
+        for (i, ins) in p.iter().enumerate() {
+            if ins.code & 0x07 == BPF_JMP && ins.code != (BPF_JMP | BPF_JA) {
+                for off in [ins.jt, ins.jf] {
+                    assert!(
+                        i + 1 + (off as usize) < p.len(),
+                        "jump at {i} leaves the program"
+                    );
+                }
+            }
+        }
+        assert_eq!(p.last().map(|i| i.code), Some(BPF_RET | BPF_K));
+    }
+
+    /// Loaded into a child: `AF_VSOCK` is refused with `EAFNOSUPPORT`, the families kern uses still
+    /// open. The control first: on a host where `AF_VSOCK` does not open at all, the test proves
+    /// nothing and says so.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_no_vsock_filter_refuses_vsock_and_nothing_kern_uses() {
+        // SAFETY: socket/close with constant arguments.
+        let base = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+        if base < 0 {
+            eprintln!("skip: AF_VSOCK does not open on this host without a filter");
+            return;
+        }
+        // SAFETY: closing the descriptor just opened.
+        unsafe { libc::close(base) };
+        // SAFETY: fork; the child only makes syscalls and leaves with _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // SAFETY: plain syscalls in the forked child.
+            let code = unsafe {
+                // Not root in a test: the kernel then wants no_new_privs before a filter.
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    10
+                } else if install_no_vsock_filter().is_err() {
+                    11
+                } else {
+                    let v = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+                    let errno = std::io::Error::last_os_error().raw_os_error();
+                    if v >= 0 || errno != Some(libc::EAFNOSUPPORT) {
+                        12
+                    } else {
+                        let mut bad = 0;
+                        for fam in [libc::AF_UNIX, libc::AF_INET] {
+                            let fd = libc::socket(fam, libc::SOCK_STREAM, 0);
+                            if fd < 0 {
+                                bad = 13;
+                            } else {
+                                libc::close(fd);
+                            }
+                        }
+                        bad
+                    }
+                }
+            };
+            // SAFETY: leaving the forked child without the parent's destructors.
+            unsafe { libc::_exit(code) };
+        }
+        let mut st = 0;
+        // SAFETY: waiting for the child forked above.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid);
+        assert!(libc::WIFEXITED(st), "the child did not exit");
+        assert_eq!(
+            libc::WEXITSTATUS(st),
+            0,
+            "child step that failed (10 nnp, 11 install, 12 vsock not refused, 13 a family kern uses refused)"
+        );
+    }
 
     /// A minimal classic-BPF interpreter for the seccomp program: enough opcodes to execute what
     /// `build_allowlist_filter`/`build_filter` emit (LD abs, JEQ/JGT/JSET/JA, RET). Returns the

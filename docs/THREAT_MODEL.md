@@ -81,6 +81,7 @@ network.
 | Secret disclosure | `/run/secrets` tmpfs mode 0400, off argv, `O_EXCL\|O_NOFOLLOW` | inline `NAME=value` is visible in the host `ps`, and is warned about |
 | Forged supervision signal | watchdogs forked before the pid namespace, pidfd-pinned | a sub-quantum, non-targetable pid-reuse window on `--health-action restart` |
 | Syscall-surface enumeration | a denied call is byte-identical to one the kernel lacks (`ENOSYS`) | whether that helps an attacker who already has code execution is not measured |
+| A box escape on WSL2 reaching Windows | the distro's user is not root, interop is off (`wsl.conf`), `/proc/1/root` is denied, a mount by that user is refused (drvfs and 9p, in a user namespace too), and every process kern starts in the distro carries a seccomp filter, installed while kern is still root, that refuses `socket(AF_VSOCK)` (measured: refused through `kern run`, the filter on a detached box's supervisor; a box already refused it) | that user reaches all of `C:\` through the automount, and through Windows' own 9P file server: measured on Windows 10 (19045), a process of that user opened vsock connections to the host's ports 50000, 50001 and 50003, and 50003 answered the 9P version handshake. A process of that user that kern did not start (a `wsl -u kern` shell) still opens vsock. So mounting fewer folders would not narrow what an escape reaches, and kern does not offer it as a boundary. Opening and closing those connections also left WSL unable to start a new instance of the distro until `wsl --shutdown` |
 
 ## Non-goals
 

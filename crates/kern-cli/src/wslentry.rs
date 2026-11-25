@@ -20,7 +20,10 @@
 //!    which every distribution shares, so two kerns with one uid would share one box registry;
 //! 3. root's terminal is handed off (`wslrelay`): kern goes on in a session of its own on a new
 //!    terminal, with no descriptor root's shell left open, while a root parent relays;
-//! 4. the identity is dropped to the user (groups, gid, uid, all three ids), verified, and kern is
+//! 4. while still root, a seccomp filter that refuses `socket(AF_VSOCK)` is installed, so nothing kern
+//!    starts from here reaches the Windows host past the network namespace (see
+//!    `kern_isolation::install_no_vsock_filter` for what was measured);
+//! 5. the identity is dropped to the user (groups, gid, uid, all three ids), verified, and kern is
 //!    executed again as that user, so nothing it memoised or opened as root survives the switch.
 //!
 //! ONLY IN THAT DISTRO. The marker `/etc/kern/wsl-user` names the user and is honoured only when it
@@ -336,6 +339,18 @@ pub(crate) fn enter_as_user_if_kern_distro() {
     }
     let placed = place_in_delegated_subtree(&acct);
     let run = runtime_dir(&acct);
+    // NO VSOCK FOR ANYTHING KERN STARTS HERE, installed while still root (so without
+    // `no_new_privs`, and the setuid id-map helpers keep working) and inherited by every box,
+    // supervisor and helper: MEASURED on WSL2, the distro's user reached Windows' 9P file server
+    // over vsock. A box already refuses the family; this is for where an escape lands. Refused
+    // rather than run without it, like every other step of this entry.
+    if let Err(e) = kern_isolation::install_no_vsock_filter() {
+        eprintln!(
+            "kern: cannot install the filter that keeps kern's processes off vsock ({e}): refusing \
+             to run in kern's WSL distro (set KERN_WSL_AS_ROOT=1 to keep root and skip this entry)"
+        );
+        std::process::exit(125);
+    }
     if let Err(why) = drop_identity(&acct, &groups) {
         eprintln!(
             "kern: cannot stop being root ({why}): refusing to run as root in kern's WSL distro"
