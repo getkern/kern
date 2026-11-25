@@ -361,10 +361,27 @@ pub fn hold_layer(dir: &Path) -> Result<(), crate::error::Error> {
     let _ = write!(f, "{}", std::process::id());
     let _ = f.flush();
     // LEAKED ON PURPOSE: see the note above. `into_raw_fd` keeps the descriptor open with no owner,
-    // so the lock lives until this process (or the fork that supervises the box) exits.
+    // so the lock lives until this process (or the fork that supervises the box) exits, or until
+    // [`release_held_layer`] hands the layer on.
     use std::os::unix::io::IntoRawFd;
-    let _ = f.into_raw_fd();
+    HELD_LAYER_FD.store(f.into_raw_fd(), std::sync::atomic::Ordering::Release);
     Ok(())
+}
+
+/// The descriptor whose lock holds the layer [`hold_layer`] took, -1 for none.
+static HELD_LAYER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Give up the layer this process holds, for a launcher that hands the box to another process
+/// (systemd's unit for `--restart always`) and runs no box itself. MEASURED before: the unit's
+/// first run found the layer "in use by another box (pid <the launcher>)", failed, and ran one
+/// `RestartSec` later, so every `docker run --restart always` through kern's socket took 1.4 s and
+/// its restart count started at 1.
+pub fn release_held_layer() {
+    let fd = HELD_LAYER_FD.swap(-1, std::sync::atomic::Ordering::AcqRel);
+    if fd >= 0 {
+        // SAFETY: a descriptor `hold_layer` leaked into this static and nothing else owns.
+        unsafe { libc::close(fd) };
+    }
 }
 
 /// Record this run's exit code against the kept box at `dir`, leaving the argv alone. Best effort:

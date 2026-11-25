@@ -2998,6 +2998,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // FIRST start with 'already starting' - systemd would only succeed on the 1s restart retry,
         // making every `--restart` install flaky. From here the unit is the name's owner.
         drop(name_claim);
+        // And the kept layer, for the same reason: the unit's run takes it.
+        crate::keepbox::release_held_layer();
         return install_persistent_box(
             &name,
             args.restart,
