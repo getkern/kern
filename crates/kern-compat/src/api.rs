@@ -17,6 +17,12 @@ use crate::{percent_decode, Request, Response};
 /// The API version kern-serve speaks, and the oldest a client may ask for.
 pub(crate) const API_VERSION: &str = "1.43";
 const MIN_API_VERSION: &str = "1.24";
+/// The Docker Engine release whose API is [`API_VERSION`]: what `Version` in `/version` and
+/// `ServerVersion` in `/info` say. Clients read those as the engine's version and gate on it
+/// (Testcontainers for Java refuses a server below 1.6.0), so kern's own version, `v0.x`, would
+/// fail them; kern and its version are in `Platform` and `Components`, where `docker version`
+/// prints them.
+const ENGINE_VERSION: &str = "24.0.0";
 
 // ---------------------------------------------------------------------------------------------
 // Responses.
@@ -512,6 +518,11 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
     })
 }
 
+/// Docker's zero time, for a moment that has not happened, as clients compare it: Testcontainers
+/// for Java takes a container as stopped only once `FinishedAt` is not this, and kept polling an
+/// exited box for its whole startup timeout while it was.
+const ZERO_TIME: &str = "0001-01-01T00:00:00Z";
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -617,7 +628,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
         return json_response(
             200,
             format!(
-                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"0001-01-01T00:00:00Z\",\"FinishedAt\":\"0001-01-01T00:00:00Z\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
+                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
                 json_str(&id),
                 json_str(&rfc3339(c.created)),
                 json_str(&format!("/{name}")),
@@ -652,7 +663,15 @@ fn inspect(bin: &Path, name: &str) -> Response {
             },
         },
     };
-    let started = v.get("started").and_then(Value::as_i64).unwrap_or(0).max(0) as u64;
+    let started = v
+        .get("started")
+        .and_then(Value::as_i64)
+        .and_then(|s| u64::try_from(s).ok())
+        .map_or_else(|| ZERO_TIME.to_string(), rfc3339);
+    let finished = match v.get("exited_ago").and_then(Value::as_i64) {
+        Some(ago) if !running => rfc3339(now().saturating_sub(u64::try_from(ago).unwrap_or(0))),
+        _ => ZERO_TIME.to_string(),
+    };
     let exit_code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
     let pid = if running {
         v.get("pid1").and_then(Value::as_i64).unwrap_or(0)
@@ -669,16 +688,20 @@ fn inspect(bin: &Path, name: &str) -> Response {
         _ => String::new(),
     };
     let labels = labels_of(&v);
+    // The image the box was started from (`kern inspect --json`'s `image`, empty for a `--rootfs`
+    // box and for a box that has exited, whose record no longer holds it).
+    let image = json_str(v.get("image").and_then(Value::as_str).unwrap_or_default());
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":\"\",\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":\"0001-01-01T00:00:00Z\"{health_json}}},\"Config\":{{\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
             json_str(&id),
-            json_str(&rfc3339(started)),
+            json_str(&started),
             json_str(&format!("/{name}")),
             json_str(command),
             json_str(if running { "running" } else { "exited" }),
-            json_str(&rfc3339(started)),
+            json_str(&started),
+            json_str(&finished),
             labels_json(&labels),
             ports_json(ports, &[])
         ),
@@ -956,19 +979,106 @@ fn pull(bin: &Path, req: &Request) -> Response {
     }
 }
 
+/// The local image cache, as `kern images --json` lists it.
+fn kern_images(bin: &Path) -> Vec<Value> {
+    let (_, out, _) = kern(bin, &["images", "--json"]);
+    json::parse(out.trim())
+        .ok()
+        .and_then(|v| v.as_array().map(<[Value]>::to_vec))
+        .unwrap_or_default()
+}
+
+/// The values of one key of a Docker `filters` parameter, in either of its two spellings:
+/// `{"reference":["alpine"]}` and the older `{"reference":{"alpine":true}}`.
+fn filter_values(filters: &Value, key: &str) -> Vec<String> {
+    let v = filters.get(key);
+    match v.and_then(Value::as_object) {
+        Some(set) => set
+            .iter()
+            .filter(|(_, on)| on.as_bool() != Some(false))
+            .map(|(k, _)| k.clone())
+            .collect(),
+        None => strings(v),
+    }
+}
+
+/// The repository of an image reference, without its tag or digest: `alpine` for `alpine:3.19`,
+/// `localhost:5000/app` for `localhost:5000/app:1` (a colon before the last `/` is a port).
+fn repository_of(image: &str) -> &str {
+    let image = image.split('@').next().unwrap_or(image);
+    let last = image.rfind('/').map_or(0, |i| i + 1);
+    match image[last..].rfind(':') {
+        Some(c) => &image[..last + c],
+        None => image,
+    }
+}
+
+/// Whether `image` matches a `reference` filter: the name itself, `name:latest` for a bare name, or
+/// every tag of a repository. Docker's glob patterns (`alp*`) are not translated: `*` matches
+/// nothing rather than everything, so a filtered list never comes back unfiltered.
+fn reference_matches(image: &str, pattern: &str) -> bool {
+    image == pattern || repository_of(image) == pattern || image == format!("{pattern}:latest")
+}
+
+/// `GET /images/json`: the local image cache as Docker's image summaries. Testcontainers for Java
+/// lists it before its first pull, and stopped on the 501 this was. Filters: `reference` and
+/// `dangling`; any other is refused by name rather than ignored.
+fn image_list(bin: &Path, req: &Request) -> Response {
+    let filters = match req.param("filters").filter(|f| !f.is_empty()) {
+        Some(f) => match json::parse(f) {
+            Ok(v) => v,
+            Err(e) => return error(400, &format!("invalid filters: {e}")),
+        },
+        None => Value::Null,
+    };
+    if let Some(keys) = filters.as_object() {
+        if let Some((k, _)) = keys
+            .iter()
+            .find(|(k, _)| k != "reference" && k != "dangling")
+        {
+            return error(
+                400,
+                &format!("images filter {k:?}: not translated by kern-serve"),
+            );
+        }
+    }
+    let references = filter_values(&filters, "reference");
+    let dangling = filter_values(&filters, "dangling");
+    let dangling = dangling.first().map(|d| d == "true" || d == "1");
+    let mut items = Vec::new();
+    for i in kern_images(bin) {
+        let Some(n) = i.get("image").and_then(Value::as_str) else {
+            continue;
+        };
+        let is_dangling = i.get("dangling").and_then(Value::as_bool) == Some(true);
+        if dangling.is_some_and(|d| d != is_dangling)
+            || (!references.is_empty() && !references.iter().any(|r| reference_matches(n, r)))
+        {
+            continue;
+        }
+        let tags = if is_dangling {
+            String::new()
+        } else {
+            json_str(n)
+        };
+        let size = i.get("size_bytes").and_then(Value::as_i64).unwrap_or(0);
+        items.push(format!(
+            "{{\"Id\":{},\"ParentId\":\"\",\"RepoTags\":[{tags}],\"RepoDigests\":[],\"Created\":{},\"Size\":{size},\"SharedSize\":-1,\"VirtualSize\":{size},\"Labels\":{{}},\"Containers\":-1}}",
+            json_str(&format!("sha256:{}", id_of(n))),
+            i.get("pulled").and_then(Value::as_i64).unwrap_or(0).max(0),
+        ));
+    }
+    json_response(200, format!("[{}]", items.join(",")))
+}
+
 /// `GET /images/{name}/json`.
 fn image_inspect(bin: &Path, name: &str) -> Response {
-    let (_, out, _) = kern(bin, &["images", "--json"]);
     let want_latest = if name.contains(':') || name.contains('@') {
         name.to_string()
     } else {
         format!("{name}:latest")
     };
-    let images = json::parse(out.trim())
-        .ok()
-        .and_then(|v| v.as_array().map(<[Value]>::to_vec))
-        .unwrap_or_default();
-    let found = images.into_iter().find(|i| {
+    let found = kern_images(bin).into_iter().find(|i| {
         i.get("image")
             .and_then(Value::as_str)
             .is_some_and(|n| n == name || n == want_latest || n.split('@').next() == Some(name))
@@ -1001,14 +1111,13 @@ fn arch() -> &'static str {
 }
 
 fn version() -> Response {
-    let ver = kern_common::VERSION;
     json_response(
         200,
         format!(
-            "{{\"Platform\":{{\"Name\":\"kern\"}},\"Components\":[{{\"Name\":\"kern\",\"Version\":{v}}}],\"Version\":{v},\"ApiVersion\":\"{API_VERSION}\",\"MinAPIVersion\":\"{MIN_API_VERSION}\",\"Os\":\"linux\",\"Arch\":{},\"KernelVersion\":{},\"GitCommit\":\"\",\"GoVersion\":\"\",\"BuildTime\":\"\"}}",
+            "{{\"Platform\":{{\"Name\":\"kern\"}},\"Components\":[{{\"Name\":\"kern\",\"Version\":{v}}}],\"Version\":\"{ENGINE_VERSION}\",\"ApiVersion\":\"{API_VERSION}\",\"MinAPIVersion\":\"{MIN_API_VERSION}\",\"Os\":\"linux\",\"Arch\":{},\"KernelVersion\":{},\"GitCommit\":\"\",\"GoVersion\":\"\",\"BuildTime\":\"\"}}",
             json_str(arch()),
             json_str(&kernel_release()),
-            v = json_str(ver)
+            v = json_str(kern_common::VERSION)
         ),
     )
 }
@@ -1040,11 +1149,10 @@ fn info(bin: &Path) -> Response {
     json_response(
         200,
         format!(
-            "{{\"ID\":\"kern\",\"Containers\":{},\"ContainersRunning\":{running},\"ContainersPaused\":0,\"ContainersStopped\":{},\"Images\":0,\"Driver\":\"overlay\",\"OperatingSystem\":\"kern\",\"OSType\":\"linux\",\"Architecture\":{},\"NCPU\":{ncpu},\"MemTotal\":{mem_total},\"Name\":\"kern\",\"ServerVersion\":{},\"KernelVersion\":{},\"Labels\":[],\"SecurityOptions\":[\"name=seccomp\",\"name=rootless\"]}}",
+            "{{\"ID\":\"kern\",\"Containers\":{},\"ContainersRunning\":{running},\"ContainersPaused\":0,\"ContainersStopped\":{},\"Images\":0,\"Driver\":\"overlay\",\"OperatingSystem\":\"kern\",\"OSType\":\"linux\",\"Architecture\":{},\"NCPU\":{ncpu},\"MemTotal\":{mem_total},\"Name\":\"kern\",\"ServerVersion\":\"{ENGINE_VERSION}\",\"KernelVersion\":{},\"Labels\":[],\"SecurityOptions\":[\"name=seccomp\",\"name=rootless\"]}}",
             boxes.len(),
             boxes.len() - running,
             json_str(std::env::consts::ARCH),
-            json_str(kern_common::VERSION),
             json_str(&kernel_release())
         ),
     )
@@ -1734,6 +1842,27 @@ fn exec_inspect(id: &str) -> Response {
 // ---------------------------------------------------------------------------------------------
 // Routing.
 
+/// `POST /{networks,volumes,images}/prune` with a `label` filter, which is how Testcontainers'
+/// reaper ends a session when Ryuk is off: what it prunes is what that session made, and this API
+/// makes no network, no volume and no image (build is not translated, a pull carries no client
+/// label), so nothing matches and the answer is Docker's empty one. A prune without a label
+/// filter would reach kern's own networks and volumes, which this API does not translate.
+fn labelled_prune(kind: &str, req: &Request) -> Response {
+    let labelled = req
+        .param("filters")
+        .and_then(|f| json::parse(f).ok())
+        .is_some_and(|f| !filter_values(&f, "label").is_empty());
+    if !labelled {
+        return not_translated(&format!("{kind} prune without a label filter"));
+    }
+    let body = match kind {
+        "networks" => "{\"NetworksDeleted\":[]}",
+        "volumes" => "{\"VolumesDeleted\":[],\"SpaceReclaimed\":0}",
+        _ => "{\"ImagesDeleted\":[],\"SpaceReclaimed\":0}",
+    };
+    json_response(200, body.to_string())
+}
+
 fn not_translated(what: &str) -> Response {
     error(
         501,
@@ -1917,6 +2046,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             no_content()
         }
         ("POST", ["images", "create"]) => pull(bin, req),
+        ("GET", ["images", "json"]) => image_list(bin, req),
         ("GET", ["images", rest @ .., "json"]) if !rest.is_empty() => {
             image_inspect(bin, &rest.join("/"))
         }
@@ -1938,6 +2068,9 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
         ("POST", ["exec", id, "start"]) => exec_start(bin, id, req),
         ("GET", ["exec", id, "json"]) => exec_inspect(id),
         ("POST", ["exec", _, "resize"]) => no_content(),
+        ("POST", [kind @ ("networks" | "volumes" | "images"), "prune"]) => {
+            labelled_prune(kind, req)
+        }
         (_, ["networks", ..]) => not_translated("networks"),
         (_, ["volumes", ..]) => not_translated("the volumes API"),
         ("POST", ["build"]) => not_translated("build"),
@@ -2146,6 +2279,84 @@ mod tests {
             self.data = &self.data[n..];
             Ok(n)
         }
+    }
+
+    /// A prune filtered by label (Testcontainers' reaper with Ryuk off) answers Docker's empty
+    /// result for networks, volumes and images; one without a label filter is still refused.
+    #[test]
+    fn labelled_prune_is_empty_and_a_bare_prune_is_refused() {
+        let req = |query: Vec<(String, String)>| Request {
+            method: "POST".into(),
+            path: "/networks/prune".into(),
+            query,
+            body: Vec::new(),
+            upgrade: false,
+            peer: None,
+            close: false,
+        };
+        let labelled = req(vec![(
+            "filters".into(),
+            r#"{"label":{"org.testcontainers.sessionId=abc":true}}"#.into(),
+        )]);
+        for (kind, key) in [
+            ("networks", "NetworksDeleted"),
+            ("volumes", "VolumesDeleted"),
+            ("images", "ImagesDeleted"),
+        ] {
+            let Response::Full { status, body, .. } = labelled_prune(kind, &labelled) else {
+                panic!("a whole body");
+            };
+            assert_eq!(status, 200, "{kind}");
+            let v = json::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+            assert_eq!(v.get(key).and_then(Value::as_array).map(<[Value]>::len), Some(0));
+        }
+        let Response::Full { status, .. } = labelled_prune("volumes", &req(Vec::new())) else {
+            panic!("a whole body");
+        };
+        assert_eq!(status, 501);
+    }
+
+    /// The `reference` filter of `GET /images/json`: a name, a bare name as `:latest`, a repository
+    /// for all its tags; a registry port is not a tag; a glob matches nothing.
+    #[test]
+    fn image_reference_filter_matches_name_latest_and_repository() {
+        assert!(reference_matches("alpine:3.19", "alpine:3.19"));
+        assert!(reference_matches("alpine:3.19", "alpine"));
+        assert!(reference_matches("alpine:latest", "alpine"));
+        assert!(!reference_matches("alpine/openssl:latest", "alpine"));
+        assert!(reference_matches(
+            "localhost:5000/app:1",
+            "localhost:5000/app"
+        ));
+        assert!(!reference_matches("localhost:5000/app:1", "localhost"));
+        assert!(!reference_matches("alpine:3.19", "alp*"));
+        assert_eq!(repository_of("ghcr.io/o/app@sha256:ab"), "ghcr.io/o/app");
+        let f = json::parse(r#"{"reference":{"alpine":true,"busybox":false}}"#).unwrap();
+        assert_eq!(filter_values(&f, "reference"), vec!["alpine".to_string()]);
+        let f = json::parse(r#"{"reference":["alpine","busybox"]}"#).unwrap();
+        assert_eq!(filter_values(&f, "reference").len(), 2);
+    }
+
+    /// `/version` says the engine version clients gate on (a dotted number at or above 1.6.0,
+    /// which Testcontainers for Java demands) and keeps kern's own in `Components`.
+    #[test]
+    fn version_reports_the_engine_version_and_kern_in_components() {
+        let Response::Full { body, .. } = version() else {
+            panic!("version is a whole body");
+        };
+        let v = json::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+        assert_eq!(
+            v.get("Version").and_then(Value::as_str),
+            Some(ENGINE_VERSION)
+        );
+        assert!(ENGINE_VERSION.split('.').all(|p| p.parse::<u32>().is_ok()));
+        let kern = v
+            .get("Components")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("Version"))
+            .and_then(Value::as_str);
+        assert_eq!(kern, Some(kern_common::VERSION));
     }
 
     /// `tail` as Docker's daemon reads it: a whole number is a line count, anything else (the

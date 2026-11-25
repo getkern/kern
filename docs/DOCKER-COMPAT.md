@@ -105,8 +105,9 @@ set TESTCONTAINERS_RYUK_DISABLED=true
 | `exec`, `exec/{id}/start`, `exec/{id}/json` | `kern exec`, stdout and stderr apart, the exit code, `-t`, `-u`, `-w`, env, detached |
 | `logs` (`stdout`, `stderr`, `follow`, `tail`, `since`, `timestamps`) | `kern logs`: stdout and stderr apart for a container made through the socket |
 | `json` (list and inspect), `wait`, `stop`, `kill`, `restart`, `DELETE` | `kern ps`, `inspect --json`, `wait`, `stop`, `kill`, `restart`, `rm` |
-| `images/create`, `images/{name}/json` | `kern pull`, `kern images --json` |
-| `_ping`, `version`, `info` | kern and kern's version |
+| `images/create`, `images/json` (`reference`, `dangling` filters), `images/{name}/json` | `kern pull`, `kern images --json` |
+| `networks/prune`, `volumes/prune`, `images/prune` with a `label` filter | nothing removed, Docker's empty answer: this API makes no network, volume or image, and that is how a Testcontainers session ends with Ryuk off; without a label filter, 501 |
+| `_ping`, `version`, `info` | kern and kern's version in `Platform` and `Components`; `Version` and `ServerVersion` are `24.0.0`, the Docker Engine whose API is 1.43, since clients gate on that number (Testcontainers for Java refuses one below 1.6.0) |
 
 Measured on this machine (Linux x86_64) with the clients themselves, through the socket unit:
 
@@ -114,6 +115,8 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
 |---|---|---|
 | `docker` CLI 29.1.3 with `DOCKER_HOST` | 18 of 18: `run --rm` stdout, stderr and exit code, `run` then `ps -a`, `inspect`, `rm`, 50,000 lines, `run -d -p` reached by curl, `exec` exit code, `stop`, `rm`, `--privileged` refused | `docker run --rm alpine` 28 ms, `exec` 15 ms |
 | Testcontainers for Python 4.15.0 | Redis module (`GET` answers), Postgres module with SQLAlchemy (`select version()`, its readiness check is an `exec` of `psql`), nginx with a log wait | Redis 136 ms, Postgres 1181 ms, nginx 1048 ms, images cached |
+| Testcontainers for Java 1.21.3 (`TESTCONTAINERS_RYUK_DISABLED=true`) | a log wait on a stderr line, `exec` stdout, stderr and exit code, logs by stream, an HTTP wait on a published port, a container that exits failing its start, the session's prune at exit | log wait 361 ms, HTTP wait 123 ms, exited container refused in 54 ms, image cached |
+| Testcontainers for Node 12.2.2 | a log wait on a stderr line (it asks `tail=-1`), `exec` exit code, a published port reached by `fetch` | started to ready 7 ms, port 69 ms |
 | docker-py 7.2.0 | 9 of 9 exec cases: stdout and stderr apart, exit codes, env, workdir, user, 200 kB of output, tty, detached, a second start refused with 409, privileged refused | one `exec_run` 6 ms |
 
 **What differs, and is said.**

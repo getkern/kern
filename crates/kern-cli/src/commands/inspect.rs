@@ -722,15 +722,20 @@ pub fn ps(
                 )
             })
             .collect();
-        // Exited rows carry the fields a dead box still has plus `exit_code`; `started`/`ports`/`rootfs`
-        // are gone with the box, so they are simply absent rather than emitted as a lie.
+        // Exited rows carry the fields a dead box still has plus `exit_code`; `ports`/`rootfs` are
+        // gone with the box, so they are simply absent rather than emitted as a lie. `started` is
+        // there when the exit record's kernel start time converts to a wall clock, the same clock
+        // the table's CREATED column reads, and absent when it does not: the Docker API's
+        // `StartedAt` of an exited container is built from it.
         for e in &exited {
+            let started = super::started_unix(e.starttime)
+                .map_or_else(String::new, |s| format!(",\"started\":{s}"));
             items.push(format!(
                 // `status` here too, with the same value `health` already carried, so a consumer can
                 // read ONE key across live and exited rows instead of knowing that a dead box spells
                 // its state in the health field. `health` keeps saying `exited` because something may
                 // already read it.
-                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"exit_code\":{},\"exited_ago\":{},\"health\":{},\"status\":{}}}",
+                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"exit_code\":{},\"exited_ago\":{}{started},\"health\":{},\"status\":{}}}",
                 json_str(&e.name),
                 e.pid,
                 json_str(&e.pod),
@@ -1843,12 +1848,20 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&gpu)
         };
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
             b.pid1_recorded,
             json_str(&b.rootfs),
+            // The `--image` the box was started from, as the registry recorded it; `null` for a
+            // `--rootfs` box, which has none. The Docker API's `Image` and `Config.Image` are
+            // this, and Testcontainers for Java inspects that image right after the start.
+            if b.image.is_empty() {
+                "null".to_string()
+            } else {
+                json_str(&b.image)
+            },
             json_str(&b.command),
             b.started,
             up,
