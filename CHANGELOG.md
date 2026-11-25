@@ -172,6 +172,16 @@ prints one JSON line per box (it printed the word `json`), and `--format` says `
   flag: a box gets every volume, anonymous volume, bind and `--mount` of another box, running or kept,
   read-only with `:ro`. A name that is neither is refused, and a box's own `-v`, `--mount` or `--tmpfs`
   on the same destination wins over the copy.
+- **A box's mounts go parent first**, whatever order they were written in (`-v a:/data/sub -v
+  b:/data`, and the same in a compose file): `/data` no longer covers `/data/sub`.
+- **`kern volume rm` and a rename refuse a volume a kept, stopped box uses**, naming `kern rm <box>`.
+- **Compose: a volume's top-level `name:` is the name it is mounted by**, without the project prefix,
+  and `down -v` removes it as the project's own.
+- **Compose: a long-form volume's `bind:` and `volume:` options are read.** `create_host_path: false`
+  on a missing source refuses the service; `subpath` and a `propagation` other than `rprivate` are
+  refused by name; `nocopy` is warned about.
+- **Compose: a YAML value written as both a mapping and a list is refused** with its line, where
+  kern kept one half of it.
 - **`kern volume ls --json`, `kern top --json` and top's volume pane say where a `--path` volume's
   data is** (`path`, `null` for one kern keeps), as the table's `at <dir>` did.
 - **An empty volume keeps the mode it is given** where the image has nothing at its mount point: a
