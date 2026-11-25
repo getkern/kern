@@ -12,7 +12,7 @@ use crate::pull::{
     check_layer_safe, detect_compression, filter_layer, merge_layer, unpack_as_root, Compression,
     ImageConfig,
 };
-use crate::push::{build_config_json, sha256_file, shell_quote, ImageConfigOut};
+use crate::push::{build_config_json, sha256_file, shell_quote};
 use crate::OciError;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -54,7 +54,7 @@ fn jstr(s: &str) -> String {
 /// tagged `repo_tags`) to `out` (a file, or stdout when `None`). `work` is a caller-owned scratch dir.
 pub fn save(
     rootfs: &Path,
-    config: &ImageConfigOut,
+    config: &crate::ImageConfig,
     repo_tags: &[String],
     out: Option<&Path>,
     work: &Path,

@@ -59,6 +59,14 @@ the first time, from the manifest and a config of a few KB, 2 ms after). `kern h
 which dropped the name and printed the last boxes run, refuses the name and points at
 `kern image history`; `kern history [-n N]` is unchanged.
 
+**`kern save` and `kern push` keep the image's labels, exposed ports, stop signal, healthcheck and
+history.** They wrote a config with the command, environment, working directory and user only, so
+an image saved and loaded back (in kern or `docker load`) or pushed and pulled lost its `LABEL`,
+`EXPOSE`, `STOPSIGNAL` and `HEALTHCHECK`: an nginx stopped with SIGTERM where it asks for SIGQUIT.
+The image's steps are kept too, as metadata under the one layer kern writes, which podman and
+buildah still take as the base of a build. A rebuild answered entirely from the cache keeps its
+steps' times, so the same image saves and pushes under the same digest.
+
 **`kern build -q` is quiet on a terminal.** It drew the whole live view and printed every
 `RUN`'s output; it is now `--progress quiet`, as without a terminal: the `built` line, and on a
 failure the build's last lines and the error.

@@ -994,22 +994,16 @@ fn push_once_to(
     // Materialize the image to a single rootfs directory. A flat pulled image IS a cache dir; a
     // layered/built image is squashed into a temp dir via its overlay chain so we push one layer.
     let (rootfs, config, cleanup) = materialize_image(local_ref)?;
-    let cfg = kern_oci::ImageConfigOut {
-        entrypoint: config.entrypoint,
-        cmd: config.cmd,
-        env: config.env,
-        workdir: config.workdir,
-        user: config.user,
-        architecture: config.architecture,
-    };
     // Scratch dir for the layer/config blobs, cleaned up on exit.
     let work = cache_dir().join(format!(".push-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| Error::Oci(format!("push work dir: {e}")))?;
 
     let result = match record {
-        None => kern_oci::push(remote, &rootfs, &cfg, &work).map_err(|e| Error::Oci(e.to_string())),
-        Some(rec) => kern_oci::push_by_digest(remote, &rootfs, &cfg, &work)
+        None => {
+            kern_oci::push(remote, &rootfs, &config, &work).map_err(|e| Error::Oci(e.to_string()))
+        }
+        Some(rec) => kern_oci::push_by_digest(remote, &rootfs, &config, &work)
             .map_err(|e| Error::Oci(e.to_string()))
             .and_then(|m| {
                 std::fs::write(
@@ -1050,14 +1044,6 @@ pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
 
 fn save_once(image: &str, out: Option<&str>) -> Result<(), Error> {
     let (rootfs, config, cleanup) = materialize_image(image)?;
-    let cfg = kern_oci::ImageConfigOut {
-        entrypoint: config.entrypoint,
-        cmd: config.cmd,
-        env: config.env,
-        workdir: config.workdir,
-        user: config.user,
-        architecture: config.architecture,
-    };
     let work = cache_dir().join(format!(".save-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| Error::Oci(format!("save work dir: {e}")))?;
@@ -1067,7 +1053,7 @@ fn save_once(image: &str, out: Option<&str>) -> Result<(), Error> {
     let repo_tag = ensure_repo_tag(image);
     let result = kern_oci::save(
         &rootfs,
-        &cfg,
+        &config,
         std::slice::from_ref(&repo_tag),
         out.map(std::path::Path::new),
         &work,

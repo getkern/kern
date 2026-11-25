@@ -17,7 +17,7 @@ pub use pull::{
     set_dir_mode, split_tag, valid_reference, verify_credentials, HealthTest, HistoryEntry,
     ImageConfig, ImageHealthcheck, OciError, Platform, RemoteDigests, SetuidBits, DEFAULT_TAG,
 };
-pub use push::{push, push_by_digest, push_index, ImageConfigOut, PushedManifest};
+pub use push::{push, push_by_digest, push_index, PushedManifest};
 pub use search::{search, SearchResult};
 
 /// Fuzzing surface - **not** part of the public API (hidden from docs, no stability guarantee). It

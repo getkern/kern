@@ -35,7 +35,7 @@ const INDEX_MT: &str = "application/vnd.docker.distribution.manifest.list.v2+jso
 pub fn push(
     image: &str,
     rootfs: &Path,
-    config: &ImageConfigOut,
+    config: &crate::ImageConfig,
     work: &Path,
 ) -> Result<(), OciError> {
     push_inner(image, rootfs, config, work, false).map(|_| ())
@@ -46,7 +46,7 @@ pub fn push(
 pub fn push_by_digest(
     image: &str,
     rootfs: &Path,
-    config: &ImageConfigOut,
+    config: &crate::ImageConfig,
     work: &Path,
 ) -> Result<PushedManifest, OciError> {
     push_inner(image, rootfs, config, work, true)
@@ -92,7 +92,7 @@ fn build_index(manifests: &[PushedManifest]) -> String {
 fn push_inner(
     image: &str,
     rootfs: &Path,
-    config: &ImageConfigOut,
+    config: &crate::ImageConfig,
     work: &Path,
     by_digest: bool,
 ) -> Result<PushedManifest, OciError> {
@@ -239,20 +239,6 @@ fn authority_of(url: &str) -> &str {
         .unwrap_or(after_scheme)
 }
 
-/// The subset of image config we serialize into the pushed config JSON. Mirror of the fields kern
-/// stores in an image's `.image` sidecar.
-#[derive(Default)]
-pub struct ImageConfigOut {
-    pub entrypoint: Vec<String>,
-    pub cmd: Vec<String>,
-    pub env: Vec<String>,
-    pub workdir: Option<String>,
-    pub user: Option<String>,
-    /// The image's own architecture; `None` is this host's. An arm64 image built here under
-    /// `--platform linux/arm64` must not be published claiming amd64.
-    pub architecture: Option<String>,
-}
-
 /// What a push of one image left at the registry: its manifest, by digest and size, and the
 /// platform it is for. An index lists these.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,10 +311,19 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String, OciError> {
     Ok(format!("sha256:{hex}"))
 }
 
-/// Build the OCI/Docker image config JSON. Minimal but valid: `rootfs.diff_ids` (the one layer's
-/// uncompressed digest) plus a `config` with the runtime fields. JSON is emitted by hand (no serde) -
-/// the fields are simple string arrays, matching the dependency-free posture of the rest of kern-oci.
-pub(crate) fn build_config_json(cfg: &ImageConfigOut, diff_id: &str) -> String {
+/// The created_by of the one layer kern writes: the image's whole filesystem.
+pub(crate) const FLAT_LAYER_STEP: &str = "kern: the image's filesystem as one layer";
+
+/// Build the OCI/Docker image config JSON from the image's own config: `rootfs.diff_ids` (the one
+/// layer's uncompressed digest), the runtime fields, the labels, the exposed ports, the stop signal,
+/// the healthcheck and the history. JSON is emitted by hand (no serde), matching the
+/// dependency-free posture of the rest of kern-oci.
+///
+/// ⛔ EVERY FIELD KERN KEEPS, not a subset: MEASURED, `kern save` of an image with `LABEL`,
+/// `EXPOSE`, `STOPSIGNAL` and `HEALTHCHECK` loaded back (in kern and in `docker load`) with none of
+/// them, and `kern push` published the same reduced config, because this wrote from a second,
+/// smaller copy of the config struct.
+pub(crate) fn build_config_json(cfg: &crate::ImageConfig, diff_id: &str) -> String {
     let arr = |xs: &[String]| {
         let items: Vec<String> = xs.iter().map(|s| json_str(s)).collect();
         format!("[{}]", items.join(","))
@@ -349,20 +344,85 @@ pub(crate) fn build_config_json(cfg: &ImageConfigOut, diff_id: &str) -> String {
     if let Some(u) = &cfg.user {
         config_fields.push(format!("\"User\":{}", json_str(u)));
     }
-    // ONE HISTORY ENTRY FOR THE ONE LAYER. `history` is optional in the OCI spec, and buildah counts its
-    // non-empty entries against the layers anyway: MEASURED, `podman build` of `FROM <an image kern
-    // saved>` failed with "history lists 0 non-empty layers, but we have 1 layers on disk", so an
-    // image kern published could not be the base of a podman or buildah build. No `created` time,
-    // which keeps the config, and so the image digest, the same for the same rootfs.
+    if !cfg.exposed_ports.is_empty() {
+        let ports: Vec<String> = cfg
+            .exposed_ports
+            .iter()
+            .map(|(p, udp)| {
+                format!(
+                    "{}:{{}}",
+                    json_str(&format!("{p}/{}", if *udp { "udp" } else { "tcp" }))
+                )
+            })
+            .collect();
+        config_fields.push(format!("\"ExposedPorts\":{{{}}}", ports.join(",")));
+    }
+    if let Some(sig) = &cfg.stop_signal {
+        config_fields.push(format!("\"StopSignal\":{}", json_str(sig)));
+    }
+    if !cfg.labels.is_empty() {
+        let labels: Vec<String> = cfg
+            .labels
+            .iter()
+            .map(|l| {
+                let (k, v) = l.split_once('=').unwrap_or((l.as_str(), ""));
+                format!("{}:{}", json_str(k), json_str(v))
+            })
+            .collect();
+        config_fields.push(format!("\"Labels\":{{{}}}", labels.join(",")));
+    }
+    if let Some(h) = &cfg.healthcheck {
+        let mut f = vec![format!("\"Test\":{}", arr(&h.test))];
+        for (k, v) in [
+            ("Interval", h.interval_ns),
+            ("Timeout", h.timeout_ns),
+            ("StartPeriod", h.start_period_ns),
+            ("StartInterval", h.start_interval_ns),
+        ] {
+            if let Some(v) = v {
+                f.push(format!("\"{k}\":{v}"));
+            }
+        }
+        if let Some(r) = h.retries {
+            f.push(format!("\"Retries\":{r}"));
+        }
+        config_fields.push(format!("\"Healthcheck\":{{{}}}", f.join(",")));
+    }
+    // THE IMAGE'S STEPS, THEN ITS ONE LAYER. kern writes the filesystem as one layer, so each step
+    // the image declares is kept as metadata (`empty_layer`) and the one entry that made a layer is
+    // the last: buildah counts the non-empty entries against the layers, MEASURED, `podman build` of
+    // `FROM <an image kern saved>` failed with "history lists 0 non-empty layers, but we have 1
+    // layers on disk". A step that is already that one layer (an image kern saved, loaded back) is
+    // not listed twice. No `created` on it, which keeps the config, and so the image digest, the
+    // same for the same image.
+    let mut history: Vec<String> = cfg
+        .history
+        .iter()
+        .filter(|h| h.created_by != FLAT_LAYER_STEP)
+        .map(|h| {
+            let mut f = Vec::new();
+            if let Some(c) = &h.created {
+                f.push(format!("\"created\":{}", json_str(c)));
+            }
+            f.push(format!("\"created_by\":{}", json_str(&h.created_by)));
+            if let Some(c) = &h.comment {
+                f.push(format!("\"comment\":{}", json_str(c)));
+            }
+            f.push("\"empty_layer\":true".to_string());
+            format!("{{{}}}", f.join(","))
+        })
+        .collect();
+    history.push(format!("{{\"created_by\":{}}}", json_str(FLAT_LAYER_STEP)));
     format!(
-        "{{\"architecture\":{},\"os\":\"linux\",\"config\":{{{}}},\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[{}]}},\"history\":[{{\"created_by\":\"kern: the image's filesystem as one layer\"}}]}}",
+        "{{\"architecture\":{},\"os\":\"linux\",\"config\":{{{}}},\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[{}]}},\"history\":[{}]}}",
         json_str(
             cfg.architecture
                 .as_deref()
                 .unwrap_or(crate::Platform::host().as_oci_arch())
         ),
         config_fields.join(","),
-        json_str(diff_id)
+        json_str(diff_id),
+        history.join(",")
     )
 }
 
@@ -605,18 +665,19 @@ mod tests {
 
     #[test]
     fn config_json_has_diff_id_and_fields() {
-        let cfg = ImageConfigOut {
+        let cfg = crate::ImageConfig {
             entrypoint: vec!["/bin/app".into()],
             cmd: vec!["--serve".into()],
             env: vec!["K=v".into()],
             workdir: Some("/srv".into()),
             user: None,
             architecture: Some("arm64".into()),
+            ..Default::default()
         };
         let j = build_config_json(&cfg, "sha256:dd");
         // The image's own architecture, whatever machine publishes it.
         assert!(j.contains("\"architecture\":\"arm64\""), "{j}");
-        let host = build_config_json(&ImageConfigOut::default(), "sha256:dd");
+        let host = build_config_json(&crate::ImageConfig::default(), "sha256:dd");
         assert!(host.contains(&format!(
             "\"architecture\":\"{}\"",
             crate::Platform::host().as_oci_arch()
@@ -629,6 +690,76 @@ mod tests {
         // One non-empty history entry per layer, or buildah refuses the image as a base.
         assert_eq!(j.matches("\"created_by\"").count(), 1, "{j}");
         assert!(!j.contains("empty_layer"), "{j}");
+    }
+
+    /// What the image keeps goes out whole and reads back the same through the pull parser: labels,
+    /// ports, stop signal, healthcheck, and the history as metadata steps under the one layer, a
+    /// layer step from an earlier save not listed twice.
+    #[test]
+    fn config_json_round_trips_through_the_parser() {
+        let step = |by: &str, empty: bool| crate::HistoryEntry {
+            created: Some("2025-01-02T03:04:05Z".into()),
+            created_by: by.into(),
+            comment: Some("buildkit.dockerfile.v0".into()),
+            empty_layer: empty,
+            layer_size: None,
+        };
+        let cfg = crate::ImageConfig {
+            cmd: vec!["nginx".into()],
+            exposed_ports: vec![(8080, false), (53, true)],
+            stop_signal: Some("SIGQUIT".into()),
+            labels: vec!["org.opencontainers.image.version=1.2".into(), "bare".into()],
+            healthcheck: Some(crate::ImageHealthcheck {
+                test: vec!["CMD-SHELL".into(), "true".into()],
+                interval_ns: Some(5_000_000_000),
+                timeout_ns: None,
+                start_period_ns: None,
+                start_interval_ns: Some(1_000_000_000),
+                retries: Some(3),
+            }),
+            history: vec![
+                step("ADD rootfs.tar /", false),
+                step("CMD [\"nginx\"]", true),
+                crate::HistoryEntry {
+                    created_by: FLAT_LAYER_STEP.into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let j = build_config_json(&cfg, "sha256:dd");
+        let back = crate::pull::parse_image_config(&j);
+        assert_eq!(back.exposed_ports, cfg.exposed_ports, "{j}");
+        assert_eq!(back.stop_signal, cfg.stop_signal);
+        assert_eq!(
+            back.labels,
+            vec![
+                "org.opencontainers.image.version=1.2".to_string(),
+                "bare=".to_string()
+            ]
+        );
+        assert_eq!(back.healthcheck, cfg.healthcheck);
+        let by: Vec<(&str, bool)> = back
+            .history
+            .iter()
+            .map(|h| (h.created_by.as_str(), h.empty_layer))
+            .collect();
+        assert_eq!(
+            by,
+            vec![
+                ("ADD rootfs.tar /", true),
+                ("CMD [\"nginx\"]", true),
+                (FLAT_LAYER_STEP, false)
+            ]
+        );
+        assert_eq!(
+            back.history[0].created.as_deref(),
+            Some("2025-01-02T03:04:05Z")
+        );
+        assert_eq!(
+            back.history[0].comment.as_deref(),
+            Some("buildkit.dockerfile.v0")
+        );
     }
 
     #[test]

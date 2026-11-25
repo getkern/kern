@@ -637,7 +637,7 @@ fn download_blob_quiet(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError
 }
 
 /// Parse the OCI image config blob's `config.{Entrypoint,Cmd,Env,WorkingDir,User}` into [`ImageConfig`].
-fn parse_image_config(blob: &str) -> ImageConfig {
+pub(crate) fn parse_image_config(blob: &str) -> ImageConfig {
     // No `"config"` object (malformed/unexpected) → scan the whole blob defensively; a real OCI
     // config always carries it, so this fallback is belt-and-braces, not the normal path.
     let cfg = object_after(blob, "config").unwrap_or(blob);

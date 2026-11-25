@@ -740,11 +740,17 @@ fn emulation_problem(arch: &str, entry: &str, body: &str) -> Option<String> {
 /// build, so a build answered from the layer cache, which may not rewrite the image's config,
 /// cannot list its steps twice. `RUN`, `COPY`, `ADD` and `WORKDIR` make a layer; the others
 /// (`ENV`, `CMD`, `LABEL`, ...) are metadata, as Docker marks them.
+///
+/// A build that made no new layer (`unchanged` holds the history from before it) and lists the
+/// same steps keeps the times it had, as Docker keeps the image id of a fully cached build: the
+/// history goes into the config `kern push` and `kern save` write, so new times would give the same
+/// image a new digest.
 fn record_build_history(
     tag: &str,
     text: &str,
     instrs: &[crate::dockerfile::Instr],
     target: Option<&str>,
+    unchanged: Option<Vec<kern_oci::HistoryEntry>>,
 ) {
     let stages = crate::dockerfile::stage_lines(text);
     let froms: Vec<(&str, Option<&str>)> = instrs
@@ -808,7 +814,16 @@ fn record_build_history(
         return;
     }
     let mut cfg = read_image_config(&cfgfile);
-    cfg.history = history;
+    let same_steps = |a: &[kern_oci::HistoryEntry], b: &[kern_oci::HistoryEntry]| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| x.created_by == y.created_by && x.empty_layer == y.empty_layer)
+    };
+    cfg.history = match unchanged {
+        Some(before) if same_steps(&before, &history) => before,
+        _ => history,
+    };
     super::imagecache::replace_image_config(&cache, &safe, &cfgfile, &cfg);
 }
 
@@ -883,6 +898,14 @@ fn build_one(args: BuildArgs) -> Result<(), Error> {
             eprintln!("kern: warning: {w}");
         }
     }
+    // The image's layer list before the build: unchanged after it, the build made nothing new.
+    let (cache, safe) = (cache_dir(), sanitize_ref(tag));
+    let layers_file = cache.join(format!("{safe}.layers"));
+    let layers_before = std::fs::read(&layers_file).ok();
+    // And its history, read now: the build rewrites the config before the history is recorded.
+    let history_before = layers_before
+        .as_ref()
+        .map(|_| read_image_config(&cache.join(format!("{safe}.image"))).history);
     let t0 = std::time::Instant::now();
     let result = if multi {
         build_multi_stage(args.quiet, tag, &ctx, &work, &instrs, args.target)
@@ -890,7 +913,10 @@ fn build_one(args: BuildArgs) -> Result<(), Error> {
         build_run(args.quiet, tag, &ctx, &work, &instrs)
     };
     if result.is_ok() {
-        record_build_history(tag, &text, &instrs, args.target);
+        let unchanged = history_before.filter(|_| {
+            layers_before.is_some() && std::fs::read(&layers_file).ok() == layers_before
+        });
+        record_build_history(tag, &text, &instrs, args.target, unchanged);
     }
     super::buildmounts::finish_build(); // the key agents `--ssh id=<key>` started
     remove_build_tree(&work); // overlay leaves mode-000 workdirs; force-clean so nothing leaks
