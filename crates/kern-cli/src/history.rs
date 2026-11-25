@@ -981,7 +981,7 @@ fn cut(s: &str, n: usize) -> String {
     }
 }
 
-fn entry_json(e: &Entry) -> String {
+pub(crate) fn entry_json(e: &Entry) -> String {
     use kern_common::json_str;
     format!(
         "{{\"ended_ms\":{},\"name\":{},\"kind\":{},\"image\":{},\"ran_ms\":{},\"exit_code\":{},\"outcome\":{},\"gpu\":{}}}",

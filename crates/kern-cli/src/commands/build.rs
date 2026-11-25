@@ -80,7 +80,7 @@ fn link_along(root: &std::path::Path, rel: &str) -> bool {
 
 /// One build record as a JSON object - the single emitter for both `kern builds --json` (an array of
 /// these) and `kern build inspect --json` (one of these), so the two can't drift on fields or escaping.
-fn build_json(r: &crate::builds::Record) -> String {
+pub(crate) fn build_json(r: &crate::builds::Record) -> String {
     format!(
         "{{\"id\":{},\"tag\":{},\"status\":{},\"duration_ms\":{},\"started\":{},\"size_bytes\":{},\"warnings\":{},\"dockerfile\":{},\"context\":{},\"error\":{},\"strategy\":{}}}",
         json_str(&r.id),

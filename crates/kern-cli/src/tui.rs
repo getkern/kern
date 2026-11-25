@@ -470,6 +470,8 @@ pub fn run() -> Result<(), crate::error::Error> {
     if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
         return snapshot(); // not a real tty after all - one-shot fallback
     }
+    // The screen refreshes for as long as it is open: its GPU rows read one running `nvidia-smi`.
+    start_gpu_stream();
     let mut raw = orig;
     raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
     raw.c_iflag &= !(libc::IXON | libc::ICRNL);
@@ -2173,6 +2175,334 @@ pub fn snapshot() -> Result<(), crate::error::Error> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// `kern top --json [--tab LIST] [--stream [--interval S]]`: the same frames, for a program.
+//
+// ONE PRODUCER. Every frame is built by `refresh_full`, the function the screen draws from, with
+// the same cost rule: the expensive records (images, builds, volume sizes) are read only for the
+// tabs asked for, exactly as the screen reads them only for the tab on view. So `kern top` and its
+// JSON cannot disagree about a box, which is the failure the `orphaned` field above records.
+//
+// THE CONTRACT IS VERSIONED. `schema` opens every frame and `kern version --json` reports it as
+// `json_schema`, so a reader decides whether it can read a kern by a number, not by parsing a
+// version string. A field is never renamed or retyped under the same schema; a new field may be
+// added.
+//
+// WHAT A FRAME COSTS, MEASURED on this host (28 cores, 2 GPUs, 557 volumes, 8951 finished
+// sandboxes): kern's own work is about 2 ms of CPU a frame. The GPUs come from one `nvidia-smi` kept
+// running (`GpuStream`): 50 frames at 0.2 s went from 0.35 s of CPU to 0.11 s, and from six
+// `nvidia-smi` to one; a single frame from 188 ms to about 150. Two lists were
+// unbounded and are not any more: every finished sandbox in every frame was 1.4 MB a line, now the
+// newest `LIST_CAP`; measuring every volume's size was 70 ms of CPU a frame, now at most once every
+// `VOLUME_SIZES_EVERY` while streaming.
+
+/// The shape `kern top --json` writes. `kern version --json` reports it.
+pub(crate) const JSON_SCHEMA: u32 = 1;
+
+/// The longest list a frame carries (builds, sandboxes): the newest, as the screen reads them at
+/// first. The count of all of them is in `counts`.
+const LIST_CAP: usize = 512;
+
+/// How old a volume size may be before a stream measures it again.
+const VOLUME_SIZES_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A tab named as the tab bar names it, any case: its index. `None` for any other word.
+pub(crate) fn json_tab(name: &str) -> Option<usize> {
+    TABS.iter().position(|t| t.eq_ignore_ascii_case(name))
+}
+
+/// What the frames are built from from one to the next: the baselines every rate and CPU% is a
+/// delta against, as the screen keeps them, and the volume sizes last measured.
+#[derive(Default)]
+struct JsonState {
+    prev: HashMap<i32, (u64, Instant)>,
+    prev_cpu: Option<(u64, u64)>,
+    prev_runs: Option<(u64, Instant)>,
+    runs_hist: Vec<f64>,
+    prev_box: Option<(u64, Instant)>,
+    box_hist: Vec<f64>,
+    sizes: HashMap<String, Option<u64>>,
+    sized_at: Option<Instant>,
+}
+
+impl JsonState {
+    fn frame(&mut self, tabs: &[usize]) -> Snapshot {
+        let mut s = refresh_full(
+            &mut self.prev,
+            &mut self.prev_cpu,
+            &mut self.prev_runs,
+            &mut self.runs_hist,
+            &mut self.prev_box,
+            &mut self.box_hist,
+            TAB_OVERVIEW,
+        );
+        if tabs.contains(&TAB_IMAGES) {
+            s.set_images(crate::commands::image_entries_with(
+                crate::listing::Detail::Read,
+            ));
+        }
+        if tabs.contains(&TAB_BUILDS) {
+            s.set_builds(builds_listing(crate::listing::Detail::Read));
+        }
+        if tabs.contains(&TAB_STORAGE) {
+            self.sized(&mut s.vols);
+        }
+        s
+    }
+
+    /// The volumes `refresh_full` listed, with sizes measured at most every `VOLUME_SIZES_EVERY`:
+    /// a volume created since then reads `null` until the next measure.
+    fn sized(&mut self, vols: &mut Vec<crate::volume::VolInfo>) {
+        let stale = self
+            .sized_at
+            .is_none_or(|t| t.elapsed() >= VOLUME_SIZES_EVERY);
+        if stale {
+            *vols = crate::volume::entries_with(crate::volume::Sizes::Measure);
+            self.sizes = vols.iter().map(|v| (v.raw.clone(), v.size)).collect();
+            self.sized_at = Some(Instant::now());
+            return;
+        }
+        for v in vols.iter_mut() {
+            v.size = self.sizes.get(&v.raw).copied().flatten();
+        }
+    }
+}
+
+/// A float JSON can carry: a non-finite one (a rate before its first delta) is `null`.
+fn put_f(o: &mut String, v: f64) {
+    use std::fmt::Write as _;
+    if v.is_finite() {
+        let _ = write!(o, "{v:.2}");
+    } else {
+        o.push_str("null");
+    }
+}
+
+fn put_opt<T: std::fmt::Display>(o: &mut String, v: Option<T>) {
+    use std::fmt::Write as _;
+    match v {
+        Some(x) => {
+            let _ = write!(o, "{x}");
+        }
+        None => o.push_str("null"),
+    }
+}
+
+fn put_str(o: &mut String, v: &str) {
+    o.push_str(&kern_common::json_str(v));
+}
+
+/// `"key":[item,item,...]`, each item written by `f`.
+fn put_list<T>(
+    o: &mut String,
+    key: &str,
+    items: impl IntoIterator<Item = T>,
+    mut f: impl FnMut(&mut String, T),
+) {
+    o.push_str(",\"");
+    o.push_str(key);
+    o.push_str("\":[");
+    for (i, it) in items.into_iter().enumerate() {
+        if i > 0 {
+            o.push(',');
+        }
+        f(o, it);
+    }
+    o.push(']');
+}
+
+/// One frame as one line of JSON, written into one buffer.
+fn frame_json(s: &Snapshot, tabs: &[usize], ts_ms: u64) -> String {
+    use std::fmt::Write as _;
+    let h = &s.host;
+    let mut o = String::with_capacity(1024 + s.rows.len() * 256);
+    let _ = write!(o, "{{\"schema\":{JSON_SCHEMA},\"kern\":");
+    put_str(&mut o, kern_common::VERSION);
+    let _ = write!(o, ",\"ts_ms\":{ts_ms},\"tabs\":[");
+    for (i, t) in tabs.iter().filter_map(|t| TABS.get(*t)).enumerate() {
+        if i > 0 {
+            o.push(',');
+        }
+        put_str(&mut o, &t.to_ascii_lowercase());
+    }
+    o.push_str("],\"host\":{\"cpu_pct\":");
+    put_f(&mut o, h.cpu_pct);
+    let _ = write!(o, ",\"cores\":{},\"load1\":", h.cores);
+    put_f(&mut o, h.load1);
+    let _ = write!(
+        o,
+        ",\"mem_used\":{},\"mem_total\":{},\"disk_used\":{},\"disk_total\":{},\"disk_fill_pct\":{},\"logs_used\":{},\"logs_total\":{},\"logs_fill_pct\":{}}}",
+        h.mem_used, h.mem_total, h.disk_used, h.disk_total, h.disk_fill, h.logs_used, h.logs_total, h.logs_fill
+    );
+    put_list(&mut o, "gpus", &h.gpus, |o, g| {
+        let _ = write!(o, "{{\"index\":{},\"name\":", g.index);
+        put_str(o, &g.name);
+        o.push_str(",\"bus\":");
+        put_str(o, &g.bus);
+        o.push_str(",\"mem_used_mib\":");
+        put_opt(o, g.mem_used_mib);
+        o.push_str(",\"mem_total_mib\":");
+        put_opt(o, g.mem_total_mib);
+        o.push_str(",\"util_pct\":");
+        put_opt(o, g.util_pct);
+        o.push_str(",\"temp_c\":");
+        put_opt(o, g.temp_c);
+        o.push_str(",\"power_w\":");
+        match g.power_w {
+            Some(w) => put_f(o, w),
+            None => o.push_str("null"),
+        }
+        o.push('}');
+    });
+    let _ = write!(o, ",\"runs\":{{\"total\":{},\"per_sec\":", h.runs_total);
+    put_f(&mut o, h.runs_per_sec);
+    o.push_str(",\"peak_per_sec\":");
+    put_f(&mut o, h.runs_peak);
+    let _ = write!(o, ",\"avg_setup_us\":{}}}", h.runs_avg_us);
+    let _ = write!(
+        o,
+        ",\"box_starts\":{{\"total\":{},\"per_sec\":",
+        h.box_starts_total
+    );
+    put_f(&mut o, h.box_starts_per_sec);
+    o.push_str(",\"peak_per_sec\":");
+    put_f(&mut o, h.box_starts_peak);
+    o.push('}');
+    put_list(&mut o, "boxes", &s.rows, |o, r| {
+        o.push_str("{\"name\":");
+        put_str(o, &r.name);
+        let _ = write!(
+            o,
+            ",\"pid\":{},\"uptime_s\":{},\"mem_bytes\":",
+            r.pid, r.uptime
+        );
+        put_opt(o, r.mem);
+        o.push_str(",\"cpu_pct\":");
+        put_f(o, r.cpu_pct);
+        o.push_str(",\"tasks\":");
+        put_opt(o, r.tasks);
+        let _ = write!(
+            o,
+            ",\"paused\":{},\"orphaned\":{},\"health\":",
+            r.paused, r.orphaned
+        );
+        put_str(o, &r.health);
+        o.push_str(",\"ports\":");
+        put_str(o, &r.ports);
+        o.push_str(",\"pod\":");
+        put_str(o, &r.pod);
+        o.push_str(",\"isolation\":");
+        put_str(o, &r.iso);
+        o.push_str(",\"confinement\":");
+        put_str(o, &r.sec);
+        o.push('}');
+    });
+    let _ = write!(
+        o,
+        ",\"counts\":{{\"boxes\":{},\"images\":{},\"builds\":{},\"profiles\":{},\"volumes\":{},\"sandboxes\":{}}}",
+        s.rows.len(),
+        s.images_total,
+        s.builds_total,
+        s.profs.len(),
+        s.vols.len(),
+        s.sbx.len()
+    );
+    if tabs.contains(&TAB_IMAGES) {
+        // The shape of `kern images --json`, field names included.
+        put_list(&mut o, "images", &s.images, |o, i| {
+            o.push_str("{\"image\":");
+            put_str(o, &i.name);
+            let _ = write!(
+                o,
+                ",\"size_bytes\":{},\"pulled\":{},\"dangling\":{}}}",
+                i.size, i.pulled, i.dangling
+            );
+        });
+    }
+    if tabs.contains(&TAB_BUILDS) {
+        put_list(&mut o, "builds", s.builds.iter().take(LIST_CAP), |o, b| {
+            o.push_str(&crate::commands::build_json(b));
+        });
+    }
+    if tabs.contains(&TAB_PROFILES) {
+        put_list(&mut o, "profiles", &s.profs, |o, p| {
+            o.push_str("{\"section\":");
+            put_str(o, p.section);
+            o.push_str(",\"name\":");
+            put_str(o, &p.name);
+            o.push_str(",\"summary\":");
+            put_str(o, &p.summary);
+            o.push('}');
+        });
+    }
+    if tabs.contains(&TAB_STORAGE) {
+        put_list(&mut o, "volumes", &s.vols, |o, v| {
+            o.push_str("{\"name\":");
+            put_str(o, &v.raw);
+            o.push_str(",\"size_bytes\":");
+            put_opt(o, v.size);
+            o.push_str(",\"quota_bytes\":");
+            put_opt(o, v.quota);
+            o.push('}');
+        });
+    }
+    if tabs.contains(&TAB_SANDBOXES) {
+        put_list(&mut o, "sandboxes", s.sbx.iter().take(LIST_CAP), |o, e| {
+            o.push_str(&crate::history::entry_json(e));
+        });
+    }
+    o.push('}');
+    o
+}
+
+/// `kern top --json`: one frame, or with `stream` one frame a line every `interval` until the
+/// reader goes away.
+pub fn json(
+    tabs: &[usize],
+    stream: bool,
+    interval: std::time::Duration,
+) -> Result<(), crate::error::Error> {
+    if tabs.contains(&TAB_LOGS) {
+        return Err(crate::error::Error::Cli(
+            "kern top --json --tab logs: the logs are a stream of their own, `kern logs --all -f` \
+             (one line each, `box | ` first)"
+                .to_string(),
+        ));
+    }
+    let mut tabs: Vec<usize> = tabs.to_vec();
+    if tabs.is_empty() {
+        tabs = vec![TAB_OVERVIEW, TAB_BOXES];
+    }
+    tabs.sort_unstable();
+    tabs.dedup();
+    // ONE `nvidia-smi` for the whole run, single frame included: started now, its first reading
+    // lands during the baseline's 120 ms instead of after them.
+    start_gpu_stream();
+    let mut st = JsonState::default();
+    // THE FIRST FRAME IS A BASELINE, not a reading: host CPU% and every rate are deltas, and the
+    // screen's first frame shows `0%` for the same reason. Sampled, then 120 ms, then reported,
+    // which is what `snapshot` (the non-terminal `kern top`) does.
+    GPU_WAIT.with(|w| w.set(false));
+    let _ = st.frame(&tabs);
+    GPU_WAIT.with(|w| w.set(true));
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let out = std::io::stdout();
+    loop {
+        let s = st.frame(&tabs);
+        let line = frame_json(&s, &tabs, registry::unix_ms());
+        let mut w = out.lock();
+        // A reader that closed the pipe ends the stream; it is not an error of kern's.
+        if writeln!(w, "{line}").and_then(|()| w.flush()).is_err() {
+            return Ok(());
+        }
+        drop(w);
+        if !stream {
+            return Ok(());
+        }
+        std::thread::sleep(interval);
+    }
+}
+
 /// The ONLY thing `collect_rows` wants from a previous frame: each box's `(cpu_usec, instant)`. Split
 /// out so a one-shot snapshot can take the earlier half of the pair without paying for a whole
 /// `collect_rows` - no health sidecars, no `/proc` isolation walk, no pod sort. Keyed on `pid` and
@@ -2761,18 +3091,143 @@ fn gpu_minor(bus: &str) -> Option<u32> {
 /// query costs about 20 ms (measured, five runs, on two RTX 5060 Ti), hence the cache; it runs
 /// under `run_bounded`'s deadline, so a wedged driver cannot freeze the screen. A host without the
 /// tool, or without NVIDIA cards, gets no section.
-fn host_gpus() -> Vec<GpuStat> {
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-    static CACHE: Mutex<Option<(Instant, Vec<GpuStat>)>> = Mutex::new(None);
-    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, gpus)) = guard.as_ref() {
-        if at.elapsed() < Duration::from_secs(2) {
-            return gpus.clone();
+/// What `nvidia-smi` is asked, one card a line.
+const SMI_QUERY: [&str; 2] = [
+    "--query-gpu=index,name,pci.bus_id,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw",
+    "--format=csv,noheader,nounits",
+];
+
+/// The cards' readings from ONE `nvidia-smi` left running (`-lms`), for the views that refresh
+/// (the screen and `--json --stream`).
+///
+/// MEASURED on this host (2 GPUs): a reading from a fresh `nvidia-smi` costs about 44 ms of CPU,
+/// almost all of it the driver library's start; from one already running, about 3 ms. The screen
+/// asked a fresh one every 2 s, so its GPU rows were most of what `kern top` cost.
+///
+/// NO THREAD: the pipe is non-blocking and each refresh takes the lines that have arrived, the way
+/// `VolumeSizer` reads its child. `kern top` stays single-threaded, which code that forks relies on.
+/// The child gets `PDEATHSIG`, so it ends with kern however kern ends.
+struct GpuStream {
+    child: std::process::Child,
+    out: std::process::ChildStdout,
+    buf: Vec<u8>,
+    cards: std::collections::BTreeMap<u32, GpuStat>,
+    alive: bool,
+}
+
+thread_local! {
+    static GPU_STREAM: std::cell::RefCell<Option<GpuStream>> = const { std::cell::RefCell::new(None) };
+    /// Whether `host_gpus` waits for the stream's first reading. Off for `--json`'s baseline frame,
+    /// which is never printed: the reading then arrives during the 120 ms that follow it.
+    static GPU_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Start the running `nvidia-smi` for this process, once. A host with no `nvidia-smi` starts nothing.
+pub(crate) fn start_gpu_stream() {
+    GPU_STREAM.with(|g| {
+        if g.borrow().is_none() {
+            *g.borrow_mut() = GpuStream::spawn();
         }
+    });
+}
+
+impl GpuStream {
+    fn spawn() -> Option<Self> {
+        let smi = smi_path()?;
+        let mut args: Vec<&str> = SMI_QUERY.to_vec();
+        args.extend(["-lms", "2000"]);
+        Self::spawn_from(&smi, &args)
     }
-    // `/usr/sbin` IS WHERE A JETSON KEEPS IT, and it was not looked at: measured on an Orin Nano.
-    // Then every directory on `PATH`, for a host that put it somewhere else.
+
+    /// The reader over any program that prints `nvidia-smi`'s lines (the tests give it a fake one).
+    fn spawn_from(program: &std::path::Path, args: &[&str]) -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: prctl with integer arguments, async-signal-safe, in the child before exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().ok()?;
+        let Some(out) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        let fd = out.as_raw_fd();
+        // SAFETY: fcntl on the pipe this process just received.
+        let nonblock = unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            fl >= 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) == 0
+        };
+        if !nonblock {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        Some(Self {
+            child,
+            out,
+            buf: Vec::with_capacity(1024),
+            cards: std::collections::BTreeMap::new(),
+            alive: true,
+        })
+    }
+
+    /// The newest reading of every card, from what has arrived. `None` before the first line, and
+    /// for good once `nvidia-smi` has ended (the caller then asks a fresh one, as before).
+    fn poll(&mut self) -> Option<Vec<GpuStat>> {
+        use std::io::Read;
+        let mut chunk = [0u8; 4096];
+        while self.alive {
+            match self.out.read(&mut chunk) {
+                Ok(0) => self.alive = false,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => self.alive = false,
+            }
+        }
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=nl).collect();
+            for g in parse_smi_gpus(&String::from_utf8_lossy(&line)) {
+                self.cards.insert(g.index, g);
+            }
+        }
+        // A line that never ends is not one: drop it rather than grow without bound.
+        if self.buf.len() > 64 * 1024 {
+            self.buf.clear();
+        }
+        if !self.alive || self.cards.is_empty() {
+            return None;
+        }
+        Some(self.cards.values().cloned().collect())
+    }
+}
+
+impl Drop for GpuStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Where `nvidia-smi` is. `/usr/sbin` IS WHERE A JETSON KEEPS IT, and it was not looked at:
+/// measured on an Orin Nano. Then every directory on `PATH`, for a host that put it somewhere else.
+fn smi_path() -> Option<std::path::PathBuf> {
     let fixed = [
         "/usr/bin/nvidia-smi",
         "/usr/sbin/nvidia-smi",
@@ -2787,17 +3242,54 @@ fn host_gpus() -> Vec<GpuStat> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let smi = fixed.into_iter().chain(on_path).find(|p| p.is_file());
-    let gpus = smi
-        .and_then(|p| {
-            crate::gpu::run_bounded(
-                &p,
-                &[
-                    "--query-gpu=index,name,pci.bus_id,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw",
-                    "--format=csv,noheader,nounits",
-                ],
-            )
-        })
+    fixed.into_iter().chain(on_path).find(|p| p.is_file())
+}
+
+fn host_gpus() -> Vec<GpuStat> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    // The running `nvidia-smi`, where this process started one: its newest reading, no process.
+    // Its FIRST reading is waited for (up to 150 ms, the driver library's start) rather than paid
+    // for twice by asking a fresh `nvidia-smi` beside it.
+    let streamed = GPU_STREAM.with(|g| {
+        let mut g = g.borrow_mut();
+        let mut got = g.as_mut().and_then(GpuStream::poll);
+        let mut waited = 0;
+        let wait = GPU_WAIT.with(std::cell::Cell::get);
+        while wait
+            && got.is_none()
+            && waited < 30
+            && g.as_ref().is_some_and(|s| s.alive && s.cards.is_empty())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+            got = g.as_mut().and_then(GpuStream::poll);
+        }
+        if g.as_ref().is_some_and(|s| !s.alive) {
+            *g = None;
+        }
+        got
+    });
+    if let Some(gpus) = streamed {
+        return gpus
+            .into_iter()
+            .map(|g| tegra_readings(g, std::path::Path::new("/")))
+            .collect();
+    }
+    // A stream that is starting and a caller that does not wait (the unprinted baseline): nothing
+    // yet, and no second `nvidia-smi` beside the one that is about to answer.
+    if !GPU_WAIT.with(std::cell::Cell::get) && GPU_STREAM.with(|g| g.borrow().is_some()) {
+        return Vec::new();
+    }
+    static CACHE: Mutex<Option<(Instant, Vec<GpuStat>)>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, gpus)) = guard.as_ref() {
+        if at.elapsed() < Duration::from_secs(2) {
+            return gpus.clone();
+        }
+    }
+    let gpus = smi_path()
+        .and_then(|p| crate::gpu::run_bounded(&p, &SMI_QUERY))
         .map(|t| parse_smi_gpus(&t))
         .unwrap_or_default();
     let gpus = gpus
@@ -4839,6 +5331,45 @@ fn trunc(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The running `nvidia-smi` is read as it writes: a line split across two reads is kept until it
+    /// ends, each card keeps its newest reading, and a reader that ended says so.
+    #[test]
+    fn the_gpu_stream_reads_lines_as_they_arrive_and_says_when_it_ended() {
+        let script = "printf '0, Card A, 00000000:01:00.0, 100, 8192, 5, 40, 20.5\n1, Card B, 0000'; \
+                      sleep 0.3; printf '0000:06:00.0, 7, 8192, 0, 30, 4.0\n0, Card A, 00000000:01:00.0, 200, 8192, 9, 41, 21.0\n'; \
+                      sleep 0.3";
+        let Some(mut st) = GpuStream::spawn_from(std::path::Path::new("/bin/sh"), &["-c", script])
+        else {
+            panic!("the fake nvidia-smi did not start");
+        };
+        let mut seen: Option<Vec<GpuStat>> = None;
+        for _ in 0..100 {
+            if let Some(v) = st.poll() {
+                if v.len() == 2 && v.first().and_then(|g| g.mem_used_mib) == Some(200) {
+                    seen = Some(v);
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let Some(cards) = seen else {
+            panic!("never read both cards with card 0's newest reading");
+        };
+        assert_eq!(
+            cards.iter().map(|g| g.index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(cards[1].bus, "0000:06:00.0", "the split line was joined");
+        for _ in 0..100 {
+            if st.poll().is_none() && !st.alive {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!st.alive, "the reader did not notice the program ended");
+        assert_eq!(st.poll(), None);
+    }
 
     /// The sparkline reader must be TOTAL on any `f64` slice: `kern top` derives it from the daemonless
     /// `runstats` mmap counter, and a corrupt page (a half-finished write, a truncated mmap - or, before
