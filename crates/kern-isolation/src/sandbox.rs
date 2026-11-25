@@ -462,10 +462,27 @@ impl Sandbox {
             out.push("--config".to_string());
             out.push(cfg.clone());
         }
-        // Network: isolated (loopback-only) is the default; opt into host net.
+        // A SANDBOX'S POSTURE, the one the Python and Node SDKs give theirs: a kern box follows
+        // docker (a NAT, an `EPERM` for a refused syscall, an OOM that kills one process), a
+        // sandbox does not. No network unless asked (`--net` shares the host's), no setuid gain,
+        // a refused syscall kills the caller with `SIGSYS`, and an OOM ends the whole box.
+        // MEASURED before: with the kern box default turned to a NAT, a builder box reached
+        // example.com while this builder's contract and its test said "isolated by default".
         if self.share_net {
             out.push("--net".to_string());
+        } else {
+            out.extend(["--network".to_string(), "none".to_string()]);
         }
+        out.extend(
+            [
+                "--security-opt",
+                "no-new-privileges",
+                "--security-opt",
+                "seccomp-deny=kill",
+                "--oom-group",
+            ]
+            .map(str::to_string),
+        );
         if self.readonly_root {
             out.push("--read-only".to_string());
         }
@@ -1339,8 +1356,21 @@ mod tests {
     fn defaults_are_secure_isolated_net_and_no_share_flags() {
         let s = Sandbox::builder().rootfs("/r").build().unwrap();
         let a = args(&s, "true", &[]);
-        // Isolated by default: NO --net.
+        // Isolated by default: NO --net, and `--network none`, since a kern box has a NAT.
         assert!(!a.iter().any(|x| x == "--net"), "default must isolate net");
+        assert!(
+            a.windows(2).any(|w| w[0] == "--network" && w[1] == "none"),
+            "default must say --network none: {a:?}"
+        );
+        // The SDKs' posture: no setuid gain, a refused syscall kills, an OOM ends the box.
+        for opt in ["no-new-privileges", "seccomp-deny=kill"] {
+            assert!(
+                a.windows(2)
+                    .any(|w| w[0] == "--security-opt" && w[1] == opt),
+                "{opt}: {a:?}"
+            );
+        }
+        assert!(a.iter().any(|x| x == "--oom-group"), "{a:?}");
         // Quiet + rootfs + command separator present.
         assert_eq!(a[0], "box");
         assert!(a.iter().any(|x| x == "-q"));
@@ -1378,6 +1408,10 @@ mod tests {
         };
         assert_eq!(flag_val("--rootfs").as_deref(), Some("/root/fs"));
         assert!(a.iter().any(|x| x == "--net"), "share_network → --net");
+        assert!(
+            !a.iter().any(|x| x == "--network"),
+            "share_network replaces --network none: {a:?}"
+        );
         assert!(a.iter().any(|x| x == "--read-only"));
         assert_eq!(flag_val("--hostname").as_deref(), Some("boxy"));
         assert_eq!(flag_val("--workdir").as_deref(), Some("/work"));

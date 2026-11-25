@@ -196,6 +196,11 @@ destination: into a box's `/` a `..` above the root stays at the root, a member 
 other destination is refused (`docker cp - c:/opt` of `../x`), and `a/../b` is `b`. Copied to the
 host, a member that leaves the directory is still refused.
 
+**The Rust `Sandbox` builder keeps a sandbox's posture.** With a kern box's network now a NAT, a box
+from `kern_isolation::Sandbox::builder()` reached the internet, while the builder's contract says
+isolated by default. It passes what the Python and Node SDKs pass: `--network none` unless
+`share_network()`, `no-new-privileges`, `seccomp-deny=kill` and `--oom-group`.
+
 **`depends_on: condition: service_healthy` through kern's socket.** A container's `Healthcheck`
 was not read, so the box had no check and the `docker compose` client refused the stack ("has no
 healthcheck configured"); it is the box's `--health-*` now, durations rounded up to whole seconds.
