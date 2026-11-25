@@ -623,7 +623,7 @@ fn the_per_verb_help_stays_per_verb_on_a_real_terminal() {
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default()
     };
-    for verb in ["box", "run", "limit", "volume", "pod", "config", "diff"] {
+    for verb in ["box", "run", "volume", "pod", "config", "diff"] {
         let text = text_of(&format!("{verb} --help"));
         let n = text.lines().count();
         assert!(
@@ -694,8 +694,12 @@ fn every_flag_box_parses_is_advertised_in_its_help() {
         //  --overlay-upper   the build path hands it the persistent upper for that step.
         //  --log-streams     `kern compat docker` asks for stdout and stderr kept apart in the log.
         //  --copy-in         `kern compat docker` hands a created container's copied archives on.
+        //  --idle            `kern cp` starts a stopped kept box on its layer, its workload idle,
+        //  --layer-of        to copy through it (`boxcp`), and nothing else passes either.
         const INTERNAL: &[&str] = &[
             "--copy-in",
+            "--idle",
+            "--layer-of",
             "--def-hash",
             "--log-streams",
             "--overlay-lower",

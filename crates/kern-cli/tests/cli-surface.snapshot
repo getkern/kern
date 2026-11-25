@@ -6,8 +6,6 @@ COMMANDS:
     box <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     box <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     run [opts] <image> [CMD...]                                    Run CMD in a sandbox from <image>, docker run's shape (box's options); -d prints the name
-    limit [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...       Run CMD on this host under CPU/mem caps (no sandbox)
-    limit --landlock-rw <path> [--] CMD...                         Confine CMD's writes to <path> (kernel LSM, no sandbox)
     exec <name> [-i|-t|-it] [-u <user>] [--env K=V] [-w <dir>] [--] [CMD...]  Run CMD in a running box
     ps [-a] [--json] [-q] [--filter name=|status=|id=|label=|pod=|health=] [--format T] [--no-trunc] [--last N|-n N]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     logs <name>|--all [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
@@ -38,10 +36,10 @@ COMMANDS:
     sandbox ls [--json] | history [-n N] [--failed] [--all] [--json] | stats [--all] [--json]  The SDK and MCP sandboxes: running now, finished, outcomes
     sandbox show [<box>] [-n N] [--json]                         The code SDK sandboxes ran and their output (kept with the history)
     sandbox keep|clear [memory|disk|off]                             Where the finished ones are kept (default memory: until reboot), or remove them
-    inspect <name> [--json] [-f|--format T] [--platform P]         Full detail for one box; -f renders a Go-style template
+    inspect <name> [--json] [-f|--format T] [--platform P]         Full detail for one box, running or kept (stopped, or between two runs); -f renders a Go-style template
     port <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
     attach <name>                                                  Stream a box's output live (Ctrl-C detaches)
-    cp [-L] <box>:<src> <dst> | [-L] <src> <box>:<dst>               Copy files or directories host<->box (- = a tar on stdout/stdin; -L follows a symlink SRC)
+    cp [-L] <box>:<src> <dst> | [-L] <src> <box>:<dst>               Copy files or directories host<->box, running or kept (stopped, or between two runs) (- = a tar on stdout/stdin; -L follows a symlink SRC)
     pause <name>... | --all                                        Freeze box(es) (cgroup freezer)
     unpause <name>... | --all                                      Thaw frozen box(es)
     kill [-s SIGNAL] <name>... | killall                           Kill box(es) at once (SIGKILL), or send SIGNAL to the init
@@ -105,6 +103,6 @@ COMMANDS:
 
 
 OPTIONS:
-    Per verb, where you are asking about it: kern <verb> --help (box, run, limit, compose, pod, volume, image, config, top)
+    Per verb, where you are asking about it: kern <verb> --help (box, run, compose, pod, volume, image, config, top)
 
 Docs & issues: https://github.com/getkern/kern
