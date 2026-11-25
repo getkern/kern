@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 kern-common = { path = "../kern-common" }
+kern-compat = { path = "../kern-compat" }
 kern-compose = { path = "../kern-compose" }
 kern-oci = { path = "../kern-oci" }
 kern-isolation = { path = "../kern-isolation" }

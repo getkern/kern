@@ -1,0 +1,16 @@
+[package]
+name = "kern-compat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Docker Engine API on a Unix socket, answered by kern: `kern compat docker` (internal)."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+kern-common = { path = "../kern-common" }
+libc = "0.2"

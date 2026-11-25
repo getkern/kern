@@ -152,6 +152,7 @@ dependencies = [
  "blake2",
  "ed25519-dalek",
  "kern-common",
+ "kern-compat",
  "kern-compose",
  "kern-isolation",
  "kern-oci",
@@ -174,6 +175,14 @@ dependencies = [
 name = "kern-common"
 version = "0.0.0"
 dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "kern-compat"
+version = "0.0.0"
+dependencies = [
+ "kern-common",
  "libc",
 ]
 

@@ -641,7 +641,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 17] = [
+const AUTHORITATIVE_DIRS: [&str; 18] = [
     "instances",
     "claims",
     "exit",
@@ -682,6 +682,10 @@ const AUTHORITATIVE_DIRS: [&str; 17] = [
     // port and signals nothing from it, but a box able to write it would point those URLs at a port
     // of its choosing, so it is kern's to write.
     "router",
+    // `compat-docker/<pid>/` holds the `docker` link `kern compat docker -- CMD` puts at the front
+    // of that command's PATH. A box able to write it would choose which binary the user's own
+    // script runs when it calls `docker`, so it is kern's to write.
+    "compat-docker",
     // `gpu/` remembers which directories of the WSL2 driver store hold the NVIDIA driver, and kern
     // binds what it lists into every `--gpus` box. A box able to write it would choose host
     // directories other boxes get, so it is authoritative; the reader also re-checks every line.

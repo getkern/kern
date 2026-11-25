@@ -1,11 +1,135 @@
 # Docker compatibility
 
-kern speaks Docker's **formats**, so existing images and stacks work. It does **not** reimplement the
-Docker Engine API. This page is the reference: what is supported, what is not, and where the
+kern speaks Docker's **formats**, so existing images and stacks work. The `docker` command line and
+the part of the Docker Engine API that test tools use are translated into kern's own commands; there
+is no Docker daemon. This page is the reference: what is supported, what is not, and where the
 differences bite.
 
 Every figure here is measured, against **Docker 29.6.2** on a real daemon (aarch64) and **podman
 4.9.3** rootless. [RUNTIME-PARITY.md](RUNTIME-PARITY.md) carries those measurements one by one.
+
+## The `docker` command line: `kern-docker`
+
+Scripts that call the `docker` CLI (`docker exec -i db psql < seed.sql`, `docker compose up -d
+--build`, `docker run --rm --network shop_default -v data:/x img cmd`) run against kern's boxes
+through `kern-docker`, a link to kern that translates the command into kern's own and runs it. No
+daemon and no socket: one process, as `kern` is.
+
+| How | What changes |
+|---|---|
+| `ln -s "$(command -v kern)" ~/.local/bin/kern-docker` | `kern-docker <docker command>` works; nothing else |
+| `kern compat docker -- npm run dev` | inside that command, and every process it starts, `docker` and `docker-compose` are kern; nothing outside it |
+| `kern compat docker link <dir>` | a `docker` link in `<dir>`, recorded; `kern compat docker status` and `kern doctor` show it and say which `docker` comes first in PATH; `kern compat docker unlink <dir>` removes it |
+| `kern compat docker -- npm run dev` in Windows | the same for a Windows command: its PATH starts with a folder holding kern's `docker.exe` and `docker-compose.exe`, which forward to kern in the distro with `C:\` paths translated; the folder goes when the command ends |
+
+A `docker` link to kern made any other way is refused, with the commands above. On Windows there is
+no `link`: Docker Desktop's `docker.exe` is in the system PATH, which Windows puts before the user's,
+so only a per-command PATH decides which `docker` a script gets. kern never replaces
+a file that is not its own, and never hands a command to a docker engine.
+
+**Translated, flag by flag.** A flag passes only when kern's flag of that name means the same:
+`run` (onto `kern box`), `create`, `exec`, `ps`, `logs`, `inspect`, `rm`, `stop`, `restart`,
+`start`, `kill`, `images`, `rmi`, `pull`, `push`, `tag`, `save`, `load`, `history`, `cp`, `stats`,
+`wait`, `rename`, `port`, `login`, `logout`, `info`, `build`, `volume ls|rm|create|inspect`,
+`network ls|inspect|create|rm`, `container <verb>`, `image <verb>`, and `compose` whole. Any other
+flag or verb stops the command with exit 125, naming it: `kern-docker: docker run --log-opt: kern has
+no flag with the same meaning, so the command is not run`.
+
+**What differs, and is said.**
+
+- `docker version` and `--version` print kern and kern's version. A script that checks for a
+  Docker version number stops there.
+- `docker run` without `--network`, or with `--network bridge`, gets kern's default, no network,
+  and says so on stderr. `--network <project>_default` joins a running stack with its outbound;
+  `--network host` shares this machine's.
+- `docker run -d` and `docker create` print the box's name where docker prints an id (`kd-` and 8
+  hex digits when no `--name` is given), so `id=$(docker run -d ...)` feeds `docker logs "$id"`.
+- `DOCKER_HOST` or `DOCKER_CONTEXT` set, or `-H`/`--context` given, is refused: the command asked
+  for a particular engine.
+- A script that calls `docker` by its full path (`/usr/bin/docker`) does not go through PATH, so
+  `kern compat docker` does not reach it.
+
+## The Docker socket: `kern compat docker enable`
+
+Programs that speak to the Docker Engine API rather than run the `docker` command (Testcontainers,
+docker-py, the `docker` CLI pointed at a socket) drive kern's boxes through a socket of this user,
+`0600`, at `$XDG_RUNTIME_DIR/kern/compat-docker.sock`. Every request becomes a `kern` command run by
+the same binary, as this user, so every rule kern applies to a box applies here.
+
+| How | What happens |
+|---|---|
+| `kern compat docker enable` | a `systemd --user` socket unit: the server starts at the first connection (24 ms for the first answer, 9 ms after) and exits after a minute without a client; boxes it started keep running |
+| `kern compat docker disable` | the unit off and removed, the socket gone; boxes keep running |
+| `kern compat docker serve` | the same server in the foreground, until stopped: where there is no systemd user manager (WSL without systemd, CI, a bare ssh session) |
+| `kern compat docker status` | whether the socket is enabled, listening, and its server running |
+
+```sh
+kern compat docker enable
+export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/kern/compat-docker.sock TESTCONTAINERS_RYUK_DISABLED=true
+```
+
+The socket lives only in kern's runtime directory, which no box may mount, whole or through a
+parent. A container asking for a socket as a bind source (Testcontainers' reaper, Ryuk, asks for
+this one) is refused at the create, naming `TESTCONTAINERS_RYUK_DISABLED=true`: whatever runs in a
+box holding the socket is this user, and could ask it for any box.
+
+**Ryuk's job, done by kern.** A container labelled with a Testcontainers session
+(`org.testcontainers.session-id`) is filed under the process that created it, read from the socket
+with its start time, and removed once that process ends, a `kill -9` included: measured 1.0 s after
+the kill on Linux. No container holds the socket and no TCP port is opened for it. While such
+containers wait, the socket-started server does not exit.
+
+**From Windows: `kern compat docker pipe`.** Windows programs (Testcontainers for Java or .NET, the
+`docker` CLI with `-H npipe:////./pipe/kern-docker`) reach the same API on the named pipe
+`\\.\pipe\kern-docker`, served by `kern.exe` while that command runs:
+
+```bat
+kern compat docker pipe
+set DOCKER_HOST=npipe:////./pipe/kern-docker
+set TESTCONTAINERS_RYUK_DISABLED=true
+```
+
+- The pipe grants access to the account that started it and nobody else (its SID, from the process
+  token), refuses remote clients, and is not shared: if another process holds the name, `pipe`
+  stops and says so. There is no TCP endpoint.
+- Each connection is carried to the distro by one `wsl.exe` (measured on Windows 10: 61 ms for a
+  connection, which a docker client keeps open for many requests); the first one starts the server
+  there.
+- A test session's containers are removed when its Windows process ends: `kern.exe` watches that
+  process and tells the distro (measured: 258 ms after the process exited).
+
+| Request | Becomes |
+|---|---|
+| `containers/create`, `start` | `kern box <name> -d ...`, run at the start; the image, command, entrypoint, env, labels, workdir, user, hostname, published ports (`PortBindings`, `PublishAllPorts`), binds, memory, CPUs, `AutoRemove`, `NetworkMode` default, bridge, host or none |
+| `attach`, then `start` (`docker run` without `-d`) | `kern box` in the foreground: stdout and stderr come back apart, and the box's exit code is the run's |
+| `exec`, `exec/{id}/start`, `exec/{id}/json` | `kern exec`, stdout and stderr apart, the exit code, `-t`, `-u`, `-w`, env, detached |
+| `json` (list and inspect), `logs`, `wait`, `stop`, `kill`, `restart`, `DELETE` | `kern ps`, `inspect --json`, `logs`, `wait`, `stop`, `kill`, `restart`, `rm` |
+| `images/create`, `images/{name}/json` | `kern pull`, `kern images --json` |
+| `_ping`, `version`, `info` | kern and kern's version |
+
+Measured on this machine (Linux x86_64) with the clients themselves, through the socket unit:
+
+| Client | Cases | Time |
+|---|---|---|
+| `docker` CLI 29.1.3 with `DOCKER_HOST` | 18 of 18: `run --rm` stdout, stderr and exit code, `run` then `ps -a`, `inspect`, `rm`, 50,000 lines, `run -d -p` reached by curl, `exec` exit code, `stop`, `rm`, `--privileged` refused | `docker run --rm alpine` 28 ms, `exec` 15 ms |
+| Testcontainers for Python 4.15.0 | Redis module (`GET` answers), Postgres module with SQLAlchemy (`select version()`, its readiness check is an `exec` of `psql`), nginx with a log wait | Redis 136 ms, Postgres 1181 ms, nginx 1048 ms, images cached |
+| docker-py 7.2.0 | 9 of 9 exec cases: stdout and stderr apart, exit codes, env, workdir, user, 200 kB of output, tty, detached, a second start refused with 409, privileged refused | one `exec_run` 6 ms |
+
+**What differs, and is said.**
+
+- Testcontainers' reaper (Ryuk) is refused, as above; with `TESTCONTAINERS_RYUK_DISABLED=true` each
+  test removes its own containers, as the `with` block does.
+- `--mount` (`HostConfig.Mounts`) is refused by name; a bind (`-v src:dst`) is translated.
+- `logs` of a box started with `-d` is one stream: kern keeps a box's stdout and stderr as one. The
+  attached `run` and `exec` keep them apart.
+- A container's id is derived from its box name, the same every time, and `docker ps` lists kern's
+  boxes, not only those made through the socket.
+- A box run attached and ended without `--rm` is remembered by the server until `docker rm`; kern
+  itself keeps nothing of a foreground box once it ends, and a restarted server knows nothing of it.
+- What kern refuses without a flag is refused here by name with a 400: `Privileged`, `Devices`,
+  `DeviceRequests` (GPUs), `CapAdd`, `SecurityOpt`, `VolumesFrom`, `Links`, and the host's pid, ipc or
+  uts namespace. An endpoint that is not translated (networks, volumes, build) answers 501 and says
+  so; kern never hands a request to a Docker daemon.
 
 ## What "compose compatibility" means, in three numbers
 
