@@ -116,6 +116,10 @@ is enabled and whether HTTPS for `.localhost` is on. `kern top` flags a box with
 `net:nat`, as it flags `net:host`, so the boxes that reach the internet are told from a `--network
 none` one.
 
+**`kern cp` and `docker cp` into a box keep a sparse file sparse.** A tar carries a sparse file
+whole, and its zeros were written out: a 1 GiB file with 1 MiB of data took 1 GiB on the destination,
+as it does under Docker. A block of zeros is a hole now, so it takes the 1 MiB, with the same bytes.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

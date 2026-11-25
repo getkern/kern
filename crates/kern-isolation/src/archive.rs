@@ -790,13 +790,28 @@ impl Dest {
         let mut f = std::fs::File::from(owned(fd));
         let mut buf = vec![0u8; 64 * 1024];
         let mut left = size;
+        // A BLOCK OF ZEROS IS A HOLE, NOT A WRITE: a tar carries a sparse file whole, and writing
+        // it out filled the disk with its zeros. MEASURED: a 1 GiB file holding 1 MiB of data took
+        // 1048580 KiB on the destination after `kern cp` and after `docker cp` alike. Each 64 KiB
+        // block that is all zero is skipped with a seek, and the length is set at the end, so the
+        // file reads back the same and takes the space its data takes.
+        let mut holes = false;
         while left > 0 {
             let want = buf.len().min(left as usize);
             if !read_full(r, &mut buf[..want])? {
                 return Err(bad("the archive ends inside a file".into()));
             }
-            f.write_all(&buf[..want])?;
+            if buf[..want].iter().all(|&b| b == 0) {
+                use std::io::Seek;
+                f.seek(std::io::SeekFrom::Current(want as i64))?;
+                holes = true;
+            } else {
+                f.write_all(&buf[..want])?;
+            }
             left -= want as u64;
+        }
+        if holes {
+            f.set_len(size)?;
         }
         unsafe { libc::fchmod(f.as_raw_fd(), mode) };
         set_times(f.as_raw_fd(), mtime);
@@ -1128,6 +1143,42 @@ mod tests {
             assert!(listing.contains(&format!("d/sub/{long}")), "{listing}");
         }
         for p in [src, out, flat] {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+
+    /// A file mostly of zeros comes out with its holes: the same bytes, a fraction of the blocks.
+    #[test]
+    fn a_sparse_file_keeps_its_holes_through_the_archive() {
+        use std::io::{Seek, Write};
+        use std::os::unix::fs::MetadataExt;
+        let src = tmp("sparse-src");
+        let d = src.join("d");
+        std::fs::create_dir_all(&d).expect("mkdir");
+        let mut f = std::fs::File::create(d.join("s")).expect("create");
+        f.seek(std::io::SeekFrom::Start(8 << 20)).expect("seek");
+        f.write_all(b"tail").expect("write");
+        drop(f);
+        std::fs::write(d.join("zeros-at-end"), vec![0u8; 256 << 10]).expect("write");
+        let tar = archive_of(&src, "d", Some(b"d"));
+        let out = tmp("sparse-out");
+        read_archive(&mut tar.as_slice(), &host_dest(&out)).expect("read archive");
+        let o = out.join("d");
+        let m = std::fs::metadata(o.join("s")).expect("s");
+        assert_eq!(m.len(), (8 << 20) + 4);
+        assert!(
+            m.blocks() * 512 < 1 << 20,
+            "{} bytes allocated",
+            m.blocks() * 512
+        );
+        let back = std::fs::read(o.join("s")).expect("read");
+        assert!(back[..8 << 20].iter().all(|&b| b == 0) && &back[8 << 20..] == b"tail");
+        // A file that ENDS in zeros still has its length.
+        assert_eq!(
+            std::fs::metadata(o.join("zeros-at-end")).expect("z").len(),
+            256 << 10
+        );
+        for p in [src, out] {
             let _ = std::fs::remove_dir_all(p);
         }
     }
