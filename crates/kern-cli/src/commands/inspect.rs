@@ -2558,9 +2558,12 @@ pub fn diff(name: &str, json: bool) -> Result<(), Error> {
 /// (`<name>-<pid>.log`): name, pid, when it last ran, and whether it's still running. A lightweight
 /// audit trail without a separate history store (prune/gc remove these, so it's "recent", not "all").
 pub fn history(count: usize) -> Result<(), Error> {
-    let dir = registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;
+    registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;
     let mut rows: Vec<(String, i32, u64, bool)> = Vec::new(); // name, pid, mtime, alive
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    for dir in registry::log_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let fname = e.file_name();
             let fname = fname.to_string_lossy();
@@ -2737,13 +2740,21 @@ fn log_head<W: std::io::Write>(
             .and_then(registry::split_log_file)
             .map(|(k, _)| k.to_string())
             .unwrap_or_default();
-        let dir = registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;
+        let dirs = registry::log_dirs();
         for key in crate::commands::boxlog::runs_with_logs(name) {
             if key == current {
                 continue;
             }
             for suffix in [".1", ""] {
-                let p = dir.join(format!("{key}.log{suffix}"));
+                // In whichever place that run's log is (on disk, or the previous version's runtime
+                // directory): `runs_with_logs` listed both.
+                let Some(p) = dirs
+                    .iter()
+                    .map(|d| d.join(format!("{key}.log{suffix}")))
+                    .find(|p| p.exists())
+                else {
+                    continue;
+                };
                 let Ok(content) = std::fs::read(&p) else {
                     continue;
                 };

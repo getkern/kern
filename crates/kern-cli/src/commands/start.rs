@@ -3390,9 +3390,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let mut reg_state = {
         let pid = launcher_pid;
         if managed {
-            let log = registry::logs_dir()
-                .ok()
-                .map(|d| d.join(format!("{}-{}.log", name.as_str(), pid)));
+            let log = registry::box_log_path(name.as_str(), pid as u32);
             detach_stdio(log.as_deref(), log_cap);
             // `[kern] log_keep_ended`: a new log is being made, so the old ones are bounded now.
             let _ = registry::expire_ended_logs();
@@ -6011,9 +6009,7 @@ fn run_detached(
         kern_isolation::arm_launcher_notice(notice_wr);
     }
     // Send the box's stdout/stderr to a per-box log file (so `kern logs` can show it).
-    let log = registry::logs_dir()
-        .ok()
-        .map(|d| d.join(format!("{}-{}.log", name.as_str(), pid)));
+    let log = registry::box_log_path(name.as_str(), pid as u32);
     detach_stdio(log.as_deref(), log_cap);
     // `[kern] log_keep_ended`: a new log is being made, so the old ones are bounded now. After the
     // log is open, so this box's own file is the youngest in the store and never a candidate.

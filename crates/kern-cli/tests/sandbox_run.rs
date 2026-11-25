@@ -23,7 +23,19 @@ fn stack_file(stem: &str, ext: &str) -> std::path::PathBuf {
 }
 
 fn kern() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_kern"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_kern"));
+    // A DATA DIR OF THIS TEST RUN, so nothing a test writes there (box logs since they are kept on
+    // disk, volumes, kept boxes, builds) lands in the data dir of whoever runs the suite. A test that
+    // needs its own sets `XDG_DATA_HOME` after this, which replaces it.
+    c.env("XDG_DATA_HOME", test_data_home());
+    c
+}
+
+/// The data dir every `kern()` of this test process uses unless the test sets its own.
+fn test_data_home() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("kern-it-data-{}", std::process::id()));
+    let _ = fs::create_dir_all(&d);
+    d
 }
 
 /// Run `kern <args>` (which is expected to print something) and return its output, retrying a few
@@ -4386,13 +4398,19 @@ fn logs_timestamps_stamp_every_line_and_the_tail_agrees() {
     );
 
     // A log with no index (an older kern's, or a rotated generation) prints, and says `-`.
-    let logdir = xdg.join("kern/logs");
+    // On disk, in this test run's data dir (`kern()`), where a box's log is kept.
+    let logdir = test_data_home().join("kern/logs");
     let idx: Vec<_> = fs::read_dir(&logdir)
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.to_string_lossy().ends_with(".log.idx"))
+        // This box's own: the data dir is shared by the tests of this run.
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("logts-"))
+                && p.to_string_lossy().ends_with(".log.idx")
+        })
         .collect();
     assert_eq!(idx.len(), 1, "the pump should write exactly one index");
     let _ = fs::remove_file(&idx[0]);
@@ -8119,7 +8137,8 @@ fn rm_takes_a_detached_boxs_logs_but_not_the_reason_it_failed_to_start() {
     let xdg = std::env::temp_dir().join(format!("kern-it-rmlogs-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let logs = xdg.join("kern").join("logs");
+    // On disk, in this test run's data dir (`kern()`), where a box's log is kept.
+    let logs = test_data_home().join("kern").join("logs");
     let run = |args: &[&str]| {
         kern()
             .env("XDG_RUNTIME_DIR", &xdg)
@@ -19983,9 +20002,9 @@ fn a_box_with_the_none_log_driver_keeps_no_output_and_logs_says_so() {
     // ONLY THE FILES THIS RUN MAKES: a box of an earlier run (or of a sabotaged build) may have left
     // one with the same prefix, and counting it would blame this box for it.
     let log_files = || -> Vec<String> {
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .and_then(|x| fs::read_dir(x.join("kern/logs")).ok())
+        // Where `kern()` keeps a box's log: on disk, in this test run's data dir.
+        fs::read_dir(test_data_home().join("kern/logs"))
+            .ok()
             .map(|rd| {
                 rd.flatten()
                     .map(|e| e.file_name().to_string_lossy().into_owned())

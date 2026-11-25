@@ -4684,7 +4684,7 @@ fn where_lines(p: &Palette) -> Vec<String> {
 }
 
 /// The WHERE block of the Storage tab, as short as the facts allow: the data root and its free space,
-/// then only the parts kept somewhere else (logs in memory are such a part by default).
+/// then only the parts kept somewhere else.
 fn where_summary(p: &Palette) -> Vec<String> {
     let (c, d, z) = (p.c, p.d, p.z);
     let place = |key: &str| -> String {
@@ -4698,14 +4698,11 @@ fn where_summary(p: &Palette) -> Vec<String> {
             .unwrap_or_default();
         format!("{c}{}{z}{free}", trunc(&path, 44))
     };
-    let mut first = format!("data {}", place("data_dir"));
+    let first = format!("data {}", place("data_dir"));
     let mut more = Vec::new();
     for (key, _) in crate::config::DIR_KEYS.iter().skip(1) {
-        let name = key.trim_end_matches("_dir");
         if crate::config::dir_setting(key).is_some() {
-            more.push(format!("{name} {}", place(key)));
-        } else if *key == "logs_dir" {
-            first.push_str(&format!(" {d}· logs in memory{z}"));
+            more.push(format!("{} {}", key.trim_end_matches("_dir"), place(key)));
         }
     }
     let mut out = vec![first];

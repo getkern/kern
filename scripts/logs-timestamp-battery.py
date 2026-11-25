@@ -29,7 +29,7 @@ import os, re, shutil, subprocess, sys, tempfile, threading, time
 K = os.environ.get("KERN_BIN") or os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "target", "release", "kern")
 XDG = tempfile.mkdtemp(prefix="kern-stress-")
-ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG)
+ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG, XDG_DATA_HOME=XDG)
 LOGS = os.path.join(XDG, "kern", "logs")
 FAIL = 0
 
@@ -131,7 +131,7 @@ shutil.rmtree(XDG, ignore_errors=True)
 
 
 XDG = tempfile.mkdtemp(prefix="kern-compact-")
-ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG)
+ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG, XDG_DATA_HOME=XDG)
 LOGS = os.path.join(XDG, "kern", "logs")
 NAME = "comp"
 # 40 s di righe corte ogni ~60 ms: ~650 marche potenziali contro un tetto di 256, quindi almeno
@@ -231,7 +231,7 @@ shutil.rmtree(XDG, ignore_errors=True)
 # uno stamp troppo RECENTE, e ogni asserzione scritta finora passa. Un test che non puo' vedere un
 # difetto non e' una prova che il difetto non c'e'.
 XDG = tempfile.mkdtemp(prefix="kern-fw-")
-ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG)
+ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG, XDG_DATA_HOME=XDG)
 LOGS = os.path.join(XDG, "kern", "logs")
 
 subprocess.run(
@@ -388,7 +388,7 @@ print(f"\n== {'TUTTO PASS' if not FAIL else str(FAIL) + ' FAIL'} ==")
 # questa giornata hanno gia' smentito, e un log cancellato per nome sotto un fd aperto e' il caso in
 # cui POSIX continua a servire i byte finche' il descrittore vive: il difetto sarebbe silenzioso.
 XDG = tempfile.mkdtemp(prefix="kern-gc-")
-ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG)
+ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG, XDG_DATA_HOME=XDG)
 LOGS = os.path.join(XDG, "kern", "logs")
 subprocess.run(
     [K, "box", "gcv", "--image", "alpine:3.19", "-d", "--log-max-size", "4k", "--",

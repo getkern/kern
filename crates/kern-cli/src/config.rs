@@ -227,8 +227,8 @@ pub struct KernSettings {
     /// `max-file` counting), for every box that does not say otherwise. Absent means 2.
     pub log_max_file: Option<u32>,
     /// `log_keep_ended` - how long the log of a box that ENDED is kept, in seconds, before kern
-    /// removes it on its own. Absent means until `kern prune`, `kern gc` or a reboot, which is what
-    /// kern always did.
+    /// removes it on its own. Absent means 7 days (`registry::LOG_KEEP_ENDED_DEFAULT_S`), since the
+    /// logs are on disk and a reboot no longer clears them; a kept box's log is never expired.
     ///
     /// Applied when a detached box starts, because that is the only moment a new log is made: with
     /// no box starting, the store is not growing, and no daemon is needed to bound it.
@@ -271,8 +271,7 @@ pub struct KernSettings {
     /// `volumes_dir` - where named volumes are made. Absent means `data_dir`'s `volumes/`. A single
     /// volume can still be put anywhere with `kern volume create <name> --path <dir>`.
     pub volumes_dir: Option<std::path::PathBuf>,
-    /// `logs_dir` - box logs on a disk, kept across reboots. Absent means the runtime directory,
-    /// in memory, cleared at reboot.
+    /// `logs_dir` - box logs on a disk of their own. Absent means the data dir's `logs/`.
     pub logs_dir: Option<std::path::PathBuf>,
     /// `history_dir` - the sandbox history when it is kept on disk. Absent means `data_dir`'s
     /// `history/`.
@@ -285,7 +284,7 @@ pub(crate) const DIR_KEYS: [(&str, &str); 5] = [
     ("data_dir", "everything below, unless set on its own"),
     ("images_dir", "images and their layers"),
     ("volumes_dir", "named volumes"),
-    ("logs_dir", "box logs (default in memory, cleared at reboot)"),
+    ("logs_dir", "box logs"),
     ("history_dir", "the sandbox history kept on disk"),
 ];
 
@@ -309,7 +308,7 @@ pub(crate) const SETTABLE_KERN_KEYS: &[(&str, SettingKind, &str)] = &[
     (
         "log_keep_ended",
         SettingKind::Duration,
-        "remove the log of a box that ended after this long (default: until `kern prune` or reboot)",
+        "remove the log of a box that ended after this long (default 7d; a kept box's stays)",
     ),
     (
         "build_keep",
@@ -364,7 +363,7 @@ pub(crate) const SETTABLE_KERN_KEYS: &[(&str, SettingKind, &str)] = &[
     (
         "logs_dir",
         SettingKind::Path,
-        "box logs on a disk, kept across reboots (default in memory, cleared at reboot)",
+        "where box logs are kept (default data_dir's logs/)",
     ),
     (
         "history_dir",

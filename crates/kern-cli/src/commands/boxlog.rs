@@ -1774,9 +1774,12 @@ fn is_run_log_of(file: &str, name: &str) -> bool {
 
 /// Every run log of `name`, oldest first (by modification time).
 pub(crate) fn logs_oldest_first(name: &str) -> Result<Vec<PathBuf>, Error> {
-    let dir = registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;
+    registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;
     let mut runs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
+    for dir in registry::log_dirs() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             if is_run_log_of(&e.file_name().to_string_lossy(), name) {
                 if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
@@ -1829,14 +1832,13 @@ pub(crate) const KEPT_RUN_LOGS: usize = 16;
 /// The runs of `name` that have a log here (`<name>-<pid>` keys), oldest first by their main
 /// file's modification time.
 pub(crate) fn runs_with_logs(name: &str) -> Vec<String> {
-    let (Ok(dir), prefix) = (registry::logs_dir(), format!("{name}-")) else {
-        return Vec::new();
-    };
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
+    let prefix = format!("{name}-");
     let mut runs: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for e in rd.flatten() {
+    for e in registry::log_dirs()
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.flatten())
+    {
         let fname = e.file_name();
         let Some((key, suffix)) = fname.to_str().and_then(registry::split_log_file) else {
             continue;
@@ -1878,13 +1880,12 @@ pub(crate) fn runs_are_one_container(name: &str) -> bool {
 }
 
 pub(crate) fn remove_logs_of(name: &str) {
-    let (Ok(dir), prefix) = (registry::logs_dir(), format!("{name}-")) else {
-        return;
-    };
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return;
-    };
-    for e in rd.flatten() {
+    let prefix = format!("{name}-");
+    for e in registry::log_dirs()
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.flatten())
+    {
         let fname = e.file_name();
         let ours = fname
             .to_str()
@@ -1899,20 +1900,22 @@ pub(crate) fn remove_logs_of(name: &str) {
 
 /// Remove one run's log: every file [`registry::run_log_files`] names for `key` (`<name>-<pid>`).
 pub(crate) fn remove_run_logs(key: &str) {
-    let Ok(dir) = registry::logs_dir() else {
-        return;
-    };
-    for (path, _) in registry::run_log_files(&dir, key) {
-        let _ = std::fs::remove_file(path);
+    for dir in registry::log_dirs() {
+        for (path, _) in registry::run_log_files(&dir, key) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
 /// The newest `<name>-<pid>.log` under the logs dir, or `None` if the box has produced no log.
 pub(crate) fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
-    let dir = registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;
+    registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;
     let prefix = format!("{name}-");
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    if let Ok(rd) = std::fs::read_dir(&dir) {
+    for dir in registry::log_dirs() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             let fname = e.file_name();
             let fname = fname.to_string_lossy();

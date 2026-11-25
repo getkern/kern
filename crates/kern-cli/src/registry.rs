@@ -271,12 +271,83 @@ pub fn dir() -> io::Result<PathBuf> {
 
 /// The logs directory (one `<name>-<pid>.log` per detached box), created on demand.
 pub fn logs_dir() -> io::Result<PathBuf> {
-    // `[kern] logs_dir`: the logs on a disk, kept across reboots. Made private, and refused if it is
-    // not a directory of this user's (a planted symlink or another account's directory).
+    // `[kern] logs_dir`: the logs where the user says. Made private, and refused if it is not a
+    // directory of this user's (a planted symlink or another account's directory).
     if let Some(dir) = crate::config::dir_setting("logs_dir") {
         return private_own_dir(&dir);
     }
-    runtime_subdir("logs")
+    default_logs_dir()
+}
+
+/// THE LOGS ARE ON DISK BY DEFAULT, in `<data dir>/logs`, as Docker keeps a container's log in its
+/// data root: a reboot no longer takes them. MEASURED before the change, a detached box started with
+/// its log on ext4 against tmpfs: -0.115 ms (95% interval [-0.166, -0.034]), no cost to pay.
+///
+/// WRITTEN THERE ALWAYS, and the logs the previous version wrote in the runtime directory are READ
+/// as well ([`log_dirs`]): a rule that kept writing to the runtime directory while it held anything
+/// made where a log went depend on the state of the machine (a first version did; MEASURED, a fresh
+/// runtime dir and the user's usual one gave two answers).
+fn default_logs_dir() -> io::Result<PathBuf> {
+    match crate::keepbox::data_root() {
+        Some(root) => private_own_dir(&root.join("logs")),
+        None => runtime_subdir("logs"),
+    }
+}
+
+/// Every directory a box's log can be in, the one written to first: [`logs_dir`], then the runtime
+/// directory the previous version wrote logs in, while it exists. For the readers that look a box's
+/// log up by name, so a box started before the upgrade keeps its `kern logs`, and for `kern prune`.
+pub(crate) fn log_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = logs_dir().ok().into_iter().collect();
+    // The runtime directory THIS process uses (its first candidate), not the first that exists: the
+    // fallback `/run/user/<uid>` is another runtime's when `XDG_RUNTIME_DIR` points elsewhere.
+    if let Some(rt) = runtime_subdir_candidates("logs")
+        .into_iter()
+        .next()
+        .filter(|p| p.is_dir())
+    {
+        if !out.contains(&rt) {
+            out.push(rt);
+        }
+    }
+    out
+}
+
+/// The log file of the box run `<name>-<pid>`, for the code that WRITES it. A file of that name made
+/// before this boot is another run's (the pid came round again), and is removed with its rotations
+/// and index first: on disk it survives the reboot, and appending to it would show that run's output
+/// as this one's.
+pub(crate) fn box_log_path(name: &str, pid: u32) -> Option<PathBuf> {
+    let dir = logs_dir().ok()?;
+    let key = format!("{name}-{pid}");
+    if let Some(boot) = boot_time() {
+        clear_run_from_before(&dir, &key, boot);
+    }
+    Some(dir.join(format!("{key}.log")))
+}
+
+/// Remove the files of run `key` in `dir` when its log was last written before `boot`.
+fn clear_run_from_before(dir: &Path, key: &str, boot: SystemTime) {
+    let stale = fs::symlink_metadata(dir.join(format!("{key}.log")))
+        .and_then(|m| m.modified())
+        .is_ok_and(|mtime| mtime < boot);
+    if stale {
+        for (f, _) in run_log_files(dir, key) {
+            let _ = fs::remove_file(f);
+        }
+    }
+}
+
+/// When this machine booted (`btime` of `/proc/stat`).
+fn boot_time() -> Option<SystemTime> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    let secs: u64 = stat
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
 }
 
 /// `dir`, created `0700` when missing, and accepted only as a real directory this user owns.
@@ -3465,8 +3536,11 @@ pub fn prune() -> (usize, u64) {
     let mut freed = 0u64;
     let instances = dir().ok(); // for the concurrent-start re-check in the sweep
     let inst = instances.as_deref();
-    // `logs` keys differently (a generation and an index suffix), so it sweeps on its own.
-    sweep_orphans(logs_dir(), log_key, &live, inst, &mut removed, &mut freed);
+    // `logs` keys differently (a generation and an index suffix), so it sweeps on its own, in every
+    // place a log can be (the runtime directory of the previous version too).
+    for d in log_dirs() {
+        sweep_orphans(Ok(d), log_key, &live, inst, &mut removed, &mut freed);
+    }
     // EVERY PLAIN `<name>-<pid>` SIDECAR, IN ONE LIST, because that is what `sidecar_key` means and
     // a list is the only shape that makes the next one hard to forget.
     //
@@ -3526,18 +3600,30 @@ pub fn prune() -> (usize, u64) {
 /// would have removed too, only later. A box is judged by its NEWEST file, so a rotated generation
 /// is never removed while the active log beside it is still young.
 pub fn expire_ended_logs() -> (usize, u64) {
-    let Some(keep_s) = crate::config::load_cached(None)
+    // A WEEK BY DEFAULT, now that the logs are on a disk a reboot does not clear: an afternoon of
+    // detached test boxes left 218 ended logs (MEASURED). `[kern] log_keep_ended` sets another.
+    let keep_s = crate::config::load_cached(None)
         .ok()
         .and_then(|c| c.kern.log_keep_ended_s)
-    else {
-        return (0, 0);
-    };
+        .unwrap_or(LOG_KEEP_ENDED_DEFAULT_S);
     let Ok(d) = logs_dir() else {
         return (0, 0);
     };
     let live: std::collections::HashSet<String> = list()
         .iter()
         .map(|i| format!("{}-{}", i.name, i.pid))
+        .collect();
+    // A KEPT BOX'S LOGS STAY until it is removed, as a stopped Docker container's do.
+    let kept: std::collections::HashSet<String> = fs::read_dir(crate::keepbox::boxes_dir())
+        .map(|r| {
+            r.flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let live: std::collections::HashSet<String> = live
+        .into_iter()
+        .chain(kept_log_keys(&d, &kept))
         .collect();
     let instances = dir().ok();
     expire_ended_logs_in(
@@ -3547,6 +3633,27 @@ pub fn expire_ended_logs() -> (usize, u64) {
         keep_s,
         std::time::SystemTime::now(),
     )
+}
+
+/// How long an ended box's log is kept when `[kern] log_keep_ended` is not set: seven days.
+pub(crate) const LOG_KEEP_ENDED_DEFAULT_S: u64 = 7 * 86_400;
+
+/// The log keys in `d` that belong to a kept box (`<kept name>-<digits>`), never expired by age.
+fn kept_log_keys(d: &Path, kept: &std::collections::HashSet<String>) -> Vec<String> {
+    if kept.is_empty() {
+        return Vec::new();
+    }
+    let Ok(rd) = fs::read_dir(d) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let f = e.file_name();
+            let key = log_key(f.to_str()?)?.to_string();
+            let (name, pid) = key.rsplit_once('-')?;
+            (pid.bytes().all(|b| b.is_ascii_digit()) && kept.contains(name)).then_some(key)
+        })
+        .collect()
 }
 
 /// [`expire_ended_logs`] on a given directory, live set and clock, for the tests.
@@ -4171,6 +4278,34 @@ mod deadline_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A LOG FROM BEFORE THE BOOT IS ANOTHER RUN'S. On disk it survives the reboot, the pid comes
+    /// round again, and appending to it showed that run's output as the new box's.
+    #[test]
+    fn a_run_log_from_before_the_boot_is_cleared_and_one_from_after_is_kept() {
+        let d = std::env::temp_dir().join(format!("kern-bootlog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("dir");
+        let boot = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let old = SystemTime::now() - std::time::Duration::from_secs(7200);
+        for f in ["web-42.log", "web-42.log.idx", "web-42.log.1"] {
+            let file = fs::File::create(d.join(f)).expect("file");
+            file.set_modified(old).expect("mtime");
+        }
+        fs::write(d.join("web-7.log"), b"this boot").expect("file");
+        fs::write(d.join("web-420.log"), b"another pid").expect("file");
+        clear_run_from_before(&d, "web-42", boot);
+        clear_run_from_before(&d, "web-7", boot);
+        let mut left: Vec<String> = fs::read_dir(&d)
+            .expect("read")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["web-420.log".to_string(), "web-7.log".to_string()]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
     use super::*;
 
     /// The orphan warning has to name WHERE it looked, because that is what separates its two causes.

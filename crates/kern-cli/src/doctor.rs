@@ -532,20 +532,25 @@ pub fn info() -> Result<(), Error> {
     let cap = crate::commands::boxlog::LogCap::resolve(None, None, true);
     let size_set = k.and_then(|k| k.log_max_size).is_some();
     let files_set = k.and_then(|k| k.log_max_file).is_some();
-    // On disk (`logs_dir`) a reboot does not clear them; in the runtime directory it does.
-    let on_disk = crate::config::dir_setting("logs_dir").is_some();
-    let ended = match (k.and_then(|k| k.log_keep_ended_s), on_disk) {
-        (Some(s), _) => format!("ended boxes' logs removed after {}", period(s)),
-        (None, true) => "ended boxes' logs kept until `kern prune`".to_string(),
-        (None, false) => "ended boxes' logs kept until `kern prune` or reboot".to_string(),
-    };
+    // WHERE THEY ARE AND HOW LONG AN ENDED BOX'S STAY: on disk by default (a reboot keeps them),
+    // in the runtime directory while the previous version's are still there, or where `logs_dir`
+    // says; a week for an ended box unless `log_keep_ended` says otherwise, a kept box's until it is
+    // removed.
     let logs_at = crate::registry::logs_dir()
         .map(|d| d.display().to_string())
         .unwrap_or_default();
-    let logs_where = if on_disk {
+    let in_runtime = crate::registry::runtime_subdir_public("logs")
+        .is_ok_and(|r| r.display().to_string() == logs_at);
+    let ended = match k.and_then(|k| k.log_keep_ended_s) {
+        Some(s) => format!("an ended box's removed after {}", period(s)),
+        None => "an ended box's removed after 7d (default), a kept box's when it is removed".to_string(),
+    };
+    let logs_where = if crate::config::dir_setting("logs_dir").is_some() {
         format!("in {logs_at} ([kern] logs_dir)")
+    } else if in_runtime {
+        format!("in {logs_at}, in memory: there is no data dir to keep them in")
     } else {
-        format!("in memory, {logs_at} (default; `kern config set logs_dir <path>` keeps them on disk)")
+        format!("in {logs_at} (default, on disk: kept across reboots)")
     };
     row(
         "box logs",
