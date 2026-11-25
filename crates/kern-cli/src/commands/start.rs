@@ -1010,6 +1010,15 @@ fn wsl_unchecked_uuid(
     }
 }
 
+/// A grant refusal worded for `--gpus device=<v>`, said for `--runtime nvidia` and the
+/// `NVIDIA_VISIBLE_DEVICES` value that asked for it.
+fn runtime_nvidia_says(msg: &str, value: &str) -> String {
+    match msg.strip_prefix("--gpus ").and_then(|r| r.split_once(": ")) {
+        Some((_, rest)) => format!("--runtime nvidia: NVIDIA_VISIBLE_DEVICES={value}: {rest}"),
+        None => msg.to_string(),
+    }
+}
+
 /// The cards `--runtime nvidia` grants for a `NVIDIA_VISIBLE_DEVICES` value, read as NVIDIA's runtime
 /// reads it: unset, empty, `void` and `none` are no GPU; `all` is every card; otherwise a list of
 /// indices or GPU UUIDs. `Ok(None)` is "no GPU", which the caller says out loud.
@@ -1026,8 +1035,9 @@ pub(crate) fn runtime_nvidia_selection(
     crate::gpu_grant::selection_from_spec(std::path::Path::new("/"), &format!("device={v}"))
         .map_err(|e| {
             Error::Cli(format!(
-                "--runtime nvidia: NVIDIA_VISIBLE_DEVICES={v} names no card kern can read ({e:?}). \
-                 It takes all, none, void, or card indices or GPU UUIDs separated by commas"
+                "--runtime nvidia: NVIDIA_VISIBLE_DEVICES={v} names no card kern can read: {}. \
+                 It takes all, none, void, or card indices or GPU UUIDs separated by commas",
+                e.reason()
             ))
         })
 }
@@ -2260,7 +2270,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         let value = set_by_caller.or(set_by_image);
         match runtime_nvidia_selection(value.as_deref())? {
             Some(selection) => {
-                let o = decide_gpu_grant(selection, None)?;
+                // The grant's refusals name `--gpus`, which this caller did not type: said as the
+                // variable it set (Grok's round 7, case 28: `NVIDIA_VISIBLE_DEVICES=99` answered
+                // "--gpus device=99: this host has no card 99").
+                let o = decide_gpu_grant(selection, None).map_err(|e| match e {
+                    Error::Cli(m) => Error::Cli(runtime_nvidia_says(&m, value.as_deref().unwrap_or(""))),
+                    other => other,
+                })?;
                 gpu_enumeration = o.enumeration;
                 gpu_for_identity = o.for_identity;
                 granted_tools = o.tools;
@@ -8688,5 +8704,33 @@ mod kept_record_tests {
         );
         let boxed = os(&["box", "rk", "--image", "alpine", "--keep", "--", "true"]);
         assert_eq!(as_box_argv(boxed.clone()), boxed);
+    }
+}
+
+#[cfg(test)]
+mod runtime_nvidia_message_tests {
+    use super::*;
+
+    /// `--runtime nvidia` says what was wrong with the value it was given, in words and by the
+    /// variable's name: never the enum's debug form, never a flag the caller did not type.
+    #[test]
+    fn a_bad_visible_devices_value_is_said_in_words_and_by_its_name() {
+        let e = runtime_nvidia_selection(Some("GPU-00000000-0000-0000-0000-000000000000"))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("NVIDIA_VISIBLE_DEVICES=GPU-0000"), "{e}");
+        assert!(
+            !e.contains("UnknownUuid") && !e.contains(" { "),
+            "debug form leaked: {e}"
+        );
+        assert_eq!(
+            runtime_nvidia_says(
+                "--gpus device=99: this host has no card 99. Present: 0, 1",
+                "99"
+            ),
+            "--runtime nvidia: NVIDIA_VISIBLE_DEVICES=99: this host has no card 99. Present: 0, 1"
+        );
+        assert_eq!(runtime_nvidia_says("other text", "x"), "other text");
     }
 }

@@ -7919,42 +7919,7 @@ fn compose_gpu_spec_problem(b: &crate::compose::ComposeBox) -> Option<String> {
     // line judges it. `config` calling a spec fine and `up` then refusing it is the one outcome
     // this check exists to prevent.
     let err = crate::gpu_grant::selection_from_spec(std::path::Path::new("/"), spec).err()?;
-    use crate::gpu_grant::GpuSpecError as G;
-    let why = match err {
-        G::Empty => "it is empty".to_string(),
-        G::ZeroIsAmbiguous => "a bare 0 has two readings, docker's \"no gpus\" and this project's \
-             \"card 0\"; write device=0 for the card"
-            .to_string(),
-        G::AllWithMore { .. } => {
-            "`all` names every card and cannot stand beside another".to_string()
-        }
-        G::Duplicate { index } => {
-            format!("card {index} is named twice and each is granted once")
-        }
-        G::NotACount { .. } => {
-            "a bare value is HOW MANY cards, as in docker (gpus: 2); device=0 names which"
-                .to_string()
-        }
-        G::NotAnIndex { .. } => {
-            "the value after device= is a card index, or a list of them".to_string()
-        }
-        // THE FILE'S OWN SHAPE: `device_ids` takes indices or UUIDs, so a compose author who wrote
-        // a UUID wrote something Docker documents, and the reason has to be that THIS HOST does
-        // not have it, with what it does have.
-        G::UnknownUuid { given, known } => {
-            if known.is_empty() {
-                format!(
-                    "{given} is a GPU UUID and this host's driver publishes none, so there is \
-                     nothing to match it against"
-                )
-            } else {
-                format!(
-                    "{given} is a GPU UUID that no card here carries. This host has: {}",
-                    known.join(", ")
-                )
-            }
-        }
-    };
+    let why = err.reason();
     Some(format!(
         "config: service '{}': `gpus: {spec}` is not a GPU request - {why}",
         b.service_name()
