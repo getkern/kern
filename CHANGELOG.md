@@ -31,11 +31,16 @@ socket as a bind source (Testcontainers' Ryuk) is refused, and an endpoint not t
 501. kern removes a Testcontainers session's containers itself when the process that made them ends.
 On Windows, `kern compat docker pipe` serves the same API on `\\.\pipe\kern-docker`, for this
 account only, with no TCP endpoint. Testcontainers for Python (Redis and Postgres modules), Java
-1.21.3 and Node 12.2.2 pass: log waits, `exec` exit codes, published ports, and an exited container
+1.21.3, Node 12.2.2 and .NET 4.17.0 (from Windows) pass: log waits, `exec` exit codes, published ports, and an exited container
 failing its start at once. The Dev Containers CLI, which VS Code runs, brings a container up from an
 image and execs into it: `--mount`, `exec -i`, and `docker events` for the containers it makes. A
 container keeps its filesystem until `docker rm` (a kept box), so the `docker start` of a reopen
 runs it again on the same files; `--rm` containers and a Testcontainers run's stay in memory.
+
+**A port published through kern's Docker API with no address is on every address.** `HostIp` left
+empty became `0.0.0.0`, IPv4 alone, where Docker binds `0.0.0.0` and `::`; a Windows client asking
+for `localhost` (.NET, PowerShell) tries `::1` first and waited 2068 ms for its refusal on every new
+connection. Measured with Testcontainers for .NET from Windows: the port case 2508 ms, then 564 ms.
 
 **`kern logs -f` and `kern wait` wake when the box writes or ends, not on a timer.** They polled every
 200 and 100 ms; measured on a box that lives 250 ms, `logs -f` returned after 251 ms instead of 402,

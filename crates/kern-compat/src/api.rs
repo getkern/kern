@@ -508,16 +508,22 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
                 binds.iter().collect()
             };
             for b in binds {
-                let ip = b
-                    .get("HostIp")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("0.0.0.0");
                 let hp = b
                     .get("HostPort")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                published.push(format!("{ip}:{hp}:{num}/{proto}"));
+                // NO ADDRESS MEANS EVERY ADDRESS, as in Docker: kern's `-p <host>:<box>` binds
+                // `0.0.0.0` and `[::]`. Spelled `0.0.0.0` it was IPv4 alone, and a Windows client
+                // that asks for `localhost` (.NET, PowerShell) tries `::1` first: MEASURED on WSL,
+                // `::1` is refused only after 2068 ms, paid on every new connection.
+                match b
+                    .get("HostIp")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(ip) => published.push(format!("{ip}:{hp}:{num}/{proto}")),
+                    None => published.push(format!("{hp}:{num}/{proto}")),
+                }
             }
         }
     }
@@ -528,7 +534,8 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
     {
         for cport in &exposed {
             let (num, proto) = cport.split_once('/').unwrap_or((cport.as_str(), "tcp"));
-            let spec = format!("0.0.0.0::{num}/{proto}");
+            // Every address, as a `HostIp` left empty above.
+            let spec = format!(":{num}/{proto}");
             if !published
                 .iter()
                 .any(|p| p.ends_with(&format!(":{num}/{proto}")))
@@ -975,6 +982,8 @@ fn list(bin: &Path, req: &Request) -> Response {
                 let (host, cport) = p.split_once("->")?;
                 let (num, proto) = cport.split_once('/').unwrap_or((cport, "tcp"));
                 let (ip, hp) = host.rsplit_once(':').unwrap_or(("0.0.0.0", host));
+                // `[::]` as Docker spells it, `::`.
+                let ip = ip.trim_start_matches('[').trim_end_matches(']');
                 Some(format!(
                     "{{\"IP\":{},\"PrivatePort\":{},\"PublicPort\":{},\"Type\":{}}}",
                     json_str(ip),
@@ -2600,7 +2609,7 @@ mod tests {
                 "-l",
                 "org.testcontainers.sessionId=s1",
                 "-p",
-                "0.0.0.0::80/tcp",
+                ":80/tcp",
                 "--image",
                 "nginx:alpine",
                 "--",
@@ -2671,7 +2680,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             a,
-            "box n -d --log-streams -p 0.0.0.0::6379/tcp -v /data:/d:ro --cpus 0.500 --rm --network host --entrypoint /bin/sh --image x -- -c echo hi"
+            "box n -d --log-streams -p :6379/tcp -v /data:/d:ro --cpus 0.500 --rm --network host --entrypoint /bin/sh --image x -- -c echo hi"
         );
         let b = body(r#"{"Image":"x","HostConfig":{"NetworkMode":"mynet"}}"#);
         assert!(create_argv("n", &b).is_err());
@@ -2781,6 +2790,24 @@ mod tests {
         let exited = ListFilters::parse(&list_req(r#"{"status":["exited"]}"#)).unwrap();
         assert!(exited.wants_exited());
         assert!(exited.keeps("x", false, &other) && !exited.keeps("x", true, &other));
+    }
+
+    /// A port binding with no `HostIp` is every address (kern's `-p <host>:<box>`, `0.0.0.0` and
+    /// `[::]`), not `0.0.0.0` alone; one with an address keeps it.
+    #[test]
+    fn an_empty_host_ip_publishes_on_every_address() {
+        let b = body(
+            r#"{"Image":"x","ExposedPorts":{"80/tcp":{},"81/tcp":{}},
+            "HostConfig":{"PortBindings":{"80/tcp":[{"HostIp":"","HostPort":""}],
+            "81/tcp":[{"HostIp":"127.0.0.1","HostPort":"9081"}]}}}"#,
+        );
+        let argv = create_argv("n", &b).map(|c| c.argv).unwrap_or_default();
+        assert!(argv.iter().any(|a| a == ":80/tcp"), "{argv:?}");
+        assert!(
+            argv.iter().any(|a| a == "127.0.0.1:9081:81/tcp"),
+            "{argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a.starts_with("0.0.0.0")), "{argv:?}");
     }
 
     /// An attached run's `--rm` is this server's: taken out of the flags, never out of the
