@@ -341,6 +341,34 @@ pub fn xdg_cache_dir() -> Option<std::path::PathBuf> {
         })
 }
 
+/// `$XDG_DATA_HOME` (absolute, as the spec has it) else `~/.local/share`: where kern keeps its
+/// persistent data under `kern/` (kept boxes, volumes, builds), as `xdg_cache_dir` is for the cache.
+pub fn xdg_data_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .filter(|h| h.is_absolute())
+                .map(|h| h.join(".local/share"))
+        })
+}
+
+/// `$XDG_CONFIG_HOME` (absolute) else `~/.config`: where the systemd user units kern writes live
+/// (`systemd/user/`).
+pub fn xdg_config_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .filter(|h| h.is_absolute())
+                .map(|h| h.join(".config"))
+        })
+}
+
 /// Unix seconds as RFC 3339 UTC (`2026-11-21T12:00:00Z`), which Docker clients parse: one formatter
 /// for kern's Docker API and the image history kern records.
 pub fn rfc3339(secs: u64) -> String {

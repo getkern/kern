@@ -308,6 +308,86 @@ fn net_forget(name: &str) {
     }
 }
 
+/// Docker's `HostConfig.RestartPolicy` of a `kern box` argv: `--restart` (a bare one is
+/// `on-failure`), its `:N`, or `--restart-max N`. `no` when none was asked. PURE.
+fn restart_policy_json(argv: &[String]) -> String {
+    let mut name = "no".to_string();
+    let mut max = 0u64;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--" => break,
+            "--restart" => {
+                let v = argv.get(i + 1).map(String::as_str).unwrap_or_default();
+                let (n, m) = v.split_once(':').unwrap_or((v, ""));
+                if matches!(n, "always" | "unless-stopped" | "on-failure" | "no") {
+                    name = n.to_string();
+                    max = m.parse().unwrap_or(0);
+                    i += 1;
+                } else {
+                    name = "on-failure".to_string();
+                }
+            }
+            "--restart-max" => {
+                max = argv.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    format!(
+        "{{\"Name\":{},\"MaximumRetryCount\":{max}}}",
+        json_str(&name)
+    )
+}
+
+/// The `kern box` argv a KEPT box was made with (every container this API makes is one, but for
+/// `--rm` and a test session's): its record, `$XDG_DATA_HOME/kern/boxes/<name>/box.rec`, a header,
+/// a blank line, then the argv NUL-separated. Empty for a box with none.
+fn kept_argv(name: &str) -> Vec<String> {
+    if !valid_name(name) {
+        return Vec::new();
+    }
+    let root = kern_common::xdg_data_dir();
+    let Some(rec) = root.map(|r| r.join("kern/boxes").join(name).join("box.rec")) else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read(rec) else {
+        return Vec::new();
+    };
+    let Some(at) = raw.windows(2).position(|w| w == b"\n\n") else {
+        return Vec::new();
+    };
+    raw[at + 2..]
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect()
+}
+
+/// The policy of the systemd unit kern wrote for `name` (`kern-<name>.service`, its
+/// `X-KernRestart=`), `always` for a unit kern wrote before it recorded one. `None` without a unit.
+fn unit_restart_policy(name: &str) -> Option<String> {
+    if !valid_name(name) {
+        return None;
+    }
+    let unit = kern_common::xdg_config_dir()?
+        .join("systemd/user")
+        .join(format!("kern-{name}.service"));
+    let text = std::fs::read_to_string(unit).ok()?;
+    if !text.lines().any(|l| l.starts_with("X-KernManagedBox=")) {
+        return None;
+    }
+    Some(
+        text.lines()
+            .find_map(|l| l.strip_prefix("X-KernRestart="))
+            .filter(|p| matches!(*p, "always" | "unless-stopped"))
+            .unwrap_or("always")
+            .to_string(),
+    )
+}
+
 fn net_aliases(name: &str) -> Vec<String> {
     if let Some(c) = created_get(name) {
         return crate::netvol::created_network(&c.argv).1;
@@ -1321,10 +1401,11 @@ fn inspect(bin: &Path, name: &str) -> Response {
     if let Some(c) = created_get(name) {
         let (net, aliases) = crate::netvol::created_network(&c.argv);
         let nets = crate::netvol::networks_json(net.as_deref(), &aliases);
+        let policy = restart_policy_json(&c.argv);
         return json_response(
             200,
             format!(
-                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"RestartCount\":0,\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
+                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"RestartCount\":0,\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
                 json_str(&id),
                 json_str(&rfc3339(c.created)),
                 json_str(&format!("/{name}")),
@@ -1405,10 +1486,17 @@ fn inspect(bin: &Path, name: &str) -> Response {
     // The image the box was started from (`kern inspect --json`'s `image`, empty for a `--rootfs`
     // box and for a box that has exited, whose record no longer holds it).
     let image = json_str(v.get("image").and_then(Value::as_str).unwrap_or_default());
+    // Docker's `HostConfig.RestartPolicy`, from the argv the box was kept with, or the systemd unit
+    // a standalone `always`/`unless-stopped` box runs under (its argv carries no `--restart`: systemd
+    // does the restarting). MEASURED before: empty for every container.
+    let policy = match unit_restart_policy(name) {
+        Some(p) => format!("{{\"Name\":{},\"MaximumRetryCount\":0}}", json_str(&p)),
+        None => restart_policy_json(&kept_argv(name)),
+    };
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{},\"Paused\":{paused},\"Restarting\":{restarting},\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{},\"Paused\":{paused},\"Restarting\":{restarting},\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
             json_str(&id),
             json_str(&created),
             json_str(&format!("/{name}")),
@@ -6055,6 +6143,35 @@ mod tests {
         ] {
             assert!(!is_buildx_builder(no), "{no}");
         }
+    }
+
+    /// The restart policy of an argv, as Docker spells it in `HostConfig.RestartPolicy`.
+    #[test]
+    fn a_restart_policy_is_read_off_the_argv() {
+        let p = |a: &[&str]| {
+            restart_policy_json(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(p(&["box", "x"]), r#"{"Name":"no","MaximumRetryCount":0}"#);
+        assert_eq!(
+            p(&["box", "x", "--restart", "always"]),
+            r#"{"Name":"always","MaximumRetryCount":0}"#
+        );
+        assert_eq!(
+            p(&["box", "x", "--restart", "on-failure:3"]),
+            r#"{"Name":"on-failure","MaximumRetryCount":3}"#
+        );
+        assert_eq!(
+            p(&["box", "x", "--restart", "--image", "a"]),
+            r#"{"Name":"on-failure","MaximumRetryCount":0}"#
+        );
+        assert_eq!(
+            p(&["box", "x", "--restart", "on-failure", "--restart-max", "5"]),
+            r#"{"Name":"on-failure","MaximumRetryCount":5}"#
+        );
+        assert_eq!(
+            p(&["box", "x", "--", "--restart", "always"]),
+            r#"{"Name":"no","MaximumRetryCount":0}"#
+        );
     }
 
     fn list_req(filters: &str) -> Request {

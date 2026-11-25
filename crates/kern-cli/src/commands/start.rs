@@ -6525,11 +6525,15 @@ fn install_persistent_box(
     // "extremely reliable, up for days/weeks" case this path exists for. `on-failure`'s retry CAP is the
     // in-process supervisor's job (this systemd unit is only ever written for a persistent policy), so
     // disabling the limit here never removes a wanted bound - it makes "always" actually mean always.
+    // `X-KernRestart`: the policy, which the unit's own `Restart=always` does not tell apart from
+    // `unless-stopped`, for kern's Docker API to answer `HostConfig.RestartPolicy` (systemd ignores
+    // an `X-` key). MEASURED before: such a container inspected as `no`.
     let unit = format!(
-        "[Unit]\nDescription=kern box {name}\n{MANAGED_MARKER}={name}\n\
+        "[Unit]\nDescription=kern box {name}\n{MANAGED_MARKER}={name}\nX-KernRestart={policy}\n\
          After=network-online.target\nStartLimitIntervalSec=0\n\n\
          [Service]\n{svc}\n[Install]\nWantedBy=default.target\n",
         name = name.as_str(),
+        policy = policy.as_str(),
     );
     let dir = user_systemd_dir()?;
     std::fs::create_dir_all(&dir)
