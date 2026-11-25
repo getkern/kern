@@ -63,26 +63,27 @@ exec'd binary and on whether the box is detached: measured at 2 on one box, so `
 | **`kern box`** | *"Isolate this workload, and slice its resources."* | Its own namespaces, overlay or read-only fs, private process tree, seccomp, **plus** the resource slices |
 | **`kern limit`** | *"Just slice resources, no sandbox."* | The same caps with no namespaces, **plus** `--landlock-rw` to confine writes |
 
-They compose: `limit` inside `box`. Both carry a default memory cap of **512 MiB** where the host can hold
-one, plus no swap and a ceiling of 512 tasks.
+They compose: `limit` inside `box`. `kern limit` carries a default memory cap of **512 MiB** where the
+host can hold one, plus no swap and a ceiling of 512 tasks. A box follows Docker: with no `--memory`
+it is bounded by the machine, and `--memory M` alone allows as much swap as memory.
 
-### What memory ceiling you get, in five cases
+### What memory ceiling you get
 
-The first two differ on purpose, and a reader who meets them one at a time concludes one is a bug:
-
-| what you ran | ceiling with no flag or key | why |
+| what you ran | ceiling and swap with no flag or key | why |
 |---|---|---|
-| `kern box`, `kern run`, `kern limit` | **512 MiB** | kern's own default: a sandbox is capped until you say otherwise |
-| `kern box --gpus` (or `--device`, `--runtime nvidia`) | **the host's RAM** | a GPU workload is never 512 MiB: on a WSL2 guest each CUDA context took about 75 MiB of host memory. On a Jetson the cap bounds GPU memory only with nvmap's page pool off (`kern doctor`) |
-| a `kern compose` service with no `mem_limit:` | **the host's RAM** | compose parity. Docker does not cap a service by default |
+| `kern box`, `kern run`, `docker run` through kern's socket | **the host's RAM**, the host's swap; `--memory M` alone: M and M of swap | Docker parity: Docker does not cap a container, and its `--memory` alone allows an equal swap. `--memory-swap-max` sets the swap |
+| a `kern compose` service with no `mem_limit:` | **the host's RAM**, the host's swap; `mem_limit` alone: an equal swap | compose parity, the same rule |
+| `kern limit` | **512 MiB**, no swap | kern's own default for a process it caps outside a box |
+| a sandbox of the Python or Node SDK, or the Rust `Sandbox` builder | **512 MiB**, no swap | the sandbox's default; the cap is the whole budget, which is what its `oom` verdict reports |
 
-Measured on a host with 33465040896 bytes of RAM: `kern box --image alpine -- cat
-/sys/fs/cgroup/memory.max` prints `536870912`, the same read inside a compose service prints
-`33465040896`. The compose case is still a ceiling, not an absence of one: the box keeps a `memory.max`
-of its own, so a failure stays attributable to its own cgroup. `[kern] compose_memory_max`
-puts a strict ceiling back ([CONFIG.md](CONFIG.md), [DOCKER-COMPAT.md](DOCKER-COMPAT.md)).
+Measured on a host with 33464963072 bytes of RAM and 25322409984 of swap: `kern run alpine` reads
+`memory.max` `33464963072` and `memory.swap.max` `25322409984` (Docker reads `max` and `max`); with
+`--memory 256m` both engines read `268435456` and `268435456`, and an SDK sandbox reads `536870912`
+and `0`. The host's RAM is still a ceiling, not an absence of one: the box keeps a `memory.max` of its
+own, so a failure stays attributable to its own cgroup. `[kern] compose_memory_max` puts a strict
+ceiling back on compose services ([CONFIG.md](CONFIG.md), [DOCKER-COMPAT.md](DOCKER-COMPAT.md)).
 
-**Third case: no mechanism at all.** A host with no systemd user manager, whose own cgroup cannot take
+**No mechanism at all.** A host with no systemd user manager, whose own cgroup cannot take
 a capped child, has neither path, so NO cap is in force, default or asked-for. A `kern box` warns at
 start, a `kern limit --memory` refuses outright, and `kern doctor` names the directories it probed. For a
 running box it is a fact you can read:
@@ -97,7 +98,7 @@ walked up its cgroup chain and counting each level's swap (an ancestor with unli
 ceiling). `null` means nothing is enforcing it, and the human output says
 `64M (requested, NOT enforced here)`.
 
-**Fourth case: a limit above the box that throttles instead of killing.** A `memory.high` on a cgroup
+**A limit above the box that throttles instead of killing.** A `memory.high` on a cgroup
 above the box is not a kill limit: past it the kernel slows the box's allocations to a halt, so a box
 that should be OOM-killed at its cap stalls until its timeout. Measured on a Jetson Orin with
 `MemoryHigh=80M` on `kern.slice`: an OOM that takes 0.06 s took **317 s**. kern does not change that
@@ -112,7 +113,7 @@ mem-cap  512M; throttled above 80M by /user.slice/user-1000.slice/user@1000.serv
 refuses to start such a box.
 
 Two ways to change the default ceiling, and they are not the same: `--memory <size>` raises or lowers
-it, which is the one you want; `KERN_NO_SCOPE=1` removes the scope and with it all three ceilings,
+it, which is the one you want; `KERN_NO_SCOPE=1` removes the scope and with it every ceiling above,
 leaving the command in your shell's cgroup.
 
 From a session outside your systemd user subtree (an ssh login on a server, a `wsl.exe -u` shell),
