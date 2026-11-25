@@ -1110,9 +1110,10 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance) {
     // box that then ends by itself has its supervisor write it again. MEASURED: a box ending 0 on
     // its SIGTERM lost its log at `kern stop` ("no logs for box"), the second write taking the first
     // for an older run of the name.
-    for old in clear_exited_named(&b.name, Some((pid, starttime))) {
-        crate::commands::boxlog::remove_run_logs(&format!("{}-{old}", b.name));
-    }
+    // ⛔ AFTER THIS RUN'S RECORD IS WRITTEN, not before: the sweep lists the registry, and `list()`
+    // prunes an entry whose supervisor is dead, which a `kern stop` has just made of this box. So a
+    // `kern wait` saw the box leave the registry with no record yet, and printed "exited without a
+    // recorded exit code" (MEASURED, 6 in 6 on a kept box beside a `kern stop -t 1`).
     if let Ok(d) = waitexit_dir() {
         // Multi-line so `kern ps -a` can render the box that exited (its name, pod, command), not only
         // the code `kern wait` needs. Line 1 stays the BARE code, so `box_exit` - and any pre-existing
@@ -1142,6 +1143,9 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance) {
             one_line(&b.labels, 8192),
         );
         let _ = fs::write(d.join(format!("{pid}-{starttime}")), body);
+    }
+    for old in clear_exited_named(&b.name, Some((pid, starttime))) {
+        crate::commands::boxlog::remove_run_logs(&format!("{}-{old}", b.name));
     }
 }
 
@@ -2077,6 +2081,13 @@ pub fn owner_stop_claim(name: &str, pid: i32) -> StopClaim {
     } else {
         StopClaim::NotStopped
     }
+}
+
+/// Is a `kern stop` ending `name`/`pid` now? Its marker stands from before its first signal until
+/// after it has recorded the box's code ([`claim_stop_record`] follows the record), so while it
+/// stands a code is still coming, for a `kern wait` that saw the supervisor go.
+pub fn stop_in_progress(name: &str, pid: i32) -> bool {
+    stop_marks(name, pid).is_some_and(|(marker, _)| marker.symlink_metadata().is_ok())
 }
 
 /// The stop's claim on the marker: `true` when this stop is the one that writes the line (it

@@ -4669,6 +4669,67 @@ fn stop_does_not_wait_the_grace_on_a_box_that_already_exited() {
     );
 }
 
+/// A `kern wait` ALREADY WAITING WHEN `kern stop` ENDS THE BOX PRINTS THE STOP'S CODE.
+///
+/// The stop ends the supervisor first and records the code after the grace; MEASURED before, the
+/// waiter saw the supervisor gone, read no record, and printed "exited without a recorded exit
+/// code" (6 in 6 on a kept box, 2 in 3 on a plain one), and `docker wait` beside a `docker stop`
+/// through kern's socket answered -1 where Docker answers 137.
+#[test]
+fn a_wait_begun_before_a_stop_prints_the_stops_code() {
+    let xdg = std::env::temp_dir().join(format!("kern-it-waitstop-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> String {
+        match kern().env("XDG_RUNTIME_DIR", &xdg).args(args).output() {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Err(_) => String::new(),
+        }
+    };
+    let id = std::process::id();
+    let mut answers = Vec::new();
+    for keep in [false, true] {
+        for round in 0..3 {
+            let name = format!("waitstop-{keep}-{round}-{id}");
+            let mut args = vec!["box", "--image", "alpine", "-d", "--name", &name];
+            if keep {
+                args.push("--keep");
+            }
+            args.extend(["--", "sleep", "60"]);
+            let _ = run(&args);
+            if !run(&["ps"]).contains(&name) {
+                let _ = std::fs::remove_dir_all(&xdg);
+                eprintln!("SKIP: this host did not run the box");
+                return;
+            }
+            let waiter = kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["wait", &name])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = run(&["stop", "-t", "1", &name]);
+            let answer = waiter
+                .and_then(std::process::Child::wait_with_output)
+                .map(|o| {
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stdout).trim(),
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    )
+                })
+                .unwrap_or_default();
+            answers.push((keep, answer));
+            let _ = run(&["rm", "-f", &name]);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&xdg);
+    assert!(
+        answers.iter().all(|(_, a)| a == "137"),
+        "every wait must print the stop's 137: {answers:?}"
+    );
+}
+
 /// `allow_gpu_grants` IS READ FROM THE OPERATOR'S OWN `kern.toml`, AND GRANTS THE GPU ONLY.
 ///
 /// Through the real config reader, not the decision function: with the key in the operator's config a

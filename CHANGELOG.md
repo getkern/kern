@@ -164,6 +164,13 @@ root, init, extra hosts, resolvers, dropped capabilities, groups, sysctls, tmpfs
 log options, stop signal and timeout are now the box's flags, and what kern does not apply
 (`--cpu-shares`, `--oom-score-adj`, `--oom-kill-disable`) is printed by the client as a warning.
 
+**`kern wait` begun before a `kern stop` prints the stop's code.** The stop records the code after
+the box's grace, and the record's own sweep of older runs listed the registry first, which dropped
+the box's entry before the code was written: the waiter printed "exited without a recorded exit
+code" (6 times in 6 on a kept box), and `docker wait` beside a `docker stop` through kern's socket
+answered -1 where Docker answers 137. The record is written first, and a waiter that sees the
+supervisor go while a stop is under way waits for that stop's code.
+
 **`depends_on: condition: service_healthy` through kern's socket.** A container's `Healthcheck`
 was not read, so the box had no check and the `docker compose` client refused the stack ("has no
 healthcheck configured"); it is the box's `--health-*` now, durations rounded up to whole seconds.

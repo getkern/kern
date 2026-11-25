@@ -2084,6 +2084,10 @@ pub fn rename(old: &str, new: &str) -> Result<(), Error> {
 /// The longest `kern wait` sleeps with nothing to wake it: the poll it had.
 const WAIT_FLOOR_MS: i32 = 100;
 
+/// How long `kern wait` gives a `kern stop` to record the code of a box whose supervisor and init
+/// are both gone. Past it the stop itself died before writing, and there is no code to wait for.
+const STOPPER_RECORDS_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// `kern wait <box>...` - block until each box exits, then print its exit code, one per line, in
 /// argument order (Docker `wait`). A box that has ALREADY exited answers at once from its exit
 /// record, for as long as `kern ps -a` still lists it; past that window, and for an interactive
@@ -2131,9 +2135,9 @@ fn wait_for(names: &[String], removed_too: bool) -> Result<(), Error> {
             )));
         };
         // Block on the EXACT (name,pid) pair leaving the registry, so a reused pid or name can't make
-        // a still-live box read as gone. The supervisor (self-exit) and `stop`/`kill` both write the
-        // `(pid,starttime)`-keyed exit sidecar before the box leaves `list()`, so once the pair is gone
-        // the code is already recorded. The read is NON-consuming, so parallel/repeat waiters all see it.
+        // a still-live box read as gone. A supervisor that ends by itself writes the
+        // `(pid,starttime)`-keyed exit sidecar before it removes its entry. The read is
+        // NON-consuming, so parallel/repeat waiters all see it.
         //
         // WOKEN AT THE REMOVAL, by inotify on the registry (`BoxWaiter`), with the old 100 ms poll
         // as the floor: an attached `docker run` paid that poll on every command that ends at once.
@@ -2141,7 +2145,32 @@ fn wait_for(names: &[String], removed_too: bool) -> Result<(), Error> {
         while registry::pair_alive(&inst.name, inst.pid) {
             waiter.wait(WAIT_FLOOR_MS);
         }
-        match registry::box_exit(inst.pid, inst.starttime) {
+        // ⛔ A `kern stop` IS THE OTHER ORDER: it ends the supervisor first (its group hears the
+        // signal), and records the code only once the init is gone, after the grace. Its marker
+        // stands until then, so a dead supervisor with the marker there means the code is coming:
+        // waited for while the init lives, then for the stopper's write. MEASURED before: `docker
+        // wait` beside a `docker stop` through kern's socket answered -1, where Docker answers 137;
+        // the marker also covers a `kern ps` elsewhere pruning the entry before the record.
+        let mut init_gone_at: Option<std::time::Instant> = None;
+        let code = loop {
+            if let Some(code) = registry::box_exit(inst.pid, inst.starttime) {
+                break Some(code);
+            }
+            if !registry::stop_in_progress(&inst.name, inst.pid) {
+                break None;
+            }
+            if inst.live_pid1().is_some() {
+                init_gone_at = None;
+            } else if init_gone_at
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed()
+                >= STOPPER_RECORDS_WITHIN
+            {
+                break None;
+            }
+            waiter.wait(WAIT_FLOOR_MS);
+        };
+        match code {
             Some(code) => println!("{code}"),
             None => {
                 // Gone but no recorded code. THREE causes, and this cannot tell them apart: a
