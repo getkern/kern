@@ -380,6 +380,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         its own on a bridge stack and every name of that network in its
                         /etc/hosts (`kern pod ls` names the stacks)
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
+    --network-alias N   Another name the box is reached by on its pod's network (repeatable)
     --egress-allow d,d  Restrict outbound to an allowlist via a filtering proxy (also with -d): domains
                         (and their subdomains), addresses and ranges (`10.1.2.0/24`, which may be
                         private), or `*` for any public host. HTTP(S) on ports 80 and 443

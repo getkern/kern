@@ -112,6 +112,8 @@ set TESTCONTAINERS_RYUK_DISABLED=true
 | `containers/{id}/pause`, `unpause`, `rename`, `top` | `kern pause`, `kern unpause`, `kern rename`; `top` reads the processes of the box's pid namespace from the host's `/proc` in `ps -ef`'s columns, as Docker's daemon does; a paused box is `paused` in `inspect` and in the list |
 | `containers/{id}/stats` (`stream`, `one-shot`), `exec/{id}/resize`, `containers/{id}/resize` | `kern stats --json` with the host's CPU clock, as Docker's `StatsJSON` (`docker stats` computes its CPU% from two readings a second apart, measured 100.09% for one busy core); a resize rewrites the terminal's size file and signals the `kern` that sizes it, and the program in the box gets `SIGWINCH` with the new size |
 | `containers/{id}/archive` (`GET`, `HEAD`, `PUT`: `docker cp`, Testcontainers' copies) | `kern cp <box>:<path> -` and `kern cp - <box>:<dir>`, the archive streamed (any size) and every path resolved inside the box; the stat `docker cp` reads first in `X-Docker-Container-Path-Stat`; into a container created and not started, the archive is kept and extracted into the box's root at its start, before its command runs |
+| `networks` (list with `label`, `name`, `id`, `driver`, `type`; create, inspect, remove, `connect` and `disconnect` before a start) | a network is a kern pod: its members share a hosts file every member reads, the ones already running included, so a container is reached by its endpoint's aliases (compose's service name, `--network-alias`) whenever it joins; `Internal` is a pod with no NAT; the labels a client gave are kept by this API; `bridge`, `host` and `none` are listed as Docker's builtins |
+| `volumes` (list with `label`, `name`; create, inspect, remove) | `kern volume create`/`inspect`/`rm`, local driver only; the labels a client gave are kept by this API, so compose finds the volumes it made |
 | `networks/prune`, `volumes/prune`, `images/prune` with a `label` filter | nothing removed, Docker's empty answer: this API makes no network, volume or image, and that is how a Testcontainers session ends with Ryuk off; without a label filter, 501 |
 | `_ping`, `version`, `info` | kern and kern's version in `Platform` and `Components`; `Version` and `ServerVersion` are `24.0.0`, the Docker Engine whose API is 1.43, since clients gate on that number (Testcontainers for Java refuses one below 1.6.0) |
 
@@ -169,10 +171,12 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
   layer) until `docker rm`, as any other container; a restarted server finds it there.
 - What kern refuses without a flag is refused here by name with a 400: `Privileged`, `Devices`,
   `DeviceRequests` (GPUs), `CapAdd`, `SecurityOpt`, `VolumesFrom`, `Links`, and the host's pid, ipc or
-  uts namespace. An endpoint that is not translated (networks, volumes, build) answers 501 and says
-  so; kern never hands a request to a Docker daemon. `docker compose` through the socket therefore
-  stops at its first network call, and the 501 names `kern compose -f <file> up`, which runs the
-  same file.
+  uts namespace. An endpoint that is not translated (`build`) answers 501 and says what does the job
+  (`kern build`); kern never hands a request to a Docker daemon.
+- `docker compose` through the socket runs a file whose containers are each on one network: `up`,
+  `ps`, `logs`, `exec` and `down -v` measured on a two-service file with a named volume, the client
+  reaching the server by its service name. A container on two networks is refused by name (a kern box
+  is in one pod); `kern compose` runs such a file.
 
 ## What "compose compatibility" means, in three numbers
 

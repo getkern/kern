@@ -150,6 +150,8 @@ pub enum Command {
         /// `--net none` / `--network none` said explicitly: no NAT, the box's own loopback only.
         /// Without it (and with no other network named), the box gets Docker's default: a NAT.
         net_none: bool,
+        /// `--network-alias NAME` / `--net-alias NAME` (repeatable): Docker's network-scoped alias.
+        network_aliases: Vec<String>,
         /// `--require-limits`: refuse to start (non-zero exit) if a requested/default resource cap
         /// cannot actually be enforced here, instead of running best-effort UNCAPPED with a warning.
         require_limits: bool,
@@ -4137,6 +4139,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--overlay-lower",
     "--overlay-upper",
     "--pids-limit",
+    "--network-alias",
+    "--net-alias",
     "--copy-in",
     "--platform",
     "--pod",
@@ -4284,6 +4288,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut read_only = false;
     let mut share_net = false;
     let mut net_none = false;
+    let mut network_aliases: Vec<String> = Vec::new();
     let mut pod: Option<String> = None;
     let mut net_container: Option<String> = None;
     let mut ipc: Option<String> = None;
@@ -4427,6 +4432,25 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--pod" => {
                     i += 1;
                     pod = Some(rest.get(i).ok_or(Error::Usage("--pod <name>"))?.to_string());
+                }
+                // Docker's network-scoped alias: another name the box is reached by on its network.
+                "--network-alias" | "--net-alias" => {
+                    i += 1;
+                    let a = rest
+                        .get(i)
+                        .ok_or(Error::Usage("--network-alias <name>"))?
+                        .to_string();
+                    if a.is_empty()
+                        || a.starts_with(['-', '.'])
+                        || !a
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+                    {
+                        return Err(Error::Cli(format!(
+                            "--network-alias {a:?}: a name is letters, digits, `-`, `_` and `.`"
+                        )));
+                    }
+                    network_aliases.push(a);
                 }
                 // `--pod-bridge <ip>/<prefix>`: join the pod through its bridge with this address,
                 // instead of sharing the pod's network namespace. Parsed here so a value that is
@@ -5763,6 +5787,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             require_limits,
             oom_group,
             net_none,
+            network_aliases,
             allow_uncapped,
             security_profile,
             overlay_lower,
@@ -7186,6 +7211,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             require_limits,
             oom_group,
             net_none,
+            network_aliases,
             allow_uncapped,
             security_profile,
             overlay_lower,
@@ -7278,6 +7304,13 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 // compose launcher waits for: MEASURED, a `--no-pod` stack's boxes hung at start for
                 // ten minutes, each side waiting on the other.
                 && crate::global_env("KERN_GATE_FD").is_none();
+            if !network_aliases.is_empty() && pod.is_none() {
+                return Err(Error::Cli(
+                    "--network-alias: an alias names the box on a network it shares, so it needs \
+                     one (`--network <pod or stack>`), as Docker's needs a user-defined network"
+                        .into(),
+                ));
+            }
             let dns: Vec<String> = if (stack_outbound || own_outbound) && dns.is_empty() {
                 crate::pod::host_nameservers()
             } else {
@@ -7335,6 +7368,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     secrets: &secrets,
                     copy_in: &copy_in,
                     seccomp_deny_kill,
+                    network_aliases: &network_aliases,
                     secret_envs: &secret_envs,
                     secret_mode,
                     ssh_port,
@@ -8747,6 +8781,30 @@ mod tests {
     /// `kern run --platform linux/arm64 alpine uname -m` was "unknown flag", and Docker prints
     /// `aarch64` there. Both spellings reach the box, `box` takes it too, and after the image it is
     /// the command's word, as `docker run` reads it.
+    /// `--network-alias` / `--net-alias`, repeatable, Docker's spellings; a name that could be a flag
+    /// or a path is refused; without a network to share it is refused at the dispatch, not here.
+    #[test]
+    fn box_takes_dockers_network_alias() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let cmd = p(&[
+            "run",
+            "--network",
+            "shop",
+            "--network-alias",
+            "web",
+            "--net-alias",
+            "w2",
+            "alpine",
+        ])
+        .map(|(_, c)| c);
+        assert!(
+            matches!(&cmd, Ok(Command::BoxRun { network_aliases, .. }) if network_aliases == &["web", "w2"]),
+            "{cmd:?}"
+        );
+        assert!(p(&["run", "--network-alias", "-x", "alpine"]).is_err());
+        assert!(p(&["run", "--network-alias", "a/b", "alpine"]).is_err());
+    }
+
     #[test]
     fn run_and_box_take_dockers_platform() {
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());

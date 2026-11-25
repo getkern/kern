@@ -316,6 +316,8 @@ pub struct BoxRunArgs<'a> {
     pub seccomp_deny_kill: Option<bool>,
     /// `--oom-group`: an OOM kills the whole box (the SDKs' sandboxes); by default, one process.
     pub oom_group: bool,
+    /// `--network-alias NAME` (repeatable): more names for the box in its pod's hosts file.
+    pub network_aliases: &'a [String],
     /// `--secret-env <name>`: content from `KERN_SECRET_<name>` rather than from argv.
     pub secret_envs: &'a [String],
     /// `--secret-mode <octal>`: the file mode every `--secret` of this box is created with.

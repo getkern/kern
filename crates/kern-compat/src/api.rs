@@ -28,7 +28,7 @@ const ENGINE_VERSION: &str = "24.0.0";
 // ---------------------------------------------------------------------------------------------
 // Responses.
 
-fn json_response(status: u16, body: String) -> Response {
+pub(crate) fn json_response(status: u16, body: String) -> Response {
     Response::Full {
         status,
         content_type: "application/json",
@@ -42,7 +42,7 @@ pub(crate) fn error(status: u16, message: &str) -> Response {
     json_response(status, format!("{{\"message\":{}}}", json_str(message)))
 }
 
-fn no_content() -> Response {
+pub(crate) fn no_content() -> Response {
     Response::Full {
         status: 204,
         content_type: "text/plain",
@@ -55,7 +55,7 @@ fn no_content() -> Response {
 // Running kern.
 
 /// `kern args...` to its end: (exit code, stdout, stderr).
-fn kern(bin: &Path, args: &[&str]) -> (i32, String, String) {
+pub(crate) fn kern(bin: &Path, args: &[&str]) -> (i32, String, String) {
     match Command::new(bin).args(args).stdin(Stdio::null()).output() {
         Ok(o) => (
             o.status.code().unwrap_or(-1),
@@ -71,7 +71,7 @@ fn kern(bin: &Path, args: &[&str]) -> (i32, String, String) {
 }
 
 /// The first `error:` line kern printed, without the prefix, or the whole stderr.
-fn kern_error(stderr: &str) -> String {
+pub(crate) fn kern_error(stderr: &str) -> String {
     stderr
         .lines()
         .find_map(|l| l.strip_prefix("error: "))
@@ -113,7 +113,7 @@ fn fresh_name() -> Option<String> {
 
 /// A name a box may have (kern's own check refuses anything else; this keeps a client's name from
 /// reaching kern's argv as something else).
-fn valid_name(n: &str) -> bool {
+pub(crate) fn valid_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= 63
         && n.bytes()
@@ -123,8 +123,8 @@ fn valid_name(n: &str) -> bool {
 
 /// A container created and not yet started: what `start` needs to run it.
 #[derive(Clone)]
-struct Created {
-    argv: Vec<String>,
+pub(crate) struct Created {
+    pub(crate) argv: Vec<String>,
     image: String,
     created: u64,
     labels: Vec<(String, String)>,
@@ -140,18 +140,53 @@ struct Created {
 
 static CREATED: Mutex<Option<HashMap<String, Created>>> = Mutex::new(None);
 
-fn created_get(name: &str) -> Option<Created> {
+pub(crate) fn created_get(name: &str) -> Option<Created> {
     CREATED
         .lock()
         .ok()
         .and_then(|g| g.as_ref().and_then(|m| m.get(name).cloned()))
 }
 
-fn created_put(name: &str, c: Created) {
+pub(crate) fn created_put(name: &str, c: Created) {
     if let Ok(mut g) = CREATED.lock() {
         g.get_or_insert_with(HashMap::new)
             .insert(name.to_string(), c);
     }
+}
+
+/// The network aliases each container's create asked for, kept past its start (when `Created` is
+/// taken) so `inspect` reports them while the box runs.
+static NET_ALIASES: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
+
+fn net_remember(name: &str, argv: &[String]) {
+    let (_, aliases) = crate::netvol::created_network(argv);
+    if let Ok(mut g) = NET_ALIASES.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        if aliases.is_empty() {
+            m.remove(name);
+        } else {
+            m.insert(name.to_string(), aliases);
+        }
+    }
+}
+
+fn net_forget(name: &str) {
+    if let Ok(mut g) = NET_ALIASES.lock() {
+        if let Some(m) = g.as_mut() {
+            m.remove(name);
+        }
+    }
+}
+
+fn net_aliases(name: &str) -> Vec<String> {
+    if let Some(c) = created_get(name) {
+        return crate::netvol::created_network(&c.argv).1;
+    }
+    NET_ALIASES
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(name).cloned()))
+        .unwrap_or_default()
 }
 
 /// Take a created container out (it starts, or is removed), waking whoever waits for that.
@@ -214,14 +249,14 @@ fn wait_until_started(name: &str) {
 /// Every box kern lists (running and exited) as `(name, json)`.
 /// Whether a row of `kern ps -a --json` is a box that runs: an `exited` one and a `kept` one not
 /// running (a stopped container whose layer is kept) are not.
-fn box_running(v: &Value) -> bool {
+pub(crate) fn box_running(v: &Value) -> bool {
     !matches!(
         v.get("status").and_then(Value::as_str),
         Some("exited" | "kept")
     )
 }
 
-fn kern_boxes(bin: &Path) -> Vec<(String, Value)> {
+pub(crate) fn kern_boxes(bin: &Path) -> Vec<(String, Value)> {
     let (_, out, _) = kern(bin, &["ps", "-a", "--json"]);
     json::parse(out.trim())
         .ok()
@@ -237,7 +272,7 @@ fn kern_boxes(bin: &Path) -> Vec<(String, Value)> {
 }
 
 /// The box a client means by `id`: a name, a full id, or a prefix of one.
-fn resolve(bin: &Path, id: &str) -> Option<String> {
+pub(crate) fn resolve(bin: &Path, id: &str) -> Option<String> {
     let id = id.trim_start_matches('/');
     if created_get(id).is_some() {
         return Some(id.to_string());
@@ -638,11 +673,33 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
             argv.push("--network".into());
             argv.push("none".into());
         }
-        Some(other) => {
-            return Err(format!(
-                "HostConfig.NetworkMode {other:?}: networks are not translated in this phase \
-                 (default, host and none are)"
-            ))
+        // Another container's namespace, as `docker run --network container:<c>` asks.
+        Some(other) if other.starts_with("container:") => {
+            argv.push("--network".into());
+            argv.push(other.to_string());
+        }
+        // A NETWORK BY NAME is a kern pod (see `netvol`): the box joins it, reached by its
+        // endpoint's aliases (compose's service name) as well as by its own name.
+        Some(net) => {
+            argv.push("--network".into());
+            argv.push(net.to_string());
+            let endpoints = body
+                .get("NetworkingConfig")
+                .and_then(|n| n.get("EndpointsConfig"))
+                .and_then(Value::as_object)
+                .unwrap_or_default();
+            if let Some((other, _)) = endpoints.iter().find(|(k, _)| k != net) {
+                return Err(format!(
+                    "NetworkingConfig names {other:?} beside {net:?}: kern's Docker API puts a \
+                     container on one network (a kern box is in one pod). For a compose file whose \
+                     services share several networks, `kern compose -f <file> up` runs it"
+                ));
+            }
+            let ep = endpoints.iter().find(|(k, _)| k == net).map(|(_, v)| v);
+            for a in crate::netvol::endpoint_aliases(ep, name) {
+                argv.push("--network-alias".into());
+                argv.push(a);
+            }
         }
     }
     // `HostConfig.RestartPolicy` is `kern box --restart`: Docker's names, and `MaximumRetryCount` as
@@ -769,7 +826,7 @@ fn ports_json(ports: &str, exposed: &[String]) -> String {
     format!("{{{}}}", items.join(","))
 }
 
-fn labels_json(labels: &[(String, String)]) -> String {
+pub(crate) fn labels_json(labels: &[(String, String)]) -> String {
     let items: Vec<String> = labels
         .iter()
         .map(|(k, v)| format!("{}:{}", json_str(k), json_str(v)))
@@ -795,10 +852,12 @@ fn labels_of(v: &Value) -> Vec<(String, String)> {
 fn inspect(bin: &Path, name: &str) -> Response {
     let id = id_of(name);
     if let Some(c) = created_get(name) {
+        let (net, aliases) = crate::netvol::created_network(&c.argv);
+        let nets = crate::netvol::networks_json(net.as_deref(), &aliases);
         return json_response(
             200,
             format!(
-                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"RestartCount\":0,\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
+                "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"RestartCount\":0,\"State\":{{\"Status\":\"created\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":\"{ZERO_TIME}\",\"FinishedAt\":\"{ZERO_TIME}\"}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
                 json_str(&id),
                 json_str(&rfc3339(c.created)),
                 json_str(&format!("/{name}")),
@@ -848,6 +907,9 @@ fn inspect(bin: &Path, name: &str) -> Response {
     // `kern pause` freezes the box: Docker's `paused`, still `Running` as Docker reports it. MEASURED
     // before: `docker pause` then `inspect` answered `running`, and `Paused` was false whatever.
     let paused = running && v.get("status").and_then(Value::as_str) == Some("paused");
+    // The pod the box is in is its network; the aliases are the ones its create asked for.
+    let pod = v.get("pod").and_then(Value::as_str).unwrap_or_default();
+    let nets = crate::netvol::networks_json(Some(pod), &net_aliases(name));
     let exit_code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
     // Docker's `RestartCount`, which kern records per run (0 for a box that never restarted).
     let restart_count = v.get("restart_count").and_then(Value::as_i64).unwrap_or(0);
@@ -872,7 +934,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":{paused},\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":{paused},\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
             json_str(&id),
             json_str(&created),
             json_str(&format!("/{name}")),
@@ -2346,6 +2408,7 @@ fn session_ended(bin: &Path, req: &Request) -> Response {
 fn remove_container(bin: &Path, name: &str) {
     stage_forget(name);
     crate::events::forget(name);
+    net_forget(name);
     if created_take(name).is_some() {
         drop(attached_take(name));
         return;
@@ -3434,8 +3497,23 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 Some(p) => return error(400, &format!("invalid platform: {p:?}")),
                 None => None,
             };
+            // A network by name must exist, as Docker's create answers 404 for one that does not.
+            if let Some(net) = body
+                .get("HostConfig")
+                .and_then(|h| h.get("NetworkMode"))
+                .and_then(Value::as_str)
+                .filter(|n| {
+                    !matches!(*n, "" | "default" | "bridge" | "host" | "none")
+                        && !n.starts_with("container:")
+                })
+            {
+                if !crate::netvol::network_exists(bin, net) {
+                    return error(404, &format!("network {net} not found"));
+                }
+            }
             match create_argv(&name, &body).map(|c| with_platform(c, platform.as_deref())) {
                 Ok(c) => {
+                    net_remember(&name, &c.argv);
                     let session = in_session(&c.labels);
                     crate::events::publish(&event_of("create", &name, &c, None));
                     created_put(&name, c);
@@ -3619,6 +3697,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             session_forget(&name);
             stage_forget(&name);
             crate::events::forget(&name);
+            net_forget(&name);
             if created_take(&name).is_some() {
                 // A pending attach ends with the container.
                 drop(attached_take(&name));
@@ -3684,8 +3763,10 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
         ("POST", [kind @ ("networks" | "volumes" | "images"), "prune"]) => {
             labelled_prune(kind, req)
         }
-        (_, ["networks", ..]) => not_translated("networks"),
-        (_, ["volumes", ..]) => not_translated("the volumes API"),
+        (_, ["networks" | "volumes", ..]) => match crate::netvol::handle(req, bin, &seg) {
+            Some(r) => r,
+            None => not_translated(&format!("{} {}", req.method, req.path)),
+        },
         ("GET", ["events"]) => crate::events::events(req),
         ("POST", ["build"]) => not_translated("build"),
         (m, _) => not_translated(&format!("{m} {}", req.path)),
@@ -4093,8 +4174,22 @@ mod tests {
             a,
             "box n -d --log-streams -p :6379/tcp -v /data:/d:ro --cpus 0.500 --rm --network host --entrypoint /bin/sh --image x -- -c echo hi"
         );
-        let b = body(r#"{"Image":"x","HostConfig":{"NetworkMode":"mynet"}}"#);
-        assert!(create_argv("n", &b).is_err());
+        // A network by name is a kern pod, joined with the endpoint's aliases (compose's service
+        // name); a second network on one container is refused by name.
+        let b = body(
+            r#"{"Image":"x","HostConfig":{"NetworkMode":"shop_default"},"NetworkingConfig":{"EndpointsConfig":{"shop_default":{"Aliases":["web","n"]}}}}"#,
+        );
+        let a = create_argv("n", &b)
+            .map(|c| c.argv.join(" "))
+            .unwrap_or_default();
+        assert!(
+            a.contains("--network shop_default --network-alias web") && !a.contains("alias n"),
+            "{a}"
+        );
+        let two = body(
+            r#"{"Image":"x","HostConfig":{"NetworkMode":"a"},"NetworkingConfig":{"EndpointsConfig":{"a":{},"b":{}}}}"#,
+        );
+        assert!(create_argv("n", &two).is_err_and(|e| e.contains("one network")));
     }
 
     #[test]
@@ -4442,10 +4537,32 @@ mod tests {
         }
     }
 
-    /// `docker compose` through the socket stops at its first network call: the 501 says what runs
-    /// the file instead, and names no internal server.
+    /// An endpoint this API does not serve answers 501 saying what does the job (here `kern build`),
+    /// and names no internal server. `/networks` used to be one; it is served now (see `netvol`).
     #[test]
-    fn a_networks_call_is_refused_naming_kern_compose() {
+    fn an_unserved_call_is_refused_naming_what_does_it() {
+        let req = Request {
+            method: "POST".into(),
+            path: "/build".into(),
+            query: Vec::new(),
+            body: Vec::new(),
+            upgrade: false,
+            peer: None,
+            close: false,
+        };
+        let Response::Full { status, body, .. } = handle(&req, Path::new("/nonexistent/kern"))
+        else {
+            panic!("a whole body");
+        };
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 501, "{text}");
+        assert!(text.contains("kern build"), "{text}");
+        assert!(!text.contains("kern-serve"), "{text}");
+    }
+
+    /// `GET /networks` lists Docker's three builtins whatever kern has, as Docker's daemon does.
+    #[test]
+    fn the_network_list_has_dockers_builtins() {
         let req = Request {
             method: "GET".into(),
             path: "/networks".into(),
@@ -4459,10 +4576,15 @@ mod tests {
         else {
             panic!("a whole body");
         };
-        let text = String::from_utf8_lossy(&body);
-        assert_eq!(status, 501, "{text}");
-        assert!(text.contains("kern compose -f"), "{text}");
-        assert!(!text.contains("kern-serve"), "{text}");
+        let v = json::parse(&String::from_utf8_lossy(&body)).unwrap();
+        let names: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.get("Name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(status, 200);
+        assert_eq!(names, ["bridge", "host", "none"]);
     }
 
     /// The `reference` filter of `GET /images/json`: a name, a bare name as `:latest`, a repository

@@ -20,6 +20,7 @@
 
 mod api;
 mod events;
+mod netvol;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};

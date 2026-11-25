@@ -466,6 +466,7 @@ fn join_pod_and_bind_its_files(
     dns_requested: bool,
     inherit_nameservers: &mut Vec<String>,
     on_bridge: bool,
+    aliases: &[String],
 ) -> Result<Option<i32>, Error> {
     let Some(pod) = pod else { return Ok(None) };
     // VALIDATED ON THE WAY IN, not only on the way out. `pod create` has always checked the name
@@ -523,6 +524,12 @@ fn join_pod_and_bind_its_files(
         return Ok(Some(holder));
     }
     crate::pod::add_member(pod, name)?;
+    // `--network-alias`: more names for this member in the pod's shared hosts file, which every
+    // member reads, the ones already running included (Docker's network-scoped alias: what a compose
+    // service is reached by, its service name, beside its container name).
+    for a in aliases {
+        crate::pod::add_member(pod, a)?;
+    }
     // Bind the pod's shared hosts over /etc/hosts. RW (not `:ro`): a read-only remount of a bind is
     // refused inside the pod's single-uid user ns (EPERM), and pod members are co-trusted anyway
     // (they already share the user+net ns).
@@ -1896,6 +1903,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             dns_requested,
             &mut inherited_nameservers,
             !args.pod_bridges.is_empty(),
+            args.network_aliases,
         )?,
     };
     let (ipc_from, shm_dir) = share_ipc(&args, &name, pod_holder, &pod_label)?;

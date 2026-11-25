@@ -157,10 +157,13 @@ through, that would leave the destination is refused. The Docker API serves
 container that has been created and not started (how Testcontainers copies its files) is in place
 when its command starts.
 
-**The Docker API's 501 says what does the job.** An endpoint it does not serve (networks, volumes,
-build) answered "not translated by kern-serve in this phase"; `docker compose` through the socket
-stops at its first network call, and the answer now names `kern compose -f <file> up` (or `kern
-build`).
+**`docker compose` works through kern's socket.** Its first network call answered 501 and it
+stopped there. Networks are served now as kern pods (a service is reached by its name from every
+member, the ones already running included) and volumes as kern volumes, with the labels compose finds
+them by: `up`, `ps`, `logs`, `exec` and `down -v` run a two-service file with a named volume. A
+container on two networks is refused by name; `kern compose` runs such a file. `kern box
+--network-alias` gives a box another name on its pod's network, as Docker's does. An endpoint still
+not served (`build`) answers 501 naming `kern build`, where it named an internal server.
 
 **`kern compose -f -` reads the file from stdin, as `docker compose -f -` does.** It answered "reading
 -: No such file or directory". The current directory is the project's, for its name and for relative
