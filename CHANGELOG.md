@@ -19,6 +19,52 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
+## Unreleased
+
+**`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
+A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
+first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).
+Testcontainers, docker-py and the `docker` CLI with `DOCKER_HOST` drive kern's boxes: create, start,
+attached `run` with stdout, stderr and exit code apart, `exec`, logs, wait, stop, remove, pull,
+inspect. Each request is a `kern` command; what kern refuses without a flag is refused by name, a
+socket as a bind source (Testcontainers' Ryuk) is refused, and an endpoint not translated answers
+501. kern removes a Testcontainers session's containers itself when the process that made them ends.
+On Windows, `kern compat docker pipe` serves the same API on `\\.\pipe\kern-docker`, for this
+account only, with no TCP endpoint. Testcontainers' Redis and Postgres modules pass. See
+[docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
+
+**`kern-docker`: the `docker` command line, translated into kern's.** A link to kern called
+`kern-docker` runs `docker run|exec|ps|logs|compose|...` against kern's boxes, flag by flag; a flag
+kern does not mean the same stops the command with exit 125, naming it. `kern compat docker -- CMD`
+answers `docker` for one command, in Windows too (`kern.exe` puts its own `docker.exe` at the front
+of that command's PATH); `kern compat docker link <dir>` makes a recorded `docker` link that
+`kern doctor` shows. `docker version` says kern. See [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
+
+**`--egress-secret`: a key the box uses and never holds.** `kern box --egress-secret
+host=H,header=N,env=VAR|file=PATH[,scheme=Bearer]`: the egress proxy adds the header to the box's
+plain `http://` requests to H and sends them on as `https://`, pinned to the address it vetted; an
+echo of the key in an answer reaches the box as `[kern-secret]`. The key is read from kern's
+environment or the file, and is not in the box, its arguments or kern's records. The SDKs take the
+same rules: `Sandbox(egress_secrets=[...])` in Python, `egressSecrets` in Node. See
+[docs/EGRESS.md](docs/EGRESS.md).
+
+**In kern's WSL distro, nothing kern starts opens a vsock socket.** A seccomp filter installed while
+kern is still root, and inherited by every box, supervisor and helper, refuses `socket(AF_VSOCK)`:
+from the distro, vsock reached Windows' own file server. Boxes already refused it. See
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+
+**`kern top --json` and `kern version --json`.** `kern top --json` prints one frame of the task
+manager as JSON, `--stream` one a line (NDJSON) every `--interval` seconds, `--tab` adds those tabs'
+records; every frame opens with `"schema"`, which `kern version --json` reports as `json_schema`.
+Built by the same function the screen draws from. See [docs/TOP-JSON.md](docs/TOP-JSON.md).
+
+**`kern self-update` in Windows updates `kern.exe` too**, after the distro's kern: to the
+`kern-windows-x86_64.exe` of the release the distro runs, whose signature `kern.exe` checks itself
+with the release keys. The replaced one is kept for `--rollback`. See [docs/INSTALL.md](docs/INSTALL.md).
+
+**`--egress-allow`, `--egress-deny` and `--egress-secret` work with `-d`.** The filter of a detached
+box is started for every attempt, `--restart` included, and stopped with it; it was refused before.
+
 ## kern sandbox 0.3.0 - 2026-11-20
 
 **It carries the kern v0.56.0 binary**, and both bindings gain what v0.56.0 lists under "kern sandbox":

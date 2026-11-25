@@ -12,6 +12,9 @@
 //! "Hybrid" = ONE kern: identical CLI on native Linux and on Windows; the Windows side is only this
 //! forwarder. No daemon, no Docker Desktop.
 
+mod npipe;
+mod selfupdate;
+
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
@@ -930,6 +933,325 @@ fn doctor_windows_rows(target: &Target) {
     println!("{}", router_row(port, &probe_port(port)));
 }
 
+// ---------------------------------------------------------------------------------------------
+// The docker command line on Windows: `kern compat docker -- CMD` and `docker.exe`.
+//
+// LEVEL 1 IS THE WINDOWS FORM. `kern compat docker -- npm run dev` runs that Windows command with a
+// folder of kern's at the FRONT of its PATH, holding `docker.exe` and `docker-compose.exe` (this
+// binary, hard-linked or copied), and `KERN_DOCKER_SHIM=1`. A `docker` the command or its children
+// start is then this binary, which forwards to kern in the distro as `kern __docker ...`, with the
+// `C:\` paths translated like every other forwarded argument. Nothing outside that command changes.
+//
+// LEVEL 2 (A PERMANENT `docker` LINK) IS NOT OFFERED HERE: Docker Desktop's `docker.exe` sits in the
+// SYSTEM PATH, which Windows puts before the user's, so a link in the user's PATH would not be the
+// `docker` a script gets. The per-command PATH is the one Windows lets kern decide.
+//
+// `docker.exe` started any other way refuses: kern answers to that name only where it was asked to.
+
+/// The variable `kern compat docker` puts on its command, as the Linux side does.
+const SHIM_ENV: &str = "KERN_DOCKER_SHIM";
+
+/// docker's own exit code for a refused command.
+const SHIM_REFUSED: i32 = 125;
+
+/// Which docker name this binary runs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerName {
+    Docker,
+    Compose,
+}
+
+/// The name from a file stem: `docker` / `docker-compose`, any case (Windows names are not
+/// case-sensitive).
+fn docker_name_of(stem: &str) -> Option<DockerName> {
+    match stem.to_ascii_lowercase().as_str() {
+        "docker" => Some(DockerName::Docker),
+        "docker-compose" => Some(DockerName::Compose),
+        _ => None,
+    }
+}
+
+/// This process's docker name, read from its own executable's file name.
+fn docker_name() -> Option<DockerName> {
+    let exe = env::current_exe().ok()?;
+    docker_name_of(exe.file_stem()?.to_str()?)
+}
+
+/// `docker.exe ARGS`: forward as `kern __docker ARGS` (or `__docker-compose`), only when asked.
+fn run_as_docker(which: DockerName, args: &[String]) -> i32 {
+    if env::var(SHIM_ENV).as_deref() != Ok("1") {
+        eprintln!(
+            "kern-docker: this is kern.exe, started under the name docker. kern answers to that \
+             name only inside `kern compat docker -- <command>`; otherwise type `kern`"
+        );
+        return SHIM_REFUSED;
+    }
+    for var in ["DOCKER_HOST", "DOCKER_CONTEXT"] {
+        if let Ok(v) = env::var(var) {
+            if !v.is_empty() {
+                eprintln!(
+                    "kern-docker: {var} is set ({}): the command asks for a particular docker \
+                     engine, and kern is not one. Unset {var} to run it with kern",
+                    short(&v)
+                );
+                return SHIM_REFUSED;
+            }
+        }
+    }
+    let verb = match which {
+        DockerName::Docker => "__docker",
+        DockerName::Compose => "__docker-compose",
+    };
+    let mut fwd = Vec::with_capacity(args.len() + 1);
+    fwd.push(verb.to_string());
+    fwd.extend(args.iter().cloned());
+    forward_to_kern(&fwd, false)
+}
+
+/// `kern compat ...` as typed in Windows.
+#[derive(Debug, PartialEq, Eq)]
+enum Compat {
+    /// Run this Windows command with `docker` answered by kern.
+    Run(Vec<String>),
+    /// `link` / `unlink` / `status`: the Linux side's level 2, not offered on Windows.
+    Level2(String),
+    /// `pipe`: the Docker API for Windows programs on `\\.\pipe\kern-docker`.
+    Pipe,
+    Usage,
+}
+
+/// Parse `kern compat docker ...`; `None` for anything else, which is forwarded.
+fn parse_compat(args: &[String]) -> Option<Compat> {
+    let (first, rest) = args.split_first()?;
+    if first != "compat" {
+        return None;
+    }
+    let Some((tool, rest)) = rest.split_first() else {
+        return Some(Compat::Usage);
+    };
+    if tool != "docker" {
+        return Some(Compat::Usage);
+    }
+    Some(match rest.split_first() {
+        None => Compat::Usage,
+        Some((w, tail)) if w == "--" => {
+            if tail.is_empty() {
+                Compat::Usage
+            } else {
+                Compat::Run(tail.to_vec())
+            }
+        }
+        Some((w, _)) if w == "link" || w == "unlink" || w == "status" => Compat::Level2(w.clone()),
+        Some((w, tail)) if w == "pipe" && tail.is_empty() => Compat::Pipe,
+        Some(_) => Compat::Run(rest.to_vec()),
+    })
+}
+
+/// The Windows program a bare name runs as, the way `cmd.exe` finds it: each PATH folder in turn,
+/// the name as given when it has an extension, then with each PATHEXT extension. `npm` is
+/// `npm.cmd`, which a lookup for `.exe` alone would not find.
+fn resolve_program(
+    prog: &str,
+    dirs: &[PathBuf],
+    exts: &[String],
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    let p = std::path::Path::new(prog);
+    if prog.contains(['\\', '/', ':']) {
+        return Some(p.to_path_buf());
+    }
+    let has_ext = p.extension().is_some();
+    for d in dirs {
+        if has_ext {
+            let c = d.join(prog);
+            if exists(&c) {
+                return Some(c);
+            }
+        }
+        for e in exts {
+            let c = d.join(format!("{prog}{e}"));
+            if exists(&c) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// PATHEXT's extensions, or Windows' default list when it is unset.
+fn path_exts() -> Vec<String> {
+    parse_path_exts(&env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string()))
+}
+
+/// The extensions of a PATHEXT value: each `.X` between the semicolons, junk dropped.
+fn parse_path_exts(raw: &str) -> Vec<String> {
+    raw.split(';')
+        .map(str::trim)
+        .filter(|e| e.starts_with('.') && e.len() > 1)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A folder name that is a process id, so the sweep only ever removes what `run_compat` made.
+fn is_pid_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 10 && n.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// The lock a running `kern compat docker` holds open in its folder for its whole life.
+const COMPAT_LOCK: &str = ".lock";
+
+/// Open the lock so that no other process can DELETE it while this one runs: the sweep below tells
+/// a live folder from a stale one by whether the lock can be removed.
+fn hold_lock(path: &std::path::Path) -> std::io::Result<fs::File> {
+    let mut o = fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ only: no FILE_SHARE_DELETE, so DeleteFile from anyone else fails.
+        o.share_mode(0x0000_0001);
+    }
+    o.open(path)
+}
+
+/// Remove the folders of runs whose process is gone: their lock can be deleted. A live run's lock
+/// cannot (it is held without delete sharing), so its folder is left alone.
+fn sweep_stale_compat(base: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if !name.to_str().is_some_and(is_pid_name) {
+            continue;
+        }
+        let dir = base.join(&name);
+        match fs::remove_file(dir.join(COMPAT_LOCK)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// `kern compat docker -- CMD ARGS`: run CMD with `docker` answered by kern; CMD's exit code.
+fn run_compat(c: Compat) -> i32 {
+    const USAGE: &str =
+        "usage: kern compat docker -- <command> [args...] | kern compat docker pipe (the Docker API on \\\\.\\pipe\\kern-docker)";
+    let cmd = match c {
+        Compat::Run(cmd) => cmd,
+        Compat::Pipe => {
+            return match resolve_target() {
+                Ok(target) => npipe::run(forward_argv(&target, &[])),
+                Err(_) => {
+                    eprintln!(
+                        "kern: compat docker pipe: no WSL distro with kern (run `kern doctor`)"
+                    );
+                    1
+                }
+            };
+        }
+        Compat::Usage => {
+            eprintln!("kern: {USAGE}");
+            return 2;
+        }
+        Compat::Level2(w) => {
+            eprintln!(
+                "kern: compat docker {w} is for Linux. On Windows, Docker Desktop's docker.exe is in \
+                 the SYSTEM PATH, which Windows puts before yours, so a link could not be the docker \
+                 a script gets. Use `kern compat docker -- <command>`: that command's PATH starts \
+                 with kern's docker.exe"
+            );
+            return 2;
+        }
+    };
+    let Some((prog, rest)) = cmd.split_first() else {
+        eprintln!("kern: {USAGE}");
+        return 2;
+    };
+    let exe = match env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("kern: compat docker: cannot find this binary: {e}");
+            return 1;
+        }
+    };
+    let base = env::temp_dir().join("kern-compat-docker");
+    if let Err(e) = fs::create_dir_all(&base) {
+        eprintln!("kern: compat docker: cannot create {}: {e}", base.display());
+        return 1;
+    }
+    sweep_stale_compat(&base);
+    let dir = base.join(std::process::id().to_string());
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("kern: compat docker: cannot create {}: {e}", dir.display());
+        return 1;
+    }
+    let lock = match hold_lock(&dir.join(COMPAT_LOCK)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("kern: compat docker: cannot lock {}: {e}", dir.display());
+            let _ = fs::remove_dir_all(&dir);
+            return 1;
+        }
+    };
+    for name in ["docker.exe", "docker-compose.exe"] {
+        let to = dir.join(name);
+        // A hard link costs nothing and is the same file; a copy where links are refused (another
+        // volume, FAT).
+        if fs::hard_link(&exe, &to).is_err() {
+            if let Err(e) = fs::copy(&exe, &to) {
+                eprintln!("kern: compat docker: cannot place {name}: {e}");
+                drop(lock);
+                let _ = fs::remove_dir_all(&dir);
+                return 1;
+            }
+        }
+    }
+    let mut dirs = vec![dir.clone()];
+    dirs.extend(
+        env::var_os("PATH")
+            .map(|p| env::split_paths(&p).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    let path = match env::join_paths(&dirs) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kern: compat docker: PATH cannot be rebuilt: {e}");
+            drop(lock);
+            let _ = fs::remove_dir_all(&dir);
+            return 1;
+        }
+    };
+    let exts = path_exts();
+    let Some(program) = resolve_program(prog, &dirs, &exts, |p| p.is_file()) else {
+        eprintln!("kern: compat docker: '{prog}' is not a program in PATH");
+        drop(lock);
+        let _ = fs::remove_dir_all(&dir);
+        return 1;
+    };
+    let status = Command::new(&program)
+        .args(rest)
+        .env("PATH", &path)
+        .env(SHIM_ENV, "1")
+        .status();
+    drop(lock);
+    // A `docker.exe` still running (a child left behind) keeps its file: the folder then stays, and
+    // the next run's sweep removes it once nothing holds it.
+    let _ = fs::remove_dir_all(&dir);
+    match status {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!(
+                "kern: compat docker: cannot start '{}': {e}",
+                program.display()
+            );
+            1
+        }
+    }
+}
+
 /// The one-shot Windows install command - quoted in both "distro missing" messages, so the URL
 /// lives in exactly one place.
 const INSTALL_HINT: &str =
@@ -949,6 +1271,24 @@ fn main() {
         exit(run_wsl_cmd(cmd));
     }
 
+    // `docker.exe` / `docker-compose.exe`: this binary under the names `kern compat docker` gives it.
+    if let Some(which) = docker_name() {
+        exit(run_as_docker(which, &args));
+    }
+    // `kern compat docker ...` typed in Windows: run a WINDOWS command with `docker` answered by kern.
+    if let Some(c) = parse_compat(&args) {
+        exit(run_compat(c));
+    }
+    // `kern self-update`: the distro's kern, then this bridge, each checked by its own signature.
+    if args.first().map(String::as_str) == Some("self-update") {
+        exit(selfupdate::run(&args));
+    }
+    exit(forward_to_kern(&args, is_plain_doctor(&args)));
+}
+
+/// Resolve the distro and forward `args` (paths translated) to kern inside it: ONE `wsl.exe`. The
+/// exit code is kern's. `doctor`: add the Windows-side rows after a plain `kern doctor`.
+fn forward_to_kern(args: &[String], doctor: bool) -> i32 {
     // Up to 2 attempts: a stale cache (distro unregistered since it was written) is cleared and
     // re-resolved ONCE, transparently - not a permanent bare WSL error until a human deletes a file.
     for attempt in 0..2 {
@@ -960,7 +1300,7 @@ fn main() {
                      {INSTALL_HINT}\n\n\
                      (one-time setup - far lighter than Docker Desktop)."
                 );
-                exit(1);
+                return 1;
             }
             Err(ResolveErr::KernMissing(d)) => {
                 eprintln!(
@@ -969,7 +1309,7 @@ fn main() {
                      {INSTALL_HINT}\n\n\
                      or, if '{d}' has curl:  wsl -d {d} -- sh -lc 'curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh'"
                 );
-                exit(1);
+                return 1;
             }
         };
 
@@ -996,15 +1336,15 @@ fn main() {
                 continue;
             }
             Ok(s) => {
-                if is_plain_doctor(&args) {
+                if doctor {
                     doctor_windows_rows(&target);
                 }
-                exit(s.code().unwrap_or(1))
+                return s.code().unwrap_or(1);
             }
             Err(e) => {
                 clear_cache(); // wsl.exe not even spawnable - force a fresh probe next time
                 eprintln!("kern: could not invoke WSL2: {e}. Is WSL installed? Try: wsl -l -v");
-                exit(1);
+                return 1;
             }
         }
     }
@@ -1016,12 +1356,102 @@ fn main() {
     eprintln!(
         "kern: internal error - the WSL retry loop ended without forwarding. Please report this."
     );
-    exit(1);
+    1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_docker_names_are_read_from_the_file_name_in_any_case() {
+        assert_eq!(docker_name_of("docker"), Some(DockerName::Docker));
+        assert_eq!(docker_name_of("DOCKER"), Some(DockerName::Docker));
+        assert_eq!(docker_name_of("docker-compose"), Some(DockerName::Compose));
+        assert_eq!(docker_name_of("kern"), None);
+        assert_eq!(docker_name_of("dockerd"), None);
+    }
+
+    #[test]
+    fn compat_docker_is_parsed_here_and_anything_else_forwarded() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_compat(&a(&["ps"])), None);
+        assert_eq!(
+            parse_compat(&a(&["compat", "docker", "--", "npm", "run", "dev"])),
+            Some(Compat::Run(a(&["npm", "run", "dev"])))
+        );
+        assert_eq!(
+            parse_compat(&a(&["compat", "docker", "npm", "test"])),
+            Some(Compat::Run(a(&["npm", "test"])))
+        );
+        assert_eq!(
+            parse_compat(&a(&["compat", "docker", "link", "C:\\bin"])),
+            Some(Compat::Level2("link".into()))
+        );
+        assert_eq!(
+            parse_compat(&a(&["compat", "docker", "--"])),
+            Some(Compat::Usage)
+        );
+        assert_eq!(parse_compat(&a(&["compat", "docker"])), Some(Compat::Usage));
+        assert_eq!(parse_compat(&a(&["compat", "podman"])), Some(Compat::Usage));
+    }
+
+    #[test]
+    fn a_bare_program_name_is_found_the_way_cmd_finds_it() {
+        let dirs = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let exts: Vec<String> = [".EXE", ".CMD"].iter().map(|s| s.to_string()).collect();
+        let have = |set: &'static [&'static str]| {
+            move |p: &std::path::Path| set.iter().any(|x| p == std::path::Path::new(x))
+        };
+        assert_eq!(
+            resolve_program("npm", &dirs, &exts, have(&["/b/npm.CMD"])),
+            Some(PathBuf::from("/b/npm.CMD"))
+        );
+        assert_eq!(
+            resolve_program("node", &dirs, &exts, have(&["/a/node.EXE", "/b/node.EXE"])),
+            Some(PathBuf::from("/a/node.EXE"))
+        );
+        assert_eq!(
+            resolve_program("run.bat", &dirs, &exts, have(&["/b/run.bat"])),
+            Some(PathBuf::from("/b/run.bat"))
+        );
+        assert_eq!(
+            resolve_program("C:\\x\\y.exe", &dirs, &exts, have(&[])),
+            Some(PathBuf::from("C:\\x\\y.exe"))
+        );
+        assert_eq!(resolve_program("none", &dirs, &exts, have(&[])), None);
+    }
+
+    #[test]
+    fn the_sweep_removes_a_stale_folder_and_only_folders_named_like_a_pid() {
+        let base = std::env::temp_dir().join(format!("kern-compat-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let stale = base.join("4242");
+        let other = base.join("keep-me");
+        let _ = fs::create_dir_all(&stale);
+        let _ = fs::create_dir_all(&other);
+        let _ = fs::write(stale.join(COMPAT_LOCK), b"");
+        let _ = fs::write(stale.join("docker.exe"), b"x");
+        sweep_stale_compat(&base);
+        assert!(!stale.exists(), "a folder whose lock nobody holds is stale");
+        assert!(
+            other.exists(),
+            "a folder not named like a pid is never touched"
+        );
+        assert!(
+            is_pid_name("123") && !is_pid_name("..") && !is_pid_name("12a") && !is_pid_name("")
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pathext_is_read_as_windows_reads_it_and_junk_is_dropped() {
+        assert_eq!(
+            parse_path_exts(".COM;.EXE;;bad;.CMD"),
+            vec![".COM", ".EXE", ".CMD"]
+        );
+        assert_eq!(parse_path_exts(""), Vec::<String>::new());
+    }
 
     #[test]
     fn the_windows_router_row_is_only_added_to_a_plain_doctor() {

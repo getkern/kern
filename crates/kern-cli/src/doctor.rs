@@ -299,6 +299,7 @@ fn rows() -> Vec<R> {
     results.extend(check_gpu());
     results.extend(check_wsl_drive());
     results.extend(check_wsl_interop());
+    results.extend(check_docker_link());
     results.extend(check_tools());
     results.push(check_duplicate_installs());
     // How full the two stores are: the disk kern's data lives on, and the (RAM) log store.
@@ -1129,6 +1130,17 @@ fn check_wsl_interop() -> Option<R> {
     }
     let conf = std::fs::read_to_string("/etc/wsl.conf").unwrap_or_default();
     Some(interop_verdict(&conf))
+}
+
+/// The `docker` links `kern compat docker link` made: shown only when there is one, because the
+/// name `docker` answered by kern is something the reader should be able to see from here.
+fn check_docker_link() -> Option<R> {
+    let (ok, msg, hint) = crate::dockershim::doctor_row()?;
+    Some(if ok {
+        R::ok_note(&msg, &hint)
+    } else {
+        R::Warn(msg, hint)
+    })
 }
 
 /// The verdict on interop from the text of /etc/wsl.conf: off only when `[interop]` says

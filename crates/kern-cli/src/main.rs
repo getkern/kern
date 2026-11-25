@@ -265,6 +265,7 @@ mod cli;
 mod commands;
 mod completions;
 mod dirwatch;
+mod dockershim;
 // The compose-file parser now lives in its own CLI-free crate (so it can be fuzzed in isolation).
 // Aliased so the existing `crate::compose::` call sites (orchestration in `commands/`) stay unchanged.
 use kern_compose as compose;
@@ -309,6 +310,12 @@ mod wslentry;
 mod wslrelay;
 
 use std::process::ExitCode;
+
+/// A `kern-docker` refusal: said once, in kern's words, with docker's own refusal code.
+fn shim_refused(r: &dockershim::Refused) -> ExitCode {
+    eprintln!("kern-docker: {}", ui::scrub_message(&r.0));
+    ExitCode::from(dockershim::REFUSED_EXIT)
+}
 
 fn main() -> ExitCode {
     // Rust ignores SIGPIPE by default, so a broken pipe (`kern … | head`, `| grep -q`, quitting a
@@ -370,22 +377,65 @@ fn main() -> ExitCode {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    // KERN IS NOT DOCKER, AND DOES NOT ANSWER TO ITS NAME. Until 2026-09-19 a symlink called
-    // `docker` made this binary rewrite a `docker …` argv into kern's own and run it. That was
-    // removed, name and all: the compatibility kern offers is with the FORMAT and the FLAGS -
-    // `kern box` already takes `-p`, `-e`, `-v`, `-it`, `-m`, `--cpus`, and `kern compose` reads a
-    // `docker-compose.yml` unchanged - not with the other tool's identity. Being invoked as
-    // `docker` added nothing a caller could not get by typing `kern`, and it cost what borrowed
-    // names always cost: a benchmark on this machine measured kern and published the row under
-    // Docker's name at 4.2 ms, next to a real podman at 285 ms, because `docker --version`
-    // answered for kern.
-    //
-    // `invoked` is still read, for the one thing argv[0] legitimately decides below.
-    let _ = invoked;
+    // THE NAME DECIDES WHO ANSWERS: `kern`, or `kern-docker` (the docker command line translated
+    // into kern's, `dockershim`). The name `docker` is answered only where the user asked for it
+    // (`kern compat docker -- CMD`, or a link made by `kern compat docker link`), and `docker
+    // version` says kern: until 2026-09-19 a bare `docker` link made kern answer silently, and a
+    // benchmark published kern's numbers under Docker's name. See `dockershim` for the rules.
+    let shim = match dockershim::mode_for(
+        invoked,
+        global_env(dockershim::SHIM_ENV).is_some_and(|v| v == "1"),
+        || dockershim::invoked_through_registered_link(&arg0),
+    ) {
+        Ok(m) => m,
+        Err(r) => return shim_refused(&r),
+    };
+    // `kern __docker ...` / `kern __docker-compose ...`: the same translation, asked for by name.
+    // `kern.exe` uses it: called as `docker.exe` on Windows (only inside `kern compat docker`), it
+    // cannot choose the argv[0] of the kern it starts in the distro.
+    let (shim, args) = match (shim, args.split_first()) {
+        (dockershim::Mode::Kern, Some((verb, rest))) if verb == "__docker" => {
+            (dockershim::Mode::Docker, rest.to_vec())
+        }
+        (dockershim::Mode::Kern, Some((verb, rest))) if verb == "__docker-compose" => {
+            (dockershim::Mode::Compose, rest.to_vec())
+        }
+        (m, _) => (m, args),
+    };
+    let mut print_after: Option<String> = None;
+    let args = if shim == dockershim::Mode::Kern {
+        args
+    } else {
+        if let Some(r) = dockershim::engine_variable(global_env) {
+            return shim_refused(&r);
+        }
+        match dockershim::translate(shim, &args) {
+            Ok(plan) => {
+                if let Some(note) = plan.note {
+                    eprintln!("{note}");
+                }
+                if plan.argv.is_empty() {
+                    if let Some(text) = plan.print_after {
+                        println!("{text}");
+                    }
+                    return ExitCode::SUCCESS;
+                }
+                print_after = plan.print_after;
+                plan.argv
+            }
+            Err(r) => return shim_refused(&r),
+        }
+    };
     // Map the result to an exit code in exactly ONE place (the lib/command layer returns
     // `Result`, never calls `process::exit` itself).
     match progress::take_progress_flag(&args).and_then(|args| cli::run(&args)) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            // `run -d` / `create` under `kern-docker`: the name, on stdout, where docker prints the id.
+            if let Some(text) = print_after {
+                println!("{text}");
+            }
+            ExitCode::SUCCESS
+        }
         // A WORKLOAD'S OWN STATUS, adopted verbatim and printed nowhere: `compose run` is
         // transparent about what the command it ran did. `as u8` is the whole range a process exit
         // status has; a code outside it cannot be produced by `WEXITSTATUS`.

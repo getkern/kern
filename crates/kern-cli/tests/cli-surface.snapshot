@@ -31,6 +31,7 @@ COMMANDS:
 
   Manage boxes
     top                                                            Interactive task manager (TUI): host, every GPU, boxes, sandboxes (finished too)
+    top --json [--tab T,..] [--stream [--interval S]]               The same frames as JSON for a program: one, or one a line every S s (NDJSON)
     stats [--json] [--no-stream] [name...]                         Per-box memory + CPU (always a snapshot; --no-stream names that, `kern top` is the live view)
     sandbox ls [--json] | history [-n N] [--failed] [--all] [--json] | stats [--all] [--json]  The SDK and MCP sandboxes: running now, finished, outcomes
     sandbox show [<box>] [-n N] [--json]                         The code SDK sandboxes ran and their output (kept with the history)
@@ -52,6 +53,8 @@ COMMANDS:
     diff <box> [--json]                                            List filesystem changes vs the image (C/D); a kept box's too, running or not
     export <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
     container <verb> ...                                           The box verbs under one name (container ls = ps; not run/top/prune)
+    compat docker (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
+    compat docker (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
     events                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     prune                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code
     gc [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image

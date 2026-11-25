@@ -18,6 +18,9 @@ pub struct GlobalOpts;
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Version,
+    /// `kern version --json` / `kern --version --json`: the binary's version and the schema of
+    /// `kern top --json`, so a reader decides by a number whether it can read this kern.
+    VersionJson,
     /// Bare `kern`: a short logo + tagline + the most-used commands (full list via `--help`).
     Banner,
     Help,
@@ -483,6 +486,11 @@ pub enum Command {
     LocalRouter,
     /// Hidden: the port of those names, for `kern.exe doctor` (`crate::localrouter::port_verb`).
     RouterPort,
+    /// `compat docker ...`: run a command with `docker` answered by kern, or manage the `docker`
+    /// links kern made (`crate::dockershim`).
+    Compat {
+        args: Vec<String>,
+    },
     /// Hidden: inotify on a sandbox workspace directory for an SDK (`crate::dirwatch`).
     WatchDir {
         root: String,
@@ -746,6 +754,12 @@ pub enum Command {
     },
     /// `kern top`: live auto-refreshing box monitor.
     Top,
+    /// `kern top --json [--tab LIST] [--stream [--interval S]]`: the same frames as JSON, one a line.
+    TopJson {
+        tabs: Vec<usize>,
+        stream: bool,
+        interval_ms: u64,
+    },
     /// `kern compose <file> [up|down] [--no-pod] [-d]`: bring up (or tear down) a stack of boxes in
     /// dependency order. `up` auto-creates a pod so services reach each other by name (`--no-pod`
     /// opts out); `down` stops the boxes and removes the pod. `-d`/`--detach` returns as soon as the
@@ -1148,6 +1162,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // Bare `kern` → the short banner; `--help`/`-h`/`help` → the full command reference.
         None => Command::Banner,
         Some("--help" | "-h" | "help") => Command::Help,
+        Some("--version" | "-V" | "version") if rest.get(1) == Some(&"--json") => {
+            reject_unknown_flags("version", &rest, &["--json"])?;
+            Command::VersionJson
+        }
         Some("--version" | "-V" | "version") => Command::Version,
         // `box`: `--plan` previews; `--rootfs <dir>`/`--image <ref>` [-d] [-- cmd] runs it.
         Some("box") => parse_box(&rest)?,
@@ -1267,6 +1285,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // Hidden: the local router (spawned by `compose up`).
         Some("__local-router") => Command::LocalRouter,
         Some("__router-port") => Command::RouterPort,
+        Some("compat") => Command::Compat {
+            args: rest.iter().skip(1).map(|s| (*s).to_string()).collect(),
+        },
         Some("__relay-holder") => Command::RelayHolder {
             dir: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
         },
@@ -2399,9 +2420,86 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
         }
         // `top`: live box monitor.
+        // `--json` is what a program reads: one frame, or `--stream` one a line (NDJSON); `--tab`
+        // adds the records of those tabs (the expensive ones are read only when asked, as on screen).
         Some("top") => {
-            reject_unknown_flags("top", &rest, &[])?;
-            Command::Top
+            let mut json = false;
+            let mut stream = false;
+            let mut tabs: Vec<usize> = Vec::new();
+            let mut interval_ms: Option<u64> = None;
+            let mut i = 1;
+            while i < rest.len() {
+                let a = rest[i];
+                let (flag, inline) = match a.split_once('=') {
+                    Some((f, v)) if f.starts_with("--") => (f, Some(v)),
+                    _ => (a, None),
+                };
+                let mut value = |name: &'static str| -> Result<String, Error> {
+                    match inline {
+                        Some(v) => Ok(v.to_string()),
+                        None => {
+                            i += 1;
+                            rest.get(i)
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage(name))
+                        }
+                    }
+                };
+                match flag {
+                    "--json" => json = true,
+                    "--stream" => stream = true,
+                    "--tab" => {
+                        for t in value("top --json --tab <overview|boxes|runs|images|builds|profiles|storage|sandboxes>[,...]")?
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                        {
+                            tabs.push(crate::tui::json_tab(t).ok_or_else(|| {
+                                Error::Cli(format!(
+                                    "top --tab {t}: not a tab (overview, boxes, runs, images, builds, profiles, storage, sandboxes, logs)"
+                                ))
+                            })?);
+                        }
+                    }
+                    "--interval" => {
+                        let v = value("top --json --stream --interval <seconds> (0.2 or more)")?;
+                        let secs: f64 = v.trim().parse().map_err(|_| {
+                            Error::Cli(format!("top --interval {v}: not a number of seconds"))
+                        })?;
+                        if !secs.is_finite() || secs < 0.2 || secs > 3600.0 {
+                            return Err(Error::Cli(format!(
+                                "top --interval {v}: between 0.2 and 3600 seconds"
+                            )));
+                        }
+                        interval_ms = Some((secs * 1000.0).round() as u64);
+                    }
+                    other => {
+                        return Err(Error::Cli(format!(
+                            "top: unknown flag {other:?} (top takes --json, --tab, --stream, --interval)"
+                        )))
+                    }
+                }
+                i += 1;
+            }
+            if !json && (stream || !tabs.is_empty() || interval_ms.is_some()) {
+                return Err(Error::Usage(
+                    "top --tab / --stream / --interval shape the JSON output: add --json",
+                ));
+            }
+            if interval_ms.is_some() && !stream {
+                return Err(Error::Usage(
+                    "top --interval is the pace of --stream: add --stream",
+                ));
+            }
+            if json {
+                Command::TopJson {
+                    tabs,
+                    stream,
+                    interval_ms: interval_ms.unwrap_or(1000),
+                }
+            } else {
+                Command::Top
+            }
         }
         // `compose <file> [up|down] [--no-pod]`: bring up / tear down a stack.
         Some("compose") => {
@@ -6424,6 +6522,14 @@ pub fn run(args: &[String]) -> Result<(), Error> {
     let (_opts, cmd) = parse(args)?;
     match cmd {
         Command::Version => commands::version(),
+        Command::VersionJson => {
+            println!(
+                "{{\"version\":{},\"json_schema\":{}}}",
+                kern_common::json_str(kern_common::VERSION),
+                crate::tui::JSON_SCHEMA
+            );
+            Ok(())
+        }
         Command::Banner => commands::banner(),
         Command::Help => commands::help(),
         Command::HelpFor(verb) => commands::help_for(&verb),
@@ -6777,6 +6883,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
         Command::LocalRouter => crate::localrouter::run(),
         Command::RouterPort => std::process::exit(crate::localrouter::port_verb()),
+        Command::Compat { args } => crate::dockershim::compat(&args),
         Command::WatchDir {
             root,
             rel,
@@ -6921,6 +7028,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Logout { registry } => crate::auth::logout(registry.as_deref()),
         Command::Completions { shell } => crate::completions::completions(&shell),
         Command::Top => commands::top(),
+        Command::TopJson {
+            tabs,
+            stream,
+            interval_ms,
+        } => crate::tui::json(&tabs, stream, std::time::Duration::from_millis(interval_ms)),
         Command::Compose {
             files,
             action,
@@ -10355,7 +10467,9 @@ mod no_verb_swallows_a_flag_it_does_not_take {
             vec!["probe", "--all"],
             vec!["prune", "-f"],
             vec!["recover", "--dry-run"],
-            vec!["top", "--json"],
+            // `top --json` is a flag since 2026-11-20; a misspelling of it is still refused.
+            vec!["top", "--jsno"],
+            vec!["top", "--json", "--stram"],
             vec!["validate", "--strict"],
             vec!["examples", "--toml"],
         ] {

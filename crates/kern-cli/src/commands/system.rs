@@ -178,6 +178,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
 
   {d}Manage boxes{z}
     {c}top{z}                                                            Interactive task manager (TUI): host, every GPU, boxes, sandboxes (finished too)
+    {c}top{z} --json [--tab T,..] [--stream [--interval S]]               The same frames as JSON for a program: one, or one a line every S s (NDJSON)
     {c}stats{z} [--json] [--no-stream] [name...]                         Per-box memory + CPU (always a snapshot; --no-stream names that, `kern top` is the live view)
     {c}sandbox{z} ls [--json] | history [-n N] [--failed] [--all] [--json] | stats [--all] [--json]  The SDK and MCP sandboxes: running now, finished, outcomes
     {c}sandbox show{z} [<box>] [-n N] [--json]                         The code SDK sandboxes ran and their output (kept with the history)
@@ -201,6 +202,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}diff{z} <box> [--json]                                            List filesystem changes vs the image (C/D); a kept box's too, running or not
     {c}export{z} <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
     {c}container{z} <verb> ...                                           The box verbs under one name (container ls = ps; not run/top/prune)
+    {c}compat docker{z} (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
+    {c}compat docker{z} (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
+                                                                     Windows programs: `kern compat docker pipe` in Windows (\\\\.\\pipe\\kern-docker)
     {c}events{z}                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     {c}prune{z}                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code
     {c}gc{z} [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
@@ -473,7 +477,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {d}which is a real kernel-enforced write boundary. For full isolation use `box`.{z}
 
 {b}OPTIONS:{z}
-    -V, --version  Print version
+    -V, --version  Print version (`--version --json`: the version and the schema of `kern top --json`)
     -h, --help     Print this help
 
 {d}Docs & issues: {z}{c}https://github.com/getkern/kern{z}",

@@ -2480,7 +2480,10 @@ fn build_check_reports_without_building_and_its_status_is_the_answer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// KERN DOES NOT ANSWER TO ANOTHER TOOL'S NAME, whatever the file it is invoked through is called.
+/// KERN DOES NOT ANSWER TO ANOTHER TOOL'S NAME UNLESS ASKED, whatever the file it is invoked through
+/// is called. Since the `kern-docker` shim (2026-11-20) the name `docker` is answered only inside
+/// `kern compat docker -- CMD` or through a link `kern compat docker link` recorded; a `docker` link
+/// made any other way, as here, is refused in kern's words with exit 125.
 ///
 /// Until 2026-09-19 a symlink called `docker` made this binary read its own `argv[0]`, rewrite a
 /// Docker command line into kern's dialect and run it. What that cost is measurable and was
@@ -2505,18 +2508,31 @@ fn kern_does_not_translate_a_docker_command_line() {
         return;
     }
 
-    // It says what it is. A shim answered this with kern's version too, so this alone is not the
-    // assertion - it is the control that the binary under the link really is ours.
-    let v = std::process::Command::new(&link).arg("--version").output();
+    // It says what it is: the control that the binary under the link really is ours. The
+    // environment is cleared of the one variable that would make the name answered.
+    let v = std::process::Command::new(&link)
+        .arg("--version")
+        .env_remove("KERN_DOCKER_SHIM")
+        .output();
     let Ok(v) = v else {
         eprintln!("skip: cannot spawn through the symlink");
         let _ = std::fs::remove_dir_all(&dir);
         return;
     };
-    let ver = String::from_utf8_lossy(&v.stdout).to_lowercase();
+    let ver = format!(
+        "{}{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    )
+    .to_lowercase();
     assert!(
         ver.contains("kern"),
         "invoked as docker it must name itself kern: {ver:?}"
+    );
+    assert_eq!(
+        v.status.code(),
+        Some(125),
+        "an unasked `docker` name is a refusal: {ver:?}"
     );
 
     // THE ASSERTION. `docker run --rm IMAGE cmd` is Docker's grammar, and the shim turned it into
@@ -2524,6 +2540,7 @@ fn kern_does_not_translate_a_docker_command_line() {
     // that still translated would succeed here and one that does not must refuse in kern's voice.
     let out = std::process::Command::new(&link)
         .args(["run", "--rm", "alpine", "/bin/true"])
+        .env_remove("KERN_DOCKER_SHIM")
         .output()
         .expect("spawn through the symlink");
     let err = String::from_utf8_lossy(&out.stderr);
@@ -2542,6 +2559,7 @@ fn kern_does_not_translate_a_docker_command_line() {
     // and its own comment claimed the surface "has never claimed to be Docker". It had.
     let c = std::process::Command::new(&link)
         .args(["compose", "version"])
+        .env_remove("KERN_DOCKER_SHIM")
         .output()
         .expect("spawn through the symlink");
     let all = format!(
@@ -2555,6 +2573,327 @@ fn kern_does_not_translate_a_docker_command_line() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A link called `kern-docker` in a fresh directory, or `None` (skip) where symlinks cannot be made.
+fn shim_link(tag: &str, name: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let dir = std::env::temp_dir().join(format!("kern-shim-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    let link = dir.join(name);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_kern"), &link).ok()?;
+    Some((dir, link))
+}
+
+fn out_err(o: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+/// `kern-docker` translates what kern means the same, and refuses the rest BY NAME with docker's
+/// refusal code; `docker version` is kern's version; an engine variable is refused. No box needed.
+#[test]
+fn kern_docker_translates_and_refuses_by_name() {
+    let Some((dir, kd)) = shim_link("tr", "kern-docker") else {
+        eprintln!("skip: cannot create a symlink here");
+        return;
+    };
+    let kern_ver = kern().arg("--version").output().expect("kern --version");
+    let kern_ver = String::from_utf8_lossy(&kern_ver.stdout).trim().to_string();
+    let v = std::process::Command::new(&kd)
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .expect("spawn kern-docker");
+    let (o, e) = out_err(&v);
+    assert!(v.status.success(), "{e}");
+    assert_eq!(
+        format!("kern {}", o.trim()),
+        kern_ver,
+        "docker version must be kern's own"
+    );
+
+    let r = std::process::Command::new(&kd)
+        .args(["run", "--log-opt", "max-size=1m", "alpine", "true"])
+        .output()
+        .expect("spawn kern-docker");
+    let (_, e) = out_err(&r);
+    assert_eq!(r.status.code(), Some(125), "{e}");
+    assert!(
+        e.contains("docker run --log-opt") && e.starts_with("kern-docker: "),
+        "{e}"
+    );
+
+    let r = std::process::Command::new(&kd)
+        .args(["ps", "-q"])
+        .env("DOCKER_HOST", "tcp://engine:2375")
+        .output()
+        .expect("spawn kern-docker");
+    let (_, e) = out_err(&r);
+    assert_eq!(r.status.code(), Some(125), "{e}");
+    assert!(e.contains("DOCKER_HOST is set"), "{e}");
+
+    // The variable level 1 sets makes the name `docker` answered.
+    let Some((dir2, d)) = shim_link("tr2", "docker") else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let r = std::process::Command::new(&d)
+        .args(["version", "--format", "{{.Client.Version}}"])
+        .env("KERN_DOCKER_SHIM", "1")
+        .output()
+        .expect("spawn docker link");
+    let (o, e) = out_err(&r);
+    assert!(r.status.success(), "{e}");
+    assert_eq!(format!("kern {}", o.trim()), kern_ver);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// `kern compat docker -- CMD`: inside CMD, `docker` is kern; the command's exit code is kern's;
+/// the folder that held the link is gone afterwards.
+#[test]
+fn compat_docker_answers_docker_for_one_command_and_cleans_up() {
+    let o = kern()
+        .args([
+            "compat",
+            "docker",
+            "--",
+            "sh",
+            "-c",
+            "docker version --format '{{.Server.Version}}' && echo \"$KERN_DOCKER_SHIM\" && command -v docker",
+        ])
+        .output()
+        .expect("kern compat docker");
+    let (out, err) = out_err(&o);
+    assert!(o.status.success(), "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.get(1).copied(), Some("1"), "{out}");
+    let link = lines.get(2).copied().unwrap_or_default();
+    assert!(
+        link.contains("/compat-docker/"),
+        "docker must resolve to kern's folder: {out}"
+    );
+    let folder = std::path::Path::new(link)
+        .parent()
+        .map(std::path::Path::to_path_buf);
+    assert!(
+        folder.as_deref().is_some_and(|f| !f.exists()),
+        "the folder of the link outlived the command: {folder:?}"
+    );
+    let o = kern()
+        .args(["compat", "docker", "--", "sh", "-c", "exit 7"])
+        .output()
+        .expect("kern compat docker");
+    assert_eq!(o.status.code(), Some(7));
+}
+
+/// The level-2 link: made in a folder the user names, recorded in kern's config dir (a temporary
+/// one here), refused over a file that is not kern, removed by `unlink`.
+#[test]
+fn compat_docker_link_is_recorded_answered_and_removed() {
+    let Some((dir, _kd)) = shim_link("ln", "kern-docker") else {
+        eprintln!("skip: cannot create a symlink here");
+        return;
+    };
+    let cfg = dir.join("cfg");
+    let bin = dir.join("bin");
+    let _ = std::fs::create_dir_all(&bin);
+    let k = |args: &[&str]| {
+        kern()
+            .args(args)
+            .env("XDG_CONFIG_HOME", &cfg)
+            .output()
+            .expect("kern compat docker")
+    };
+    let bin_s = bin.to_string_lossy().into_owned();
+    let o = k(&["compat", "docker", "link", &bin_s]);
+    let (out, err) = out_err(&o);
+    assert!(o.status.success(), "{err}");
+    assert!(
+        out.contains("remove it with: kern compat docker unlink"),
+        "{out}"
+    );
+    let recorded =
+        std::fs::read_to_string(cfg.join("kern").join("docker-links")).unwrap_or_default();
+    assert!(recorded.contains("/bin/docker"), "{recorded:?}");
+    // Answered through the link with no variable set.
+    let r = std::process::Command::new(bin.join("docker"))
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .env_remove("KERN_DOCKER_SHIM")
+        .env("XDG_CONFIG_HOME", &cfg)
+        .output()
+        .expect("spawn the link");
+    let (o2, e2) = out_err(&r);
+    assert!(r.status.success(), "a recorded link must be answered: {e2}");
+    assert!(!o2.trim().is_empty());
+    let o = k(&["compat", "docker", "unlink", &bin_s]);
+    assert!(o.status.success(), "{}", out_err(&o).1);
+    assert!(!bin.join("docker").exists());
+    // A file that is not kern is never replaced.
+    let _ = std::fs::write(bin.join("docker"), "#!/bin/sh\n");
+    let o = k(&["compat", "docker", "link", &bin_s]);
+    assert!(!o.status.success());
+    assert!(out_err(&o).1.contains("is not kern"), "{}", out_err(&o).1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a seeding script does, through `kern-docker`, on real boxes: `run --rm` prints the command's
+/// output, `run -d` prints the name `logs`/`exec` take, `exec -i` reads stdin to EOF.
+#[test]
+fn kern_docker_runs_a_script_shaped_session_on_real_boxes() {
+    if let Some(why) = no_box_here() {
+        eprintln!("skip: {why}");
+        return;
+    }
+    let Some((dir, kd)) = shim_link("box", "kern-docker") else {
+        eprintln!("skip: cannot create a symlink here");
+        return;
+    };
+    let run = |args: &[&str]| {
+        std::process::Command::new(&kd)
+            .args(args)
+            .output()
+            .expect("spawn kern-docker")
+    };
+    let o = run(&["run", "--rm", "alpine:latest", "echo", "-n", "hi"]);
+    let (out, err) = out_err(&o);
+    assert!(o.status.success(), "{err}");
+    assert_eq!(out, "hi");
+    assert!(err.contains("run without --network"), "{err}");
+    let o = run(&["run", "-d", "alpine:latest", "sleep", "60"]);
+    let (out, err) = out_err(&o);
+    assert!(o.status.success(), "{err}");
+    let name = out.trim().to_string();
+    assert!(name.starts_with("kd-") && name.len() == 11, "{out:?}");
+    let mut c = std::process::Command::new(&kd)
+        .args(["exec", "-i", &name, "wc", "-l"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn exec");
+    if let Some(mut w) = c.stdin.take() {
+        use std::io::Write;
+        let _ = w.write_all(b"a\nb\nc\n");
+    }
+    let o = c.wait_with_output().expect("exec output");
+    let (out, err) = out_err(&o);
+    let _ = run(&["stop", "-t", "0", &name]);
+    assert!(o.status.success(), "{err}");
+    assert_eq!(out.trim(), "3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `-d` with `--egress-allow`: the detached box gets its filter (refused before 2026-11-20). Checked
+/// with no internet: inside the box the pump answers on the proxy port, which only happens once the
+/// filter was delivered the box's PID 1; after `stop` the box is gone with it.
+#[test]
+fn a_detached_box_gets_its_egress_filter() {
+    if let Some(why) = no_box_here() {
+        eprintln!("skip: {why}");
+        return;
+    }
+    let name = format!("egd-{}", std::process::id());
+    let o = kern()
+        .args([
+            "box",
+            &name,
+            "--image",
+            "alpine:latest",
+            "-d",
+            "--egress-allow",
+            "example.com",
+            "--",
+            "sleep",
+            "60",
+        ])
+        .output()
+        .expect("kern box -d");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let probe = kern()
+        .args(["exec", &name, "--", "sh", "-c", "echo \"$http_proxy\"; nc -z -w 2 127.0.0.1 \"${http_proxy##*:}\" && echo pump-listening"])
+        .output()
+        .expect("kern exec");
+    let out = String::from_utf8_lossy(&probe.stdout).into_owned();
+    let ins = kern()
+        .args(["inspect", "--json", &name])
+        .output()
+        .expect("kern inspect");
+    let _ = kern().args(["stop", "-t", "0", &name]).output();
+    assert!(out.contains("http://127.0.0.1:"), "{out}");
+    assert!(
+        out.contains("pump-listening"),
+        "the detached box's egress pump is not listening: {out}"
+    );
+    assert!(
+        String::from_utf8_lossy(&ins.stdout).contains("\"egress\":\"example.com\""),
+        "{}",
+        String::from_utf8_lossy(&ins.stdout)
+    );
+}
+
+/// `kern top --json` is one versioned frame and `--stream` one frame a line; `kern version --json`
+/// reports the same schema number the frames open with, which is how a reader decides by a number.
+#[test]
+fn top_json_is_a_versioned_frame_and_the_stream_one_a_line() {
+    let v = kern()
+        .args(["version", "--json"])
+        .output()
+        .expect("kern version --json");
+    let vs = String::from_utf8_lossy(&v.stdout).into_owned();
+    let schema = vs
+        .split("\"json_schema\":")
+        .nth(1)
+        .and_then(|t| t.trim().trim_end_matches('}').parse::<u32>().ok());
+    assert!(vs.starts_with("{\"version\":") && schema.is_some(), "{vs}");
+    let open = format!("{{\"schema\":{},", schema.unwrap_or(0));
+    let one = kern()
+        .args(["top", "--json"])
+        .output()
+        .expect("kern top --json");
+    let frame = String::from_utf8_lossy(&one.stdout).into_owned();
+    assert!(
+        one.status.success(),
+        "{}",
+        String::from_utf8_lossy(&one.stderr)
+    );
+    assert_eq!(frame.lines().count(), 1, "{frame}");
+    assert!(
+        frame.starts_with(&open) && frame.trim_end().ends_with('}'),
+        "{frame}"
+    );
+    for key in [
+        "\"host\":{",
+        "\"gpus\":[",
+        "\"boxes\":[",
+        "\"counts\":{",
+        "\"runs\":{",
+    ] {
+        assert!(frame.contains(key), "{key} missing: {frame}");
+    }
+    let mut child = kern()
+        .args(["top", "--json", "--stream", "--interval", "0.2"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("kern top --json --stream");
+    let mut lines = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        use std::io::BufRead;
+        for l in std::io::BufReader::new(out).lines().take(2) {
+            lines.push(l.unwrap_or_default());
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.iter().all(|l| l.starts_with(&open)), "{lines:?}");
+    let bad = kern()
+        .args(["top", "--json", "--tab", "logs"])
+        .output()
+        .expect("kern top");
+    assert!(!bad.status.success());
 }
 
 /// A name longer than the column must widen the column, not shift every row after it.
