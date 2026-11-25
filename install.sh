@@ -77,17 +77,42 @@ kern_macos() {
       limactl start --tty=false "$vm" || err "could not start the Lima VM '${vm}'."
     fi
   else
-    # SAID BEFORE IT STARTS: the first run downloads Ubuntu's cloud image, 931 MiB measured on an
-    # Apple Silicon Mac (3.5 min at 4.4 MiB/s), and a reader who is not told waits on a bar.
-    info "creating the Lima VM '${vm}': Ubuntu, no Docker, no containerd (about 1 GB to download and a few minutes, once)"
+    # THE IMAGE IS UBUNTU 24.04 LTS MINIMAL, not Lima's default. The default is the latest Ubuntu
+    # SERVER image, 931 MiB on an Apple Silicon Mac (3.5 min at 4.4 MiB/s, measured), and nobody
+    # had chosen it: it came with `template:default`. The minimal LTS image is 200 MiB (arm64) and
+    # 232 MiB (amd64), it keeps apt (uidmap) and the AppArmor step, and it does not move every six
+    # months. Its SHA256 comes from Ubuntu's own SHA256SUMS over HTTPS, so Lima verifies the image.
+    # A Lima without `--set` (older than this script expects) keeps its default image.
+    case "$(uname -m)" in
+      arm64) iarch="arm64"; garch="aarch64" ;;
+      *) iarch="amd64"; garch="x86_64" ;;
+    esac
+    ibase="https://cloud-images.ubuntu.com/minimal/releases/noble/release"
+    ifile="ubuntu-24.04-minimal-cloudimg-${iarch}.img"
+    iset=""
+    if limactl start --help 2>/dev/null | grep -q -- '--set'; then
+      idigest="$(curl -fsSL "${ibase}/SHA256SUMS" | awk -v f="*${ifile}" '$2 == f { print $1 }')"
+      [ -n "$idigest" ] || err "could not read the checksum of ${ifile} from ${ibase}/SHA256SUMS."
+      iset=".images = [{\"location\": \"${ibase}/${ifile}\", \"arch\": \"${garch}\", \"digest\": \"sha256:${idigest}\"}]"
+      info "creating the Lima VM '${vm}': Ubuntu 24.04 minimal, no Docker, no containerd (about 200 MB to download and a few minutes, once)"
+    else
+      info "creating the Lima VM '${vm}': Ubuntu, no Docker, no containerd (about 1 GB to download and a few minutes, once)"
+    fi
     # `template:default` since Lima 2.0, which warns at `template://default` ("should be written");
     # a Lima from before 2.0, as an older Homebrew can have, knows only the old spelling.
     lmaj="$(limactl --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p')"
     if [ "${lmaj:-0}" -ge 2 ]; then ltpl="template:default"; else ltpl="template://default"; fi
     # KERN_LIMA_ARGS is split into flags on purpose, e.g. "--vm-type qemu".
     # shellcheck disable=SC2086
-    limactl start --tty=false --name="$vm" --containerd=none --mount-writable \
-      ${KERN_LIMA_ARGS:-} "$ltpl" || err "could not create the Lima VM '${vm}'."
+    if [ -n "$iset" ]; then
+      # shellcheck disable=SC2086
+      limactl start --tty=false --name="$vm" --containerd=none --mount-writable --set "$iset" \
+        ${KERN_LIMA_ARGS:-} "$ltpl" || err "could not create the Lima VM '${vm}'."
+    else
+      # shellcheck disable=SC2086
+      limactl start --tty=false --name="$vm" --containerd=none --mount-writable \
+        ${KERN_LIMA_ARGS:-} "$ltpl" || err "could not create the Lima VM '${vm}'."
+    fi
   fi
 
   # kern inside the VM, through this script's Linux path, as root so it lands in /usr/local/bin:
