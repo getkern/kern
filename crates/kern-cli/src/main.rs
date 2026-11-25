@@ -395,8 +395,8 @@ fn main() -> ExitCode {
     // In kern's own WSL distro, root becomes the distro's ordinary user before anything else runs
     // (see `wslentry`). One failed `stat` everywhere else.
     wslentry::enter_as_user_if_kern_distro();
-    // Stamp process entry as early as possible: `kern limit` measures entry→exec against it to record its
-    // own per-run setup latency (the honest "~1 ms" shown in `kern top`'s Limits tab). Cheap and harmless
+    // Stamp process entry as early as possible: the start-up profile (`KERN_TIMING`) measures against it.
+    // Cheap and harmless
     // on every other subcommand.
     runstats::mark_start();
     // Scope-readiness signal: if we are the kern re-exec'd INSIDE a transient systemd scope, reaching
@@ -548,17 +548,17 @@ fn main() -> ExitCode {
                 eprintln!("hint: {}", ui::scrub_message(&hint));
             }
             // `kern run <word>` where the word is a program here and no image: before 0.57.0 that
-            // command line capped the program on this host, which is `kern limit` now.
+            // command line capped the program on this host, which is systemd's to do now.
             if let Some((word, cmd)) = cli::run_bare_image() {
                 let msg = e.to_string();
                 if (msg.contains("no such image") || msg.contains("cannot access"))
                     && is_host_program(word)
                 {
                     eprintln!(
-                        "hint: {} is also a program on this host: `kern limit -- {}` runs it here, \
-                         capped and without a sandbox (what `kern run` did before kern 0.57.0)",
+                        "hint: {} is also a program on this host; `kern run` ran it here, capped \
+                         and without a container, before kern 0.57.0. systemd does that: {}",
                         ui::scrub_message(word),
-                        ui::scrub_message(cmd)
+                        ui::scrub_message(&cli::systemd_cap_line(cmd))
                     );
                 }
             }

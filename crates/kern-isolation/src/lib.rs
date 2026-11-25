@@ -72,24 +72,6 @@ pub fn landlock_abi() -> Option<i32> {
     landlock::abi_version()
 }
 
-/// Confine the CALLING process's writes to `rw` (plus the minimum character devices a program needs to
-/// open for writing), leaving the whole filesystem readable and executable. Survives `execve`, so the
-/// workload `kern limit` is about to exec inherits it and cannot lift it.
-///
-/// This is the `kern limit` counterpart of the box's `--landlock-rw`: same kernel mechanism, but with the
-/// auto-grant set that is correct when there is NO mount namespace and every path is the host's own.
-/// The box path is not reachable from outside this crate and stays where it is, applied on box PID 1.
-///
-/// Returns `Ok(true)` when the ruleset is enforced, `Ok(false)` when this kernel has no Landlock, and
-/// `Err` when a ruleset that WAS available could not be built or enforced. The caller must treat all
-/// three distinctly: only `Ok(true)` means the operator got what they asked for.
-///
-/// Side effect the caller must document to the operator: this sets `PR_SET_NO_NEW_PRIVS`, which
-/// Landlock requires. A workload run under it cannot gain privileges through a setuid binary, so
-/// `sudo` and friends stop working inside the confined command.
-pub fn landlock_confine_writes(rw: &[String]) -> Result<bool, Error> {
-    landlock::apply_rw_allowlist_host(rw)
-}
 mod outcome;
 /// Allocate the `-it` terminal from the BOX's devpts and pass the master back. See [`ptybox`].
 mod ptybox;
@@ -241,11 +223,6 @@ pub use cgroup::user_delegation_root;
 /// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
 pub use cgroup::user_systemd_present;
 pub use cgroup::warn_unenforced_caps;
-/// The RAII handle on a capped cgroup leaf: it names the directory the workload must run in and
-/// removes it on drop. Exported because `kern limit` holds one across its own fork now - the parent
-/// keeps it precisely so that something outlives the workload and can `rmdir` the leaf.
-/// See [`cgroup::CgroupGuard`].
-pub use cgroup::CgroupGuard;
 /// Bytes the per-box scope gets ABOVE the box's `--memory`, to hold kern's supervisor without eating
 /// into the workload's budget. See [`cgroup::SCOPE_SUPERVISOR_HEADROOM`].
 pub use cgroup::SCOPE_SUPERVISOR_HEADROOM;
@@ -254,18 +231,9 @@ pub use cgroup::SCOPE_SUPERVISOR_HEADROOM;
 /// log. See [`cgroup::arm_launcher_notice`].
 pub use cgroup::{arm_launcher_notice, disarm_launcher_notice};
 /// The direct-cap-path decision (skip the per-box scope iff kern's delegated `kern.slice` is usable;
-/// records itself in an in-process marker), the READ-BACK of that decision, and the scrub of an
-/// INHERITED marker (a nested kern must not be poisoned by its parent's decision).
-///
-/// `took_direct_cap_path` is exported because `kern limit` now branches on it in the CLI: on the direct
-/// path it forks the workload into a `kern-run-*` leaf and reaps it, on the scope path it `exec()`s in
-/// place as it always did. Reading the RECORDED decision rather than re-deriving it from the
-/// environment is the whole point - a re-derivation reports the direct path on a host where the scope
-/// re-exec was attempted and its `exec()` failed. The remaining fail-closed consumer
-/// (`env_claims_enforcer_but_none_real`) stays crate-internal; only `real.rs` reads it.
-pub use cgroup::{
-    choose_direct_cap_path, choose_direct_cap_path_given, scrub_direct_marker, took_direct_cap_path,
-};
+/// records itself in an in-process marker), and the scrub of an INHERITED marker (a nested kern must
+/// not be poisoned by its parent's decision).
+pub use cgroup::{choose_direct_cap_path, choose_direct_cap_path_given, scrub_direct_marker};
 /// Which local change, if any, would make a cap bind here - so a hint cannot suggest a write that
 /// this user is not allowed to perform. See [`cgroup::delegation_blocker`].
 pub use cgroup::{delegation_blocker, DelegationBlocker};
@@ -351,8 +319,6 @@ pub use real::forward_signals_to_the_box;
 /// Take the first fatal signal without dying, so this process lives to read the box's status and
 /// record it. For every kern process behind a supervisor. See [`real::keep_waiting_through_signals`].
 pub use real::keep_waiting_through_signals;
-/// Apply cgroup v2 memory/PID/CPU caps to the current process (and whatever it forks/execs next).
-/// Used by `kern box` (inside the sandbox) and `kern limit` (caps without a sandbox).
 /// The per-phase timer, exported because the PARENT was not instrumented at all: `KERN_TIMING`
 /// covered only the child's setup, so the time spent before the fork was invisible, and no amount
 /// of looking would have shown it.

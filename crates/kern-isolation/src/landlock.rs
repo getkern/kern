@@ -73,33 +73,8 @@ const FILE_RIGHTS: u64 = FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE | FS_TRUNCATE
 ///
 /// These are safe to grant WHOLESALE only because they are the box's own: inside a box `/dev` is the
 /// small device set kern mounts, `/tmp` and `/run` are fresh tmpfs that die with the box, and `/proc`
-/// is masked. None of them is the host's. See [`HOST_AUTO_RW`] for the set used when there is no
-/// mount namespace at all.
+/// is masked. None of them is the host's.
 const AUTO_RW: &[&str] = &["/dev", "/tmp", "/run", "/proc"];
-
-/// The auto-grant set for `kern run`, which has NO mount namespace: every path the workload sees is the
-/// host's own. Granting the box set here would be a silent, material widening of what the operator
-/// asked for - `/tmp` and `/run` are persistent host state (`/run/user/$UID` holds the systemd user
-/// manager's private socket), and `/proc` is the real one, not a masked view.
-///
-/// So the host set is the minimum a normal process needs in order to run at all under a write
-/// allowlist, and nothing else: the character devices that programs OPEN for writing. Everything else
-/// must be named explicitly with `--landlock-rw`.
-///
-/// Note what is deliberately absent and why it is not needed:
-///  * stdout/stderr: Landlock governs path RESOLUTION, not already-open descriptors. Inherited fds keep
-///    their access, so a workload writing to a redirected stdout is unaffected by any of this.
-///  * `/tmp`: a program that needs a temp dir gets it by being told, `--landlock-rw /tmp`. Granting it
-///    by default would make the flag mean "confine writes to these paths, and also all of /tmp", which
-///    is not what it says.
-const HOST_AUTO_RW: &[&str] = &[
-    "/dev/null",
-    "/dev/zero",
-    "/dev/full",
-    "/dev/random",
-    "/dev/urandom",
-    "/dev/tty",
-];
 
 #[repr(C)]
 struct RulesetAttr {
@@ -250,27 +225,11 @@ pub fn apply_rw_allowlist(rw: &[String]) -> Result<bool, Error> {
     apply_rw_allowlist_with(rw, AUTO_RW, false)
 }
 
-/// The `kern run` entry point: same ruleset construction, but with [`HOST_AUTO_RW`] instead of the box
-/// scratch set, because `run` has no mount namespace and every path is the host's own.
-///
-/// The caller in `commands/start.rs` treats `Ok(false)` and `Err` alike as a REFUSAL, deliberately
-/// diverging from `run`'s cooperative-governor policy for resource caps. A cap that cannot be applied
-/// leaves the workload running fast; a confinement that cannot be applied leaves it running
-/// UNCONFINED while the operator believes otherwise, which is the one failure shape this flag must
-/// never have.
-pub fn apply_rw_allowlist_host(rw: &[String]) -> Result<bool, Error> {
-    // `strict_user: true` - on this path the allowlist IS the whole confinement, so a grant that cannot
-    // be bound is an error naming the path, decided on the very fd the rule would have used. See the
-    // note on [`add_path`] for why a `stat` at the call site cannot give that guarantee.
-    apply_rw_allowlist_with(rw, HOST_AUTO_RW, true)
-}
-
 /// Build and enforce the ruleset: `READ_EXEC` on `/`, full access under `auto` and under `rw`.
 ///
-/// `auto` and `strict_user` are parameters rather than constants because both correct values depend on
-/// whether the caller has a mount namespace: see [`AUTO_RW`] and [`HOST_AUTO_RW`]. They are the ONLY
-/// differences between the two entry points; the syscall sequence, the ABI negotiation and the failure
-/// reporting are shared, so the two paths cannot drift apart in how they enforce.
+/// `auto` and `strict_user` are parameters because their correct values depend on whether the caller
+/// has a mount namespace (see [`AUTO_RW`]). A box always has one; the host-side entry point that had
+/// none went with `kern limit` in 0.57.0, and the parameters keep the rule stated where it applies.
 ///
 /// `strict_user` decides what a user path that could not be granted MEANS. With a namespace it is
 /// fail-safe silence (the allowlist narrows, everything else still confines); without one it is the
@@ -353,72 +312,6 @@ mod tests {
         assert_eq!(v5 & FS_IOCTL_DEV, FS_IOCTL_DEV);
         assert_eq!(v1 & v2, v1, "v2 is a superset of v1");
         assert_eq!(v2 & v3, v2, "v3 is a superset of v2");
-    }
-
-    #[test]
-    fn host_auto_rw_grants_no_directory_wide_write() {
-        // `kern run` has no mount namespace, so every auto-grant is on the HOST's own filesystem. The
-        // box set (`/dev`, `/tmp`, `/run`, `/proc`) would hand the workload write access to persistent
-        // host state the operator never named - `/run/user/$UID` alone holds the systemd user manager's
-        // private socket. Assert the host set names individual character devices and nothing else, so a
-        // future edit cannot widen it back to a directory without this failing.
-        for p in HOST_AUTO_RW {
-            assert!(
-                p.starts_with("/dev/"),
-                "host auto-grant '{p}' is outside /dev"
-            );
-            assert!(
-                p.matches('/').count() == 2,
-                "host auto-grant '{p}' is a subtree, not a single device node"
-            );
-        }
-        for denied in ["/tmp", "/run", "/proc", "/dev", "/home", "/"] {
-            assert!(
-                !HOST_AUTO_RW.contains(&denied),
-                "host auto-grant must never include '{denied}'"
-            );
-        }
-    }
-
-    #[test]
-    fn strict_user_refuses_a_grant_it_could_not_bind() {
-        // The refusal is decided by `add_path`'s return, i.e. by the same open that would have bound the
-        // rule, which is what makes it immune to the path changing under a separate `stat`. Asserted
-        // through the real entry point rather than a helper, so a refactor that stops threading
-        // `strict_user` fails here.
-        //
-        // Safe to run in-process: the strict branch returns BEFORE `restrict_self`, so this test builds
-        // and discards a ruleset without ever confining the test runner. The assertion below on the
-        // non-strict path is what proves that ordering still holds.
-        if abi_version().is_none() {
-            eprintln!("skip: this kernel has no Landlock");
-            return;
-        }
-        let missing = "/kern-landlock-strict-probe-does-not-exist".to_string();
-        match apply_rw_allowlist_host(std::slice::from_ref(&missing)) {
-            Err(Error::Spec(msg)) => {
-                assert!(
-                    msg.contains(&missing),
-                    "the refusal must name the path that could not be bound: {msg}"
-                );
-            }
-            other => panic!("a grant that cannot be bound must be refused on `run`, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn box_and_host_auto_sets_stay_distinct() {
-        // The two sets answer different questions (is this path the box's own, or the host's?). If a
-        // refactor ever collapses them into one, `kern run --landlock-rw` silently starts granting the
-        // host's /tmp, /run and /proc. Fail here instead.
-        assert_ne!(
-            AUTO_RW, HOST_AUTO_RW,
-            "the box and host auto-grant sets must not be unified"
-        );
-        assert!(
-            HOST_AUTO_RW.iter().all(|h| !AUTO_RW.contains(h)),
-            "the host set must not reuse a box scratch directory verbatim"
-        );
     }
 
     #[test]

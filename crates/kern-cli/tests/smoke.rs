@@ -99,11 +99,30 @@ fn help_lists_commands() {
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
     for verb in [
-        "box", "run", "limit", "pull", "compose", // core
+        "box", "run", "pull", "compose", // core
         "rename", "update", "wait", "diff", "events", // container-lifecycle verbs
     ] {
         assert!(s.contains(verb), "help missing {verb}");
     }
+    // `kern limit` was removed in 0.57.0: the reference must not offer it.
+    assert!(
+        !s.lines().any(|l| l.trim_start().starts_with("limit ")),
+        "help still lists `limit`"
+    );
+}
+
+/// `kern limit` was removed in 0.57.0 and answers with the systemd line that does what it did.
+#[test]
+fn kern_limit_is_refused_and_names_systemd() {
+    let out = kern()
+        .args(["limit", "--memory", "64m", "--", "true"])
+        .output()
+        .expect("run kern");
+    assert!(!out.status.success(), "kern limit must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("removed in kern 0.57.0"), "{err}");
+    assert!(err.contains("systemd-run --user --scope"), "{err}");
+    assert!(err.contains("-- true"), "{err}");
 }
 
 /// The new lifecycle verbs reject bad invocation at the parse/resolution layer - no sandbox needed,
@@ -606,196 +625,7 @@ fn show_config_reports_the_uid_range_the_box_will_actually_get() {
     assert_eq!(field(&profile_added, "uid_range"), "true");
 }
 
-/// `KERN_NO_SCOPE=1` drops kern's own DEFAULT memory cap, and has to say so.
-///
-/// A plain `kern limit` is not uncapped: it re-execs into a transient systemd scope carrying
-/// `MemoryMax=512M`, `MemorySwapMax=0` and `TasksMax=512`, so a workload over that ceiling is
-/// OOM-killed and told why. The opt-out skips the scope, and the default goes with it. Both warnings
-/// on that path used to be gated on the caller having ASKED for a cap, so the case where nothing was
-/// typed ran uncapped in the caller's own cgroup and printed nothing at all.
-///
-/// SKIP-GRACEFUL, and the control is what decides it: if a plain `kern limit` already warns, this host
-/// has no delegation to lose and there is nothing here to assert. A skip that says why beats a
-/// failure that blames the host.
-#[test]
-fn the_opt_out_that_drops_the_default_cap_says_so() {
-    let plain = kern()
-        .args(["limit", "--", "/bin/true"])
-        .output()
-        .expect("run kern");
-    let plain_err = String::from_utf8_lossy(&plain.stderr).to_string();
-    if !plain.status.success() || !plain_err.is_empty() {
-        eprintln!(
-            "SKIP: a plain `kern run` is not silently capped on this host, so the default this test \
-             is about does not exist here. stderr: {plain_err}"
-        );
-        return;
-    }
-
-    let dropped = kern()
-        .env("KERN_NO_SCOPE", "1")
-        .args(["limit", "--", "/bin/true"])
-        .output()
-        .expect("run kern");
-    let err = String::from_utf8_lossy(&dropped.stderr);
-    assert!(
-        err.contains("DEFAULT memory cap"),
-        "KERN_NO_SCOPE removed the default cap and said nothing. stderr: {err}"
-    );
-
-    // The two ways to mean it, each of which must return the command to silence: saying the uncapped
-    // run is intended, and an embedder whose channel is a machine one.
-    for (k, v) in [("KERN_ALLOW_UNCAPPED", "1"), ("KERN_QUIET", "1")] {
-        let quiet = kern()
-            .env("KERN_NO_SCOPE", "1")
-            .env(k, v)
-            .args(["limit", "--", "/bin/true"])
-            .output()
-            .expect("run kern");
-        assert!(
-            quiet.stderr.is_empty(),
-            "{k} did not silence the notice. stderr: {}",
-            String::from_utf8_lossy(&quiet.stderr)
-        );
-    }
-}
-
-/// A box killed by its own memory cap must SAY so, and this covers the reporting END TO END rather
-/// than the helper underneath it.
-///
-/// WHY THIS EXISTS SEPARATELY from `the_oom_directory_is_resolved_from_a_pid_and_outlives_it`: that
-/// one asserts the helper resolves a directory, and it stayed green when the CALLER was reverted to
-/// the old `oom_kill_count()` walk that reads kern's own ancestors. Measured: with that exact
-/// regression put back, all 1048 tests passed. A helper nobody is required to call is not covered.
-///
-/// SKIP-GRACEFUL, and the condition is read from the BOX rather than from this test's assumptions:
-/// if a plain `kern limit` is not capped here (no cgroup delegation, no systemd, a container), then the
-/// cap cannot fire and there is nothing to report. `memory.max` inside the box answers that, and it
-/// is the same question the feature depends on, so the skip cannot hide the defect.
-///
-/// EXIT 137 IS NOT THE QUESTION, and believing it was made this test fail a release on a runner that
-/// had done nothing wrong. 137 means the workload was SIGKILLed by SOMEBODY - the box's own cgroup
-/// hitting its ceiling, or the HOST's OOM killer picking a victim while a shared runner allocates
-/// 900 MB alongside other jobs, or anything else with a signal. kern already draws that line
-/// deliberately (`start.rs` writes an OOM-outcome byte that is 1 only when "the kernel's OOM killer
-/// fired against this box's OWN cgroup") and correctly says NOTHING when the kill came from
-/// elsewhere. So the old assertion demanded a sentence whose absence was the right answer, and it
-/// read exit 137 with an empty stderr as a defect in the message. MEASURED: green 12/12 here in both
-/// host shapes, red once on a runner, on a commit that changed four version strings and no Rust.
-///
-/// THE QUESTION IS ASKED OF THE KERNEL, not of kern's stderr, which is the channel under test: the
-/// `oom_kill` counter in `memory.events` of the slice the run's cgroup lives under, read before and
-/// after. It is hierarchical, so it counts a kill in any descendant. No increment means no cgroup OOM
-/// happened, and then there is nothing for kern to have explained.
-#[test]
-fn a_box_killed_by_its_memory_cap_says_why() {
-    // The box's own cgroup path AND its ceiling, from one run: the path is what locates the counter,
-    // and asking for it separately would name a different, already-gone per-run cgroup.
-    let probe = kern()
-        .args([
-            "limit",
-            "--",
-            "sh",
-            "-c",
-            "cg=$(awk -F: '/^0::/{print $3}' /proc/self/cgroup); echo $cg; \
-                cat /sys/fs/cgroup$cg/memory.max 2>/dev/null",
-        ])
-        .output()
-        .expect("run kern");
-    let probe = String::from_utf8_lossy(&probe.stdout);
-    let mut lines = probe.lines();
-    let cg = lines.next().unwrap_or("").trim().to_string();
-    let cap = lines.next().unwrap_or("").trim().to_string();
-    if cap.is_empty() || cap == "max" {
-        eprintln!("SKIP: no memory cap is in force here (memory.max = {cap:?}), so none can fire");
-        return;
-    }
-    // The PARENT of the per-run cgroup: that one is created and removed per run, its parent is where
-    // every run lands and where a hierarchical `oom_kill` accumulates.
-    let slice = match cg.rsplit_once('/') {
-        Some((parent, _)) if !parent.is_empty() => format!("/sys/fs/cgroup{parent}/memory.events"),
-        _ => String::new(),
-    };
-    let kills = |p: &str| -> Option<u64> {
-        std::fs::read_to_string(p).ok()?.lines().find_map(|l| {
-            l.strip_prefix("oom_kill ")
-                .and_then(|v| v.trim().parse().ok())
-        })
-    };
-    let before = kills(&slice);
-
-    // Ask for more than the cap. `bytearray` touches every page, so the kernel has to back it.
-    let out = kern()
-        .args(["limit", "--", "python3", "-c", "bytearray(900*1024*1024)"])
-        .output()
-        .expect("run kern");
-    if out.status.code() != Some(137) {
-        eprintln!(
-            "SKIP: the workload was not SIGKILLed here (exit {:?}), so there is no kill to explain",
-            out.status.code()
-        );
-        return;
-    }
-    // WAS IT THIS CGROUP'S OOM? Only then is there a message to demand. Unreadable counters skip too:
-    // a test that cannot ask the kernel must not convict kern on the strength of an exit code.
-    let seen = kills(&slice);
-    match (before, seen) {
-        (Some(b), Some(a)) if a > b => {}
-        (Some(b), Some(a)) => {
-            eprintln!(
-                "SKIP: SIGKILLed but this cgroup recorded no OOM ({} -> {} in {slice}), so the kill \
-                 came from outside the box and kern is right to say nothing",
-                b, a
-            );
-            return;
-        }
-        _ => {
-            eprintln!("SKIP: cannot read {slice}, so there is no independent judge of the kill");
-            return;
-        }
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    // THE NUMBERS GO IN THE MESSAGE, because the first version of this assertion said only "nothing
-    // said about why" and a CI failure was then indistinguishable between two very different causes:
-    // kern failing to report a real cgroup OOM, and kern's own before/after pair disagreeing with this
-    // one (the file it reads from documents that exact intermittency, "two unrelated counters").
-    // A red that cannot name its own cause costs the next reader the whole investigation.
-    assert!(
-        err.contains("OOM killer"),
-        "exit 137, this cgroup DID record an OOM ({before:?} -> {seen:?} in {slice}), and kern said \
-         nothing about why. stderr: {err:?}"
-    );
-    // And the message must stay honest about what it measured: a subtree, not the process.
-    assert!(
-        err.contains("cgroup"),
-        "the message must say where the killer fired: {err:?}"
-    );
-}
-
-/// The other half: a SIGKILL that is NOT the memory cap must not be reported as one. Without this,
-/// a version that printed the OOM line on every 137 would pass the test above.
-#[test]
-fn a_sigkill_that_is_not_an_oom_is_not_reported_as_one() {
-    let out = kern()
-        .args(["limit", "--", "sh", "-c", "kill -9 $$"])
-        .output()
-        .expect("run kern");
-    if out.status.code() != Some(137) {
-        eprintln!(
-            "SKIP: the shell did not die of SIGKILL here (exit {:?})",
-            out.status.code()
-        );
-        return;
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !err.contains("OOM killer"),
-        "a self-inflicted SIGKILL was blamed on the memory cap: {err:?}"
-    );
-}
-
-/// `kern box` killed by its own cap must say why, DETERMINISTICALLY, and this is the case that the
-/// `kern limit` test above cannot cover.
+/// `kern box` killed by its own cap must say why, DETERMINISTICALLY.
 ///
 /// TWO DEFECTS SIT UNDER THIS. The first: the message only ever existed on the systemd-scope path, so a
 /// host with no systemd printed nothing. The second, found when the first was fixed and it still
@@ -949,8 +779,8 @@ fn the_host_capability_guard_matches_what_the_runner_prints() {
 /// IT USED TO SKIP ON EVERY HOST, which is a green that guards nothing. The workload was
 /// `sh -c "kill -9 $$"`, and the box's shell is pid 1 of its own pid namespace: the kernel does not
 /// deliver an unhandled SIGKILL to a namespace's init from inside it, so the shell survived and exited 0
-/// and the assertion below was never reached. Measured: `kern limit` (no pid namespace of its own for the
-/// shell) exits 137 there, `kern box` exits 0 - which is why the `kern limit` twin of this test did run.
+/// and the assertion below was never reached. Measured: a process with no pid namespace of its own
+/// exits 137 there, `kern box` exits 0.
 ///
 /// A workload CHOOSING exit 137 reaches the same branch (kern only sees the code) and is the sharper
 /// case anyway: 137 without a signal behind it is exactly the ambiguity the message must not guess at.

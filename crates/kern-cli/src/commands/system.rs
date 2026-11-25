@@ -69,7 +69,7 @@ fn help_overview(p: &crate::ui::Palette) -> String {
                 out.push(String::new());
                 out.push(format!(
                     "{b}OPTIONS:{z}\n    {d}Per verb, where you are asking about it:{z} \
-                     {c}kern <verb> --help{z}{d} (box, run, limit, compose, pod, volume, image, config, top){z}"
+                     {c}kern <verb> --help{z}{d} (box, run, compose, pod, volume, image, config, top){z}"
                 ));
             }
             continue;
@@ -128,8 +128,6 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}box{z} <name> (--rootfs <dir>|--image <ref>) [opts] [-- CMD...]   Run CMD in a sandbox
     {c}box{z} <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     {c}run{z} [opts] <image> [CMD...]                                    Run CMD in a sandbox from <image>, docker run's shape (box's options); -d prints the name
-    {c}limit{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...       Run CMD on this host under CPU/mem caps (no sandbox)
-    {c}limit{z} --landlock-rw <path> [--] CMD...                         Confine CMD's writes to <path> (kernel LSM, no sandbox)
     {c}exec{z} <name> [-i|-t|-it] [-u <user>] [--env K=V] [-w <dir>] [--] [CMD...]  Run CMD in a running box
                                                                      -t allocates a PTY; -i only keeps stdin attached, so
                                                                      `exec -i <box> psql … < file.sql` reaches EOF instead of hanging
@@ -468,9 +466,6 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         nowhere. It claims one address, not a subnet, and adds no route out
     -l, --label <k=v>   Attach metadata, selectable with `ps --filter label=`; repeatable
     --landlock-rw <path> Confine writes to these paths with the Landlock LSM; root stays read+exec (repeatable)
-                        Also valid on `limit`, where it is the only real confinement: it needs no
-                        namespace. There it grants ONLY these paths (plus /dev/null and friends),
-                        refuses if the kernel has no Landlock, and implies no-new-privs (no sudo)
     --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data, and for
                         `kern exec -u <non-root>` later); an --image box maps it by DEFAULT, and
                         this flag asks for it where the default is dropped: with --no-uid-range,
@@ -495,18 +490,6 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --security-opt V    no-new-privileges[:true|:false]; seccomp-deny=eperm|kill: a denied syscall
                         answers EPERM, as under Docker (default), or kill ends the caller with SIGSYS
     --plan              Preview the isolation sequence and any device grants, without running
-
-{b}OPTIONS for limit:{z}
-    -m, --memory <SIZE>     RAM ceiling for the process (e.g. 512m, 2g)
-    --memory-swap-max <S>   cgroup v2 swap allowance (NOT a mem+swap total; 0 = no swap)
-    --cpus <N>              CPU quota, fractional allowed (0.5 = half a core)
-    --cpuset-cpus <LIST>    Pin to these CPUs (e.g. 0-3,8); a CPU that does not exist is dropped
-    --config <PATH>         kern.toml to resolve `vcpu:`/`vgpio:`/`vdisk:` profiles against
-    --landlock-rw <PATH>    Confine the process's WRITES to PATH (kernel LSM, needs no namespace);
-                            everything else stays readable and executable. Repeatable. Refuses to
-                            run if this kernel has no Landlock, and implies no-new-privs (no sudo)
-    {d}`limit` caps a process on the HOST: no image, no namespaces, no sandbox - except --landlock-rw,{z}
-    {d}which is a real kernel-enforced write boundary. For a sandbox use `run` or `box`.{z}
 
 {b}OPTIONS:{z}
     -V, --version  Print version (`--version --json`: the version and the schema of `kern top --json`)

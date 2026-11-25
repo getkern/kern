@@ -1956,35 +1956,6 @@ mod net_resource_tests {
     }
 
     #[test]
-    fn run_leading_dashdash_is_not_reclassified_as_a_profile() {
-        // Hacker-mode regression: `kern run -- vcpu:heavy prog` - the `--` end-of-options contract means
-        // `vcpu:heavy` is the literal command, NOT a profile to peel. peel_run_profiles must skip the
-        // leading `--` and return start=1 without applying any profile.
-        fn empty() -> AppliedProfiles {
-            AppliedProfiles {
-                memory: None,
-                cpus: None,
-                cpuset: None,
-                nice: None,
-                vgpio: Vec::new(),
-                vdisk: Vec::new(),
-            }
-        }
-        let cmd = vec![
-            "--".to_string(),
-            "vcpu:heavy".to_string(),
-            "prog".to_string(),
-        ];
-        let mut out = empty();
-        // Must NOT error on a (possibly non-existent) profile name, and must start the command at 1
-        // (right after the `--`), leaving `vcpu:heavy prog` as the literal argv.
-        let start = peel_run_profiles(&cmd, None, &mut out).unwrap();
-        assert_eq!(start, 1);
-        assert!(out.cpuset.is_none() && out.cpus.is_none() && out.memory.is_none());
-        assert_eq!(&cmd[start..], ["vcpu:heavy", "prog"]);
-    }
-
-    #[test]
     fn parse_volumes_guards_targets() {
         // `parse_volumes` resolves the registry root from the process-global `XDG_RUNTIME_DIR`; hold
         // `TEST_ENV_LOCK` so a sibling test flipping that var under /tmp can't make `/tmp` look like an
@@ -7734,39 +7705,6 @@ mod scratch_placement_tests {
             "as the declared system base, /tmp is usable: so the refusal above was about ownership"
         );
     }
-}
-
-/// **`kern run`'s fork decision, all four inputs, because the two ways to get it wrong are not
-/// symmetric and neither is visible in a passing box.**
-///
-/// The same value feeds `apply_limits` as `supervisor_forks_workload` and the fork itself. If they
-/// ever disagree the failure is silent in both directions:
-///
-///   forked but told `apply_limits` false  -> this process is written INTO the leaf and then forks;
-///                                            the child inherits it, so the cap holds, but the
-///                                            parent is inside a cgroup carrying `oom.group=1` and
-///                                            dies with the workload it was meant to report on.
-///   not forked but told `apply_limits` true -> the supervisor is kept OUTSIDE the leaf and then
-///                                            `exec()`s in place, so THE WORKLOAD RUNS IN THE
-///                                            UNCAPPED PARENT. That is the cap escape `apply_limits`
-///                                            documents against that very parameter.
-///
-/// A pure function of two bools, so the four combinations are asserted here rather than inferred
-/// from a box that happened to start.
-#[test]
-fn run_forks_only_when_it_has_both_a_cgroup_to_enter_and_nobody_else_supervising() {
-    use crate::commands::start::run_should_fork;
-    // A capped leaf exists and nothing outside owns the workload: fork, because otherwise the leaf
-    // outlives every process that knows its name. This is the case a later pass measured on
-    // WSL2 with no systemd user manager: 200 sequential `kern run` left 201 directories behind.
-    assert!(run_should_fork(false, true));
-    // An outer enforcer already waits, reports and cleans up (kern's own scope proxy, a `--restart`
-    // unit, a build step). A second supervisor would be a third process in the chain buying nothing.
-    assert!(!run_should_fork(true, true));
-    // No cap was built, so there is nothing to be inside, nothing to reap and nothing to remove.
-    // `kern run` is a cooperative governor and does not refuse; it warns and runs.
-    assert!(!run_should_fork(false, false));
-    assert!(!run_should_fork(true, false));
 }
 
 /// A MISSING BIND SOURCE IS PLANNED BEFORE IT IS CREATED, and the plan is the FULL path.

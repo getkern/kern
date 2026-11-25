@@ -1,8 +1,7 @@
 //! `kern top` - a small, dependency-free task-manager TUI (alternate screen, tabs, live refresh,
-//! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Seven tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
+//! keyboard nav; each data tab shows a live item count, e.g. `Boxes (3)`). Eight tabs: **Overview** (host CPU / RAM / load + the box aggregate), **Boxes** (the
 //! per-box table - MEM/CPU/PIDS plus HEALTH and PORTS (parity with `kern ps`) - with lifecycle
-//! actions: stop/pause/unpause/logs), **Runs** (aggregate `kern limit` throughput - rate/sec, avg
-//! setup latency, peak, total + sparkline; a `⚡` on the tab marks live activity), **Builds** (`kern
+//! actions: stop/pause/unpause/logs), **Images**, **Builds** (`kern
 //! build` history), **Profiles** (the reusable
 //! specs you attach by prefix - vcpu/vgpio/vdisk; a vdisk *selects* one of the read-only physical
 //! disks, and its `[[disk]]` is materialised from that choice, never hand-created) and **Storage** (the
@@ -28,13 +27,9 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
-const TABS: [&str; 9] = [
+const TABS: [&str; 8] = [
     "Overview",
     "Boxes",
-    // `kern limit`'s, named after the verb. It was "Runs" while that verb was `kern run`; since
-    // `kern run` starts a box, as `docker run` does, a "Runs" tab beside "Boxes" read as a second
-    // kind of box. Every box, `run` or `box`, is on the Boxes tab.
-    "Limits",
     "Images",
     "Builds",
     "Profiles",
@@ -54,15 +49,14 @@ const STEADY_WAIT_MS: i32 = 1000;
 
 const TAB_OVERVIEW: usize = 0;
 const TAB_BOXES: usize = 1;
-const TAB_RUNS: usize = 2;
-const TAB_IMAGES: usize = 3;
-const TAB_BUILDS: usize = 4;
-const TAB_PROFILES: usize = 5;
-const TAB_STORAGE: usize = 6;
+const TAB_IMAGES: usize = 2;
+const TAB_BUILDS: usize = 3;
+const TAB_PROFILES: usize = 4;
+const TAB_STORAGE: usize = 5;
 /// The SDK and MCP sandboxes: the ones running and the ones that finished (see `history.rs`).
-const TAB_SANDBOXES: usize = 7;
+const TAB_SANDBOXES: usize = 6;
 /// Every box's output in one stream: see [`crate::logview`].
-const TAB_LOGS: usize = 8;
+const TAB_LOGS: usize = 7;
 
 /// What the TUI is doing right now: plain navigation, or a modal layered over it.
 enum Mode {
@@ -514,8 +508,6 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut mode = Mode::Nav;
     let mut prev: HashMap<i32, (u64, Instant)> = HashMap::new();
     let mut prev_cpu: Option<(u64, u64)> = None;
-    let mut prev_runs: Option<(u64, std::time::Instant)> = None;
-    let mut runs_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the Limits tab
     let mut prev_box: Option<(u64, std::time::Instant)> = None;
     let mut box_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the box-start rate
                                              // Cleared by the first poll that times out; see the comment at that poll for why.
@@ -545,15 +537,7 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut last_refresh = Instant::now();
     // Set by a wake that has nothing new for the screen; the next turn skips the paint once.
     let mut skip_paint = false;
-    let mut snap = refresh_full(
-        &mut prev,
-        &mut prev_cpu,
-        &mut prev_runs,
-        &mut runs_hist,
-        &mut prev_box,
-        &mut box_hist,
-        tab,
-    );
+    let mut snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_box, &mut box_hist, tab);
     loop {
         let (cols, term_rows) = term_size();
         let list_len = tab_list_len(
@@ -706,15 +690,7 @@ pub fn run() -> Result<(), crate::error::Error> {
                 }
                 first_wait = false;
                 last_refresh = Instant::now();
-                snap = refresh_full(
-                    &mut prev,
-                    &mut prev_cpu,
-                    &mut prev_runs,
-                    &mut runs_hist,
-                    &mut prev_box,
-                    &mut box_hist,
-                    tab,
-                ); // timeout → periodic refresh (CPU% window)
+                snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_box, &mut box_hist, tab); // timeout → periodic refresh (CPU% window)
                 continue;
             }
             // A MEASUREMENT LANDED: the sizes reach the frame drawn next, without a key, and the
@@ -741,15 +717,7 @@ pub fn run() -> Result<(), crate::error::Error> {
             if ino_fd >= 0 && pfds[1].revents & libc::POLLIN != 0 {
                 let mut ibuf = [0u8; 4096];
                 while unsafe { libc::read(ino_fd, ibuf.as_mut_ptr().cast(), ibuf.len()) } > 0 {}
-                snap = refresh_full(
-                    &mut prev,
-                    &mut prev_cpu,
-                    &mut prev_runs,
-                    &mut runs_hist,
-                    &mut prev_box,
-                    &mut box_hist,
-                    tab,
-                );
+                snap = refresh_full(&mut prev, &mut prev_cpu, &mut prev_box, &mut box_hist, tab);
                 if pfds[0].revents & libc::POLLIN == 0 {
                     continue;
                 }
@@ -965,13 +933,12 @@ fn handle_nav(
         b'h' => switch(tab, sel, (*tab + TABS.len() - 1) % TABS.len()),
         b'1' => switch(tab, sel, TAB_OVERVIEW),
         b'2' => switch(tab, sel, TAB_BOXES),
-        b'3' => switch(tab, sel, TAB_RUNS),
-        b'4' => switch(tab, sel, TAB_IMAGES),
-        b'5' => switch(tab, sel, TAB_BUILDS),
-        b'6' => switch(tab, sel, TAB_PROFILES),
-        b'7' => switch(tab, sel, TAB_STORAGE),
-        b'8' => switch(tab, sel, TAB_SANDBOXES),
-        b'9' => switch(tab, sel, TAB_LOGS),
+        b'3' => switch(tab, sel, TAB_IMAGES),
+        b'4' => switch(tab, sel, TAB_BUILDS),
+        b'5' => switch(tab, sel, TAB_PROFILES),
+        b'6' => switch(tab, sel, TAB_STORAGE),
+        b'7' => switch(tab, sel, TAB_SANDBOXES),
+        b'8' => switch(tab, sel, TAB_LOGS),
         b'j' => down(sel),
         // `k` IS UP. It was not bound here at all, so it fell through to the per-tab arms below,
         // where the Boxes tab read it as a lifecycle key and STOPPED the selected box. The help
@@ -2213,7 +2180,8 @@ pub fn snapshot() -> Result<(), crate::error::Error> {
 // `VOLUME_SIZES_EVERY` while streaming.
 
 /// The shape `kern top --json` writes. `kern version --json` reports it.
-pub(crate) const JSON_SCHEMA: u32 = 1;
+/// 2 since 0.57.0: the `runs` object (`kern limit` invocations) went with the verb.
+pub(crate) const JSON_SCHEMA: u32 = 2;
 
 /// The longest list a frame carries (builds, sandboxes): the newest, as the screen reads them at
 /// first. The count of all of them is in `counts`.
@@ -2223,11 +2191,7 @@ const LIST_CAP: usize = 512;
 const VOLUME_SIZES_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A tab named as the tab bar names it, any case: its index. `None` for any other word.
-/// `runs` is the tab's name before `kern limit` had that name, kept for a script written then.
 pub(crate) fn json_tab(name: &str) -> Option<usize> {
-    if name.eq_ignore_ascii_case("runs") {
-        return Some(TAB_RUNS);
-    }
     TABS.iter().position(|t| t.eq_ignore_ascii_case(name))
 }
 
@@ -2237,8 +2201,6 @@ pub(crate) fn json_tab(name: &str) -> Option<usize> {
 struct JsonState {
     prev: HashMap<i32, (u64, Instant)>,
     prev_cpu: Option<(u64, u64)>,
-    prev_runs: Option<(u64, Instant)>,
-    runs_hist: Vec<f64>,
     prev_box: Option<(u64, Instant)>,
     box_hist: Vec<f64>,
     sizes: HashMap<String, Option<u64>>,
@@ -2250,8 +2212,6 @@ impl JsonState {
         let mut s = refresh_full(
             &mut self.prev,
             &mut self.prev_cpu,
-            &mut self.prev_runs,
-            &mut self.runs_hist,
             &mut self.prev_box,
             &mut self.box_hist,
             TAB_OVERVIEW,
@@ -2379,11 +2339,6 @@ fn frame_json(s: &Snapshot, tabs: &[usize], ts_ms: u64) -> String {
         }
         o.push('}');
     });
-    let _ = write!(o, ",\"runs\":{{\"total\":{},\"per_sec\":", h.runs_total);
-    put_f(&mut o, h.runs_per_sec);
-    o.push_str(",\"peak_per_sec\":");
-    put_f(&mut o, h.runs_peak);
-    let _ = write!(o, ",\"avg_setup_us\":{}}}", h.runs_avg_us);
     let _ = write!(
         o,
         ",\"box_starts\":{{\"total\":{},\"per_sec\":",
@@ -2841,8 +2796,6 @@ fn detail_policy(tab: usize, owner: usize) -> crate::listing::Detail {
 fn refresh_full(
     prev: &mut HashMap<i32, (u64, Instant)>,
     prev_cpu: &mut Option<(u64, u64)>,
-    prev_runs: &mut Option<(u64, Instant)>,
-    runs_hist: &mut Vec<f64>,
     prev_box: &mut Option<(u64, Instant)>,
     box_hist: &mut Vec<f64>,
     tab: usize,
@@ -2851,14 +2804,9 @@ fn refresh_full(
     *prev = seen;
     let (mut host, cpu_now) = read_host(*prev_cpu);
     *prev_cpu = cpu_now;
-    // Two daemonless throughput lenses from the same mmap counter, same reader-side rate+sparkline shape
-    // (see `sample_rate`): `kern limit` invocations (offset 0, + an honest average setup latency), and box
-    // STARTS (offset 16). The box lens is what makes an ephemeral agent firehose visible - the live list
-    // can't show a ~ms box, the rate can. Neither is a live "peak concurrent" (that would need a reaper).
-    let (rt, lat_sum_us) = crate::runstats::snapshot();
-    (host.runs_per_sec, host.runs_peak, host.runs_spark) = sample_rate(rt, prev_runs, runs_hist);
-    host.runs_total = rt;
-    host.runs_avg_us = lat_sum_us.checked_div(rt).unwrap_or(0);
+    // A daemonless throughput lens from the mmap counter, with a reader-side rate+sparkline (see
+    // `sample_rate`): box STARTS. It is what makes an ephemeral agent firehose visible - the live list
+    // can't show a ~ms box, the rate can. It is not a live "peak concurrent" (that would need a reaper).
     let bt = crate::runstats::box_total();
     (
         host.box_starts_per_sec,
@@ -3165,16 +3113,6 @@ struct HostStats {
     cpu_pct: f64,
     cores: usize,
     load1: f64,
-    /// Cumulative `kern limit` invocations (from the daemonless runstats mmap counter) + the derived
-    /// rate/sec: fire-and-forget capped processes are too many to list, so they are counted instead.
-    runs_total: u64,
-    runs_per_sec: f64,
-    /// Average per-run setup latency in microseconds (entry→exec, the honest "~1 ms"); 0 with no runs.
-    runs_avg_us: u64,
-    /// The highest runs/sec seen since `top` started (session peak throughput) and a reader-side ring of
-    /// recent runs/sec samples for the Runs-tab sparkline - both derived from the monotonic total.
-    runs_peak: f64,
-    runs_spark: Vec<f64>,
     /// Cumulative box STARTS (daemonless runstats counter, offset 16) + derived rate/sec, session peak,
     /// and a reader-side sparkline. This is the lens the live Boxes list can't give for EPHEMERAL boxes:
     /// a `kern box` lives ~ms (below a 1 s refresh), so an agent firing hundreds/sec (via the SDK/MCP)
@@ -3700,11 +3638,6 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
             cpu_pct,
             cores,
             load1,
-            runs_total: 0,
-            runs_per_sec: 0.0,
-            runs_avg_us: 0,
-            runs_peak: 0.0,
-            runs_spark: Vec::new(),
             box_starts_total: 0,
             box_starts_per_sec: 0.0,
             box_starts_peak: 0.0,
@@ -3816,17 +3749,6 @@ fn render(
                 TABS[i],
                 n(crate::history::sandboxes_newest_first().len())
             ),
-            // Runs are fire-and-forget (~1 ms) - there's no "current items" set like the other tabs,
-            // so a cumulative count would mislead (it'd only grow). Show the LIVE rate while streaming
-            // (that's the only meaningful "now"); nothing when idle. The cumulative total lives on the
-            // tab body ("Total"), not here.
-            TAB_RUNS if host.runs_per_sec > 0.5 => {
-                format!(
-                    "{} ({}/s) ⚡",
-                    TABS[i],
-                    human_count(host.runs_per_sec.round() as u64)
-                )
-            }
             _ => TABS[i].to_string(),
         }
     };
@@ -3847,18 +3769,20 @@ fn render(
         }
     };
     // TIGHT: two spaces between two tabs instead of three, tried at each step BEFORE that step's
-    // counts give way, so nine columns of spacing go before a number does. MEASURED: renaming the
-    // third tab from "Runs" to "Limits" took a 100-column bar with `Images (1k)` and `Builds (12k)`
-    // from 100 columns to 102, and both counts went for two letters.
+    // counts give way, so a column per tab of spacing goes before a number does. MEASURED: a third
+    // tab named "Limits" took a 100-column bar with `Images (1k)` and `Builds (12k)` from 100 columns
+    // to 102, and both counts went for two letters.
     let bar_w = |step: usize, tight: bool| {
         1 + (0..TABS.len())
             .map(|i| shown(i, step).chars().count() + if tight { 2 } else { 3 })
             .sum::<usize>()
     };
-    let (step, tight) = (0..3)
+    // The names alone are the last step and get the tight spacing too: falling back to them with
+    // the loose one wrapped a bar whose tight form fit (eight names take 70 columns tight, 78 loose).
+    let (step, tight) = (0..=3)
         .flat_map(|st| [(st, false), (st, true)])
         .find(|(st, t)| bar_w(*st, *t) <= width)
-        .unwrap_or((3, false));
+        .unwrap_or((3, true));
     let sep = if tight { "" } else { " " };
     s.push(' ');
     for i in 0..TABS.len() {
@@ -3908,7 +3832,6 @@ fn render(
         Mode::Nav => {
             match tab {
                 TAB_BOXES => s.push_str(&boxes_table(p, rows, body_rows, sel, host)),
-                TAB_RUNS => s.push_str(&runs_table(p, host)),
                 TAB_IMAGES => s.push_str(&images_table(p, images, body_rows, sel)),
                 TAB_BUILDS => s.push_str(&builds_table(p, builds, builds_total, body_rows, sel)),
                 TAB_PROFILES => s.push_str(&profiles_table(p, profs, body_rows, sel)),
@@ -3951,7 +3874,7 @@ fn help_text() -> String {
      \n\
      MOVE\n\
        Tab / → / l      next tab            ← / h      previous tab\n\
-       1 2 3 4 5 6 7 8 9  jump to a tab    ↑ ↓ / j k  select a row\n\
+       1 2 3 4 5 6 7 8  jump to a tab      ↑ ↓ / j k  select a row\n\
        PgUp / PgDn      a page up / down    Home / End the first / last row\n\
        q  or  Ctrl-C    quit\n\
      \n\
@@ -3961,14 +3884,13 @@ fn help_text() -> String {
      \x20                PORTS; a --restart box between two runs is listed as restarting\n\
      \x20                (yellow net:host / root-mapped / caps:+ / gpu:N flags a box LESS\n\
      \x20                 isolated than default; gpu:N says WHICH cards, never how busy)\n\
-       3 Limits     kern limit throughput: rate/sec, avg latency, peak, total (aggregate)\n\
-       4 Images     cached OCI images: repository:tag, size, pulled age (like kern images)\n\
-       5 Builds     build history: status, duration, size, age (like kern builds)\n\
-       6 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
-       7 Storage    physical disks (read-only) and your named volumes\n\
-       8 Sandboxes  SDK and MCP sandboxes: running now, and the ones that finished with how\n\
+       3 Images     cached OCI images: repository:tag, size, pulled age (like kern images)\n\
+       4 Builds     build history: status, duration, size, age (like kern builds)\n\
+       5 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
+       6 Storage    physical disks (read-only) and your named volumes\n\
+       7 Sandboxes  SDK and MCP sandboxes: running now, and the ones that finished with how\n\
      \x20                they ended; Enter shows one (its code and output: kern sandbox show)\n\
-       9 Logs       every box's output in one stream, newest at the bottom, live\n\
+       8 Logs       every box's output in one stream, newest at the bottom, live\n\
      \n\
      LOGS tab\n\
        /  search (a|b matches either, case ignored; Esc clears)   e  level: all, warn+, error\n\
@@ -4743,9 +4665,8 @@ fn storage_table(
     s
 }
 
-/// Compact large counts (`1.2k`, `3.4M`) for the runs metric - thousands of runs shouldn't sprawl.
 /// A count in the fewest characters, for a tab bar short of room: `1k`, `12k`, `2M`, rounded.
-/// `human_count`'s `1.5k` is as long as the `1464` it replaces.
+/// A `1.5k` would be as long as the `1464` it replaces.
 fn short_count(n: usize) -> String {
     if n < 1_000 {
         n.to_string()
@@ -4795,16 +4716,6 @@ fn alerts(p: &Palette, host: &HostStats) -> String {
         return out;
     }
     format!("\n  {b}ALERTS{z}\n{out}")
-}
-
-fn human_count(n: u64) -> String {
-    if n < 1_000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
 }
 
 /// The title bar's GPU figure, on every tab: how many cards and their memory, summed. `GPU none`
@@ -4999,16 +4910,6 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
         gpu_nodes_from_flag,
         gpu_minor,
     ));
-    // `kern limit` throughput lives on its own **Limits** tab (fire-and-forget capped processes) - Overview
-    // stays the host + box picture. A one-line pointer only while runs actively stream (same > 0.5/s
-    // threshold as the Runs-tab `⚡`, so the two never disagree), never a stale idle cumulative.
-    if host.runs_per_sec > 0.5 {
-        s.push_str(&row(
-            "Limits",
-            format!("{d}⚡ live - see the {z}{b}Limits{z}{d} tab{z}"),
-        ));
-    }
-
     // Boxes - the aggregate of what kern is running.
     let total_mem: u64 = rows.iter().filter_map(|r| r.mem).sum();
     // `pct()` normalises a stray `-0.0` (float rounding on an idle host) to a clean `0.0`.
@@ -5107,101 +5008,6 @@ fn spark(samples: &[f64]) -> String {
             BARS[idx.min(BARS.len() - 1)]
         })
         .collect()
-}
-
-/// The Runs tab. `kern limit` is fire-and-forget (~1 ms, no sandbox, exec-in-place, not registered), so it
-/// has NO per-row list - it's shown as **aggregate throughput**. Every figure here is really measured
-/// from the daemonless mmap counter: the live rate, the honest average setup latency (entry→exec - this
-/// IS the "~1 ms"), the session-peak rate, the cumulative total, and a recent-shape sparkline.
-/// Deliberately NOT shown: "active / peak concurrent" - unmeasurable without a per-run reaper that would
-/// defeat the whole point of a ~1 ms run, so we don't invent it.
-fn runs_table(p: &Palette, host: &HostStats) -> String {
-    let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
-    let row = |k: &str, v: String| format!("  {b}{:<14}{z}{v}\n", k);
-    let mut s = String::new();
-    s.push_str(&format!(
-        // NO FIGURE HERE. This said "gone in ~1 ms": a number with no machine and no method beside it,
-        // in a panel that cannot carry either, and one that ages every time the runtime moves. What a
-        // reader needs from this line is what a run IS. The measurements live in BENCHMARKS.md.
-        "\n  {b}Limits{z}{d} = CPU/memory-capped commands - {z}{c}kern limit -- <cmd>{z}{d} - with {z}{b}no sandbox{z}{d}.{z}\n"
-    ));
-    s.push_str(&format!(
-        "  {d}A limit is {z}{b}NOT a container{z}{d}: every box ({z}{c}kern run{z}{d}, {z}{c}kern box{z}{d}) is on the {z}{c}Boxes{z}{d} tab. These are too many to{z}\n"
-    ));
-    s.push_str(&format!(
-        "  {d}list one-by-one, so this tab {z}{b}counts{z}{d} them as live throughput instead.{z}\n\n"
-    ));
-
-    if host.runs_total == 0 {
-        s.push_str(&format!(
-            "  {d}none yet - fire capped processes with {z}{c}kern limit -- <cmd>{z}\n"
-        ));
-        s.push_str(&format!(
-            "  {d}e.g.  {z}{c}for i in $(seq 1000); do kern limit -- true; done{z}\n\n"
-        ));
-        s.push_str(&format!(
-            "  {d}a limit is a CPU/mem-capped process with no sandbox: cgroup caps only, no namespaces.{z}\n"
-        ));
-        return s;
-    }
-
-    let rate = host.runs_per_sec.round().max(0.0) as u64;
-    let per_min = (host.runs_per_sec * 60.0).round().max(0.0) as u64;
-    // Live rate is green while streaming, dim when idle (0/s) - the number is the honest "now".
-    let rate_col = if host.runs_per_sec > 0.5 { g } else { d };
-    s.push_str(&row(
-        "Speed",
-        format!(
-            "{rate_col}{} {d}/sec{z}   {d}({}/min){z}",
-            human_count(rate),
-            human_count(per_min)
-        ),
-    ));
-    s.push_str(&row(
-        "Avg latency",
-        format!(
-            "{:.1} {d}ms · kern setup overhead (entry→exec){z}",
-            host.runs_avg_us as f64 / 1000.0
-        ),
-    ));
-    s.push_str(&row(
-        "Peak speed",
-        format!(
-            "{} {d}/sec · session max{z}",
-            human_count(host.runs_peak.round().max(0.0) as u64)
-        ),
-    ));
-    s.push_str(&row(
-        "Total",
-        format!("{} {d}so far this session{z}", human_count(host.runs_total)),
-    ));
-
-    // Recent-shape sparkline of runs/sec (the reader-side ring). When the whole window is idle, an
-    // all-`▁` baseline rendered green looks like a growing bar next to "0 /s" (confusing) - so show a
-    // green sparkline only when there's real recent activity, else a dim "idle" so a flat line never
-    // reads as throughput.
-    if host.runs_spark.len() >= 2 {
-        if host.runs_spark.iter().any(|&v| v > 0.0) {
-            s.push_str(&format!(
-                "\n  {b}{:<14}{z}{g}{}{z}\n",
-                "Recent",
-                spark(&host.runs_spark)
-            ));
-        } else {
-            s.push_str(&format!(
-                "\n  {b}{:<14}{z}{d}idle - no runs in the last window{z}\n",
-                "Recent"
-            ));
-        }
-    }
-
-    s.push_str(&format!(
-        "\n  {d}runs = capped processes (CPU/mem cgroup, no sandbox), fire-and-forget - shown as{z}\n"
-    ));
-    s.push_str(&format!(
-        "  {d}aggregate throughput, not a per-row list: at scale, the list is the wrong shape.{z}\n"
-    ));
-    s
 }
 
 /// The Images tab: cached OCI images (`repository` + `tag` split, size, pulled age) - a read-only
@@ -5383,8 +5189,8 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         format!("\n  {d}boxes (containers) - {z}{c}kern run -d --name <name> <image>{z}{d} · pods grouped{z}\n");
     // Box-START rate. The live list below shows only boxes alive right NOW, but a `kern box` lives ~ms:
     // an agent firing hundreds/sec (via the SDK / kern-mcp) flickers past a 1 s refresh and never appears
-    // in the list. This header counts STARTS as a rate + sparkline (same daemonless counter as the Runs
-    // tab uses for `kern limit`), so the ephemeral firehose is visible even when the list is empty.
+    // in the list. This header counts STARTS as a rate + sparkline (a daemonless mmap counter, see
+    // `runstats`), so the ephemeral firehose is visible even when the list is empty.
     if host.box_starts_total > 0 {
         let rate = host.box_starts_per_sec.round().max(0.0) as u64;
         let col = if host.box_starts_per_sec > 0.5 { g } else { d };
@@ -6461,11 +6267,6 @@ mod tests {
             cpu_pct: 0.0,
             cores: 1,
             load1: 0.0,
-            runs_total: 0,
-            runs_per_sec: 0.0,
-            runs_avg_us: 0,
-            runs_peak: 0.0,
-            runs_spark: Vec::new(),
             box_starts_total: 0,
             box_starts_per_sec: 0.0,
             box_starts_peak: 0.0,
@@ -6475,8 +6276,8 @@ mod tests {
             https: String::new(),
         };
         let boxes = [row("a", false), row("b", false), row("c", false)];
-        // A wide terminal (100 columns, about the 97 the counted bar takes with its zeros dropped)
-        // shows the live counts.
+        // A terminal of 90 columns, the width the counted bar takes with its zeros dropped, shows
+        // the live counts that say something.
         let out = render(
             &plain(),
             TAB_BOXES,
@@ -6494,7 +6295,7 @@ mod tests {
             7,
             &[],
             5,
-            100,
+            90,
             24,
             0,
             &Mode::Nav,
@@ -6513,8 +6314,8 @@ mod tests {
             out.contains("Boxes (3)"),
             "Boxes tab shows its count: {out}"
         );
-        // AT 100 COLUMNS NINE COUNTED TABS DO NOT FIT, and the bar gives up the `(0)`s first,
-        // keeping every count that says something: the three above.
+        // AT 90 COLUMNS THE COUNTED TABS DO NOT FIT EVEN WITH TWO SPACES BETWEEN THEM, and the bar
+        // gives up the `(0)`s first, keeping every count that says something: the three above.
         assert!(
             !out.contains("Profiles (0)"),
             "a zero count is the first to go"
@@ -6595,7 +6396,7 @@ mod tests {
             11_961,
             &[],
             1_464,
-            95,
+            86,
             24,
             0,
             &Mode::Nav,
@@ -6610,8 +6411,9 @@ mod tests {
         assert_eq!(short_count(999_499), "999k");
         assert_eq!(short_count(999_500), "1M");
 
-        // A narrow terminal drops the counts but keeps EVERY tab visible (the overflow bug: at 80
-        // cols the counted bar would wrap and shove Images/Builds/… off screen).
+        // A narrow terminal drops the counts but keeps EVERY tab visible (the overflow bug: a counted
+        // bar wider than the terminal wraps and shoves Images/Builds/… off screen). At 72 columns
+        // only the names fit, with two spaces between them.
         let narrow = render(
             &plain(),
             TAB_BOXES,
@@ -6623,7 +6425,7 @@ mod tests {
             7,
             &[],
             0,
-            80,
+            72,
             24,
             0,
             &Mode::Nav,
@@ -6631,13 +6433,51 @@ mod tests {
         );
         assert!(!narrow.contains("Boxes (3)"), "narrow bar drops counts");
         for t in [
-            "Overview", "Boxes", "Limits", "Images", "Builds", "Profiles", "Storage",
+            "Overview",
+            "Boxes",
+            "Images",
+            "Builds",
+            "Profiles",
+            "Storage",
+            "Sandboxes",
+            "Logs",
         ] {
             assert!(
                 narrow.contains(t),
                 "narrow bar keeps every tab: missing {t}"
             );
         }
+        // AND IT FITS: the names alone with two spaces between them take 70 columns, so at 70 the
+        // bar is one line no wider than the terminal. The fallback used to take the loose spacing
+        // (78 columns) and wrap.
+        let tightest = render(
+            &plain(),
+            TAB_BOXES,
+            &boxes,
+            &host,
+            &[],
+            &[],
+            &[],
+            7,
+            &[],
+            0,
+            70,
+            24,
+            0,
+            &Mode::Nav,
+            &crate::logview::LogView::default(),
+        );
+        let bar = tightest
+            .lines()
+            .find(|l| l.contains("Overview"))
+            .unwrap_or_default();
+        // VISIBLE columns: the selected tab carries reverse-video escapes even in the plain palette.
+        let visible = bar.replace("\x1b[7m", "").replace("\x1b[27m", "");
+        assert!(
+            visible.chars().count() <= 70 && bar.contains("Logs"),
+            "the names-only bar must fit 70 columns: {} columns, {bar:?}",
+            visible.chars().count()
+        );
     }
 
     #[test]
