@@ -334,9 +334,9 @@ pub fn ps(
                         | "kept"
                 ) {
                     return Err(Error::Usage(
-                        "ps --filter status=: running | paused | orphaned | exited | kept \
+                        "ps --filter status=: running | paused | orphaned | exited | kept | restarting \
                          (a `kern create` box that never ran is status=kept; \
-                         created/dead/restarting match nothing)",
+                         created and dead match nothing)",
                     ));
                 }
             }
@@ -483,13 +483,16 @@ pub fn ps(
     let kept_possible = view.last.is_none()
         && filters.iter().all(|(k, v)| match k.as_str() {
             "name" => true,
-            "status" => matches!(v.as_str(), "kept" | "exited"),
+            "status" => matches!(v.as_str(), "kept" | "exited" | "restarting"),
             // `pod`, `id`, `label`, `health`: a kept box has none of them, and `kept_matches`
             // answers false for every one. Asking is the same answer for less work.
             _ => false,
         });
-    let want_kept =
-        kept_possible && (all || filters.iter().any(|(k, v)| k == "status" && v == "kept"));
+    let want_kept = kept_possible
+        && (all
+            || filters
+                .iter()
+                .any(|(k, v)| k == "status" && matches!(v.as_str(), "kept" | "restarting")));
     // One that is RUNNING is not a kept ROW: it is in the live set, with its uptime and health, so
     // one box is never two rows of one `ps -a`.
     let mut kept: Vec<crate::keepbox::KeptBox> = if want_kept {
@@ -1117,9 +1120,16 @@ pub fn ps(
                 // No pid: it is not running, and a stale one would read as a process. The time cell
                 // is how long ago it was created, which is the only clock a kept box has that does
                 // not expire with the machine.
-                let status = match k.meta.last_exit {
-                    Some(code) => format!("exit {code}"),
-                    None => "never ran".to_string(),
+                // `restarting (code)` between two runs of a `--restart always` box, the word `ps
+                // --json` and kern's Docker API use (Docker: `Restarting (3) ...`). MEASURED
+                // before: the JSON said `restarting` and this cell `exit 3`.
+                let restarting =
+                    crate::commands::managed_unit_runs(&k.name).is_some_and(|(r, _)| r);
+                let status = match (restarting, k.meta.last_exit) {
+                    (true, Some(code)) => format!("restarting ({code})"),
+                    (true, None) => "restarting".to_string(),
+                    (false, Some(code)) => format!("exit {code}"),
+                    (false, None) => "never ran".to_string(),
                 };
                 let hc = if k.meta.last_exit == Some(0) {
                     p.g
@@ -1149,6 +1159,9 @@ fn kept_matches(k: &crate::keepbox::KeptBox, filters: &[(String, String)]) -> bo
             // exited registry box has no such status, so `ps_matches` excludes it).
             "kept" => true,
             "exited" => k.meta.last_exit.is_some(),
+            // Between two runs systemd makes of a `--restart always` box: the state `ps --json`
+            // and kern's Docker API report, from the same function.
+            "restarting" => crate::commands::managed_unit_runs(&k.name).is_some_and(|(r, _)| r),
             // NOT `created`: the usage message for this flag says kern has no created state, and a
             // mapping here would have made that sentence false for one row kind only. A kept box
             // that has never run is `status=kept` with no `exit_code` in `--json`, which answers the
