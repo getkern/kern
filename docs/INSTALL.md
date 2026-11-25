@@ -173,13 +173,16 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
 On a Mac it installs Lima (with Homebrew if you have it, else the latest Lima release, checked
-against its SHA256SUMS, in `~/.kern/lima`), creates a VM named `kern` from Lima's default Ubuntu
-template with no Docker and no containerd in it and your home mounted writable, installs kern inside
-it with this same script and kern's AppArmor profile, and puts `kern` in `~/.local/bin` on the Mac.
+against its SHA256SUMS, in `~/.kern/lima`), creates a VM named `kern` from Ubuntu 24.04 LTS minimal
+(about 200 MB to download, once, checked against Ubuntu's SHA256SUMS) with no Docker and no containerd
+in it and your home mounted writable, installs kern inside it with this same script, kern's AppArmor
+profile and `uidmap` (so images that switch to a service user, such as nginx and redis, start), and
+puts `kern` in `~/.local/bin` on the Mac. Measured on an Apple Silicon Mac: about two and a half
+minutes from nothing to a box running.
 That `kern` starts the VM when it is stopped and runs kern in it; under your home the current
 directory is the same path in the VM, so `-v "$PWD:/w"` works as on Linux. `KERN_VM` names the VM
 (default `kern`), `KERN_LIMA_ARGS` adds `limactl start` flags (`--vm-type qemu` on an Intel Mac
-without `vz`). To remove it: `rm ~/.local/bin/kern && limactl delete --force kern`.
+without `vz`). To remove it: `rm ~/.local/bin/kern && ~/.kern/lima/bin/limactl delete --force kern && rm -r ~/.kern`.
 
 **Kern Sandbox runs where kern runs, so your code goes in the VM too.** `pip install kern-sandbox`
 on the Mac itself installs, and its first call stops with an error that says so. Inside the VM
