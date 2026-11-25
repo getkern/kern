@@ -265,7 +265,29 @@ pub struct KernSettings {
     /// refusal to mount kern's own state into a box follows it, because it is built from the same
     /// resolver. Absolute and free of `..`, checked where the file is read.
     pub data_dir: Option<std::path::PathBuf>,
+    /// `images_dir` - the image and layer cache alone, on a disk of its own (images are the largest
+    /// thing kern keeps). Absent means `data_dir`'s `cache/`, or the XDG cache.
+    pub images_dir: Option<std::path::PathBuf>,
+    /// `volumes_dir` - where named volumes are made. Absent means `data_dir`'s `volumes/`. A single
+    /// volume can still be put anywhere with `kern volume create <name> --path <dir>`.
+    pub volumes_dir: Option<std::path::PathBuf>,
+    /// `logs_dir` - box logs on a disk, kept across reboots. Absent means the runtime directory,
+    /// in memory, cleared at reboot.
+    pub logs_dir: Option<std::path::PathBuf>,
+    /// `history_dir` - the sandbox history when it is kept on disk. Absent means `data_dir`'s
+    /// `history/`.
+    pub history_dir: Option<std::path::PathBuf>,
 }
+
+/// The `[kern]` keys that place a part of kern's data on a disk, with what each holds: one table
+/// for `kern config`, `kern info` and `kern top`, so the three name the same places.
+pub(crate) const DIR_KEYS: [(&str, &str); 5] = [
+    ("data_dir", "everything below, unless set on its own"),
+    ("images_dir", "images and their layers"),
+    ("volumes_dir", "named volumes"),
+    ("logs_dir", "box logs (default in memory, cleared at reboot)"),
+    ("history_dir", "the sandbox history kept on disk"),
+];
 
 /// The `[kern]` keys `kern config set|get|unset` reads and writes, with the shape of each value.
 ///
@@ -328,6 +350,26 @@ pub(crate) const SETTABLE_KERN_KEYS: &[(&str, SettingKind, &str)] = &[
         "data_dir",
         SettingKind::Path,
         "where kern keeps volumes, kept boxes, builds and history, and images in its cache/ (default ~/.local/share/kern, ~/.cache/kern)",
+    ),
+    (
+        "images_dir",
+        SettingKind::Path,
+        "where images and their layers are kept (default data_dir's cache/)",
+    ),
+    (
+        "volumes_dir",
+        SettingKind::Path,
+        "where named volumes are made (default data_dir's volumes/)",
+    ),
+    (
+        "logs_dir",
+        SettingKind::Path,
+        "box logs on a disk, kept across reboots (default in memory, cleared at reboot)",
+    ),
+    (
+        "history_dir",
+        SettingKind::Path,
+        "the sandbox history kept on disk (default data_dir's history/)",
     ),
     (
         "publish_bind",
@@ -454,6 +496,20 @@ pub(crate) fn check_data_dir(v: &str) -> Result<std::path::PathBuf, String> {
 /// runs on its defaults, as every other key does).
 pub(crate) fn data_dir() -> Option<std::path::PathBuf> {
     load_cached(None).ok()?.kern.data_dir.clone()
+}
+
+/// One of the [`DIR_KEYS`] as the active config sets it; `None` when unset or unreadable.
+pub(crate) fn dir_setting(key: &str) -> Option<std::path::PathBuf> {
+    let c = load_cached(None).ok()?;
+    let k = &c.kern;
+    match key {
+        "data_dir" => k.data_dir.clone(),
+        "images_dir" => k.images_dir.clone(),
+        "volumes_dir" => k.volumes_dir.clone(),
+        "logs_dir" => k.logs_dir.clone(),
+        "history_dir" => k.history_dir.clone(),
+        _ => None,
+    }
 }
 
 /// A retention period: `<n>d`, or a Go duration (`90s`, `30m`, `24h`, `1h30m`), in whole seconds,
@@ -1207,9 +1263,16 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
         }
         "sandbox_transcripts" => k.sandbox_transcripts = Some(value_bool(v)?),
         "local_domains" => k.local_domains = Some(value_bool(v)?),
-        "data_dir" => {
+        "data_dir" | "images_dir" | "volumes_dir" | "logs_dir" | "history_dir" => {
             let raw = value_string(v)?;
-            k.data_dir = Some(check_data_dir(&raw).map_err(|e| format!("[kern] data_dir = {e}"))?);
+            let dir = Some(check_data_dir(&raw).map_err(|e| format!("[kern] {key} = {e}"))?);
+            match key {
+                "data_dir" => k.data_dir = dir,
+                "images_dir" => k.images_dir = dir,
+                "volumes_dir" => k.volumes_dir = dir,
+                "logs_dir" => k.logs_dir = dir,
+                _ => k.history_dir = dir,
+            }
         }
         "local_domains_port" => {
             let n = value_u32(v)?;
@@ -3442,6 +3505,21 @@ mod tests {
             refused_parent.is_some(),
             "and so must a directory that contains it"
         );
+    }
+
+    /// Every key that places a part of kern's data takes an absolute plain path, as data_dir does.
+    #[test]
+    fn the_directory_keys_take_an_absolute_path() {
+        for (key, _) in DIR_KEYS {
+            assert!(check_kern_value(key, "\"/mnt/ssd2/kern\"").is_ok(), "{key}");
+            for bad in ["\"rel/x\"", "\"/a/../b\"", "\"/\""] {
+                assert!(check_kern_value(key, bad).is_err(), "{key} = {bad} must be refused");
+            }
+        }
+        let c = parse("[kern]\nimages_dir = \"/mnt/a\"\nlogs_dir = \"/mnt/b\"\n").expect("parse");
+        assert_eq!(c.kern.images_dir, Some(std::path::PathBuf::from("/mnt/a")));
+        assert_eq!(c.kern.logs_dir, Some(std::path::PathBuf::from("/mnt/b")));
+        assert_eq!(c.kern.volumes_dir, None);
     }
 
     #[test]

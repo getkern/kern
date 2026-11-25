@@ -271,7 +271,28 @@ pub fn dir() -> io::Result<PathBuf> {
 
 /// The logs directory (one `<name>-<pid>.log` per detached box), created on demand.
 pub fn logs_dir() -> io::Result<PathBuf> {
+    // `[kern] logs_dir`: the logs on a disk, kept across reboots. Made private, and refused if it is
+    // not a directory of this user's (a planted symlink or another account's directory).
+    if let Some(dir) = crate::config::dir_setting("logs_dir") {
+        return private_own_dir(&dir);
+    }
     runtime_subdir("logs")
+}
+
+/// `dir`, created `0700` when missing, and accepted only as a real directory this user owns.
+pub(crate) fn private_own_dir(dir: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let m = fs::symlink_metadata(dir)?;
+    // SAFETY: getuid has no preconditions.
+    let me = unsafe { libc::getuid() };
+    if !m.is_dir() || m.uid() != me {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory of yours", dir.display()),
+        ));
+    }
+    Ok(dir.to_path_buf())
 }
 
 /// The SSH keys directory (`--ssh` stores a throwaway private key here so the user can `ssh -i` it).
@@ -835,6 +856,11 @@ pub(crate) fn materialize_authoritative_dirs_for_test() {
 
 /// The canonical registry ROOT `<runtime>/kern` (parent of `instances/`), or `None` if it does not
 /// resolve. Canonicalized so the containment test below matches the canonicalized `-v` source.
+/// [`registry_root`] for the checks outside this module that must keep data out of it.
+pub(crate) fn registry_root_pub() -> Option<PathBuf> {
+    registry_root()
+}
+
 fn registry_root() -> Option<PathBuf> {
     dir()
         .ok()
@@ -926,6 +952,16 @@ pub fn trusted_state_overlap(src: &Path) -> Option<PathBuf> {
         if let Some(verdict) = mount_refused_by_path(src, store) {
             if verdict {
                 return Some(store.to_path_buf());
+            }
+        }
+    }
+    // THE PARTS OF THE DATA ROOT THAT CAN LIVE ELSEWHERE are refused wherever they are, as they are
+    // inside it: every named volume, and the sandbox history a box could read or forge.
+    for key in ["volumes_dir", "history_dir"] {
+        if let Some(dir) = crate::config::dir_setting(key) {
+            let dir = fs::canonicalize(&dir).unwrap_or(dir);
+            if mount_refused_by_path(src, &dir) == Some(true) {
+                return Some(dir);
             }
         }
     }

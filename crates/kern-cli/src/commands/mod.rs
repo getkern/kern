@@ -9192,7 +9192,7 @@ pub(crate) fn missing_device_source(shown: &str, source: &str) -> Option<String>
 ///
 /// `None` when the path cannot be resolved that way, which includes a `..` in the part that does not
 /// exist yet. Nothing is created then, which is the conservative direction.
-fn planned_bind_source(source: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn planned_bind_source(source: &str) -> Option<std::path::PathBuf> {
     let want = std::path::Path::new(source);
     let abs = if want.is_absolute() {
         want.to_path_buf()

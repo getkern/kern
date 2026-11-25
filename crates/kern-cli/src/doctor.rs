@@ -483,17 +483,34 @@ pub fn info() -> Result<(), Error> {
     // XDG default or `[kern] data_dir` (a second disk, an SD card).
     let data = crate::kern_xdg_root("XDG_DATA_HOME", ".local/share");
     let cache = crate::kern_xdg_root("XDG_CACHE_HOME", ".cache");
+    // EACH PART WITH WHERE ITS PLACE COMES FROM: the default (the data dir), or its own key.
+    let set_by = |key: &str| crate::config::dir_setting(key).is_some();
     if let (Some(data), Some(cache)) = (data, cache) {
-        let why = if crate::config::data_dir().is_some() {
+        let why = if set_by("data_dir") {
             "[kern] data_dir"
         } else {
-            "default; `kern config set data_dir <path>` moves both"
+            "default; `kern config set data_dir <path>` moves it all"
         };
-        row(
-            "data dir",
-            &format!("{}, images in {} ({why})", data.display(), cache.display()),
-        );
+        row("data dir", &format!("{} ({why})", data.display()));
+        let images_why = if set_by("images_dir") {
+            "[kern] images_dir"
+        } else {
+            "with the data dir; `kern config set images_dir <path>` for its own disk"
+        };
+        row("images", &format!("{} ({images_why})", cache.display()));
     }
+    let volumes_why = if set_by("volumes_dir") {
+        "[kern] volumes_dir"
+    } else {
+        "with the data dir; `--path` puts one anywhere"
+    };
+    row(
+        "volumes",
+        &format!(
+            "{} ({volumes_why})",
+            crate::volume::volumes_dir().display()
+        ),
+    );
     row("sandbox history", &crate::history::keep_line());
     // THE RETENTION SETTINGS, each with where its value comes from, so `kern config set` has a
     // place to be seen working. Facts only, like every other row: one cached config load and one
@@ -515,14 +532,25 @@ pub fn info() -> Result<(), Error> {
     let cap = crate::commands::boxlog::LogCap::resolve(None, None, true);
     let size_set = k.and_then(|k| k.log_max_size).is_some();
     let files_set = k.and_then(|k| k.log_max_file).is_some();
-    let ended = match k.and_then(|k| k.log_keep_ended_s) {
-        Some(s) => format!("ended boxes' logs removed after {}", period(s)),
-        None => "ended boxes' logs kept until `kern prune` or reboot".to_string(),
+    // On disk (`logs_dir`) a reboot does not clear them; in the runtime directory it does.
+    let on_disk = crate::config::dir_setting("logs_dir").is_some();
+    let ended = match (k.and_then(|k| k.log_keep_ended_s), on_disk) {
+        (Some(s), _) => format!("ended boxes' logs removed after {}", period(s)),
+        (None, true) => "ended boxes' logs kept until `kern prune`".to_string(),
+        (None, false) => "ended boxes' logs kept until `kern prune` or reboot".to_string(),
+    };
+    let logs_at = crate::registry::logs_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    let logs_where = if on_disk {
+        format!("in {logs_at} ([kern] logs_dir)")
+    } else {
+        format!("in memory, {logs_at} (default; `kern config set logs_dir <path>` keeps them on disk)")
     };
     row(
         "box logs",
         &format!(
-            "{} x {} files per box ({}), {ended}",
+            "{} x {} files per box ({}), {ended}, {logs_where}",
             crate::commands::human_bytes(cap.max_bytes),
             cap.files,
             origin(size_set || files_set)

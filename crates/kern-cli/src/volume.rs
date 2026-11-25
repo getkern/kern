@@ -13,6 +13,11 @@ use std::path::PathBuf;
 
 /// Root directory holding all named volumes.
 pub fn volumes_dir() -> PathBuf {
+    // `[kern] volumes_dir` puts them on a disk of their own; refused as a mount source wherever it is
+    // (see `registry::trusted_state_overlap`), as the data root they otherwise live in is.
+    if let Some(dir) = crate::config::dir_setting("volumes_dir") {
+        return dir;
+    }
     crate::keepbox::data_root().map_or_else(
         || PathBuf::from(format!("/tmp/kern-volumes-{}", unsafe { libc::getuid() })),
         |r| r.join("volumes"),
@@ -122,6 +127,11 @@ pub fn resolve_named(name: &str) -> Result<String, Error> {
     validate(name)?;
     let base_dir = volumes_dir();
     let vol = base_dir.join(name);
+    // A VOLUME AT A PATH OF THE USER'S (`kern volume create <n> --path <dir>`): its files are there,
+    // checked at every mount as a `-v <dir>` is, because the file naming it could have been edited.
+    if let Some(dev) = device_of(&vol) {
+        return checked_device(name, &dev).map(|d| d.to_string_lossy().into_owned());
+    }
     let data = vol.join("data");
     if !data.exists() {
         std::fs::create_dir_all(&data)
@@ -149,6 +159,55 @@ pub fn resolve_named(name: &str) -> Result<String, Error> {
         )));
     }
     Ok(real.to_string_lossy().into_owned())
+}
+
+/// The file that names where a volume's files are, for a volume made with `--path`.
+const DEVICE_FILE: &str = "device";
+
+/// Where the volume in `vol` keeps its files when it was made with `--path`; `None` otherwise.
+pub(crate) fn device_of(vol: &std::path::Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(vol.join(DEVICE_FILE)).ok()?;
+    let p = PathBuf::from(raw.trim_end_matches('\n'));
+    p.is_absolute().then_some(p)
+}
+
+/// The directory a volume's files are in: its `--path`, or its `data/`.
+pub(crate) fn files_of(vol: &std::path::Path) -> PathBuf {
+    device_of(vol).unwrap_or_else(|| vol.join("data"))
+}
+
+/// A `--path` volume's directory, canonical, refused for what a `-v <dir>` is refused for: kern's
+/// own state (another box's record, every volume, the history) and the host's IPC sockets.
+fn checked_device(name: &str, dev: &std::path::Path) -> Result<PathBuf, Error> {
+    let canon = std::fs::canonicalize(dev).map_err(|e| {
+        Error::Volume(format!(
+            "volume '{name}': its directory {} is not reachable: {e} (a disk not mounted?)",
+            dev.display()
+        ))
+    })?;
+    if !canon.is_dir() {
+        return Err(Error::Volume(format!(
+            "volume '{name}': {} is not a directory",
+            canon.display()
+        )));
+    }
+    if canon.parent().is_none() {
+        return Err(Error::Volume(format!(
+            "volume '{name}': not the root directory itself"
+        )));
+    }
+    if let Some(state) = crate::registry::trusted_state_overlap(&canon) {
+        return Err(Error::Volume(format!(
+            "volume '{name}': {} overlaps kern's own state ({}); a box mounting it could reach \
+             other boxes' records or volumes. Choose a directory outside it",
+            canon.display(),
+            state.display()
+        )));
+    }
+    if let Some(msg) = crate::commands::host_ipc_source_refusal(&format!("volume '{name}'"), &canon) {
+        return Err(Error::Volume(msg));
+    }
+    Ok(canon)
 }
 
 // ─────────────────────────── anonymous volumes (an image's VOLUME) ───────────────────────────
@@ -664,6 +723,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
 
 fn create(args: &[String]) -> Result<(), Error> {
     let (mut name, mut size): (Option<&str>, Option<u64>) = (None, None);
+    let mut path: Option<String> = None;
     // The `--name=` form owns its string (it is a slice of one argument, not an argument), so it is
     // kept separately and resolved after the loop.
     let mut named: Option<String> = None;
@@ -691,6 +751,45 @@ fn create(args: &[String]) -> Result<(), Error> {
                 };
                 size = Some(parse_size(&v)?);
             }
+            // `--path <dir>`: the volume's files live in a directory of the user's choosing, on any
+            // disk. `--opt device=<dir>` (with `type=none`, `o=bind`) is Docker's spelling of it.
+            "--path" | "--opt" | "-o" | "--driver" | "-d" => {
+                let v = match inline {
+                    Some(v) => v.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i)
+                            .ok_or(Error::Usage("volume create <name> --path <dir>"))?
+                            .to_string()
+                    }
+                };
+                match key {
+                    "--path" => path = Some(v),
+                    "--driver" | "-d" if v == "local" => {}
+                    "--driver" | "-d" => {
+                        return Err(Error::Volume(format!(
+                            "volume driver '{v}': kern has the local one; for a NAS, mount it with \
+                             -v nfs://host/path:/dst (or smb://, sshfs://), or mount it on the host \
+                             and use --path"
+                        )))
+                    }
+                    _ => match v.split_once('=') {
+                        Some(("device", d)) => path = Some(d.to_string()),
+                        Some(("type", "none" | "bind")) | Some(("o", "bind" | "rbind")) => {}
+                        Some(("type", t)) => {
+                            return Err(Error::Volume(format!(
+                                "volume option type={t}: for a network share use -v {t}://host/path:/dst \
+                                 (nfs, smb, sshfs), or mount it on the host and use --path"
+                            )))
+                        }
+                        _ => {
+                            return Err(Error::Volume(format!(
+                                "volume option '{v}': kern takes device=<dir> (with type=none, o=bind)"
+                            )))
+                        }
+                    },
+                }
+            }
             // `--name <n>` / `--name=<n>`: Docker's legacy spelling of the positional.
             "--name" => {
                 let v = match inline {
@@ -709,7 +808,7 @@ fn create(args: &[String]) -> Result<(), Error> {
                 }
             }
             s if !s.starts_with('-') && name.is_none() => name = Some(s),
-            _ => return Err(Error::Usage("volume create <name> [--size <N>]")),
+            _ => return Err(Error::Usage("volume create <name> [--size <N> | --path <dir>]")),
         }
         i += 1;
     }
@@ -724,8 +823,47 @@ fn create(args: &[String]) -> Result<(), Error> {
     };
     validate(name)?;
     let vol = volumes_dir().join(name);
+    // The directory chosen, made when missing (as a `-v` source is) and checked before anything of
+    // the volume exists. No quota there: kern's quota is a disk image of its own, not a directory.
+    let device = match &path {
+        Some(p) => {
+            if size.is_some() {
+                return Err(Error::Volume(format!(
+                    "volume '{name}': --size and --path together: a volume at a directory of yours \
+                     has no kern quota (the disk's own size bounds it)"
+                )));
+            }
+            let dir = crate::config::check_data_dir(p)
+                .map_err(|e| Error::Volume(format!("volume '{name}': --path {e}")))?;
+            if vol.exists() {
+                return Err(Error::Volume(format!("volume '{name}' already exists")));
+            }
+            // CHECKED BEFORE IT IS MADE: creating first left an empty directory inside kern's own
+            // state for a refused path (MEASURED: `--path /run/user/1000/kern/x`).
+            if let Some(state) = crate::commands::planned_bind_source(&dir.to_string_lossy())
+                .and_then(|planned| crate::registry::trusted_state_overlap(&planned))
+            {
+                return Err(Error::Volume(format!(
+                    "volume '{name}': {} overlaps kern's own state ({}); a box mounting it could \
+                     reach other boxes' records or volumes. Choose a directory outside it",
+                    dir.display(),
+                    state.display()
+                )));
+            }
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                Error::Volume(format!("volume '{name}': cannot create {}: {e}", dir.display()))
+            })?;
+            Some(checked_device(name, &dir)?)
+        }
+        None => None,
+    };
     std::fs::create_dir_all(vol.join("data"))
         .map_err(|e| Error::Volume(format!("cannot create volume '{name}': {e}")))?;
+    if let Some(dev) = &device {
+        std::fs::write(vol.join(DEVICE_FILE), format!("{}\n", dev.display())).map_err(|e| {
+            Error::Volume(format!("cannot write volume metadata for '{name}': {e}"))
+        })?;
+    }
     let created = crate::registry::now_unix();
     let meta = match size {
         Some(n) => format!("{{\"created\":{created},\"size_limit\":{n}}}"),
@@ -938,6 +1076,8 @@ pub(crate) struct VolInfo {
     pub size: Option<u64>,
     /// Quota (bytes) from `meta.json`, if one was set at create time.
     pub quota: Option<u64>,
+    /// The directory of a volume made with `--path`; `None` for one in kern's volumes directory.
+    pub device: Option<PathBuf>,
 }
 
 /// Whether [`entries_with`] pays for the recursive size walk.
@@ -983,10 +1123,11 @@ pub(crate) fn entries_with(sizes: Sizes) -> Vec<VolInfo> {
                 name: crate::ui::scrub(&raw),
                 raw,
                 size: match sizes {
-                    Sizes::Measure => Some(dir_size(&p.join("data"))),
+                    Sizes::Measure => Some(dir_size(&files_of(&p))),
                     Sizes::Skip => None,
                 },
                 quota,
+                device: device_of(&p),
             });
         }
     }
@@ -1098,8 +1239,15 @@ fn list() -> Result<(), Error> {
         } else {
             "  (unusable: not a kern-created name)"
         };
+        // WHERE a volume made with `--path` keeps its files: the one column that says it is not in
+        // kern's volumes directory.
+        let at = v
+            .device
+            .as_ref()
+            .map(|d| format!("  at {}", crate::ui::scrub(&d.to_string_lossy())))
+            .unwrap_or_default();
         println!(
-            "{b}{c}{:<nw$}{z} {:>10} {d}{}{flag}{z}",
+            "{b}{c}{:<nw$}{z} {:>10} {d}{}{flag}{at}{z}",
             v.name,
             v.size.map_or_else(|| "-".to_string(), human_bytes),
             kern_common::pad_visible(&quota, 10),
@@ -1192,10 +1340,10 @@ fn inspect(name: Option<&String>, json: bool) -> Result<(), Error> {
     let name = name.ok_or(Error::Usage("volume inspect <name>"))?;
     validate(name)?;
     let vol = volumes_dir().join(name);
-    let data = vol.join("data");
-    if !data.is_dir() {
+    if !vol.join("data").is_dir() {
         return Err(Error::Volume(format!("no volume named '{name}'")));
     }
+    let data = files_of(&vol);
     if json {
         // Same three facts as the human view and the same units as `volume ls --json`: bytes as
         // numbers, absence as `null`. `path` is escaped because a volume directory is a filesystem
@@ -1318,7 +1466,7 @@ fn usage() {
         "\
 {b}kern volume{z} - named persistent volumes
 
-    {c}create{z} <name|--name N> [--size N]   Create a volume (also auto-created by `-v name:/dest`)
+    {c}create{z} <name|--name N> [--size N | --path DIR | --driver local --opt device=DIR]   Create a volume, its files in DIR on any disk when given (also auto-created by `-v name:/dest`)
     {c}ls{z} [-q] [--filter name=S]   List volumes with sizes; `-q` names only
     {c}inspect{z} <name>      Show a volume's path, size and metadata
     {c}edit{z} <name> [--name NEW] [--size N|0]   Rename and/or re-quota a volume
@@ -1609,6 +1757,49 @@ mod tests {
             validate(&"a".repeat(72)).is_ok(),
             "a 72-byte compose project name is valid"
         );
+    }
+
+    /// A VOLUME AT A PATH OF THE USER'S: its files are there, at every mount, and a path inside
+    /// kern's own state is refused before anything is made there.
+    #[test]
+    fn a_volume_at_a_path_is_mounted_from_there_and_refused_inside_kerns_state() {
+        let _g = crate::env_guard();
+        let tmp = std::env::temp_dir().join(format!("kern-volpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::set_global_env("XDG_DATA_HOME", tmp.join("data"));
+        crate::set_global_env("KERN_CONFIG", tmp.join("absent.toml"));
+        crate::config::forget_cached();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let ext = tmp.join("ext/pv");
+        create(&s(&["pv", "--path", &ext.to_string_lossy()])).expect("create --path");
+        let got = resolve_named("pv").expect("resolve");
+        assert_eq!(
+            std::path::PathBuf::from(&got),
+            std::fs::canonicalize(&ext).expect("canon"),
+            "the box mounts the directory chosen"
+        );
+        // Docker's spelling of the same thing.
+        let dk = tmp.join("ext/dk");
+        let dev = format!("device={}", dk.display());
+        create(&s(&[
+            "dk", "--driver", "local", "--opt", "type=none", "--opt", "o=bind", "--opt", &dev,
+        ]))
+        .expect("create --opt device");
+        assert_eq!(
+            std::path::PathBuf::from(resolve_named("dk").expect("resolve dk")),
+            std::fs::canonicalize(&dk).expect("canon dk")
+        );
+        // No kern quota on a directory of the user's, and no network driver by this route.
+        assert!(create(&s(&["q", "--size", "1m", "--path", &tmp.join("ext/q").to_string_lossy()])).is_err());
+        assert!(create(&s(&["n", "--opt", "type=nfs"])).is_err());
+        // Inside kern's volumes directory: refused, and NOT created first.
+        let inside = volumes_dir().join("sub");
+        assert!(create(&s(&["x", "--path", &inside.to_string_lossy()])).is_err());
+        assert!(!inside.exists(), "a refused path must not be made");
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::unset_global_env("XDG_DATA_HOME");
+        crate::unset_global_env("KERN_CONFIG");
+        crate::config::forget_cached();
     }
 
     #[test]

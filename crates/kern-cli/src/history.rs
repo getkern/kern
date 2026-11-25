@@ -339,6 +339,10 @@ fn memory_dir() -> std::io::Result<PathBuf> {
 /// `$XDG_DATA_HOME/kern`, so a box can neither read nor forge this history.
 /// `the_disk_history_is_refused_as_a_mount_source` holds the agreement.
 pub(crate) fn disk_dir_path() -> Option<PathBuf> {
+    // `[kern] history_dir`, refused as a mount source wherever it is, as the data root is.
+    if let Some(dir) = crate::config::dir_setting("history_dir") {
+        return Some(dir);
+    }
     crate::keepbox::data_root().map(|r| r.join("history"))
 }
 
