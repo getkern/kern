@@ -156,7 +156,6 @@ const RUN: &[Flag] = &[
     b(&["-i", "--interactive"], "-i"),
     b(&["-t", "--tty"], "-t"),
     b(&["--init"], "--init"),
-    b(&["--privileged"], "--privileged"),
     b(&["--read-only"], "--read-only"),
     v(&["--name"], "--name"),
     v(&["-e", "--env"], "--env"),
@@ -1769,6 +1768,14 @@ mod tests {
         );
         let r = refused(&["run", "-P", "img"]);
         assert!(r.starts_with("docker run -P:"), "{r}");
+        // NOT the same flag: docker's grants every capability and device and drops seccomp, kern's
+        // only relaxes seccomp so a nested box can start. Translating one into the other ran
+        // `docker run --privileged` with exit 0 and far less than it asked for.
+        let r = refused(&["run", "--privileged", "img"]);
+        assert!(
+            r.starts_with("docker run --privileged: kern has no flag"),
+            "{r}"
+        );
         let r = refused(&["run", "-dP", "img"]);
         assert!(r.contains("-P (in -dP)"), "{r}");
         let r = refused(&["exec", "-d", "c", "true"]);
