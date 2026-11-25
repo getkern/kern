@@ -422,6 +422,16 @@ impl<'a> Extract<'a> {
 /// `FROM <stage>` and a `COPY --from` did not. MEASURED on 2026-11-18: any multi-stage build on a
 /// `python:*-slim` base (`/var/lib/apt/lists/partial`, `drwx------ _apt`) failed rootless, and passed
 /// as root.
+/// What a `COPY --from` extract answers when its path is not in the stage: ONE value, produced here
+/// (exit 108 of the merged-view child, `NotFound` of the single-layer copy) and compared for equality
+/// by the caller that names the path and the stage, so rewording it cannot silently undo that.
+pub(crate) const COPY_FROM_MISSING: &str =
+    "COPY --from source does not exist in the stage's final filesystem";
+
+/// The start of the message a `COPY --from` with a missing path ends with, which `error.rs` reads to
+/// leave the FROM hint off (the FROM line was right).
+pub(crate) const COPY_FROM_PREFIX: &str = "COPY --from: ";
+
 pub(crate) fn merged_view_extract(
     chain: &[String],
     src_rel: Extract<'_>,
@@ -605,9 +615,7 @@ fn merged_view_extract_once(
             "reading the image's merged view needs openat2 (Linux 5.6+); this kernel is older"
                 .into(),
         )),
-        108 => Err(Error::Build(
-            "COPY --from source does not exist in the stage's final filesystem".into(),
-        )),
+        108 => Err(Error::Build(COPY_FROM_MISSING.into())),
         120 => Err(Error::Build(
             "COPY --from source tree is nested too deeply (refused)".into(),
         )),

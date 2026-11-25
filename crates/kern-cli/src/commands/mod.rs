@@ -4746,23 +4746,22 @@ fn copy_from_stage_chain(
     // filesystem", naming neither the path nor the stage.
     let missing = || {
         Error::Build(format!(
-            "COPY --from: '{src_rel}' does not exist in {source}"
+            "{}'{src_rel}' does not exist in {source}",
+            rootfs::COPY_FROM_PREFIX
         ))
+    };
+    let named = |e: Error| match e {
+        Error::Build(m) if m == rootfs::COPY_FROM_MISSING => missing(),
+        other => other,
     };
     if chain.len() >= 2 {
         // ≥2 stacked layers → cross-layer opaque is possible → read the kernel-merged view (which also
         // handles file AND directory sources uniformly, confining `src_rel` via `openat2(RESOLVE_IN_ROOT)`).
-        return merged_view_extract(chain, Extract::Entry(src_rel), dest).map_err(|e| match e {
-            Error::Build(m) if m.starts_with("COPY --from source does not exist") => missing(),
-            other => other,
-        });
+        return merged_view_extract(chain, Extract::Entry(src_rel), dest).map_err(named);
     }
     // Exactly one layer: it IS its own merged rootfs (no cross-layer opaque to honour). Copy directly
     // through the shared single-rootfs confine helper (canonicalize + `starts_with`, `cp -a` no-follow).
-    copy_from_stage_rootfs(std::path::Path::new(&chain[0]), src_rel, dest).map_err(|e| match e {
-        Error::Build(m) if m.contains("No such file or directory") => missing(),
-        other => other,
-    })
+    copy_from_stage_rootfs(std::path::Path::new(&chain[0]), src_rel, dest).map_err(named)
 }
 
 /// Copy `src_rel` OUT of a single source rootfs `src_rootfs` into `dest`, confined to it (canonicalize +
@@ -4786,8 +4785,15 @@ fn copy_from_stage_rootfs(
             src_rootfs.display()
         ))
     })?;
-    let src = std::fs::canonicalize(root.join(clean))
-        .map_err(|e| Error::Build(format!("COPY --from source '{src_rel}': {e}")))?;
+    // A PATH THAT IS NOT THERE is said as one, by kind and not by the text of the error; every other
+    // failure keeps its own words.
+    let src = std::fs::canonicalize(root.join(clean)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::Build(rootfs::COPY_FROM_MISSING.into())
+        } else {
+            Error::Build(format!("COPY --from source '{src_rel}': {e}"))
+        }
+    })?;
     if !src.starts_with(&root) {
         return Err(Error::Build(format!(
             "COPY --from source '{src_rel}' escapes the source stage"

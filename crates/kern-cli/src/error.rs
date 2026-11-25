@@ -235,7 +235,7 @@ impl Error {
             Error::Build(msg) if msg.starts_with("COPY --chown") => None,
             // Nor under a COPY --from that names the path and the stage it is missing from: the FROM
             // hint there sent the reader to a line that was right.
-            Error::Build(msg) if msg.starts_with("COPY --from:") => None,
+            Error::Build(msg) if msg.starts_with(crate::commands::COPY_FROM_PREFIX) => None,
             Error::Build(msg) if msg.starts_with("no build ") => {
                 Some("run `kern builds` to list build ids".into())
             }
