@@ -11297,7 +11297,11 @@ pub(crate) fn normalize_project_name(s: &str) -> String {
 /// Docker; `-p` tells them apart.
 fn compose_pod_name(file: &str) -> String {
     let path = std::path::Path::new(file);
-    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // `-` (stdin) is no file to canonicalize: it stands in the current directory, which is Docker's
+    // project directory for it, so its absolute path's parent is the directory named.
+    let canon = std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
     let dir = canon
         .parent()
         .and_then(|p| p.file_name())

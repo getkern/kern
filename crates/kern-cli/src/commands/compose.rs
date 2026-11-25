@@ -331,7 +331,7 @@ fn load_config_file(
             path.display()
         )));
     }
-    let text = std::fs::read_to_string(path)
+    let text = read_compose_file(path)
         .map_err(|e| Error::Compose(format!("reading {}: {e}", path.display())))?;
     let dir = std::path::absolute(compose_dir(&path.to_string_lossy()))
         .map_err(|e| Error::Compose(format!("{}: {e}", path.display())))?;
@@ -1188,6 +1188,24 @@ const DEFAULT_OVERRIDE_NAMES: [&str; 4] = [
     "docker-compose.override.yml",
 ];
 
+/// The text of compose file `path`, where `-` is STDIN, as `docker compose -f -` reads it: read once
+/// per process, so the several reads of one invocation see the same text. Its directory is the
+/// current one (`compose_dir("-")` is `.`), which is Docker's project directory for a stdin file.
+fn read_compose_file(path: &std::path::Path) -> std::io::Result<String> {
+    static STDIN: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    if path.as_os_str() != "-" {
+        return std::fs::read_to_string(path);
+    }
+    STDIN
+        .get_or_init(|| {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                .map(|_| text)
+                .map_err(|e| e.to_string())
+        })
+        .clone()
+        .map_err(std::io::Error::other)
+}
 /// The override file `docker compose` would have loaded beside `files[0]`, if there is one.
 ///
 /// THE SILENT DIFFERENCE THIS CLOSES. A developer whose project has `docker-compose.yml` plus
@@ -1698,7 +1716,7 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
         .first()
         .map(String::as_str)
         .ok_or_else(|| Error::Compose("compose needs at least one file".to_string()))?;
-    let text = std::fs::read_to_string(file)
+    let text = read_compose_file(std::path::Path::new(file))
         .map_err(|e| Error::Compose(format!("reading {file}: {e}")))?;
     // Docker loads a `.env` sitting next to the compose file and uses it for `${VAR}` interpolation.
     // Without this, every real project (nearly all ship one) silently substituted EMPTY: a
@@ -1814,7 +1832,7 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
     let mut texts: Vec<String> = vec![text.clone()];
     for extra in files.iter().skip(1) {
         texts.push(
-            std::fs::read_to_string(extra)
+            read_compose_file(std::path::Path::new(extra))
                 .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?,
         );
     }

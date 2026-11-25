@@ -104,6 +104,10 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**`kern compose -f -` reads the file from stdin, as `docker compose -f -` does.** It answered "reading
+-: No such file or directory". The current directory is the project's, for its name and for relative
+paths, as under Docker, and a `${VAR:?message}` the file requires stops it with that message.
+
 **A secret is read-only in the box, for its root too.** The write bit of `/run/secrets/<name>` was
 dropped, which binds every user but the box's root: `echo x >> /run/secrets/s` from a compose service
 succeeded, where Docker answers "Read-only file system". `/run/secrets` is a read-only mount once the

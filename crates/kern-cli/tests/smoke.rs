@@ -9562,6 +9562,62 @@ fn kern_unshare_removes_what_a_box_user_wrote_and_passes_the_exit_code() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `kern compose -f -` READS THE FILE FROM STDIN, as `docker compose -f -` does, with the current
+/// directory as the project's: its name, and where relative paths start. MEASURED before: "reading -:
+/// No such file or directory", then, once read, "project name must not be empty". Offline: `config`.
+#[test]
+fn compose_reads_the_file_from_stdin_in_the_current_directory() {
+    use std::io::Write as _;
+    let dir = std::env::temp_dir().join(format!("kern-smoke-cstdin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let proj = dir.join("stdinproj");
+    std::fs::create_dir_all(&proj).expect("dir");
+    let file = "services:\n  w:\n    image: alpine:3.21\n    environment:\n      X: ${MUST:?MUST not set}\n    volumes: [\"./data:/d\"]\n";
+    let config = |must: Option<&str>| {
+        let mut c = kern();
+        c.current_dir(&proj)
+            .env("XDG_CACHE_HOME", dir.join("cache"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env_remove("MUST")
+            .env_remove("COMPOSE_PROJECT_NAME")
+            .args(["compose", "-f", "-", "config"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(v) = must {
+            c.env("MUST", v);
+        }
+        let mut child = c.spawn().expect("run kern");
+        let _ = child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(file.as_bytes());
+        let out = child.wait_with_output().expect("wait");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let (ok, _, err) = config(None);
+    assert!(
+        !ok && err.contains("MUST not set"),
+        "the required variable stops it: {err}"
+    );
+    let (ok, out, err) = config(Some("1"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(ok, "the file read from stdin: {err}");
+    assert!(
+        out.contains("name: stdinproj"),
+        "the project is the current directory's: {out}"
+    );
+    assert!(
+        out.contains(&format!("{}/data", proj.display())),
+        "./data starts at the current directory: {out}"
+    );
+}
+
 /// `kern build -` and `-f -` READ STDIN, as `docker build` does: a Dockerfile (empty context), a tar
 /// that is the context, or with `-f -` the Dockerfile for a context on disk; both at once refused.
 /// MEASURED before: `kern build -t x -` answered "unknown build flag '-'". Offline: `FROM scratch`.
