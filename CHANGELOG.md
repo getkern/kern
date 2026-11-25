@@ -74,6 +74,13 @@ process the kernel's OOM killer ended reads true, and so does a running one that
 as under Docker; `kern ps --json` and `kern inspect --json` carry it as `oom_killed`. The verdict a
 detached box recorded was the runner's latch read in the wrong process, so it was never set.
 
+**kern's Docker API server survives a burst of clients.** 200 `docker run --rm` at once took it to its
+file limit (systemd's soft 1024), and it exited on `accept failed: No file descriptors available`,
+ending every request in flight with `EOF`. It now waits out a shortage of descriptors or memory with
+the connections queued, and runs with its soft file limit raised to the hard one, as Docker's daemon
+does; the boxes it starts keep the limit they had (soft 1024, as a Docker container's). Measured: 200
+at once, three times, 200 of 200 in about one second, the same server, no box left.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

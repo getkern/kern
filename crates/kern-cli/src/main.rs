@@ -370,6 +370,26 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    // THE FILE LIMIT A KERN STARTED BY THE DOCKER API SERVER HAD BEFORE THE SERVER RAISED ITS OWN
+    // (see `dockershim::raise_server_nofile`): put back here, first, so the boxes this kern runs
+    // keep the limit a Docker container gets (soft 1024 under systemd) and not the server's. One
+    // syscall, and only when the server set it; the marker is removed so no box inherits it.
+    if let Some(v) = global_env("KERN_NOFILE_SOFT") {
+        if let Some(soft) = v.to_str().and_then(|s| s.parse::<libc::rlim_t>().ok()) {
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: get/setrlimit on this process with a struct owned here.
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0
+                && soft <= lim.rlim_max
+            {
+                lim.rlim_cur = soft;
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+            }
+        }
+        unset_global_env("KERN_NOFILE_SOFT");
+    }
     // In kern's own WSL distro, root becomes the distro's ordinary user before anything else runs
     // (see `wslentry`). One failed `stat` everywhere else.
     wslentry::enter_as_user_if_kern_distro();

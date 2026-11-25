@@ -1113,6 +1113,30 @@ const UNIT_MARK: &str =
 /// A socket-started server exits after this long without a connection; systemd starts it again.
 const IDLE_EXIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The server's own file limit, raised from the soft value to the hard one, as Docker's daemon runs
+/// with a high `LimitNOFILE`: each client holds a connection, and each request runs a `kern` with
+/// its pipes. MEASURED before: 200 `docker run --rm` at once took the server, at systemd's soft 1024,
+/// to `accept failed: No file descriptors available`, and every request in flight ended in `EOF`.
+/// The kern it runs is handed the original (`KERN_NOFILE_SOFT`, applied first thing in `main`), so a
+/// box keeps the limit a Docker container has. Called while this process has one thread.
+fn raise_server_nofile() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: get/setrlimit on this process with a struct owned here.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0
+        || lim.rlim_cur >= lim.rlim_max
+    {
+        return;
+    }
+    let original = lim.rlim_cur;
+    lim.rlim_cur = lim.rlim_max.min(1 << 20);
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0 {
+        crate::set_global_env("KERN_NOFILE_SOFT", original.to_string());
+    }
+}
+
 /// `$XDG_RUNTIME_DIR/kern/compat-docker.sock`: in kern's runtime root, which no box may mount.
 fn socket_path() -> Result<PathBuf, Error> {
     crate::registry::runtime_subdir_public("compat-docker")
@@ -1161,6 +1185,7 @@ fn serve(args: &[String]) -> Result<(), Error> {
         // parent; a socket in any other directory could be handed to a box with that directory.
         _ => return Err(Error::Usage("compat docker serve")),
     };
+    raise_server_nofile();
     let attempts = crate::registry::runtime_subdir_public("attempt").ok();
     kern_compat::serve(listen, kern, idle, attempts)
         .map_err(|e| Error::Cli(format!("compat docker serve: {e}")))

@@ -631,6 +631,18 @@ fn monotonic_secs() -> u64 {
     u64::try_from(ts.tv_sec).unwrap_or(0)
 }
 
+/// Said once per run of refused accepts, not once per retry.
+static ACCEPT_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An `accept` refused for a shortage that passes: descriptors (`EMFILE`, `ENFILE`), memory
+/// (`ENOMEM`, `ENOBUFS`), or a client that hung up while queued (`ECONNABORTED`).
+fn accept_is_transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS | libc::ECONNABORTED)
+    )
+}
+
 /// Serve the Docker API until killed, or, with `idle`, until no connection has been open for that
 /// long (systemd starts it again at the next one). Every request is run by the `kern` binary at
 /// `kern`; `attempts` is kern's `attempt/` directory, for the restarts `/events` reports. `Err` says
@@ -705,8 +717,20 @@ pub fn serve(
             Ok((s, _)) => s,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) if idle.is_some() && e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            // ⛔ OUT OF DESCRIPTORS OR MEMORY IS A WAIT, NOT THE SERVER'S END: the connection stays in
+            // the socket's backlog, and the requests in flight free what they hold as they finish.
+            // MEASURED before: 200 `docker run --rm` at once ended this process with `accept failed:
+            // No file descriptors available`, and every request it was serving ended in `EOF`.
+            Err(e) if accept_is_transient(&e) => {
+                if !ACCEPT_WAITING.swap(true, Ordering::AcqRel) {
+                    eprintln!("kern: {shown}: {e}; waiting for connections in flight to finish");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(e) => return Err(format!("{shown}: accept failed: {e}")),
         };
+        ACCEPT_WAITING.store(false, Ordering::Release);
         let kern = kern.clone();
         ACTIVE.fetch_add(1, Ordering::AcqRel);
         let spawned = std::thread::Builder::new()
@@ -927,6 +951,24 @@ mod tests {
     }
 
     use super::*;
+
+    /// A shortage that passes is a wait; anything else still ends the server with its reason.
+    #[test]
+    fn an_accept_out_of_descriptors_is_a_wait_not_an_exit() {
+        let e = |n| std::io::Error::from_raw_os_error(n);
+        for n in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::ENOBUFS,
+            libc::ECONNABORTED,
+        ] {
+            assert!(accept_is_transient(&e(n)), "{n}");
+        }
+        for n in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            assert!(!accept_is_transient(&e(n)), "{n}");
+        }
+    }
 
     /// The parser takes what any client of this user sends: mutated real requests, from the shapes
     /// Testcontainers and the docker CLI send, must end in a request, a 400 or a close, never a
