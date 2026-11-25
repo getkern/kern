@@ -6120,6 +6120,143 @@ pub fn with_id_mapped_userns<F: FnOnce(bool) -> i32>(f: F) -> Result<i32, Error>
     }
 }
 
+/// How [`exec_in_id_mapped_userns`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappedExit {
+    /// The command's exit code, or 128 + the number of the signal that ended it (the shell's rule).
+    pub code: i32,
+    /// The namespace carried kern's subordinate id RANGE; `false` is a single-uid map, where only the
+    /// caller's own id is uid 0 and a box's other ids are out of reach.
+    pub ranged: bool,
+}
+
+/// Run the program `argv` (looked up in PATH) as uid 0 of a user namespace carrying kern's
+/// subordinate id range, the ids a box's files are owned by on disk, and return how it ended.
+/// `on_mapped` runs in the child once the map is in place and before the program starts, told
+/// whether it is a range: the place to say what the program will and will not be able to reach.
+///
+/// WHY NOT [`with_id_mapped_userns`]: it reports its own failures as exit codes 121 and 122, which a
+/// program can exit with too, and a `kern unshare -- sh -c 'exit 121'` would then read as "could not
+/// map a user namespace". Here the child writes one byte on a close-on-exec pipe once it is uid 0 of
+/// the mapped namespace: with the byte, every status after it is the program's own; without it,
+/// the mapping failed and the status says how.
+///
+/// The caller ignores SIGINT and SIGQUIT while it waits, as `system(3)` does: a Ctrl-C at the
+/// terminal reaches the program, which decides, and the caller then reports what it did.
+pub fn exec_in_id_mapped_userns<F: FnOnce(bool)>(
+    argv: &[std::ffi::CString],
+    on_mapped: F,
+) -> Result<MappedExit, Error> {
+    if argv.is_empty() {
+        return Err(Error::Unsupported("id-mapped run: no program to run"));
+    }
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let range = detect_id_range(euid, egid);
+    if !single_threaded() {
+        return Err(Error::Unsupported(
+            "id-mapped run: refusing to fork in a multi-threaded process (fork-safety)",
+        ));
+    }
+    // Built BEFORE the fork: the child only reads it.
+    let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2 writes two descriptors into `fds`.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(Error::last("pipe2(id-mapped run)"));
+    }
+    let (rd, wr) = (fds[0], fds[1]);
+    // SAFETY: single-threaded (checked above); the child runs only what follows and then execs or
+    // exits.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(Error::last("fork(id-mapped run)"));
+    }
+    if child == 0 {
+        unsafe { libc::close(rd) };
+        let mapped = match &range {
+            Some(r) => apply_userns_range(libc::CLONE_NEWUSER, euid, egid, r, None, None).is_ok(),
+            None => {
+                let unshared = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0;
+                unshared && write_single_uid_map(euid, egid).is_ok()
+            }
+        };
+        if !mapped {
+            unsafe { libc::_exit(121) };
+        }
+        if unsafe { libc::setresgid(0, 0, 0) } != 0 || unsafe { libc::setresuid(0, 0, 0) } != 0 {
+            unsafe { libc::_exit(122) };
+        }
+        let ranged = uid_map_is_ranged();
+        on_mapped(ranged);
+        let byte = if ranged { b'R' } else { b'S' };
+        // SAFETY: one byte from a local, on the pipe's write end; it closes at the exec (O_CLOEXEC).
+        if unsafe { libc::write(wr, (&byte as *const u8).cast(), 1) } != 1 {
+            unsafe { libc::_exit(123) };
+        }
+        // SAFETY: `ptrs` is a NULL-terminated array of pointers into `argv`, alive in this process.
+        unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
+        // Only reached when the exec failed: the shell's 127 for a program not found, 126 otherwise.
+        let err = std::io::Error::last_os_error();
+        let not_found = err.raw_os_error() == Some(libc::ENOENT);
+        eprintln!(
+            "kern: unshare: cannot run '{}': {err}",
+            argv[0].to_string_lossy()
+        );
+        unsafe { libc::_exit(if not_found { 127 } else { 126 }) };
+    }
+    unsafe { libc::close(wr) };
+    // SAFETY: SIG_IGN for two signals in this (parent) process; the child keeps its own dispositions.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+    }
+    let mut byte = 0u8;
+    let got = loop {
+        // SAFETY: one byte into a local.
+        let n = unsafe { libc::read(rd, (&mut byte as *mut u8).cast(), 1) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break n == 1;
+    };
+    unsafe { libc::close(rd) };
+    let mut st = 0;
+    loop {
+        // SAFETY: waits for the child forked above.
+        if unsafe { libc::waitpid(child, &mut st, 0) } >= 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(Error::last("waitpid(id-mapped run)"));
+        }
+    }
+    let status = if libc::WIFEXITED(st) {
+        libc::WEXITSTATUS(st)
+    } else if libc::WIFSIGNALED(st) {
+        128 + libc::WTERMSIG(st)
+    } else {
+        return Err(Error::Unsupported(
+            "id-mapped run: the child neither exited nor was signalled",
+        ));
+    };
+    if got {
+        return Ok(MappedExit {
+            code: status,
+            ranged: byte == b'R',
+        });
+    }
+    Err(match status {
+        121 => Error::Unsupported("id-mapped run: could not map a user namespace"),
+        122 => Error::Unsupported("id-mapped run: could not become root of the mapped namespace"),
+        _ => Error::Unsupported("id-mapped run: the child ended before the program started"),
+    })
+}
+
 /// Does THIS process's uid map cover more than the single self-mapped id?
 ///
 /// Read from `/proc/self/uid_map` and not deduced from what was requested: the range helpers can be

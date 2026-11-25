@@ -54,6 +54,7 @@ COMMANDS:
     export <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
     container <verb> ...                                           The box verbs under one name (container ls = ps; not run/top/prune)
     compat docker (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
+    unshare [--] [CMD...]                                          Run CMD (default: your shell) with the ids a box's files carry on disk
     compat docker (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
     events                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     prune                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code

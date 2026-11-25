@@ -658,8 +658,24 @@ service with `user: "1000:1000"`, writing into a bind-mounted host directory
 
 kern maps the box's uids through the caller's subuid range, so the box's 1000 is 100999 outside. The
 first `ls -la ./data` after a migration shows it. It is structural to running without root and
-cannot be removed while kern stays rootless; `podman unshare` is the equivalent tool for handling
-such a tree, and `kern` inherits the same problem shape.
+cannot be removed while kern stays rootless.
+
+`kern unshare` is the tool for such a tree, as `podman unshare` is for podman's: it runs a command as
+uid 0 of the user namespace kern builds with that same map, where the file is uid 1000 again and can
+be changed or removed.
+
+```
+kern unshare -- ls -ln ./data            # the box's ids: 999, not 100998
+kern unshare -- chown -R 0:0 ./data      # hand the tree back to you
+kern unshare -- rm -rf ./old-rootfs      # what a plain rm refuses (Permission denied)
+kern unshare                             # your shell, there
+```
+
+Measured on 2026-11-20: a directory a box wrote as uid 999 with mode 700 was `100998 700` on the
+host, a plain `rm -rf` was refused, and `kern unshare -- rm -rf` removed it. The command's exit code
+is kern's. Where there is no subordinate id range (no `newuidmap`/`newgidmap`, or no `/etc/subuid`
+line), the command still runs as uid 0, with only your own id mapped, and kern says so before it
+starts: the files of a box's other users stay out of reach there.
 
 ## 39. After a reboot
 

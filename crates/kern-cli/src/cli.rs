@@ -491,6 +491,11 @@ pub enum Command {
     Compat {
         args: Vec<String>,
     },
+    /// `unshare [--] [CMD...]`: run CMD (default: the caller's shell) as uid 0 of a user namespace
+    /// with the ids a box's files carry on disk (`crate::unshare`).
+    Unshare {
+        cmd: Vec<String>,
+    },
     /// Hidden: inotify on a sandbox workspace directory for an SDK (`crate::dirwatch`).
     WatchDir {
         root: String,
@@ -1285,6 +1290,21 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // Hidden: the local router (spawned by `compose up`).
         Some("__local-router") => Command::LocalRouter,
         Some("__router-port") => Command::RouterPort,
+        Some("unshare") => {
+            let tail = rest.get(1..).unwrap_or_default();
+            let cmd: &[&str] = match tail.split_first() {
+                Some((&"--", after)) => after,
+                // No flags of its own: a word starting with `-` before the command is a mistake,
+                // not something to pass along, and `--` is the way to start a command with one.
+                Some((f, _)) if f.starts_with('-') => {
+                    return Err(Error::Usage("unshare [--] [CMD...]"))
+                }
+                _ => tail,
+            };
+            Command::Unshare {
+                cmd: cmd.iter().map(|w| (*w).to_string()).collect(),
+            }
+        }
         Some("compat") => Command::Compat {
             args: rest.iter().skip(1).map(|s| (*s).to_string()).collect(),
         },
@@ -6884,6 +6904,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::LocalRouter => crate::localrouter::run(),
         Command::RouterPort => std::process::exit(crate::localrouter::port_verb()),
         Command::Compat { args } => crate::dockershim::compat(&args),
+        Command::Unshare { cmd } => crate::unshare::run(&cmd),
         Command::WatchDir {
             root,
             rel,

@@ -203,6 +203,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}export{z} <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
     {c}container{z} <verb> ...                                           The box verbs under one name (container ls = ps; not run/top/prune)
     {c}compat docker{z} (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
+    {c}unshare{z} [--] [CMD...]                                          Run CMD (default: your shell) with the ids a box's files carry on disk
+                                                                     (chown/rm what a box's non-root users wrote in a bind), as podman unshare
     {c}compat docker{z} (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
                                                                      Windows programs: `kern compat docker pipe` in Windows (\\\\.\\pipe\\kern-docker)
     {c}events{z}                                                         Stream box start/die/rename events (Ctrl-C; best-effort)

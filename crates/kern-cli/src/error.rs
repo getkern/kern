@@ -446,7 +446,14 @@ mod tests {
             // `kern_isolation::with_id_mapped_userns`). It CONTAINS `fork`, so the hint branch
             // already covers it; the list is pinned so a new site is a conscious addition rather
             // than something that slid in behind a substring match.
-            vec!["execvp", "fork", "fork(id-mapped)", "fork(idmap helper)"],
+            // `fork(id-mapped run)` is `kern unshare` (`kern_isolation::exec_in_id_mapped_userns`).
+            vec![
+                "execvp",
+                "fork",
+                "fork(id-mapped run)",
+                "fork(id-mapped)",
+                "fork(idmap helper)",
+            ],
             "the process-creation failure sites changed. A new one must either contain `fork`, so the \
              hint branch sees it, or be given its own branch: falling through to the generic setup \
              hint is the defect this test exists to stop"

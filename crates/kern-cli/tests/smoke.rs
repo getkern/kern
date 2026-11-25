@@ -9493,3 +9493,70 @@ fn a_restarted_service_does_not_leave_its_old_pasta_behind() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(stopped, "the old pasta outlived the restart of its service");
 }
+
+/// `kern unshare` reaches what a box's non-root user left on a bind mount: on the host that tree is a
+/// subordinate uid's (a box's 999 is 100998 here) and a plain remove is refused; through `kern
+/// unshare` it is the box's 999 again and `rm -rf` takes it. The command's exit code is kern's, the
+/// two codes kern's own id-mapped helper uses for its failures included.
+#[test]
+fn kern_unshare_removes_what_a_box_user_wrote_and_passes_the_exit_code() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    // SAFETY: geteuid has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    let dir = std::env::temp_dir().join(format!("kern-unshare-{}", std::process::id()));
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).expect("data dir");
+    let name = format!("un{}", std::process::id());
+    let bind = format!("{}:/data", data.display());
+    let wrote = kern()
+        .args(["box", &name, "--image", "busybox:1.36", "-v", &bind, "--"])
+        .args([
+            "sh",
+            "-c",
+            "mkdir -p /data/pg && echo x > /data/pg/f && chown -R 999:999 /data/pg && chmod 700 /data/pg",
+        ])
+        .output()
+        .expect("box");
+    if !wrote.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "SKIP: the box could not chown to 999 (no subordinate id range?): {:.300}",
+            String::from_utf8_lossy(&wrote.stderr)
+        );
+        return;
+    }
+    let pg = data.join("pg");
+    if !root {
+        assert!(
+            std::fs::remove_dir_all(&pg).is_err(),
+            "a plain remove took a box user's 0700 tree: the test proves nothing here"
+        );
+    }
+    let ls = kern()
+        .args(["unshare", "--", "stat", "-c", "%u"])
+        .arg(&pg)
+        .output()
+        .expect("unshare stat");
+    assert_eq!(String::from_utf8_lossy(&ls.stdout).trim(), "999", "{ls:?}");
+    let rm = kern()
+        .args(["unshare", "--", "rm", "-rf"])
+        .arg(&pg)
+        .status()
+        .expect("unshare rm");
+    assert!(
+        rm.success() && !pg.exists(),
+        "kern unshare -- rm -rf left {}",
+        pg.display()
+    );
+    for code in [0, 7, 121, 122] {
+        let st = kern()
+            .args(["unshare", "--", "sh", "-c", &format!("exit {code}")])
+            .status()
+            .expect("unshare sh");
+        assert_eq!(st.code(), Some(code), "exit {code} came back as {st:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

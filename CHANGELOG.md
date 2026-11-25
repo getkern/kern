@@ -65,6 +65,12 @@ with the release keys. The replaced one is kept for `--rollback`. See [docs/INST
 **`--egress-allow`, `--egress-deny` and `--egress-secret` work with `-d`.** The filter of a detached
 box is started for every attempt, `--restart` included, and stopped with it; it was refused before.
 
+**`kern unshare [--] [CMD...]`: a command with the ids a box's files carry on disk**, as `podman
+unshare`. A bind-mounted directory a box's non-root user wrote is owned on the host by a subordinate
+uid (100998 for a box's 999), which you cannot `chown` or remove; `kern unshare -- rm -rf ./old` and
+`kern unshare -- chown -R 0:0 ./data` can. Without a subordinate id range it still runs, as uid 0 of
+your own id only, and says so first. See [docs/RUNTIME-PARITY.md](docs/RUNTIME-PARITY.md) section 38.
+
 ## kern sandbox 0.3.0 - 2026-11-20
 
 **It carries the kern v0.56.0 binary**, and both bindings gain what v0.56.0 lists under "kern sandbox":

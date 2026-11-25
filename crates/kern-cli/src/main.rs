@@ -304,6 +304,7 @@ mod toml_surgery;
 mod transcript;
 mod tui;
 mod ui;
+mod unshare;
 mod vdisk;
 mod volume;
 mod wslentry;
