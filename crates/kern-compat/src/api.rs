@@ -1760,6 +1760,33 @@ fn logs(bin: &Path, name: &str, req: &Request) -> Response {
 }
 
 /// `POST /images/create?fromImage=X&tag=Y`: `kern pull`, answered as Docker's progress stream.
+/// The image buildx runs its own BuildKit in, when the daemon it talks to has none: `moby/buildkit`
+/// at a `buildx-stable` tag (the driver's default).
+fn is_buildx_builder(image: &str) -> bool {
+    let image = image.strip_prefix("docker.io/").unwrap_or(image);
+    image
+        .strip_prefix("moby/buildkit:")
+        .is_some_and(|tag| tag.starts_with("buildx-stable"))
+}
+
+/// `docker build` WITH BUILDX, refused before it costs anything and with the way that works. On
+/// Linux the docker CLI hands every build to buildx when the plugin is installed, whatever the
+/// daemon says (`cmd/docker/builder.go`: only a Windows daemon without BuildKit keeps the classic
+/// builder), and buildx, finding no BuildKit in this API, pulls `moby/buildkit` to run one in a
+/// privileged container. MEASURED with buildx 0.39.1: a 23 s pull of 230 MB, then "HostConfig.
+/// Privileged: kern does not grant it", which names neither the cause nor the way out.
+/// `DOCKER_BUILDKIT=0` is that way: the classic builder, `POST /build`, measured working for
+/// `docker build` and `docker compose build` alike with buildx installed.
+fn buildx_refusal() -> Response {
+    error(
+        501,
+        "docker build with buildx runs BuildKit in a privileged container of its own, which kern's \
+         Docker API does not start. Build with the classic builder, which it serves: \
+         `DOCKER_BUILDKIT=0 docker build ...` (and `DOCKER_BUILDKIT=0 docker compose build`), \
+         or `kern build`",
+    )
+}
+
 fn pull(bin: &Path, req: &Request) -> Response {
     let Some(from) = req.param("fromImage").filter(|f| !f.is_empty()) else {
         return error(
@@ -1776,6 +1803,9 @@ fn pull(bin: &Path, req: &Request) -> Response {
         }
         _ => from.to_string(),
     };
+    if is_buildx_builder(&image) {
+        return buildx_refusal();
+    }
     // `docker pull --platform` / `docker run --platform`: that platform's own cache entry, the one
     // the create's `--platform` then runs.
     let platform = match req.param("platform").filter(|p| !p.is_empty()) {
@@ -4990,6 +5020,10 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             extra: vec![
                 ("Docker-Experimental", "false".into()),
                 ("Ostype", "linux".into()),
+                // THE CLASSIC BUILDER, the one `POST /build` serves (Docker says `2`, BuildKit).
+                // True, and read by the clients that ask; the docker CLI on Linux hands a build to
+                // buildx regardless, which is why `buildx_refusal` exists.
+                ("Builder-Version", "1".into()),
             ],
         },
         ("GET", ["version"]) => version(),
@@ -5015,6 +5049,13 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 Ok(b) => b,
                 Err(e) => return error(400, &e.to_string()),
             };
+            if body
+                .get("Image")
+                .and_then(Value::as_str)
+                .is_some_and(is_buildx_builder)
+            {
+                return buildx_refusal();
+            }
             let platform = match req.param("platform").filter(|p| !p.is_empty()) {
                 Some(p) if valid_platform(p) => Some(p.to_string()),
                 Some(p) => return error(400, &format!("invalid platform: {p:?}")),
@@ -5994,6 +6035,25 @@ mod tests {
                 .take_while(|(x, y)| x == y)
                 .count();
             assert!(common < 4, "{a} {ia} / {b} {ib}: {common} digits alike");
+        }
+    }
+
+    /// buildx's own builder image is recognised at its default tags, and nothing else is.
+    #[test]
+    fn buildx_builder_image_is_recognised() {
+        for yes in [
+            "moby/buildkit:buildx-stable-1",
+            "docker.io/moby/buildkit:buildx-stable-1",
+        ] {
+            assert!(is_buildx_builder(yes), "{yes}");
+        }
+        for no in [
+            "moby/buildkit:latest",
+            "moby/buildkit",
+            "alpine:3.21",
+            "x/moby/buildkit:buildx-stable-1",
+        ] {
+            assert!(!is_buildx_builder(no), "{no}");
         }
     }
 
