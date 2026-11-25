@@ -107,6 +107,12 @@ working directory ran in the root where Docker refuses it, and now gets Docker's
 `ulimit` above what a rootless box can have is applied at that ceiling with a warning the client
 prints, where it was lowered without a word to the client.
 
+**`kern info` and `kern top` say what 0.57 changed.** `kern info` names a box's network (its own NAT
+when pasta is here, loopback only when it is not), its memory default, whether the Docker API socket
+is enabled and whether HTTPS for `.localhost` is on. `kern top` flags a box with its own NAT as
+`net:nat`, as it flags `net:host`, so the boxes that reach the internet are told from a `--network
+none` one.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

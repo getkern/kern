@@ -771,13 +771,17 @@ pub(crate) fn summary() -> Option<Summary> {
 }
 
 pub(crate) fn status() -> Result<(), Error> {
+    println!("https: {}", status_line());
+    Ok(())
+}
+
+/// The `https:` state in one line, the ONE sentence `kern proxy status` and `kern info` print.
+pub(crate) fn status_line() -> String {
     if paths().is_none() {
-        println!("https: off (no home directory)");
-        return Ok(());
+        return "off (no home directory)".to_string();
     }
     let Some(s) = summary() else {
-        println!("https: off (`kern proxy trust` turns it on)");
-        return Ok(());
+        return "off (`kern proxy trust` turns it on)".to_string();
     };
     let port = s
         .port
@@ -788,8 +792,7 @@ pub(crate) fn status() -> Result<(), Error> {
     } else {
         String::new()
     };
-    println!("https: on {port}; local CA {}{kept}", s.cert.display());
-    Ok(())
+    format!("on {port}; local CA {}{kept}", s.cert.display())
 }
 
 /// `kern __local-ca` (hidden): the authority's name and certificate, for `kern.exe`, which adds it to

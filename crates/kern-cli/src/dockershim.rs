@@ -1461,7 +1461,7 @@ fn disable() -> Result<(), Error> {
 }
 
 /// The `status` line of the socket.
-fn socket_status() -> String {
+pub(crate) fn socket_status() -> String {
     let enabled = unit_dir().is_ok_and(|d| is_ours(&d.join(SOCKET_UNIT)));
     let path = socket_path()
         .map(|p| p.display().to_string())

@@ -425,6 +425,27 @@ pub fn info() -> Result<(), Error> {
     };
     row("userns", if userns { "enabled" } else { "DISABLED" });
     row("gpu", &gpu_inventory());
+    // THE DEFAULTS A BOX GETS, which 0.57 made Docker's: what a reader asks first when a box
+    // reaches (or cannot reach) the internet, or is killed at a memory figure. Facts of this host:
+    // whether pasta is here decides the network, the RAM is the memory ceiling.
+    row(
+        "box network",
+        if which("pasta") {
+            "a NAT of its own (pasta), as Docker's; `--network none` is loopback only"
+        } else {
+            "loopback only: pasta (passt) is not installed, which a box's NAT needs"
+        },
+    );
+    row(
+        "box memory",
+        "the host's RAM and swap unless --memory, as Docker's (SDK sandboxes: 512 MiB, no swap)",
+    );
+    let api = crate::dockershim::socket_status();
+    row(
+        "docker API",
+        api.strip_prefix("Docker API socket: ").unwrap_or(&api),
+    );
+    row("https", &crate::localtls::status_line());
     if let Ok(d) = crate::registry::dir() {
         if let Some(parent) = d.parent() {
             row("runtime dir", &parent.to_string_lossy());

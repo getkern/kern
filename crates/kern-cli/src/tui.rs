@@ -2850,17 +2850,26 @@ fn refresh_full(
 /// 0 - kern ran as root). Empty when the box is fully isolated, so the Boxes tab flags only the boxes
 /// that are LESS confined than default (the always-on layers - seccomp, masked `/proc`, dropped caps -
 /// are identical for every box, so a "secure" badge would be vanity). Read-only `/proc` introspection.
-fn box_isolation(pid: i32) -> String {
+fn box_isolation(pid: i32, pod: &str) -> String {
     let mut flags = Vec::new();
     // Shared host netns? `kern top` runs in the host netns, so an equal namespace link means the box
     // was started with `--network host` (no isolated netns).
+    let mut host_net = false;
     if let (Ok(bx), Ok(me)) = (
         std::fs::read_link(format!("/proc/{pid}/ns/net")),
         std::fs::read_link("/proc/self/ns/net"),
     ) {
         if bx == me {
+            host_net = true;
             flags.push("net:host");
         }
+    }
+    // ITS OWN NAT, Docker's default since 0.57: the box reaches the internet, which is the one thing
+    // a reader of this column most needs to tell apart from a `--network none` box (no flag, the
+    // most isolated). Read off the box's own interfaces: anything but `lo` outside a pod (whose
+    // network the POD column already names). One small `/proc` read.
+    if !host_net && pod.is_empty() && has_interface_beyond_lo(pid) {
+        flags.push("net:nat");
     }
     // Root-mapped: the first uid_map line is `inside outside count`; inside-0 → outside-0 means the box
     // root is host root (a rootless box maps 0 to the unprivileged user's uid instead).
@@ -2915,6 +2924,17 @@ fn box_isolation(pid: i32) -> String {
     flags.join(" ")
 }
 
+/// Does the network namespace of `pid` have an interface other than `lo`?
+fn has_interface_beyond_lo(pid: i32) -> bool {
+    pid > 0
+        && std::fs::read_to_string(format!("/proc/{pid}/net/dev")).is_ok_and(|t| {
+            t.lines()
+                .skip(2)
+                .filter_map(|l| l.split(':').next())
+                .any(|n| n.trim() != "lo")
+        })
+}
+
 fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, (u64, Instant)>) {
     let now_t = Instant::now();
     let now_u = registry::now_unix();
@@ -2937,7 +2957,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
         // supervisor lives in the host netns with the kernel's trivial uid_map, which would falsely flag
         // every box. `pid1 == 0` (unrecorded / old entry) → the /proc reads fail → no flag, no false
         // positive.
-        let iso = box_isolation(b.live_pid1().unwrap_or(0));
+        let iso = box_isolation(b.live_pid1().unwrap_or(0), &b.pod);
         let mut sec = String::new();
         if !b.egress.is_empty() {
             sec.push_str("egress");
