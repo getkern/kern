@@ -134,6 +134,11 @@ container systemd runs again (and any kept box) kept only its last run's log: si
 under Docker, one through `kern logs` and none through kern's socket. The earlier runs' logs stay,
 the last 16 of them, and are read oldest first before the current one; `kern rm` takes them all.
 
+**`docker run --gpus` through kern's socket, under the operator's GPU gate.** It was refused always.
+It is `kern box --gpus` (`all`, a count, `device=`) when `allow_gpu_grants` or `allow_device_grants`
+is set in your own `kern.toml`, the same gate `kern compose` reads, and refused naming that key
+otherwise.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

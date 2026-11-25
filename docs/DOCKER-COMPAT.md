@@ -170,8 +170,12 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
 - A box run attached and ended without `--rm` is listed from kern's own exit record (or its kept
   layer) until `docker rm`, as any other container; a restarted server finds it there.
 - What kern refuses without a flag is refused here by name with a 400: `Privileged`, `Devices`,
-  `DeviceRequests` (GPUs), `CapAdd`, `SecurityOpt`, `VolumesFrom`, `Links`, and the host's pid, ipc or
-  uts namespace. An endpoint that is not translated (`build`) answers 501 and says what does the job
+  `CapAdd`, `SecurityOpt`, `VolumesFrom`, `Links`, and the host's pid, ipc or uts namespace. A GPU
+  (`docker run --gpus all|N|device=I`, a compose `deploy` reservation) is `kern box --gpus` when the
+  operator has set `allow_gpu_grants` (or `allow_device_grants`) in their own `kern.toml`, the gate
+  `kern compose` reads, and is refused naming that key otherwise: a Docker client can no more grant
+  itself a card than a compose file can. Measured: `all` gives both cards, `device=1` the one at
+  `06:00.0`, `1` one card. An endpoint that is not translated (`build`) answers 501 and says what does the job
   (`kern build`); kern never hands a request to a Docker daemon.
 - `docker compose` through the socket runs a file whose containers are each on one network: `up`,
   `ps`, `logs`, `exec` and `down -v` measured on a two-service file with a named volume, the client

@@ -626,7 +626,73 @@ fn hard_limit_of(name: &str) -> Option<u64> {
     Some(lim.rlim_max)
 }
 
+#[cfg(test)]
 fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
+    create_argv_gated(name, body, false)
+}
+
+/// `HostConfig.DeviceRequests` as `kern box --gpus`: GPU requests only (driver `nvidia`, or a `gpu`
+/// capability), `Count` -1 as `all`, a count as how many, `DeviceIDs` as `device=`. `None` for no
+/// request. MEASURED before: `docker run --gpus all` through kern's socket was refused whatever the
+/// operator had allowed, where `kern compose` grants the same request under `allow_gpu_grants`.
+fn gpu_spec(host: Option<&Value>) -> Result<Option<String>, String> {
+    let reqs = host
+        .and_then(|h| h.get("DeviceRequests"))
+        .and_then(Value::as_array)
+        .unwrap_or_default();
+    if reqs.is_empty() {
+        return Ok(None);
+    }
+    let mut all = false;
+    let mut count: i64 = 0;
+    let mut ids: Vec<String> = Vec::new();
+    for r in reqs {
+        let driver = r.get("Driver").and_then(Value::as_str).unwrap_or_default();
+        let gpu_cap = r
+            .get("Capabilities")
+            .and_then(Value::as_array)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_array)
+            .any(|set| set.iter().any(|c| c.as_str() == Some("gpu")));
+        if !(driver == "nvidia" || (driver.is_empty() && gpu_cap)) {
+            return Err(format!(
+                "HostConfig.DeviceRequests with driver {driver:?}: kern grants NVIDIA GPUs and no \
+                 other device this way"
+            ));
+        }
+        for id in r
+            .get("DeviceIDs")
+            .and_then(Value::as_array)
+            .unwrap_or_default()
+        {
+            let Some(id) = id.as_str().filter(|i| {
+                !i.is_empty()
+                    && i.len() <= 64
+                    && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            }) else {
+                return Err("HostConfig.DeviceRequests: a device id is a GPU index or UUID".into());
+            };
+            ids.push(id.to_string());
+        }
+        match r.get("Count").and_then(Value::as_i64).unwrap_or(0) {
+            n if n < 0 => all = true,
+            n => count += n,
+        }
+    }
+    Ok(Some(if !ids.is_empty() {
+        format!("device={}", ids.join(","))
+    } else if all || count == 0 {
+        "all".to_string()
+    } else {
+        count.to_string()
+    }))
+}
+
+/// [`create_argv`], with `gpu_allowed` the operator's `allow_gpu_grants` (or `allow_device_grants`):
+/// the same gate `kern compose` applies, since a Docker client can no more grant itself a card than a
+/// compose file can.
+fn create_argv_gated(name: &str, body: &Value, gpu_allowed: bool) -> Result<Created, String> {
     let image = body
         .get("Image")
         .and_then(Value::as_str)
@@ -637,7 +703,6 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
     for f in [
         "Privileged",
         "Devices",
-        "DeviceRequests",
         "CapAdd",
         "SecurityOpt",
         "VolumesFrom",
@@ -1118,6 +1183,18 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
                 argv.push(r.to_string());
             }
         }
+    }
+    if let Some(spec) = gpu_spec(host)? {
+        if !gpu_allowed {
+            return Err(
+                "HostConfig.DeviceRequests: a GPU is a device grant, and a Docker client cannot grant \
+                 itself one: set allow_gpu_grants (GPUs only) in YOUR OWN kern.toml (`kern config \
+                 set allow_gpu_grants true`), the gate `kern compose` reads too"
+                    .into(),
+            );
+        }
+        argv.push("--gpus".into());
+        argv.push(spec);
     }
     argv.push("--image".into());
     argv.push(image.clone());
@@ -4561,7 +4638,14 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             // MEASURED before: "No such image: sha256:4422...", and the service never started.
             let by_id = image_by_id(bin, &body);
             let platform = platform.or_else(|| by_id.as_ref().and_then(|(_, p)| p.clone()));
-            match create_argv(&name, &body)
+            // The GPU gate is read only for a create that asks for a card.
+            let wants_gpu = gpu_spec(body.get("HostConfig")).ok().flatten().is_some();
+            let gpu_allowed = wants_gpu
+                && ["allow_gpu_grants", "allow_device_grants"].iter().any(|k| {
+                    let (code, out, _) = kern(bin, &["config", "get", k]);
+                    code == 0 && out.trim() == "true"
+                });
+            match create_argv_gated(&name, &body, gpu_allowed)
                 .map(|c| match &by_id {
                     Some((image, _)) => with_image_name(c, image),
                     None => c,
@@ -5235,6 +5319,50 @@ mod tests {
             let run = argv(&format!(r#"{{"Image":"x","Labels":{{"{label}":"s"}}}}"#));
             assert!(!has(&run, "--keep"), "{label}");
         }
+    }
+
+    /// A GPU request is `--gpus` under the operator's gate, and refused naming the gate without it;
+    /// a request for another driver is refused either way.
+    #[test]
+    fn a_gpu_request_is_granted_under_the_gate_and_refused_without_it() {
+        let b = |dr: &str| {
+            body(&format!(
+                r#"{{"Image":"x","HostConfig":{{"DeviceRequests":{dr}}}}}"#
+            ))
+        };
+        let spec = |dr: &str| {
+            let a = create_argv_gated("n", &b(dr), true).unwrap().argv;
+            let i = a.iter().position(|x| x == "--gpus").unwrap();
+            assert!(i < a.iter().position(|x| x == "--image").unwrap());
+            a[i + 1].clone()
+        };
+        assert_eq!(
+            spec(r#"[{"Driver":"nvidia","Count":-1,"Capabilities":[["gpu"]]}]"#),
+            "all"
+        );
+        assert_eq!(spec(r#"[{"Count":2,"Capabilities":[["gpu"]]}]"#), "2");
+        assert_eq!(
+            spec(r#"[{"Driver":"nvidia","DeviceIDs":["1"]}]"#),
+            "device=1"
+        );
+        let refused = create_argv_gated("n", &b(r#"[{"Driver":"nvidia","Count":-1}]"#), false)
+            .map(|c| c.argv);
+        assert!(
+            matches!(&refused, Err(m) if m.contains("allow_gpu_grants")),
+            "{refused:?}"
+        );
+        let other =
+            create_argv_gated("n", &b(r#"[{"Driver":"amd","Count":1}]"#), true).map(|c| c.argv);
+        assert!(
+            matches!(&other, Err(m) if m.contains("NVIDIA")),
+            "{other:?}"
+        );
+        let bad_id = create_argv_gated(
+            "n",
+            &b(r#"[{"Driver":"nvidia","DeviceIDs":["0;rm"]}]"#),
+            true,
+        );
+        assert!(bad_id.is_err());
     }
 
     #[test]
