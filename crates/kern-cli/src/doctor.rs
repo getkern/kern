@@ -1063,18 +1063,88 @@ pub(crate) fn no_map_hint() -> String {
     let me = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "kern".into());
+    // DECIDED, NOT "IF": the profile attaches by path and kern knows both. MEASURED on the VPS
+    // (Ubuntu 24.04, a fresh account): a kern run from `~/kf/kern` printed the conditional sentence,
+    // the profile was installed as told, loaded, and the blocker stayed; the reader had to work out
+    // that the path was the reason. Where this binary is not covered, the remedy starts by putting
+    // it where the profile looks, and the commands name that copy.
+    let (first, run) = if profile_covers(&me) {
+        (String::new(), me.clone())
+    } else {
+        // `~` UNQUOTED in what the reader pastes: their shell expands it, so nothing here reads
+        // the environment for a path the reader's own shell knows.
+        let dst = "~/.local/bin/kern".to_string();
+        (
+            format!(
+                "This binary is at {me}, and the profile it carries attaches only to {}, so there it \
+                 would load and change nothing: copy it first, `mkdir -p ~/.local/bin && cp {me} \
+                 {dst}`, and run the rest with that copy. ",
+                profile_attachments().join(", ")
+            ),
+            dst,
+        )
+    };
     format!(
-        "an LSM is blocking the rootless map; on Ubuntu 23.10+ that is AppArmor. Install the \
-         profile this binary carries, then run the check again: `{me} doctor --apparmor-profile | \
+        "an LSM is blocking the rootless map; on Ubuntu 23.10+ that is AppArmor. {first}Install the \
+         profile this binary carries, then run the check again: `{run} doctor --apparmor-profile | \
          sudo tee /etc/apparmor.d/kern >/dev/null && sudo apparmor_parser -r /etc/apparmor.d/kern \
-         && {me} doctor`. THE LAST STEP IS NOT OPTIONAL: AppArmor attaches at exec, so a kern that \
-         was already running cannot see a profile loaded afterwards. The profile also attaches BY \
-         PATH and you are running {me}, so if that path is not in its attachment line the profile \
-         loads and changes nothing. If it still says this after the reload, or you cannot install \
-         one at all, `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` always works \
-         and then run `{me} doctor` again - but it lifts the restriction for every program on the \
-         machine and is lost at reboot"
+         && {run} doctor`. THE LAST STEP IS NOT OPTIONAL: AppArmor attaches at exec, so a kern that \
+         was already running cannot see a profile loaded afterwards. If it still says this after the \
+         reload, or you cannot install one at all, `sudo sysctl -w \
+         kernel.apparmor_restrict_unprivileged_userns=0` always works and then run `{run} doctor` \
+         again - but it lifts the restriction for every program on the machine and is lost at reboot"
     )
+}
+
+/// The paths the profile kern carries attaches to, READ FROM ITS OWN `profile NAME PATH` lines, so
+/// the profile and this list cannot disagree: `{a,b}` expanded, `@{HOME}` as Ubuntu's
+/// `tunables/home` defines it (`/home/*/` and `/root/`), a doubled `/` folded as AppArmor folds it.
+fn profile_attachments() -> Vec<String> {
+    fn expand(s: &str) -> Vec<String> {
+        if let Some(i) = s.find("@{HOME}") {
+            let (head, tail) = (&s[..i], &s[i + "@{HOME}".len()..]);
+            return ["/home/*/", "/root/"]
+                .iter()
+                .flat_map(|h| expand(&format!("{head}{h}{tail}")))
+                .collect();
+        }
+        let (Some(open), Some(close)) = (s.find('{'), s.find('}')) else {
+            return vec![s.replace("//", "/")];
+        };
+        if close < open {
+            return vec![s.replace("//", "/")];
+        }
+        let (head, alts, tail) = (&s[..open], &s[open + 1..close], &s[close + 1..]);
+        alts.split(',')
+            .flat_map(|a| expand(&format!("{head}{a}{tail}")))
+            .collect()
+    }
+    APPARMOR_PROFILE
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            (w.next() == Some("profile")).then(|| w.nth(1))?
+        })
+        .filter(|p| p.starts_with('/') || p.starts_with('@'))
+        .flat_map(expand)
+        .collect()
+}
+
+/// Does the profile kern carries attach to the binary at `path`? A `*` stands for one path element.
+fn profile_covers(path: &str) -> bool {
+    fn glob(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => {
+                glob(&p[1..], s) || (s.first().is_some_and(|c| *c != b'/') && glob(p, &s[1..]))
+            }
+            (Some(a), Some(b)) if a == b => glob(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    profile_attachments()
+        .iter()
+        .any(|a| glob(a.as_bytes(), path.as_bytes()))
 }
 
 /// Ubuntu 23.10+ restricts unprivileged userns via AppArmor even when the namespace sysctls allow it.
@@ -4605,5 +4675,21 @@ mod period_tests {
         assert_eq!(super::period(3_600), "1h");
         assert_eq!(super::period(90), "90s");
         assert_eq!(super::period(1), "1s");
+    }
+
+    /// The paths are the profile's own, and a binary outside them is told to move first.
+    #[test]
+    fn the_profile_covers_the_install_paths_and_not_others() {
+        let a = super::profile_attachments();
+        assert!(a.contains(&"/usr/bin/kern".to_string()), "{a:?}");
+        assert!(a.contains(&"/usr/local/bin/kern".to_string()), "{a:?}");
+        assert!(a.contains(&"/home/*/.local/bin/kern".to_string()), "{a:?}");
+        assert!(a.contains(&"/root/.cargo/bin/kern".to_string()), "{a:?}");
+        assert!(super::profile_covers("/usr/local/bin/kern"));
+        assert!(super::profile_covers("/home/kernfield/.local/bin/kern"));
+        assert!(super::profile_covers("/root/.local/bin/kern"));
+        assert!(!super::profile_covers("/home/kernfield/kf/kern"));
+        assert!(!super::profile_covers("/home/a/b/.local/bin/kern"));
+        assert!(!super::profile_covers("/opt/kern"));
     }
 }
