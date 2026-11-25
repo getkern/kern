@@ -4813,12 +4813,18 @@ mod tests {
             // Nothing to normalize.
             ("", ""),
             // Docker Hub's three host spellings are the familiar name, as Docker keys them.
-            ("docker.io/library/wordpress:php8.2-apache", "wordpress:php8.2-apache"),
+            (
+                "docker.io/library/wordpress:php8.2-apache",
+                "wordpress:php8.2-apache",
+            ),
             ("docker.io/library/alpine", "alpine:latest"),
             ("index.docker.io/library/alpine:3.20", "alpine:3.20"),
             ("registry-1.docker.io/bitnami/redis", "bitnami/redis:latest"),
             ("docker.io/bitnami/redis:7", "bitnami/redis:7"),
-            ("docker.io/library/alpine@sha256:abc123", "alpine@sha256:abc123"),
+            (
+                "docker.io/library/alpine@sha256:abc123",
+                "alpine@sha256:abc123",
+            ),
             // Another registry keeps its host.
             ("ghcr.io/library/x:1", "ghcr.io/library/x:1"),
         ] {
@@ -6219,7 +6225,10 @@ mod tests {
         bad_path.extend_from_slice(&hdr(b"../escape", b'6', 0, b""));
         bad_path.extend(end_marker());
         let mut r: &[u8] = &bad_path;
-        assert!(vet_tar_stream(&mut r).is_err(), "a FIFO with an unsafe path is refused");
+        assert!(
+            vet_tar_stream(&mut r).is_err(),
+            "a FIFO with an unsafe path is refused"
+        );
     }
 
     /// The modelled member types (dir '5', regular '0', contiguous '7') still pass.
