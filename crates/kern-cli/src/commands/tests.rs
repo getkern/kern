@@ -886,6 +886,8 @@ mod ps_exited_tests {
             code,
             pod: pod.to_string(),
             command: "python app.py".to_string(),
+            image: String::new(),
+            labels: String::new(),
             exited_ago: 5,
         }
     }
@@ -1285,6 +1287,17 @@ two"
         assert!(exited_matches(&e, &[("name".into(), "db".into())]));
         assert!(exited_matches(&e, &[("id".into(), "42".into())]));
         assert!(!exited_matches(&e, &[("label".into(), "k=v".into())]));
+        let mut labelled = dead("tc-1", 0, "");
+        labelled.labels = "org.testcontainers.session-id=s42,a=b".into();
+        assert!(exited_matches(
+            &labelled,
+            &[("label".into(), "org.testcontainers.session-id=s42".into())]
+        ));
+        assert!(exited_matches(&labelled, &[("label".into(), "a".into())]));
+        assert!(!exited_matches(
+            &labelled,
+            &[("label".into(), "a=c".into())]
+        ));
         // AND semantics: one non-matching clause fails the whole filter.
         assert!(!exited_matches(
             &e,

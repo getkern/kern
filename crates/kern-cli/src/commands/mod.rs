@@ -3044,15 +3044,7 @@ fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
         // says `"noequals":""`. MEASURED: docker 29.1.3 and podman both match it under both
         // spellings. Asked of the same pairs the document is built from, so the filter and the
         // renderer can no longer answer differently about one label.
-        "label" => {
-            let pairs = inspect::label_pairs(&b.labels);
-            match v.split_once('=') {
-                // `label=k=v`: the exact pair, with `label=k=` matching an empty value.
-                Some((k, val)) => pairs.iter().any(|(pk, pv)| pk == k && pv == val),
-                // `label=k`: the key, whatever its value.
-                None => pairs.iter().any(|(pk, _)| pk == v),
-            }
-        }
+        "label" => label_filter_matches(&b.labels, v),
         "id" => b.pid.to_string() == *v,
         // `health=` READS THE VERDICT, not the merged status column: a paused box with a passing
         // healthcheck is `paused` there and still `healthy` here, and a readiness loop wants the
@@ -3083,9 +3075,21 @@ fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
 /// query therefore correctly excludes it, and `label=` matches nothing. Only `status=exited` accepts
 /// it - kern has no `dead` state, so `status=dead` matches nothing (Docker's `dead` is a failed
 /// removal kern cannot produce).
+/// `--filter label=k=v` (the exact pair, `label=k=` an empty value) or `label=k` (the key, whatever
+/// its value) against a box's comma-joined labels: ONE reading for a running box and an exited one.
+fn label_filter_matches(labels: &str, v: &str) -> bool {
+    let pairs = inspect::label_pairs(labels);
+    match v.split_once('=') {
+        Some((k, val)) => pairs.iter().any(|(pk, pv)| pk == k && pv == val),
+        None => pairs.iter().any(|(pk, _)| pk == v),
+    }
+}
+
 fn exited_matches(e: &registry::ExitedBox, filters: &[(String, String)]) -> bool {
     filters.iter().all(|(k, v)| match k.as_str() {
         "name" => e.name.contains(v.as_str()),
+        // Its labels are in its exit record since 0.57.0; a record from before has none.
+        "label" => label_filter_matches(&e.labels, v),
         "pod" => e.pod == *v,
         "id" => e.pid.to_string() == *v,
         // An exited box kept no health verdict, so it is `none` and nothing else - the same answer
@@ -3296,13 +3300,13 @@ impl PsRow for registry::ExitedBox {
         &self.name
     }
     fn ps_labels(&self) -> &str {
-        ""
+        &self.labels
     }
     fn ps_pid(&self) -> Option<i32> {
         Some(self.pid)
     }
     fn ps_image(&self) -> String {
-        String::new()
+        self.image.clone()
     }
     fn ps_command(&self) -> String {
         crate::ui::scrub(&self.command)

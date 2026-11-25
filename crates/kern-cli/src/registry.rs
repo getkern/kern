@@ -1011,19 +1011,32 @@ fn waitexit_dir() -> io::Result<PathBuf> {
 /// Record a completed box's exit code for `kern wait`, keyed `<pid>-<starttime>`. Written by the
 /// detached supervisor as its LAST act (before it unregisters) and by `stop`/`kill` (which SIGKILL the
 /// supervisor before it can record its own). Best-effort.
-pub fn set_box_exit(pid: i32, starttime: u64, code: i32, name: &str, pod: &str, command: &str) {
+pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance) {
     if let Ok(d) = waitexit_dir() {
         // Multi-line so `kern ps -a` can render the box that exited (its name, pod, command), not only
         // the code `kern wait` needs. Line 1 stays the BARE code, so `box_exit` - and any pre-existing
-        // bare-code sidecar from an older kern - still parses. The command is flattened to one line (the
+        // bare-code sidecar from an older kern - still parses. Each field is flattened to one line (the
         // record is line-delimited) and CAPPED: it is a display string, and an unbounded argv must not
         // set the sidecar's on-disk size - the dir is bounded by count, not by any single record.
-        let command: String = command
-            .chars()
-            .filter(|c| *c != '\n' && *c != '\r')
-            .take(512)
-            .collect();
-        let body = format!("{code}\n{name}\n{pod}\n{command}");
+        let one_line = |s: &str, max: usize| -> String {
+            s.chars()
+                .filter(|c| *c != '\n' && *c != '\r')
+                .take(max)
+                .collect()
+        };
+        // THE IMAGE AND THE LABELS TOO, after the four lines older records have, each on a keyed
+        // line so a record without them reads as before. An exited box is what `docker ps -a
+        // --filter label=` finds a test session's containers by, and what kern's Docker API lists
+        // and inspects once the box has gone: it held them only in its own memory, which a server
+        // that restarts loses.
+        let body = format!(
+            "{code}\n{}\n{}\n{}\nimage\t{}\nlabels\t{}",
+            b.name,
+            b.pod,
+            one_line(&b.command, 512),
+            one_line(&b.image, 1024),
+            one_line(&b.labels, 8192),
+        );
         let _ = fs::write(d.join(format!("{pid}-{starttime}")), body);
     }
 }
@@ -1301,6 +1314,10 @@ pub struct ExitedBox {
     pub code: i32,
     pub pod: String,
     pub command: String,
+    /// The image it ran, empty for a `--rootfs` box or a record from before it was kept.
+    pub image: String,
+    /// Its `--label` pairs, comma-joined as [`Instance::labels`]; empty when none or not recorded.
+    pub labels: String,
     /// Seconds since the box exited, from the sidecar's mtime.
     pub exited_ago: u64,
 }
@@ -1371,6 +1388,13 @@ pub fn list_exited_among(boxes: &[Instance]) -> Vec<ExitedBox> {
             continue;
         };
         let (code, name, pod, command) = parse_waitexit_body(&body);
+        let keyed = |k: &str| {
+            body.lines()
+                .skip(4)
+                .find_map(|l| l.strip_prefix(k).and_then(|v| v.strip_prefix('\t')))
+                .unwrap_or_default()
+                .to_string()
+        };
         if !name.is_empty() && live.contains(name) {
             continue;
         }
@@ -1389,6 +1413,8 @@ pub fn list_exited_among(boxes: &[Instance]) -> Vec<ExitedBox> {
             code,
             pod: crate::ui::scrub(pod),
             command: command.to_string(),
+            image: crate::ui::scrub(&keyed("image")),
+            labels: crate::ui::scrub(&keyed("labels")),
             exited_ago: ago,
         });
     }
@@ -5797,7 +5823,19 @@ mod removed_record_tests {
         );
 
         // A normal record beside it, and a sweep with no grace: only the hidden one goes.
-        set_box_exit(pid - 1, st, 3, "kept", "", "true");
+        set_box_exit(
+            pid - 1,
+            st,
+            3,
+            &parse("name=kept\npid=1\ncommand=true\nimage=alpine:3.21\nlabels=a=b\n")
+                .expect("an instance record"),
+        );
+        let kept = list_exited().into_iter().find(|e| e.code == 3);
+        assert!(
+            kept.as_ref()
+                .is_some_and(|e| e.image == "alpine:3.21" && e.labels == "a=b"),
+            "an exit record keeps the image and the labels"
+        );
         let Ok(dir) = waitexit_dir() else {
             panic!("waitexit dir");
         };

@@ -5997,14 +5997,7 @@ fn supervise_box(
             // stack at the first exit, and the service's status is 1.
             if !rm && !never_started {
                 adopt_current_name(inst);
-                registry::set_box_exit(
-                    std::process::id() as i32,
-                    inst.starttime,
-                    code,
-                    &inst.name,
-                    &inst.pod,
-                    &inst.command,
-                );
+                registry::set_box_exit(std::process::id() as i32, inst.starttime, code, inst);
             }
             registry::set_box_attempt(
                 &inst.name,
@@ -6044,14 +6037,7 @@ fn supervise_box(
             ran_once.then_some(log_key.as_str()),
         );
     } else {
-        registry::set_box_exit(
-            std::process::id() as i32,
-            inst.starttime,
-            final_code,
-            &inst.name,
-            &inst.pod,
-            &inst.command,
-        );
+        registry::set_box_exit(std::process::id() as i32, inst.starttime, final_code, inst);
     }
     // A DETACHED BOX'S LINE IN THE HISTORY, from the last attempt: its run time measured here to the
     // millisecond, its signal and OOM verdict from the runner (see `latch`), its image, GPUs and

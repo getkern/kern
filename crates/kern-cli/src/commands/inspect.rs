@@ -468,14 +468,8 @@ pub fn ps(
     // status asked against, so this gate is only "should we even read the exited set at all". `dead`
     // is NOT here: kern has no dead state, so `status=dead` matches nothing (like `created`).
     let want_exited = all || filters.iter().any(|(k, v)| k == "status" && v == "exited");
-    // An exited box did not keep its labels (they lived in the pruned instance record; the breadcrumb
-    // carries only name/pod/command). Say so rather than let `label=` silently match zero exited rows -
-    // the same "no accept-and-ignore on an explicit filter" rule as `status=dead`.
-    if want_exited && filters.iter().any(|(k, _)| k == "label") {
-        eprintln!(
-            "kern: note: --filter label= does not apply to exited boxes (labels are not retained past exit)"
-        );
-    }
+    // An exited box keeps its labels in its exit record (since 0.57.0), so `label=` selects among
+    // exited boxes as among running ones.
     // KEPT BOXES, the ones `kern start` can run: `-a`, or an explicit `status=kept`, exactly as the
     // exited set above. NOT in a plain `kern ps`, whose contract is the boxes that are UP: a kept box
     // is a layer on disk, and listing one there put a row that is not a process in the view a reader
@@ -714,11 +708,13 @@ pub fn ps(
                 // An object rather than the registry's comma-joined text, because a consumer that
                 // has to re-split a string is doing the parsing this document exists to avoid.
                 format!(
-                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"status\":{}}}",
+                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"started\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"status\":{}}}",
                     json_str(&b.name),
                     b.pid,
                     json_str(&b.pod),
                     json_str(&b.rootfs),
+                    // The image it runs, as its exited and kept rows say it; empty for `--rootfs`.
+                    json_str(&b.image),
                     json_str(&b.command),
                     b.started,
                     json_str(&b.ports),
@@ -744,11 +740,13 @@ pub fn ps(
                 // read ONE key across live and exited rows instead of knowing that a dead box spells
                 // its state in the health field. `health` keeps saying `exited` because something may
                 // already read it.
-                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"exit_code\":{},\"exited_ago\":{}{started},\"health\":{},\"status\":{}}}",
+                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"image\":{},\"labels\":{},\"exit_code\":{},\"exited_ago\":{}{started},\"health\":{},\"status\":{}}}",
                 json_str(&e.name),
                 e.pid,
                 json_str(&e.pod),
                 json_str(&e.command),
+                json_str(&e.image),
+                labels_object(e.labels.split(',').filter(|l| !l.is_empty()).map(str::to_string)),
                 e.code,
                 e.exited_ago,
                 json_str("exited"),
@@ -2784,7 +2782,7 @@ pub fn stop_with_grace(
         // Without this branch `kern stop <name>` answered "no running box" while the port stayed bound.
         if b.orphaned {
             let reaped = registry::reap_orphan(b);
-            registry::set_box_exit(b.pid, b.starttime, 137, &b.name, &b.pod, &b.command);
+            registry::set_box_exit(b.pid, b.starttime, 137, b);
             crate::history::record_stopped(b, 137);
             registry::clear_health(&b.name, b.pid);
             // The environment sidecar has the same lifetime as the health one: cleared together so a
@@ -2902,14 +2900,7 @@ pub fn stop_with_grace(
         // answers like Docker instead of "no exit code recorded". The code is the box's REAL one when
         // it shut itself down inside the grace: a workload that traps the signal and exits 0 has to
         // read as `exited (0)`, not as the SIGKILL we never sent it. See `Teardown`.
-        registry::set_box_exit(
-            b.pid,
-            b.starttime,
-            outcome.exit_code(),
-            &b.name,
-            &b.pod,
-            &b.command,
-        );
+        registry::set_box_exit(b.pid, b.starttime, outcome.exit_code(), b);
         crate::history::record_stopped(b, outcome.exit_code());
         // AND THE KEPT RECORD, FOR THE SAME REASON, in the same place: the sentence above says the
         // supervisor never records its own code under a `stop`, and the kept record is the one that

@@ -247,12 +247,7 @@ fn resolve(bin: &Path, id: &str) -> Option<String> {
         .ok()
         .and_then(|g| g.as_ref().map(|m| m.keys().cloned().collect()))
         .unwrap_or_default();
-    let ended = runs_ended().into_iter().map(|(n, _)| n);
-    let names = kern_boxes(bin)
-        .into_iter()
-        .map(|(n, _)| n)
-        .chain(pending)
-        .chain(ended);
+    let names = kern_boxes(bin).into_iter().map(|(n, _)| n).chain(pending);
     let mut by_id = None;
     for n in names {
         if n == id {
@@ -776,10 +771,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
         Some(v) if box_running(&v) => (v, true),
         _ => match exited() {
             Some(v) => (v, false),
-            None => match run_ended(name) {
-                Some(r) => return inspect_ended(name, &r),
-                None => return error(404, &format!("No such container: {name}")),
-            },
+            None => return error(404, &format!("No such container: {name}")),
         },
     };
     let secs = |k: &str| {
@@ -834,28 +826,6 @@ fn inspect(bin: &Path, name: &str) -> Response {
 }
 
 /// `GET /containers/json`: running boxes, `all=1` the exited ones too, `filters={"label":[...]}`.
-/// `inspect` of a box started for an attach that has ended, from this server's record of it.
-fn inspect_ended(name: &str, r: &Run) -> Response {
-    let c = &r.created;
-    json_response(
-        200,
-        format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Image\":{},\"State\":{{\"Status\":\"exited\",\"Running\":false,\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":0,\"ExitCode\":{},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}}},\"Config\":{{\"Image\":{},\"Env\":{},\"Cmd\":{},\"Labels\":{},\"Tty\":false}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{{}},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
-            json_str(&id_of(name)),
-            json_str(&rfc3339(c.created)),
-            json_str(&format!("/{name}")),
-            json_str(&c.image),
-            r.exit.unwrap_or(-1),
-            json_str(&rfc3339(c.created)),
-            json_str(&rfc3339(r.finished)),
-            json_str(&c.image),
-            str_array(&c.env),
-            str_array(&c.cmd),
-            labels_json(&c.labels)
-        ),
-    )
-}
-
 /// The filters of `GET /containers/json` kern translates. A filter is how a client finds ITS
 /// container among the user's boxes (Dev Containers looks its own up by label, then `exec`s into
 /// it), so one that is not understood is refused by name: ignored, the list came back whole and the
@@ -1003,9 +973,12 @@ fn list(bin: &Path, req: &Request) -> Response {
             })
             .collect();
         items.push(format!(
-            "{{\"Id\":{},\"Names\":[{}],\"Image\":\"\",\"Command\":{},\"Created\":{},\"State\":{},\"Status\":{},\"Ports\":[{}],\"Labels\":{}}}",
+            // The image kern recorded, running or exited: it was an empty string for every row, so
+            // `docker ps` showed `<no image>` for every container.
+            "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"Command\":{},\"Created\":{},\"State\":{},\"Status\":{},\"Ports\":[{}],\"Labels\":{}}}",
             json_str(&id_of(&name)),
             json_str(&format!("/{name}")),
+            json_str(v.get("image").and_then(Value::as_str).unwrap_or_default()),
             json_str(v.get("command").and_then(Value::as_str).unwrap_or_default()),
             // The same `Created` `inspect` says: when the box was made.
             v.get("created")
@@ -1019,26 +992,6 @@ fn list(bin: &Path, req: &Request) -> Response {
         ));
     }
     if all {
-        let listed: Vec<String> = items.clone();
-        for (name, r) in runs_ended() {
-            let id = id_of(&name);
-            if listed.iter().any(|i| i.contains(&id)) {
-                continue;
-            }
-            if !filters.keeps(&name, "exited", &r.created.labels) {
-                continue;
-            }
-            items.push(format!(
-                "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"Command\":{},\"Created\":{},\"State\":\"exited\",\"Status\":{},\"Ports\":[],\"Labels\":{}}}",
-                json_str(&id),
-                json_str(&format!("/{name}")),
-                json_str(&r.created.image),
-                json_str(&r.created.cmd.join(" ")),
-                r.created.created,
-                json_str(&format!("Exited ({})", r.exit.unwrap_or(-1))),
-                labels_json(&r.created.labels)
-            ));
-        }
         // CREATED AND NOT STARTED, or whose start failed, as Docker lists them: `docker create`
         // then `ps -a` showed nothing, and Testcontainers' cleanup, which lists by label, never
         // found a container whose start had failed, so it stayed behind.
@@ -1734,9 +1687,7 @@ fn remove_container(bin: &Path, name: &str) {
         drop(attached_take(name));
         return;
     }
-    if run_ended(name).is_some() {
-        run_forget(name);
-    }
+    run_forget(name);
     let _ = kern(bin, &["stop", "-t", "0", name]);
     let _ = kern(bin, &["rm", "-f", name]);
 }
@@ -1878,30 +1829,6 @@ fn run_forget(name: &str) {
             m.remove(name);
         }
     }
-}
-
-/// An ended box started for an attach, without `--rm`: what this server recorded of it.
-fn run_ended(name: &str) -> Option<Run> {
-    RUNS.lock().ok().and_then(|g| {
-        g.as_ref()
-            .and_then(|m| m.get(name))
-            .filter(|r| r.exit.is_some() && !r.created.auto_remove)
-            .cloned()
-    })
-}
-
-fn runs_ended() -> Vec<(String, Run)> {
-    RUNS.lock()
-        .ok()
-        .and_then(|g| {
-            g.as_ref().map(|m| {
-                m.iter()
-                    .filter(|(_, r)| r.exit.is_some() && !r.created.auto_remove)
-                    .map(|(n, r)| (n.clone(), r.clone()))
-                    .collect()
-            })
-        })
-        .unwrap_or_default()
 }
 
 /// The exit code of `name` if this server started it for an attach, waiting for its end; `None`
@@ -2815,9 +2742,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             }
             // An attached run that ended: forgotten here, and its kept layer, if it has one, is
             // removed below like any other container's.
-            if run_ended(&name).is_some() {
-                run_forget(&name);
-            }
+            run_forget(&name);
             let force = req.flag("force");
             let running = kern_boxes(bin)
                 .into_iter()

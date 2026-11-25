@@ -84,6 +84,15 @@ The image's steps are kept too, as metadata under the one layer kern writes, whi
 buildah still take as the base of a build. A rebuild answered entirely from the cache keeps its
 steps' times, so the same image saves and pushes under the same digest.
 
+**An exited box keeps its image and labels, and kern's Docker API reads them from kern.** A box's
+exit record held its name, pod and command, so `kern ps -a --filter label=` matched no exited box
+(kern said so) and kern's API kept what it knew of an ended `docker run` in its own memory, which a
+server that restarts loses. The record carries the image and the labels now: `ps -a --json` lists
+them for an exited box, `--filter label=` selects among exited boxes as among running ones, and the
+API lists and inspects an ended container from kern's record, after a restart too (a test session's
+container found by its label, its exit code and image). `kern ps --json` also gives a running box's
+`image`, and `docker ps` shows each container's image (it showed `<no image>` for all of them).
+
 **`docker run --rm` through kern's API is removed by kern, whatever becomes of the server.** The
 server removed such a box itself after following its log, so a server stopped meanwhile left the
 box listed as exited for good. The box is `kern box --rm` now: its log stays for the server's
