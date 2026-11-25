@@ -120,6 +120,10 @@ none` one.
 whole, and its zeros were written out: a 1 GiB file with 1 MiB of data took 1 GiB on the destination,
 as it does under Docker. A block of zeros is a hole now, so it takes the 1 MiB, with the same bytes.
 
+**io_uring, userfaultfd, perf_event_open, the keyring, syslog and open_by_handle_at answer `EPERM`, as
+under Docker.** They answered `ENOSYS`. They are still denied, and never kill under any verdict, as
+software probes them at start; `clone3` keeps `ENOSYS`, which glibc needs to fall back to `clone`.
+
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the
 first connection and lets it exit when idle (`kern compat docker serve` runs it in the foreground).

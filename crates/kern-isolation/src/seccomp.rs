@@ -367,6 +367,31 @@ fn errno_syscalls() -> Vec<libc::c_long> {
     v
 }
 
+/// The deny-but-degrade entries that answer `ENOSYS` and not `EPERM`: the ones a libc probes and
+/// falls back from ONLY on `ENOSYS` (`clone3`, glibc's `pthread_create`/`posix_spawn`), and one too
+/// new for any caller to probe (`listns`). Docker answers these the same.
+fn enosys_only() -> Vec<libc::c_long> {
+    let mut v = vec![libc::SYS_clone3];
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    v.push(470);
+    v
+}
+
+/// The deny-but-degrade entries that answer `EPERM`, as Docker's default profile answers them
+/// (io_uring, userfaultfd, perf_event_open, the keyring, syslog, open_by_handle_at), and NEVER a
+/// kill, whatever `seccomp-deny` says: software probes these at start (libuv, Node's, probes io_uring;
+/// Redis 8's modules too) and falls back on either errno. MEASURED before: `io_uring_setup` and
+/// `userfaultfd` answered `ENOSYS` in a box, `EPERM` under Docker.
+fn eperm_like_docker() -> Vec<libc::c_long> {
+    let keep = enosys_only();
+    errno_syscalls()
+        .into_iter()
+        .filter(|n| !keep.contains(n))
+        .collect()
+}
+
+const RET_EPERM: u32 = SECCOMP_RET_ERRNO | (libc::EPERM as u32 & SECCOMP_RET_DATA);
+
 /// How many syscalls the denylist blocks (for the box status banner - kept truthful by reading the
 /// live list rather than a hard-coded number). `allow_nesting` reflects a rootless `--privileged`
 /// box, which blocks [`nesting_syscalls`] fewer.
@@ -521,9 +546,17 @@ fn build_filter(allow_nesting: bool) -> Vec<libc::sock_filter> {
     // never runs (isolation identical to a kill); the caller merely sees "not implemented" and takes
     // its fallback path, so probing software (Redis 8's io_uring, profilers, …) keeps working.
     let errno_ret = SECCOMP_RET_ERRNO | (libc::ENOSYS as u32 & SECCOMP_RET_DATA);
+    let enosys = enosys_only();
     for nr in errno_syscalls() {
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (errno); else skip
-        prog.push(stmt(BPF_RET | BPF_K, errno_ret));
+        prog.push(stmt(
+            BPF_RET | BPF_K,
+            if enosys.contains(&nr) {
+                errno_ret
+            } else {
+                RET_EPERM
+            },
+        ));
     }
     // 3b-family. `socket(AF_VSOCK | AF_XDP, …)` → EAFNOSUPPORT (the netns contains no vsock transport
     // and no device queue to bind an XDP socket to; see `emit_socket_family_rule`). Placed while the
@@ -708,6 +741,15 @@ fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_fi
         SECCOMP_RET_ERRNO | (libc::ENOSYS as u32 & SECCOMP_RET_DATA)
     };
     let enosys_idx = prog.len();
+    // Before the default: the deny-but-degrade numbers Docker answers `EPERM` (see
+    // `eperm_like_docker`). Here, on the path of a call the allow set already refused, so a call it
+    // allows pays nothing for them. In `audit` they log and run, as every refusal does there, so the
+    // two variants still differ in their actions alone.
+    let eperm_action = if audit { SECCOMP_RET_LOG } else { RET_EPERM };
+    for nr in eperm_like_docker() {
+        prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next; else skip
+        prog.push(stmt(BPF_RET | BPF_K, eperm_action));
+    }
     prog.push(stmt(BPF_RET | BPF_K, default_action));
     let allow_idx = prog.len();
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
@@ -1268,7 +1310,9 @@ mod tests {
     /// nesting, so both apply uniformly to all four numbers. When `open_tree_attr` and `listns` joined
     /// the denied sets (17/11) the allowlist grew by 2 (189, 184 nesting) and the denylist by 4 (99,
     /// 85 nesting), two instructions per syscall there. The `ioctl` TIOCSTI/TIOCLINUX rule (18/11) adds
-    /// 6 to all four.
+    /// 6 to all four. The deny-but-degrade numbers Docker answers `EPERM` (22/11) add 20 to the
+    /// allowlist (215, 210 nesting), two instructions for each of ten, on the default terminal's path
+    /// only; the denylist already had one check per number and keeps its count.
     #[test]
     fn the_seccomp_filter_instruction_counts_are_pinned() {
         for &nesting in &[false, true] {
@@ -1284,7 +1328,7 @@ mod tests {
                 // to x86_64. aarch64 still gets the fit check above.
                 #[cfg(target_arch = "x86_64")]
                 {
-                    let allow_expected = if nesting { 190 } else { 195 };
+                    let allow_expected = if nesting { 210 } else { 215 };
                     assert_eq!(
                         len, allow_expected,
                         "x86_64 allowlist instruction count changed (nesting={nesting}): {len} vs \
@@ -1407,6 +1451,15 @@ mod tests {
                     }
                     if allow.binary_search(&nr).is_ok() {
                         return SECCOMP_RET_ALLOW;
+                    }
+                    // A refused probe Docker answers EPERM (io_uring, userfaultfd, ...): EPERM here,
+                    // never a kill; logged and run under audit.
+                    if super::eperm_like_docker().iter().any(|&n| n as u32 == nr) {
+                        return if audit {
+                            SECCOMP_RET_LOG
+                        } else {
+                            super::RET_EPERM
+                        };
                     }
                     default_deny
                 };
