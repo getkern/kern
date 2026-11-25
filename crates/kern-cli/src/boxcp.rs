@@ -192,6 +192,10 @@ fn dispatch(
 /// it was created in, so a path inside one reaches the volume, as it does under Docker.
 struct LayerBox {
     name: String,
+    /// The box's PID 1 and its supervisor, pinned in `start`, BEFORE the copy joins the box's user
+    /// namespace: the removal signals them rather than running `kern rm -f`, see the `Drop`.
+    pid1: Option<crate::pidfd::PidFd>,
+    supervisor: Option<crate::pidfd::PidFd>,
 }
 
 impl LayerBox {
@@ -307,7 +311,11 @@ impl LayerBox {
             pause_ms = (pause_ms * 2).min(200);
         };
         // From here the box may exist: the guard removes it on every way out, the errors included.
-        let lb = LayerBox { name };
+        let mut lb = LayerBox {
+            name,
+            pid1: None,
+            supervisor: None,
+        };
         if !out.status.success() {
             let why = String::from_utf8_lossy(&out.stderr);
             let why = why.trim().trim_start_matches("error: ");
@@ -315,12 +323,17 @@ impl LayerBox {
                 "kept box '{owner}' is not running and kern could not open its layer to copy: {why}"
             )));
         }
-        let pid1 = crate::registry::find(&lb.name).and_then(|i| {
+        let found = crate::registry::find(&lb.name).and_then(|i| {
             i.live_pid1()
                 .or_else(|| crate::registry::box_init_under(i.pid))
+                .map(|p1| (p1, i.pid))
         });
-        match pid1 {
-            Some(p) => Ok((lb, p)),
+        match found {
+            Some((p, sup)) => {
+                lb.pid1 = crate::pidfd::PidFd::open(p);
+                lb.supervisor = crate::pidfd::PidFd::open(sup);
+                Ok((lb, p))
+            }
             None => Err(Error::Sandbox(format!(
                 "kept box '{owner}': the box kern started on its layer is not up"
             ))),
@@ -356,8 +369,28 @@ impl LayerBox {
 }
 
 impl Drop for LayerBox {
-    /// Removed as `kern rm -f` removes a box: its PID 1 ends on the SIGTERM, `--rm` leaves no record.
+    /// Ended the way `kern rm -f` ends a box, without running one: SIGTERM to its PID 1 (`--idle`
+    /// exits on it), and the supervisor, which `--rm` makes remove the record and release the layer,
+    /// waited for, so the layer is free when the copy returns.
+    ///
+    /// NOT A CHILD `kern rm -f`. By now the copy has joined the box's user namespace, where a child
+    /// kern sees uid 0. MEASURED on WSL (Alpine distro, kern entered as root and dropped to its
+    /// user): that child took the root entry, could not drop again and exited 125 unread, so the box
+    /// on the layer stayed up and every later `kern cp` of the stopped box waited 20 s and failed
+    /// "in use by another box". Elsewhere it worked only because a uid-0 kern there runs as one.
+    /// The child remains the fallback where there is no pidfd or the supervisor does not end.
     fn drop(&mut self) {
+        const SUPERVISOR_EXIT_MS: i32 = 5000;
+        if let Some(p1) = &self.pid1 {
+            if p1.send_signal(libc::SIGTERM)
+                && self
+                    .supervisor
+                    .as_ref()
+                    .is_some_and(|s| s.wait_exit(SUPERVISOR_EXIT_MS))
+            {
+                return;
+            }
+        }
         if let Ok(me) = std::env::current_exe() {
             let _ = std::process::Command::new(me)
                 .args(["rm", "-f", &self.name])
@@ -796,6 +829,41 @@ fn print_stat(pid1: i32, box_src: &str, follow: bool) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The box on a layer is ended by a signal to its PID 1 and a wait on its supervisor, not by a
+    /// child kern: a child started after the copy joined the box's user namespace sees uid 0 (on WSL
+    /// it then refused to run and the box stayed up, holding the layer). One `sleep` plays both
+    /// parts: the drop must TERM it and return once it has exited.
+    #[test]
+    fn the_box_on_a_layer_ends_on_a_signal_not_a_child_kern() {
+        let Ok(mut child) = std::process::Command::new("sleep").arg("30").spawn() else {
+            eprintln!("skip: no `sleep` here");
+            return;
+        };
+        let Ok(pid) = i32::try_from(child.id()) else {
+            return;
+        };
+        let (Some(p1), Some(sup)) = (
+            crate::pidfd::PidFd::open(pid),
+            crate::pidfd::PidFd::open(pid),
+        ) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("skip: no pidfd_open on this kernel");
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        drop(LayerBox {
+            name: "kern-test-no-such-box".into(),
+            pid1: Some(p1),
+            supervisor: Some(sup),
+        });
+        let waited = t0.elapsed();
+        let status = child.wait().expect("wait");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+        assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
+    }
 
     /// The three answers `classify` must keep apart, because collapsing them is what produced a
     /// syntax error for a correct spelling: the old shape of this test asserted that a box-shaped
