@@ -287,6 +287,10 @@ and a developer's laptop is where a database, a Redis and a dashboard sit bound 
 password. The same connect is refused under the default `network: false`, and `egressAllow` refuses
 it too, because that one goes through kern's proxy rather than through the host's stack.
 
+**No network means no interface, not no channel**: a mount is one. A sandbox with `network: false`
+that mounts a directory holding a Unix socket of a process with network (another box, a host daemon)
+reaches through it; a test fetched a web page that way. Mount only what the code may use.
+
 ```js
 await kern.withSandbox({ egressAllow: ["pypi.org", "files.pythonhosted.org"] }, async (sbx) => { /* ... */ });
 ```

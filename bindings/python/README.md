@@ -208,6 +208,11 @@ relaxation is a named argument.
   filesystem answers or is unmounted.
 - **`network=True` includes the host's loopback**, where unauthenticated services live: a test read
   the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the route-level middle setting.
+- **No network means no interface, not no channel**: a mount is one. A sandbox with `network=False`
+  that mounts a directory holding a Unix socket of a process with network (another box, a host
+  daemon) reaches through it; a test fetched a web page that way. Mount only what the code may use.
+- **A mount kern itself refuses** (a data directory or an image cache moved in `kern.toml`, which
+  this package cannot see) raises `MountRefused` with kern's reason, as one refused here does.
 
 `gpus=` hands the box NVIDIA cards, in docker's grammar: `gpus="2"` is how many, `gpus="device=0,1"`
 is which, `gpus="all"` is all, and a card's UUID works where its index does

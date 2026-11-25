@@ -177,6 +177,15 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
   flag: a box gets every volume, anonymous volume, bind and `--mount` of another box, running or kept,
   read-only with `:ro`. A name that is neither is refused, and a box's own `-v`, `--mount` or `--tmpfs`
   on the same destination wins over the copy.
+- **Two of a box's own mounts on one path are refused** (`-v a:/data -v b:/data`, `--tmpfs /data` with
+  a `-v` there, a `--mount` there), where the later covered the earlier in silence.
+- **The image cache cannot be mounted into a box** (`-v`, `--mount`, `volume --path`), nor a directory
+  holding it such as `~/.cache`: a box could change the files every later box of an image runs. The
+  build cache inside it is still what `RUN --mount=type=cache` mounts. The SDKs refused it already.
+- **A `kern.toml` that is not text stops a box from starting**, as one that does not parse and names a
+  data place does, instead of a warning and the default place.
+- **The SDKs raise `MountRefused` for a mount kern refuses** (a data dir or image cache moved in
+  `kern.toml`), where they returned a `startup_failed` result.
 - **A mount on `/etc/resolv.conf`, `/etc/hosts` or `/etc/hostname` is shown as mounted**, in a box and
   in a compose service: kern's own entries, the pod's shared files, `--add-host` and `--dns` no longer
   cover or merge into it.
