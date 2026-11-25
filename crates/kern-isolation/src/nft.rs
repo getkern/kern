@@ -29,8 +29,13 @@
 //!    answered by this namespace's own RST|ACK, which the socket takes: `ECONNREFUSED` a second
 //!    after the SYN instead of at the client's timeout.
 //!
-//! Both are inert under a pasta that has the fixes: its RST carries the ACK, so rule 2 never matches,
-//! and it ignores a repeated SYN, so rule 1 only spares it a packet. That is why no version is read.
+//! 3. A segment from pasta with none of SYN, RST and ACK is dropped before connection tracking, as a
+//!    socket's own stack drops it. Only a connection the box forwards ever noticed it (see the rule).
+//!
+//! Rules 1 and 2 are inert under a pasta that has the fixes: its RST carries the ACK, so rule 2 never
+//! matches, and it ignores a repeated SYN, so rule 1 only spares it a packet. Rule 3 drops only what
+//! every socket drops, so a connection that ends in the box sees no change under any pasta. That is
+//! why no version is read.
 //! MEASURED with passt's own build of 2026-10-02 ahead in `PATH`, the rules installed: a closed port
 //! refused in 13 ms, a dropped first SYN 1009-1060 ms.
 //!
@@ -62,6 +67,7 @@ const NLA_F_NESTED: u16 = 0x8000;
 const NFPROTO_INET: u8 = 1;
 const NFPROTO_IPV4: u8 = 2;
 const NFPROTO_IPV6: u8 = 10;
+const NF_INET_PRE_ROUTING: u32 = 0;
 const NF_INET_LOCAL_IN: u32 = 1;
 const NF_INET_LOCAL_OUT: u32 = 3;
 const NF_DROP: u32 = 0;
@@ -389,13 +395,18 @@ fn table_batch(ifname: &str) -> (Vec<u8>, u32) {
     b.msg(NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_EXCL, |m| {
         attr_str(m, NFTA_TABLE_NAME, TABLE)
     });
-    for (chain, hook) in [("in", NF_INET_LOCAL_IN), ("out", NF_INET_LOCAL_OUT)] {
+    // `pre` at -300, ahead of connection tracking (-200): see the rule it holds.
+    for (chain, hook, prio) in [
+        ("pre", NF_INET_PRE_ROUTING, -300i32),
+        ("in", NF_INET_LOCAL_IN, 0),
+        ("out", NF_INET_LOCAL_OUT, 0),
+    ] {
         b.msg(NFT_MSG_NEWCHAIN, NLM_F_CREATE, |m| {
             attr_str(m, NFTA_CHAIN_TABLE, TABLE);
             attr_str(m, NFTA_CHAIN_NAME, chain);
             nest(m, NFTA_CHAIN_HOOK, |h| {
                 attr_u32(h, NFTA_HOOK_HOOKNUM, hook);
-                attr_u32(h, NFTA_HOOK_PRIORITY, 0);
+                attr_u32(h, NFTA_HOOK_PRIORITY, prio as u32);
             });
             attr_str(m, NFTA_CHAIN_TYPE, "filter");
         });
@@ -419,6 +430,25 @@ fn table_batch(ifname: &str) -> (Vec<u8>, u32) {
                 attr(m, NFTA_SET_TIMEOUT, &ms.to_be_bytes());
             });
         }
+        // PRE: a segment from pasta with none of SYN, RST and ACK is dropped before connection
+        // tracking sees it, as a socket's stack drops it (`!ack && !rst && !syn`: discard). The old
+        // pasta sends one (a window update, `Flags [none]`) in the middle of a connection. A local
+        // socket never noticed; a connection the box FORWARDS (a runtime's bridge in a
+        // `--privileged` box, behind its NAT) did: conntrack calls it invalid, does not translate it
+        // back, the box's own stack finds no socket for it and answers RST, and pasta closes the
+        // connection. MEASURED with docker:dind: `wget` from a container on dind's bridge timed out,
+        // the same from one on dind's host network fetched.
+        b.rule("pre", |e| {
+            prologue(
+                e,
+                NFT_META_IIFNAME,
+                ifname,
+                family,
+                TCP_SYN | TCP_RST | TCP_ACK,
+                0,
+            );
+            drop_verdict(e);
+        });
         // IN: a RST without ACK, which a socket in SYN-SENT discards, marks the connection refused.
         b.rule("in", |e| {
             prologue(
@@ -689,8 +719,8 @@ mod tests {
             assert_eq!(kinds.first(), Some(&NFNL_MSG_BATCH_BEGIN));
             assert_eq!(kinds.last(), Some(&NFNL_MSG_BATCH_END));
             assert_eq!(kinds.len() as u32, acks + 2);
-            // 1 table, 2 chains, per family 2 sets and 4 rules.
-            assert_eq!(acks, 1 + 2 + 2 * 6);
+            // 1 table, 3 chains, per family 2 sets and 5 rules.
+            assert_eq!(acks, 1 + 3 + 2 * 7);
         }
     }
 
@@ -744,6 +774,11 @@ mod against_a_stand_in {
     /// The port the stand-in refuses (a RST without ACK to every SYN), and the one it never answers.
     const REFUSING: u16 = 7001;
     const SILENT: u16 = 7002;
+    /// A SYN to this port is answered by a segment with no flags, to [`NO_SOCKET`] of the box: the old
+    /// pasta's window update, aimed where the box has no socket, as one a NAT does not translate back
+    /// lands. The box's kernel answers it with a RST unless rule 3 dropped it.
+    const FLAGLESS: u16 = 7003;
+    const NO_SOCKET: u16 = 40999;
 
     fn ip_bin() -> Option<&'static str> {
         ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"]
@@ -788,6 +823,18 @@ mod against_a_stand_in {
 
     /// A RST with no ACK, as that pasta sends it, answering the SYN in `frame`.
     fn rst_for(frame: &[u8], l3: usize, v6: bool, tcp: usize) -> Vec<u8> {
+        reply_for(frame, l3, v6, tcp, TCP_RST, None)
+    }
+
+    /// A segment back to the sender of `frame` with `flags`, to `to_port` of it when given.
+    fn reply_for(
+        frame: &[u8],
+        l3: usize,
+        v6: bool,
+        tcp: usize,
+        flags: u8,
+        to_port: Option<u16>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&frame[6..12]); // to the sender
         out.extend_from_slice(&frame[0..6]);
@@ -799,10 +846,14 @@ mod against_a_stand_in {
         };
         let mut t = vec![0u8; 20];
         t[0..2].copy_from_slice(&frame[tcp + 2..tcp + 4]);
-        t[2..4].copy_from_slice(&frame[tcp..tcp + 2]);
+        match to_port {
+            Some(p) => t[2..4].copy_from_slice(&p.to_be_bytes()),
+            None => t[2..4].copy_from_slice(&frame[tcp..tcp + 2]),
+        }
         t[4..8].copy_from_slice(&0x1234_5678u32.to_be_bytes());
         t[12] = 5 << 4;
-        t[13] = TCP_RST;
+        t[13] = flags;
+        t[14..16].copy_from_slice(&255u16.to_be_bytes());
         let c = csum(&t, pseudo_sum(src, dst, 20));
         t[16..18].copy_from_slice(&c.to_be_bytes());
         if v6 {
@@ -901,14 +952,26 @@ mod against_a_stand_in {
                 0x86dd if f[20] == 6 => (true, 54),
                 _ => continue,
             };
-            if f.len() < tcp + 20 || f[tcp + 13] & (TCP_SYN | TCP_ACK) != TCP_SYN {
+            if f.len() < tcp + 20 {
                 continue;
             }
             let sport = u16::from_be_bytes([f[tcp], f[tcp + 1]]);
             let dport = u16::from_be_bytes([f[tcp + 2], f[tcp + 3]]);
+            // The box's answer to the flagless segment, counted under destination port 0.
+            if sport == NO_SOCKET && f[tcp + 13] & TCP_RST != 0 {
+                *counts.entry((v6, 0, NO_SOCKET)).or_default() += 1;
+                continue;
+            }
+            if f[tcp + 13] & (TCP_SYN | TCP_ACK) != TCP_SYN {
+                continue;
+            }
             *counts.entry((v6, dport, sport)).or_default() += 1;
             if dport == REFUSING {
                 let r = rst_for(f, 14, v6, tcp);
+                unsafe { libc::send(sock, r.as_ptr().cast(), r.len(), 0) };
+            }
+            if dport == FLAGLESS {
+                let r = reply_for(f, 14, v6, tcp, 0, Some(NO_SOCKET));
                 unsafe { libc::send(sock, r.as_ptr().cast(), r.len(), 0) };
             }
         }
@@ -1035,9 +1098,10 @@ mod against_a_stand_in {
         }
     }
 
-    /// Per family (IPv4, IPv6): the refused port's errno and milliseconds, and how many SYNs to the
-    /// silent port the stand-in saw.
-    type Seen = Vec<(i32, u128, u32, u32)>;
+    /// Per family (IPv4, IPv6): the refused port's errno and milliseconds, how many SYNs to the
+    /// silent port the stand-in saw (from a free port, and from a fixed one twice), and how many RSTs
+    /// the box sent back for the flagless segment.
+    type Seen = Vec<(i32, u128, u32, u32, u32)>;
 
     fn scenario(with_rules: bool) -> Result<Seen, String> {
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
@@ -1117,6 +1181,7 @@ mod against_a_stand_in {
                     let fixed = if target.contains(':') { 41002 } else { 41001 };
                     connect_from(target, SILENT, fixed, 300);
                     connect_from(target, SILENT, fixed, 300);
+                    connect(target, FLAGLESS, 400);
                     (errno, ms, sport, fixed)
                 })
             })
@@ -1145,18 +1210,32 @@ mod against_a_stand_in {
                 })
                 .sum::<u32>()
         };
+        let resets = |v6: bool| {
+            text.lines()
+                .filter_map(|l| {
+                    let f: Vec<u32> = l.split(' ').filter_map(|x| x.parse().ok()).collect();
+                    (f.len() == 4
+                        && f[0] == u32::from(v6)
+                        && f[1] == 0
+                        && f[2] == u32::from(NO_SOCKET))
+                    .then_some(f[3])
+                })
+                .sum::<u32>()
+        };
         Ok(vec![
             (
                 seen[0].0,
                 seen[0].1,
                 count(false, silent_ports[0].0),
                 count(false, silent_ports[0].1),
+                resets(false),
             ),
             (
                 seen[1].0,
                 seen[1].1,
                 count(true, silent_ports[1].0),
                 count(true, silent_ports[1].1),
+                resets(true),
             ),
         ])
     }
@@ -1171,7 +1250,7 @@ mod against_a_stand_in {
             let line = match scenario(with_rules) {
                 Ok(s) => s
                     .iter()
-                    .map(|(e, ms, n, r)| format!("{e} {ms} {n} {r}"))
+                    .map(|(e, ms, n, r, x)| format!("{e} {ms} {n} {r} {x}"))
                     .collect::<Vec<_>>()
                     .join(";"),
                 Err(e) => format!("err {e}"),
@@ -1195,6 +1274,7 @@ mod against_a_stand_in {
                     v.get(1)?.parse().ok()?,
                     v.get(2)?.parse().ok()?,
                     v.get(3)?.parse().ok()?,
+                    v.get(4)?.parse().ok()?,
                 ))
             })
             .collect();
@@ -1205,10 +1285,11 @@ mod against_a_stand_in {
         }
     }
 
-    /// WITHOUT the rules the stand-in reproduces both defects, which is what makes the second half
-    /// mean anything: the refused port runs to the deadline, and the box sends its SYN again (the
-    /// retry the old pasta reset on). WITH them, over IPv4 and IPv6 alike: `ECONNREFUSED` within
-    /// about a second, and one SYN to the silent port in 2.3 s.
+    /// WITHOUT the rules the stand-in reproduces the three defects, which is what makes the second
+    /// half mean anything: the refused port runs to the deadline, the box sends its SYN again (the
+    /// retry the old pasta reset on), and a segment with no flags to a port without a socket is
+    /// answered with a RST. WITH them, over IPv4 and IPv6 alike: `ECONNREFUSED` within about a
+    /// second, one SYN to the silent port in 2.3 s, and no RST.
     #[test]
     fn the_rules_refuse_and_hold_back_over_ipv4_and_ipv6() {
         // The control and the case run at once, each in namespaces of its own.
@@ -1245,6 +1326,14 @@ mod against_a_stand_in {
             assert_eq!(
                 w.3, 2,
                 "{fam}: a new connection on the same port is not a retry: {after:?}"
+            );
+            assert!(
+                wo.4 >= 1,
+                "{fam}: the control must answer the flagless segment with a RST: {before:?}"
+            );
+            assert_eq!(
+                w.4, 0,
+                "{fam}: the flagless segment must be dropped before the stack: {after:?}"
             );
         }
     }
