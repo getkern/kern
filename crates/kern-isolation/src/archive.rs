@@ -563,6 +563,42 @@ pub fn member_path(raw: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A member path (or a hardlink's target) as Docker resolves it against the destination `prefix`:
+/// lexically, `..` taking back one component, and refused only when the result is not inside the
+/// destination. In a box's root (`clamp_at_root`) a `..` above `/` stays at `/`, as it does there
+/// for every path; on the host it is a member leaving the directory, refused. Relative to `prefix`;
+/// `None` when it leaves it.
+///
+/// MEASURED against Docker 29 (`docker cp - c:<dest> < archive`): `../../tmp/x` into `/` lands at
+/// `/tmp/x`, into `/opt` is refused (`"../../tmp/x" is outside of "/opt"`), and `a/../b` is `b`.
+/// kern refused every `..`, so an archive Docker extracts into `/` failed whole.
+pub fn member_under(prefix: &[u8], raw: &[u8], clamp_at_root: bool) -> Option<Vec<u8>> {
+    let parts = |p: &[u8]| -> Vec<Vec<u8>> {
+        p.split(|&b| b == b'/')
+            .filter(|c| !c.is_empty() && *c != b".")
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let base = parts(prefix);
+    if base.iter().any(|c| c == b"..") {
+        return None;
+    }
+    let mut at = base.clone();
+    for c in parts(raw) {
+        if c == b".." {
+            if at.pop().is_none() && !clamp_at_root {
+                return None;
+            }
+        } else {
+            at.push(c);
+        }
+    }
+    if at.len() < base.len() || at[..base.len()] != base[..] {
+        return None;
+    }
+    Some(at[base.len()..].join(&b'/'))
+}
+
 fn parse_octal(f: &[u8]) -> u64 {
     // GNU's base-256 for a value that does not fit the octal field.
     if f.first().is_some_and(|b| b & 0x80 != 0) {
@@ -801,12 +837,13 @@ impl Dest {
 
     fn make_hardlink(&self, member: &[u8], target: &[u8]) -> std::io::Result<()> {
         self.check(member)?;
-        let target = member_path(target).ok_or_else(|| {
-            bad(format!(
-                "the archive's hardlink {} leaves the destination",
-                String::from_utf8_lossy(target)
-            ))
-        })?;
+        let target = member_under(&self.prefix, target, self.confine == Confine::InRoot)
+            .ok_or_else(|| {
+                bad(format!(
+                    "the archive's hardlink {} leaves the destination",
+                    String::from_utf8_lossy(target)
+                ))
+            })?;
         // The link's target, resolved as confined as any member: never a file outside.
         let src = owned(openat2_confined(
             self.base.as_raw_fd(),
@@ -943,12 +980,13 @@ pub fn read_archive<R: Read>(r: &mut R, dest: &Dest) -> std::io::Result<u64> {
             (Some(l), _) | (None, Some(l)) => l,
             (None, None) => cfield(&block[157..257]).to_vec(),
         };
-        let member = member_path(&raw_name).ok_or_else(|| {
-            bad(format!(
-                "the archive member {} leaves the destination (`..`)",
-                String::from_utf8_lossy(&raw_name)
-            ))
-        })?;
+        let member = member_under(&dest.prefix, &raw_name, dest.confine == Confine::InRoot)
+            .ok_or_else(|| {
+                bad(format!(
+                    "the archive member {} is outside of the destination",
+                    String::from_utf8_lossy(&raw_name)
+                ))
+            })?;
         let regular = matches!(kind, b'0' | 0 | b'7');
         if member.is_empty() {
             // The destination directory itself (`./`): it exists; nothing to create.
@@ -1092,6 +1130,35 @@ mod tests {
         for p in [src, out, flat] {
             let _ = std::fs::remove_dir_all(p);
         }
+    }
+
+    /// Docker's resolution of a member against the destination, case by case as measured on
+    /// Docker 29: into a box's `/` a `..` above the root stays at the root; into `/opt` a member
+    /// that leaves `/opt` is refused; inside the destination `a/../b` is `b`; on the host any exit
+    /// from the directory is refused.
+    #[test]
+    fn a_member_resolves_against_the_destination_as_docker_resolves_it() {
+        let m = |prefix: &str, raw: &str, root: bool| {
+            member_under(prefix.as_bytes(), raw.as_bytes(), root)
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+        };
+        assert_eq!(m("/", "../../../../tmp/x", true).as_deref(), Some("tmp/x"));
+        assert_eq!(m("", "../x", true).as_deref(), Some("x"));
+        assert_eq!(m("/", "a/../../x", true).as_deref(), Some("x"));
+        assert_eq!(m("/opt", "../x", true), None);
+        assert_eq!(m("/opt", "a/../../x", true), None);
+        assert_eq!(m("/opt", "../opt/x", true).as_deref(), Some("x"));
+        assert_eq!(m("/opt", "a/../b", true).as_deref(), Some("b"));
+        assert_eq!(m("/opt", "/abs/x", true).as_deref(), Some("abs/x"));
+        assert_eq!(m("", "../escaped", false), None);
+        assert_eq!(m("", "a/../../x", false), None);
+        assert_eq!(m("", "a/../b", false).as_deref(), Some("b"));
+        assert_eq!(m("", "./", false).as_deref(), Some(""));
+        assert_eq!(
+            m("/x/../y", "f", true),
+            None,
+            "a destination with `..` is not resolved"
+        );
     }
 
     /// What a hostile box can put in an archive does not leave a host destination: a `..` member,

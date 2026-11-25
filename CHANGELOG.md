@@ -186,6 +186,12 @@ create), and `docker rmi` of the arm64 id removes that entry and not this machin
 --platform <os/arch>` shows an image's entry for that platform, `Architecture` is the image's own
 (it was the host's for every image), and `kern images --json` carries each entry's `cache` name.
 
+**An archive copied into a box resolves `..` as Docker does.** kern refused every member with a
+`..`, so an archive Docker extracts into `/` failed whole. A member is now resolved against the
+destination: into a box's `/` a `..` above the root stays at the root, a member that leaves any
+other destination is refused (`docker cp - c:/opt` of `../x`), and `a/../b` is `b`. Copied to the
+host, a member that leaves the directory is still refused.
+
 **`depends_on: condition: service_healthy` through kern's socket.** A container's `Healthcheck`
 was not read, so the box had no check and the `docker compose` client refused the stack ("has no
 healthcheck configured"); it is the box's `--health-*` now, durations rounded up to whole seconds.
