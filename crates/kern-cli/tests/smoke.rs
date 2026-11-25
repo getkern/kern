@@ -2059,6 +2059,128 @@ fn a_bridge_member_has_a_route_out_and_still_reaches_its_peers() {
     );
 }
 
+/// A box on two networks of one stack, the way kern's Docker API puts a compose service on its
+/// second network: a pod with a bridge per network, each network's record written with every
+/// member's planned address (`pod __record`), then `--network` repeated. The member on both
+/// reaches the peers of each, at the addresses the records planned; a member of one network does
+/// not resolve the other's; and two networks that are not one stack's are refused by name.
+#[test]
+fn a_box_on_two_networks_of_a_stack_reaches_each_and_only_its_peers() {
+    let xdg = std::env::temp_dir().join(format!("kern-it-twonet-xdg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&xdg);
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str], stdin: Option<&str>| -> (i32, String, String) {
+        use std::io::Write;
+        let child = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut child) = child else {
+            return (-1, String::new(), "spawn".into());
+        };
+        if let Some(mut sin) = child.stdin.take() {
+            let _ = sin.write_all(stdin.unwrap_or("").as_bytes());
+        }
+        let Ok(o) = child.wait_with_output() else {
+            return (-1, String::new(), "wait".into());
+        };
+        (
+            o.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        )
+    };
+    let (code, _, err) = run(
+        &[
+            "pod",
+            "create",
+            "tn",
+            "--no-outbound",
+            "--bridge",
+            "10.89.0.0/24",
+            "--bridge",
+            "10.89.1.0/24",
+        ],
+        None,
+    );
+    if code != 0 {
+        let _ = std::fs::remove_dir_all(&xdg);
+        eprintln!("skip: this host could not make a bridge pod ({err})");
+        return;
+    }
+    let front = "10.89.0.2 tna\n10.89.0.3 tnm\n";
+    let back = "10.89.1.2 tnb\n10.89.1.3 tnm\n";
+    let r1 = run(&["pod", "__record", "tn", "front", "0", "24"], Some(front));
+    let r2 = run(
+        &["pod", "__record", "tn", "back", "1", "24", "internal"],
+        Some(back),
+    );
+    let box_on = |name: &str, nets: &[&str]| {
+        let mut a = vec!["run", "-d", "-q", "--name", name];
+        for n in nets {
+            a.extend(["--network", n]);
+        }
+        a.extend(["alpine", "sleep", "60"]);
+        run(&a, None)
+    };
+    let a = box_on("tna", &["tn_front"]);
+    let b = box_on("tnb", &["tn_back"]);
+    let m = box_on("tnm", &["tn_front", "tn_back"]);
+    let inside = |name: &str, cmd: &str| run(&["exec", name, "--", "sh", "-c", cmd], None).1;
+    let m_addrs = inside(
+        "tnm",
+        "ip -4 -o addr show | awk '{print $4}' | tr '\\n' ' '",
+    );
+    let m_peers = inside(
+        "tnm",
+        "getent hosts tna tnb | awk '{print $1}' | tr '\\n' ' '",
+    );
+    let b_sees_a = inside("tnb", "getent hosts tna || echo unseen");
+    let mixed = run(
+        &[
+            "run",
+            "--rm",
+            "--network",
+            "tn_front",
+            "--network",
+            "elsewhere",
+            "alpine",
+            "true",
+        ],
+        None,
+    );
+    for n in ["tna", "tnb", "tnm"] {
+        let _ = run(&["rm", "-f", n], None);
+    }
+    let _ = run(&["pod", "rm", "tn"], None);
+    let _ = std::fs::remove_dir_all(&xdg);
+
+    assert!(r1.0 == 0 && r2.0 == 0, "pod __record: {r1:?} {r2:?}");
+    assert!(
+        a.0 == 0 && b.0 == 0 && m.0 == 0,
+        "a box did not start: {a:?} {b:?} {m:?}"
+    );
+    assert!(
+        m_addrs.contains("10.89.0.3/24") && m_addrs.contains("10.89.1.3/24"),
+        "the member on two networks must hold the address each record planned: {m_addrs:?}"
+    );
+    assert!(
+        m_peers.contains("10.89.0.2") && m_peers.contains("10.89.1.2"),
+        "the member on two networks must resolve the peers of each: {m_peers:?}"
+    );
+    assert!(
+        b_sees_a.contains("unseen"),
+        "a member of one network resolved a member of the other: {b_sees_a:?}"
+    );
+    assert!(
+        mixed.0 != 0 && mixed.2.contains("one pod"),
+        "two networks that are not one stack's must be refused by name: {mixed:?}"
+    );
+}
+
 /// A stack whose FIRST service is refused must not leave its pod behind.
 ///
 /// MEASURED before the guard existed, on 0.9.32-37-g02ecedf: `compose up` printed

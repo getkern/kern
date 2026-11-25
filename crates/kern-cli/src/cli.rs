@@ -458,6 +458,14 @@ pub enum Command {
     },
     /// `kern pod create <name> [--no-outbound] [--no-uid-range] [--bridge <cidr>]` / `pod ls` / `pod rm
     /// <name>`: a pod is a shared network, either one namespace or one bridge.
+    /// `kern pod __record`: one network record of a pod on a bridge, its hosts on stdin (hidden).
+    PodRecord {
+        pod: String,
+        network: String,
+        bridge: u8,
+        prefix: u8,
+        internal: bool,
+    },
     PodCreate {
         name: String,
         outbound: bool,
@@ -4581,7 +4589,16 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         // be running - untestable without a live registry, and different on two
                         // machines given one command line. `join_pod_and_bind_its_files` already
                         // asks that question for `--pod` and now answers it for both flags.
-                        Some(name) if !name.starts_with('-') => pod = Some(name.to_string()),
+                        // REPEATED, a box on several networks of one compose stack, as a container
+                        // on several Docker networks: the names travel as one comma-separated list
+                        // (no pod name has a comma) and `stack_network_join` reads it; anything
+                        // but networks of one stack on a bridge is refused there by name.
+                        Some(name) if !name.starts_with('-') => {
+                            pod = Some(match pod.take() {
+                                Some(prev) if prev != name => format!("{prev},{name}"),
+                                _ => name.to_string(),
+                            })
+                        }
                         _ => {
                             return Err(Error::Usage(
                                 "--network <host|none|container:BOX|pod-name> (host = share host net; none = isolated; container:BOX = BOX's network)",
@@ -6552,6 +6569,36 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
                 no_uid_range: rest.contains(&"--no-uid-range"),
             })
         }
+        // `pod __record <pod> <network> <bridge> <prefix> [internal]`, the hosts of that network on
+        // stdin (`<ip> <name>` a line): kern's Docker API keeping a compose project's network record
+        // as its containers are created, the record `kern compose` writes at `up`. Hidden: no person
+        // types it.
+        Some("__record") => {
+            let (Some(pod), Some(network), Some(bridge), Some(prefix)) =
+                (rest.get(2), rest.get(3), rest.get(4), rest.get(5))
+            else {
+                return Err(Error::Usage("pod __record <pod> <network> <bridge> <prefix> [internal]"));
+            };
+            let (Ok(bridge), Ok(prefix)) = (bridge.parse::<u8>(), prefix.parse::<u8>()) else {
+                return Err(Error::Usage("pod __record <pod> <network> <bridge> <prefix> [internal]"));
+            };
+            let internal = match rest.get(6).copied() {
+                None => false,
+                Some("internal") if rest.len() == 7 => true,
+                _ => {
+                    return Err(Error::Usage(
+                        "pod __record <pod> <network> <bridge> <prefix> [internal]",
+                    ))
+                }
+            };
+            Ok(Command::PodRecord {
+                pod: (*pod).to_string(),
+                network: (*network).to_string(),
+                bridge,
+                prefix,
+                internal,
+            })
+        }
         Some("ls" | "list" | "ps") => {
             reject_unknown_flags("pod ls", &rest[1..], &["--json"])?;
             Ok(Command::PodList {
@@ -7342,7 +7389,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             crate::progress::quiet_flag(quiet);
             // `--network <project>_<network>` onto a running stack: see `stack_network_join`.
             let (pod, pod_bridges, add_hosts, stack_outbound) =
-                commands::stack_network_join(pod, pod_bridges, add_hosts)?;
+                commands::stack_network_join(pod, pod_bridges, add_hosts, &name)?;
             // ITS RESOLVERS WITH ITS NAT, as `compose up` hands them to each service it gives one:
             // the host's, reachable through the NAT. A `--dns` the caller gave is theirs and is
             // not appended to.
@@ -7571,6 +7618,47 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             } else {
                 commands::build(a)
             }
+        }
+        Command::PodRecord {
+            pod,
+            network,
+            bridge,
+            prefix,
+            internal,
+        } => {
+            use std::io::Read as _;
+            let mut text = String::new();
+            std::io::stdin()
+                .lock()
+                .take(4 << 20)
+                .read_to_string(&mut text)
+                .map_err(|e| Error::Cli(format!("pod __record: reading the hosts: {e}")))?;
+            let hosts = text
+                .lines()
+                .filter_map(|l| {
+                    let (ip, name) = l.split_once(' ')?;
+                    // A host name, as a hosts file holds one: letters, digits, `.`, `_`, `-`.
+                    let name = name.trim();
+                    (!name.is_empty()
+                        && name.len() <= 253
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+                    .then_some(())?;
+                    Some((ip.parse().ok()?, name.to_string()))
+                })
+                .collect();
+            crate::pod::write_bridge_network(
+                &pod,
+                &crate::pod::BridgeNetwork {
+                    network,
+                    bridge,
+                    prefix,
+                    hosts,
+                    internal,
+                },
+            )
+            .map_err(|e| Error::Cli(format!("pod __record: {e}")))
         }
         Command::PodCreate {
             name,

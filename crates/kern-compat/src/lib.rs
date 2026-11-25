@@ -21,6 +21,7 @@
 mod api;
 mod events;
 mod netvol;
+mod projnet;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};

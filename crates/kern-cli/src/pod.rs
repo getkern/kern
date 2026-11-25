@@ -2725,20 +2725,46 @@ pub fn write_bridge_networks(pod: &str, nets: &[BridgeNetwork]) -> std::io::Resu
         .mode(0o700)
         .create(&dir)?;
     for n in nets.iter().filter(|n| network_file_name_ok(&n.network)) {
-        let mut text = format!(
-            "bridge {} {}{}\n",
-            n.bridge,
-            n.prefix,
-            if n.internal { " internal" } else { "" }
-        );
-        for (ip, name) in &n.hosts {
-            text.push_str(&format!("{ip} {name}\n"));
-        }
-        let tmp = dir.join(format!(".{}.tmp", n.network));
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, dir.join(&n.network))?;
+        write_network_file(&dir, n)?;
     }
     Ok(())
+}
+
+/// Record ONE network of `pod`, replacing that network's record and no other: how kern's Docker API
+/// keeps a compose project's networks as their containers are created one by one. A pod that does
+/// not exist, or a network name that cannot be a file name, is refused.
+pub fn write_bridge_network(pod: &str, net: &BridgeNetwork) -> std::io::Result<()> {
+    if validate_join_name(pod).is_err() || holder_pid(pod).is_none() {
+        return Err(std::io::Error::other(format!("no running pod named {pod}")));
+    }
+    if !network_file_name_ok(&net.network) {
+        return Err(std::io::Error::other(format!(
+            "{:?} cannot name a network record",
+            net.network
+        )));
+    }
+    let dir = networks_dir(pod);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    write_network_file(&dir, net)
+}
+
+/// One network's record file, written whole and renamed into place.
+fn write_network_file(dir: &std::path::Path, n: &BridgeNetwork) -> std::io::Result<()> {
+    let mut text = format!(
+        "bridge {} {}{}\n",
+        n.bridge,
+        n.prefix,
+        if n.internal { " internal" } else { "" }
+    );
+    for (ip, name) in &n.hosts {
+        text.push_str(&format!("{ip} {name}\n"));
+    }
+    let tmp = dir.join(format!(".{}.tmp", n.network));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, dir.join(&n.network))
 }
 
 /// The networks [`write_bridge_networks`] recorded for `pod`, sorted by name; empty for a pod whose

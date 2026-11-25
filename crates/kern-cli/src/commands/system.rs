@@ -382,7 +382,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         a running pod; or a running `kern compose` stack, by its project name or
                         as <project>_<network>: the box joins that network, with an address of
                         its own on a bridge stack and every name of that network in its
-                        /etc/hosts (`kern pod ls` names the stacks)
+                        /etc/hosts (`kern pod ls` names the stacks); repeated, several
+                        networks of one bridge stack
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
     --network-alias N   Another name the box is reached by on its pod's network (repeatable)
     --egress-allow d,d  Restrict outbound to an allowlist via a filtering proxy (also with -d): domains

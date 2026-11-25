@@ -4,7 +4,8 @@
 //! A DOCKER NETWORK IS A KERN POD. Its members share one network namespace and a hosts file every
 //! member reads, the ones already running included, so a service is reached by its name (a
 //! `--network-alias`) whenever it joins, as Docker's embedded DNS answers. A box is in one pod, so
-//! a container is on one network: a second one is refused by name rather than half-joined.
+//! the networks of one compose project are bridges of ONE pod (`projnet`), and a container joins as
+//! many of them as compose asks; any other second network is refused by name rather than half-joined.
 //!
 //! A DOCKER VOLUME IS A KERN VOLUME. kern keeps no labels on either, and compose finds what it made
 //! by label (`com.docker.compose.project`) and refuses to reuse one it did not make, so the labels a
@@ -31,7 +32,7 @@ fn now() -> u64 {
 }
 
 /// `<cache>/kern/compat-meta/<kind>/`, where the labels a client gave an object are kept.
-fn meta_dir(kind: &str) -> Option<PathBuf> {
+pub(crate) fn meta_dir(kind: &str) -> Option<PathBuf> {
     Some(
         kern_common::xdg_cache_dir()?
             .join("kern")
@@ -139,12 +140,27 @@ fn pods(bin: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The networks this API answers for beside the builtins: every pod but a compose project's own
+/// (see `projnet`), and every network of a project, whose pod may not exist yet.
+fn networks(bin: &Path) -> Vec<String> {
+    let mut v: Vec<String> = pods(bin)
+        .into_iter()
+        .filter(|p| !crate::projnet::is_project_pod(p))
+        .collect();
+    for p in crate::projnet::all() {
+        if !v.contains(&p.name) {
+            v.push(p.name);
+        }
+    }
+    v
+}
+
 /// The network a client means by `id`: a builtin, a pod by name, or an id or a prefix of one.
 fn resolve_network(bin: &Path, id: &str) -> Option<String> {
     let names = BUILTIN
         .iter()
         .map(|(n, _)| (*n).to_string())
-        .chain(pods(bin));
+        .chain(networks(bin));
     let mut by_id = None;
     for n in names {
         if n == id {
@@ -157,9 +173,15 @@ fn resolve_network(bin: &Path, id: &str) -> Option<String> {
     by_id
 }
 
-/// Is `name` a network this API (or kern) can put a container on? A pod that exists.
+/// Is `name` a pod that exists?
 pub(crate) fn network_exists(bin: &Path, name: &str) -> bool {
     pods(bin).iter().any(|p| p == name)
+}
+
+/// Is `name` a network this API can put a container on: a pod that exists, or a compose project's
+/// network (its pod is made by its first container).
+pub(crate) fn network_usable(bin: &Path, name: &str) -> bool {
+    crate::projnet::get(name).is_some() || network_exists(bin, name)
 }
 
 fn network_json(bin: &Path, name: &str, members: &[(String, Value)]) -> String {
@@ -170,9 +192,13 @@ fn network_json(bin: &Path, name: &str, members: &[(String, Value)]) -> String {
         meta_read("networks", name)
     };
     let driver = builtin.map_or("bridge", |(_, d)| d);
+    let project = crate::projnet::get(name);
     let containers: Vec<String> = members
         .iter()
-        .filter(|(_, v)| v.get("pod").and_then(Value::as_str) == Some(name))
+        .filter(|(n, v)| match &project {
+            Some(p) => p.address_of(n).is_some(),
+            None => v.get("pod").and_then(Value::as_str) == Some(name),
+        })
         .map(|(n, _)| {
             format!(
                 "{}:{{\"Name\":{},\"EndpointID\":{},\"MacAddress\":\"\",\"IPv4Address\":\"\",\"IPv6Address\":\"\"}}",
@@ -212,7 +238,7 @@ fn network_list(bin: &Path, req: &Request) -> Response {
     let all: Vec<String> = BUILTIN
         .iter()
         .map(|(n, _)| (*n).to_string())
-        .chain(pods(bin))
+        .chain(networks(bin))
         .collect();
     let rows: Vec<String> = all
         .iter()
@@ -267,23 +293,32 @@ fn network_create(bin: &Path, req: &Request) -> Response {
             )
         }
     }
-    if BUILTIN.iter().any(|(n, _)| *n == name) || network_exists(bin, name) {
+    if BUILTIN.iter().any(|(n, _)| *n == name) || network_usable(bin, name) {
         return error(409, &format!("network with name {name} already exists"));
     }
     let internal = body.get("Internal").and_then(Value::as_bool) == Some(true);
-    let mut args = vec!["pod", "create", name];
-    if internal {
-        args.push("--no-outbound");
-    }
-    let (code, _, err) = kern(bin, &args);
-    if code != 0 {
-        return error(500, &kern_error(&err));
+    let labels = labels_of_value(body.get("Labels"));
+    // A COMPOSE PROJECT'S NETWORK is recorded and becomes a bridge of the project's pod when its
+    // first container is made (see `projnet`), so a service can be on several. Any other network, or
+    // one created after its project's pod was made, is a pod of its own, as before.
+    let recorded = crate::projnet::project_of(name, &labels).is_some_and(|(project, network)| {
+        crate::projnet::create(name, &project, &network, internal).is_ok()
+    });
+    if !recorded {
+        let mut args = vec!["pod", "create", name];
+        if internal {
+            args.push("--no-outbound");
+        }
+        let (code, _, err) = kern(bin, &args);
+        if code != 0 {
+            return error(500, &kern_error(&err));
+        }
     }
     meta_write(
         "networks",
         name,
         &Meta {
-            labels: labels_of_value(body.get("Labels")),
+            labels,
             created: now(),
             internal,
         },
@@ -306,6 +341,15 @@ fn network_remove(bin: &Path, id: &str) -> Response {
             403,
             &format!("{name} is a pre-defined network and cannot be removed"),
         );
+    }
+    if crate::projnet::get(&name).is_some() {
+        return match crate::projnet::remove(bin, &name) {
+            Ok(()) => {
+                meta_forget("networks", &name);
+                no_content()
+            }
+            Err((status, why)) => error(status, &why),
+        };
     }
     let busy = kern_boxes(bin).iter().any(|(_, v)| {
         v.get("pod").and_then(Value::as_str) == Some(name.as_str()) && crate::api::box_running(v)
@@ -369,6 +413,27 @@ fn network_connect(bin: &Path, id: &str, req: &Request) -> Response {
         return error(404, &format!("No such container: {container}"));
     };
     let aliases = endpoint_aliases(body.get("EndpointConfig"), &name);
+    // A COMPOSE PROJECT'S NETWORK, onto a container created and not started: another bridge of the
+    // project's pod, its address taken now so the peers created after know it (see `projnet`). This
+    // is how `docker compose` puts a service on its second network (API 1.43: one network at the
+    // create, the rest connected before the start).
+    if let Some(mut c) = created_get(&name).filter(|_| crate::projnet::get(&net).is_some()) {
+        let on = crate::api::argv_networks(&c.argv);
+        if let Err(why) = crate::projnet::attach(bin, &net, &name, &aliases, &on) {
+            return error(400, &why);
+        }
+        if !on.contains(&net) {
+            let at = c
+                .argv
+                .iter()
+                .position(|a| a == "--image")
+                .unwrap_or(c.argv.len());
+            c.argv
+                .splice(at..at, ["--network".to_string(), net.clone()]);
+        }
+        created_put(&name, c);
+        return json_response(200, String::new());
+    }
     if let Some(mut c) = created_get(&name) {
         match argv_network(&c.argv) {
             Some(n) if n == net => {}
@@ -376,9 +441,11 @@ fn network_connect(bin: &Path, id: &str, req: &Request) -> Response {
                 return error(
                     400,
                     &format!(
-                        "container {name} is on network {other}: kern's Docker API puts a \
-                         container on one network (a kern box is in one pod). For a compose file \
-                         whose services share several networks, `kern compose -f <file> up` runs it"
+                        "container {name} is on network {other}: through kern's Docker API a \
+                         container joins several networks only when they are one compose \
+                         project's (a kern box is in one pod, and a project's networks are \
+                         bridges of one pod). Put both networks in one compose file, or run it \
+                         with `kern compose -f <file> up`"
                     ),
                 )
             }
@@ -432,6 +499,28 @@ fn network_disconnect(bin: &Path, id: &str, req: &Request) -> Response {
     let Some(name) = resolve(bin, container) else {
         return error(404, &format!("No such container: {container}"));
     };
+    if let Some(mut c) = created_get(&name).filter(|_| crate::projnet::get(&net).is_some()) {
+        crate::projnet::detach(bin, &net, &name);
+        let mut out: Vec<String> = Vec::with_capacity(c.argv.len());
+        let mut it = c.argv.into_iter();
+        while let Some(a) = it.next() {
+            if a == "--network" {
+                match it.next() {
+                    Some(n) if n == net => continue,
+                    Some(n) => {
+                        out.push(a);
+                        out.push(n);
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            out.push(a);
+        }
+        c.argv = out;
+        created_put(&name, c);
+        return json_response(200, String::new());
+    }
     if let Some(mut c) = created_get(&name) {
         if argv_network(&c.argv) == Some(net.as_str()) {
             let mut out: Vec<String> = Vec::with_capacity(c.argv.len());
@@ -461,6 +550,37 @@ fn network_disconnect(bin: &Path, id: &str, req: &Request) -> Response {
         400,
         &format!("container {name} is running on {net}: kern does not take a running box off its network"),
     )
+}
+
+/// The `NetworkSettings.Networks` of `container`: every compose project network it is on, each with
+/// its address on that network's bridge (`10.89.<bridge>.0/24`, the bridge `.1`), or else the one
+/// `net` with its `aliases`, as [`networks_json`] says it.
+pub(crate) fn container_networks_json(
+    container: &str,
+    net: Option<&str>,
+    aliases: &[String],
+) -> String {
+    let projnets = crate::projnet::networks_of(container);
+    if projnets.is_empty() {
+        return networks_json(net, aliases);
+    }
+    let rows: Vec<String> = projnets
+        .iter()
+        .map(|(n, ip, als)| {
+            let a: Vec<String> = als.iter().map(|x| json_str(x)).collect();
+            let o = ip.octets();
+            format!(
+                "{}:{{\"Aliases\":[{a}],\"DNSNames\":[{a}],\"NetworkID\":{},\"EndpointID\":\"\",\"Gateway\":\"{}.{}.{}.1\",\"IPAddress\":\"{ip}\",\"IPPrefixLen\":24,\"MacAddress\":\"\"}}",
+                json_str(n),
+                json_str(&network_id(n)),
+                o[0],
+                o[1],
+                o[2],
+                a = a.join(","),
+            )
+        })
+        .collect();
+    format!("{{{}}}", rows.join(","))
 }
 
 /// The `NetworkSettings.Networks` of a container on `net`, as `inspect` reports it.

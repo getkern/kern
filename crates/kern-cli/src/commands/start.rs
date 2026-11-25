@@ -8390,59 +8390,129 @@ pub(crate) fn stack_network_join(
     pod: Option<String>,
     mut pod_bridges: Vec<kern_isolation::BridgeAttach>,
     mut add_hosts: Vec<(String, String)>,
+    own: &str,
 ) -> Result<StackJoin, Error> {
-    let Some(name) = pod.as_deref().filter(|_| pod_bridges.is_empty()) else {
+    let Some(spec) = pod.as_deref().filter(|_| pod_bridges.is_empty()) else {
         return Ok((pod, pod_bridges, add_hosts, false));
     };
-    // A name that cannot name a pod is left to the join, which refuses it as a name: nothing here
-    // turns it into a path first.
-    if crate::pod::validate_join_name(name).is_err() {
-        return Ok((pod, pod_bridges, add_hosts, false));
-    }
-    let (stack, network): (String, Option<String>) = if crate::pod::holder_pid(name).is_some() {
-        (name.to_string(), None)
-    } else {
-        match name.rmatch_indices('_').find_map(|(i, _)| {
-            let p = name.get(..i)?;
-            let n = name.get(i + 1..)?;
-            (!p.is_empty()
-                && !n.is_empty()
-                && crate::pod::validate_join_name(p).is_ok()
-                && crate::pod::holder_pid(p).is_some())
-            .then(|| (p.to_string(), n.to_string()))
-        }) {
-            Some((p, n)) => (p, Some(n)),
-            None => return Ok((pod, pod_bridges, add_hosts, false)),
+    let names: Vec<&str> = spec.split(',').filter(|n| !n.is_empty()).collect();
+    // ONE NAME: a pod, or one network of a stack, as before. SEVERAL: networks of ONE stack on a
+    // bridge, each its own `--pod-bridge`, as a container on several Docker networks; a box is in one
+    // pod, so anything else is refused by name rather than read as the first.
+    let resolved: Vec<Option<(String, Option<String>)>> =
+        names.iter().map(|n| stack_of_network(n)).collect();
+    if names.len() > 1 {
+        let stacks: Vec<&str> = resolved
+            .iter()
+            .filter_map(|r| {
+                r.as_ref()
+                    .filter(|(_, n)| n.is_some())
+                    .map(|(s, _)| s.as_str())
+            })
+            .collect();
+        if stacks.len() != names.len() || stacks.iter().any(|s| *s != stacks[0]) {
+            return Err(Error::Sandbox(format!(
+                "a box is in one pod: {} are not networks of one compose stack on a bridge \
+                 (several `--network` name networks of the same stack, as <project>_<network>)",
+                names.join(", ")
+            )));
         }
+    }
+    let Some(Some((stack, _))) = resolved.first().cloned() else {
+        return Ok((pod, pod_bridges, add_hosts, false));
     };
     let nets = crate::pod::bridge_networks(&stack);
     if nets.is_empty() {
+        if names.len() > 1 {
+            return Err(Error::Sandbox(format!(
+                "stack '{stack}' shares one namespace and has no networks to choose between"
+            )));
+        }
         // One namespace for the whole stack: the pod IS every network of it.
         return Ok((Some(stack), pod_bridges, add_hosts, false));
     }
-    let chosen = match &network {
-        Some(n) => nets.iter().find(|x| &x.network == n).ok_or_else(|| {
-            Error::Sandbox(format!(
-                "stack '{stack}' has no network '{n}'; its networks are: {}",
-                nets.iter()
-                    .map(|x| format!("{stack}_{}", x.network))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        })?,
-        None => nets
-            .iter()
-            .find(|x| x.network == "default")
-            .or(nets.first())
-            .ok_or_else(|| Error::Sandbox(format!("stack '{stack}' records no network")))?,
-    };
-    let Some((first, _)) = chosen.hosts.first() else {
+    let mut nat = false;
+    for r in &resolved {
+        let network = r.as_ref().and_then(|(_, n)| n.clone());
+        let chosen = match &network {
+            Some(n) => nets.iter().find(|x| &x.network == n).ok_or_else(|| {
+                Error::Sandbox(format!(
+                    "stack '{stack}' has no network '{n}'; its networks are: {}",
+                    nets.iter()
+                        .map(|x| format!("{stack}_{}", x.network))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?,
+            None => nets
+                .iter()
+                .find(|x| x.network == "default")
+                .or(nets.first())
+                .ok_or_else(|| Error::Sandbox(format!("stack '{stack}' records no network")))?,
+        };
+        let ip = bridge_address_for(&stack, chosen, own)?;
+        pod_bridges.push(kern_isolation::BridgeAttach {
+            ip,
+            prefix: chosen.prefix,
+            bridge: chosen.bridge,
+        });
+        for (ip, n) in &chosen.hosts {
+            if n != own && !add_hosts.iter().any(|(h, _)| h == n) {
+                add_hosts.push((n.clone(), ip.to_string()));
+            }
+        }
+        // EGRESS AS ITS SERVICES HAVE IT. Every service on a bridge gets its own NAT (the holder's
+        // namespace is no member's), so a box joining the network later needs its own too. MEASURED
+        // before this: `kern box --network kcu_default` reached the stack's services by name and had
+        // no default route and no `resolv.conf`, where Docker's one-off on the same network reaches
+        // the internet. A network the file marks `internal: true` gets none, as its services got
+        // none; on several networks, one that is not internal is the way out, as under Docker.
+        nat |= !chosen.internal;
+    }
+    Ok((Some(stack), pod_bridges, add_hosts, nat))
+}
+
+/// The stack a `--network` value names and the network in it: the pod itself (`None`, its default
+/// network), or `<project>_<network>` of a running stack. `None` for anything else.
+fn stack_of_network(name: &str) -> Option<(String, Option<String>)> {
+    // A name that cannot name a pod is left to the join, which refuses it as a name: nothing here
+    // turns it into a path first.
+    if crate::pod::validate_join_name(name).is_err() {
+        return None;
+    }
+    if crate::pod::holder_pid(name).is_some() {
+        return Some((name.to_string(), None));
+    }
+    name.rmatch_indices('_').find_map(|(i, _)| {
+        let p = name.get(..i)?;
+        let n = name.get(i + 1..)?;
+        (!p.is_empty()
+            && !n.is_empty()
+            && crate::pod::validate_join_name(p).is_ok()
+            && crate::pod::holder_pid(p).is_some())
+        .then(|| (p.to_string(), Some(n.to_string())))
+    })
+}
+
+/// The address a box joining `net` of `stack` takes on its bridge: the one the network's record
+/// already gives its name (a launcher that planned every member's address, as kern's Docker API does
+/// for a compose project, so each member knew its peers at its start), else the next free one,
+/// reserved against a concurrent one-off.
+fn bridge_address_for(
+    stack: &str,
+    net: &crate::pod::BridgeNetwork,
+    own: &str,
+) -> Result<std::net::Ipv4Addr, Error> {
+    if let Some((ip, _)) = net.hosts.iter().find(|(_, n)| n == own) {
+        return Ok(*ip);
+    }
+    let Some((first, _)) = net.hosts.first() else {
         return Err(Error::Sandbox(format!(
             "network '{}' of stack '{stack}' has no member, so its addresses are not known",
-            chosen.network
+            net.network
         )));
     };
-    let prefix = u32::from(chosen.prefix.min(30));
+    let prefix = u32::from(net.prefix.min(30));
     let mask: u32 = if prefix == 0 {
         0
     } else {
@@ -8451,40 +8521,23 @@ pub(crate) fn stack_network_join(
     let base = u32::from(*first) & mask;
     let broadcast = base | !mask;
     let mut used: std::collections::HashSet<u32> =
-        chosen.hosts.iter().map(|(ip, _)| u32::from(*ip)).collect();
+        net.hosts.iter().map(|(ip, _)| u32::from(*ip)).collect();
     for i in crate::registry::list() {
         for a in crate::registry::recorded_bridge_addrs(&i.bridges) {
             used.insert(u32::from(a));
         }
     }
     // `.1` is the bridge's own address, the members' gateway.
-    let free = (base.saturating_add(2)..broadcast)
+    (base.saturating_add(2)..broadcast)
         .filter(|a| !used.contains(a))
         .map(std::net::Ipv4Addr::from)
-        .find(|ip| crate::pod::lease_bridge_addr(&stack, chosen.bridge, *ip))
+        .find(|ip| crate::pod::lease_bridge_addr(stack, net.bridge, *ip))
         .ok_or_else(|| {
             Error::Sandbox(format!(
                 "network '{}' of stack '{stack}' has no free address left",
-                chosen.network
+                net.network
             ))
-        })?;
-    pod_bridges.push(kern_isolation::BridgeAttach {
-        ip: free,
-        prefix: chosen.prefix,
-        bridge: chosen.bridge,
-    });
-    for (ip, n) in &chosen.hosts {
-        if !add_hosts.iter().any(|(h, _)| h == n) {
-            add_hosts.push((n.clone(), ip.to_string()));
-        }
-    }
-    // EGRESS AS ITS SERVICES HAVE IT. Every service on a bridge gets its own NAT (the holder's
-    // namespace is no member's), so a box joining the network later needs its own too. MEASURED
-    // before this: `kern box --network kcu_default` reached the stack's services by name and had no
-    // default route and no `resolv.conf`, where Docker's one-off on the same network reaches the
-    // internet. A network the file marks `internal: true` gets none, as its services got none.
-    let nat = !chosen.internal;
-    Ok((Some(stack), pod_bridges, add_hosts, nat))
+        })
 }
 
 #[cfg(test)]

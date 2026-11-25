@@ -1001,12 +1001,12 @@ fn create_argv_gated(name: &str, body: &Value, gpu_allowed: bool) -> Result<Crea
                 .and_then(|n| n.get("EndpointsConfig"))
                 .and_then(Value::as_object)
                 .unwrap_or_default();
-            if let Some((other, _)) = endpoints.iter().find(|(k, _)| k != net) {
-                return Err(format!(
-                    "NetworkingConfig names {other:?} beside {net:?}: kern's Docker API puts a \
-                     container on one network (a kern box is in one pod). For a compose file whose \
-                     services share several networks, `kern compose -f <file> up` runs it"
-                ));
+            // Every other network the create names goes on as well; whether they can all be one
+            // box's (the networks of one compose project) is decided where the networks are known,
+            // `projnet_argv`, which refuses the rest by name.
+            for (other, _) in endpoints.iter().filter(|(k, _)| k != net) {
+                argv.push("--network".into());
+                argv.push(other.clone());
             }
             let ep = endpoints.iter().find(|(k, _)| k == net).map(|(_, v)| v);
             for a in crate::netvol::endpoint_aliases(ep, name) {
@@ -1400,7 +1400,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
     let id = id_of(name);
     if let Some(c) = created_get(name) {
         let (net, aliases) = crate::netvol::created_network(&c.argv);
-        let nets = crate::netvol::networks_json(net.as_deref(), &aliases);
+        let nets = crate::netvol::container_networks_json(name, net.as_deref(), &aliases);
         let policy = restart_policy_json(&c.argv);
         return json_response(
             200,
@@ -1464,7 +1464,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
     let oom_killed = v.get("oom_killed").and_then(Value::as_bool) == Some(true);
     // The pod the box is in is its network; the aliases are the ones its create asked for.
     let pod = v.get("pod").and_then(Value::as_str).unwrap_or_default();
-    let nets = crate::netvol::networks_json(Some(pod), &net_aliases(name));
+    let nets = crate::netvol::container_networks_json(name, Some(pod), &net_aliases(name));
     let exit_code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
     // Docker's `RestartCount`, which kern records per run (0 for a box that never restarted).
     let restart_count = v.get("restart_count").and_then(Value::as_i64).unwrap_or(0);
@@ -1710,7 +1710,7 @@ fn list(bin: &Path, req: &Request) -> Response {
             ports.join(","),
             labels_json(&labels),
             json_str(if pod.is_empty() { "default" } else { pod }),
-            crate::netvol::networks_json(Some(pod), &net_aliases(&name))
+            crate::netvol::container_networks_json(&name, Some(pod), &net_aliases(&name))
         ));
     }
     if all {
@@ -1731,7 +1731,7 @@ fn list(bin: &Path, req: &Request) -> Response {
                 c.created,
                 labels_json(&c.labels),
                 json_str(net.as_deref().unwrap_or("default")),
-                crate::netvol::networks_json(net.as_deref(), &aliases)
+                crate::netvol::container_networks_json(name, net.as_deref(), &aliases)
             ));
         }
     }
@@ -3541,7 +3541,66 @@ fn session_ended(bin: &Path, req: &Request) -> Response {
 
 /// Remove `name` whatever its state: created, running (stopped at once, when `running`) or ended;
 /// then Docker's `destroy`.
+/// The networks a create's argv names (`--network`, past the builtins), in order.
+pub(crate) fn argv_networks(argv: &[String]) -> Vec<String> {
+    argv.windows(2)
+        .filter(|w| w[0] == "--network")
+        .map(|w| w[1].clone())
+        .filter(|n| !matches!(n.as_str(), "host" | "none") && !n.starts_with("container:"))
+        .collect()
+}
+
+/// A create's argv with its networks made one box's. On networks of a compose project (see
+/// `projnet`) each is attached with the aliases its endpoint asked for, taking an address on that
+/// network's bridge, and the aliases leave the argv: the project's records carry them. On one
+/// network of any other kind nothing changes. Several networks that are not one project's are
+/// refused by name, a box being in one pod.
+fn projnet_argv(
+    bin: &Path,
+    name: &str,
+    argv: Vec<String>,
+    body: &Value,
+) -> Result<Vec<String>, String> {
+    let nets = argv_networks(&argv);
+    let Some(first) = nets.first() else {
+        return Ok(argv);
+    };
+    if crate::projnet::get(first).is_none() {
+        if let Some(other) = nets.get(1) {
+            return Err(format!(
+                "NetworkingConfig names {other:?} beside {first:?}: kern's Docker API puts a \
+                 container on several networks when they are one compose project's, and a box \
+                 is in one pod otherwise. For such a file, `kern compose -f <file> up` runs it"
+            ));
+        }
+        return Ok(argv);
+    }
+    let endpoints = body
+        .get("NetworkingConfig")
+        .and_then(|n| n.get("EndpointsConfig"))
+        .and_then(Value::as_object)
+        .unwrap_or_default();
+    for (i, net) in nets.iter().enumerate() {
+        let ep = endpoints.iter().find(|(k, _)| k == net).map(|(_, v)| v);
+        let aliases = crate::netvol::endpoint_aliases(ep, name);
+        crate::projnet::attach(bin, net, name, &aliases, &nets[..i])?.ok_or_else(|| {
+            format!("network {net} is not a network of the same compose project as {first}")
+        })?;
+    }
+    let mut out = Vec::with_capacity(argv.len());
+    let mut it = argv.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--network-alias" {
+            let _ = it.next();
+            continue;
+        }
+        out.push(a);
+    }
+    Ok(out)
+}
+
 fn remove_container(bin: &Path, name: &str, running: bool) {
+    crate::projnet::detach_everywhere(bin, name);
     session_forget(name);
     stage_forget(name);
     net_forget(name);
@@ -5156,7 +5215,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                         && !n.starts_with("container:")
                 })
             {
-                if !crate::netvol::network_exists(bin, net) {
+                if !crate::netvol::network_usable(bin, net) {
                     return error(404, &format!("network {net} not found"));
                 }
             }
@@ -5178,7 +5237,10 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                     None => c,
                 })
                 .map(|c| with_platform(c, platform.as_deref()))
-            {
+                .and_then(|mut c| {
+                    c.argv = projnet_argv(bin, &name, c.argv, &body)?;
+                    Ok(c)
+                }) {
                 Ok(c) => {
                     net_remember(&name, &c.argv);
                     let session = in_session(&c.labels);
@@ -5946,7 +6008,8 @@ mod tests {
             "box n -d --log-streams -p :6379/tcp -v /data:/d:ro --cpus 0.500 --rm --network host --entrypoint /bin/sh --image x -- -c echo hi"
         );
         // A network by name is a kern pod, joined with the endpoint's aliases (compose's service
-        // name); a second network on one container is refused by name.
+        // name); a second network is a second `--network`, joined or refused at the create by
+        // `projnet_argv`.
         let b = body(
             r#"{"Image":"x","HostConfig":{"NetworkMode":"shop_default"},"NetworkingConfig":{"EndpointsConfig":{"shop_default":{"Aliases":["web","n"]}}}}"#,
         );
@@ -5960,7 +6023,36 @@ mod tests {
         let two = body(
             r#"{"Image":"x","HostConfig":{"NetworkMode":"a"},"NetworkingConfig":{"EndpointsConfig":{"a":{},"b":{}}}}"#,
         );
-        assert!(create_argv("n", &two).is_err_and(|e| e.contains("one network")));
+        let a = create_argv("n", &two)
+            .map(|c| c.argv.join(" "))
+            .unwrap_or_default();
+        assert!(
+            a.contains("--network a") && a.contains("--network b"),
+            "{a}"
+        );
+        // Two networks that are not one compose project's are refused by name, before any kern
+        // call: a box is in one pod.
+        let argv: Vec<String> = [
+            "--network",
+            "kern-test-solo-a",
+            "--network",
+            "kern-test-solo-b",
+        ]
+        .map(String::from)
+        .to_vec();
+        let refused = projnet_argv(Path::new("/nonexistent/kern"), "n", argv, &two);
+        assert!(
+            refused.as_ref().is_err_and(
+                |e| e.contains("\"kern-test-solo-b\"") && e.contains("one compose project's")
+            ),
+            "{refused:?}"
+        );
+        let one: Vec<String> = ["--network", "kern-test-solo-a"].map(String::from).to_vec();
+        assert_eq!(
+            projnet_argv(Path::new("/nonexistent/kern"), "n", one.clone(), &two).ok(),
+            Some(one),
+            "one network of any other kind passes unchanged"
+        );
     }
 
     #[test]
