@@ -852,6 +852,13 @@ fn frame_of(kind: u8, data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The `tail` of a logs request as a line count, `None` for the whole log. Docker's daemon reads
+/// anything that is not a whole number (`all`, empty) and any negative number as the whole log;
+/// Testcontainers for Node sends `tail=-1`, which `kern logs --tail` refuses.
+fn tail_lines(tail: Option<&str>) -> Option<u64> {
+    tail.and_then(|t| t.parse::<u64>().ok())
+}
+
 /// `GET /containers/{id}/logs`: kern's log of the box, in Docker's multiplexed frames, which
 /// `kern logs --frames` writes itself: stdout and stderr apart for a box this server created (its
 /// `--log-streams`), all stdout for one started otherwise. `stdout=0`/`stderr=0` drop a stream;
@@ -866,7 +873,7 @@ fn logs(bin: &Path, name: &str, req: &Request) -> Response {
     if req.flag("follow") {
         args.push("-f".into());
     }
-    if let Some(t) = req.param("tail").filter(|t| *t != "all" && !t.is_empty()) {
+    if let Some(t) = tail_lines(req.param("tail")) {
         args.push("--tail".into());
         args.push(t.to_string());
     }
@@ -2139,6 +2146,19 @@ mod tests {
             self.data = &self.data[n..];
             Ok(n)
         }
+    }
+
+    /// `tail` as Docker's daemon reads it: a whole number is a line count, anything else (the
+    /// `-1` Testcontainers for Node sends, `all`, empty, junk) is the whole log, never a
+    /// `--tail` that `kern logs` refuses and that ends the stream empty.
+    #[test]
+    fn tail_negative_or_not_a_number_is_the_whole_log() {
+        assert_eq!(tail_lines(Some("10")), Some(10));
+        assert_eq!(tail_lines(Some("0")), Some(0));
+        for t in ["-1", "-20", "all", "", "x"] {
+            assert_eq!(tail_lines(Some(t)), None, "tail={t:?}");
+        }
+        assert_eq!(tail_lines(None), None);
     }
 
     /// The frames `kern logs --frames` writes pass through whole, and only the streams asked for:
