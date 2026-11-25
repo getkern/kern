@@ -104,6 +104,13 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**A build's `ARG` and `ENV` are scoped to their stage, as Docker scopes them.** A `--build-arg` for an
+`ARG` declared in one stage was expanded in a later stage that never declared it, so a value passed
+for one stage reached another; and an `ARG` before the first `FROM` was used inside every stage. Now
+a global `ARG` reaches the `FROM` lines, and a stage only through `ARG NAME`; a stage's `ARG` and
+`ENV` end with it, and a stage built `FROM` an earlier one inherits its `ENV`. A Dockerfile that used
+a global `ARG` in a stage without naming it there built differently from Docker; name it there.
+
 **`kern build -` reads stdin, as `docker build -` does.** A Dockerfile on stdin builds with an empty
 context, a tar (plain or gzip) on stdin is the context, and `-f -` takes the Dockerfile from stdin for
 a context on disk; both at once is refused. It answered "unknown build flag '-'".

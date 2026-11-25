@@ -555,6 +555,15 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
     for (k, v) in automatic_platform_args() {
         vars.insert(k.to_string(), build_args.get(k).cloned().unwrap_or(v));
     }
+    // SCOPES, AS DOCKER HAS THEM. An `ARG` before the first FROM is GLOBAL: it reaches the FROM
+    // lines, and the inside of a stage only through an `ARG NAME` there. An `ARG` or `ENV` in a stage
+    // ends with it; a stage built FROM an earlier one inherits that one's ENV. MEASURED before: one
+    // table for the whole file, so `--build-arg V=secret` with `ARG V` in stage one reached
+    // `RUN echo $V` in stage two, which never declared it (Docker gives an empty value there).
+    let auto_args = vars.clone();
+    let mut globals: HashMap<String, String> = HashMap::new();
+    let mut stage_envs: Vec<HashMap<String, String>> = Vec::new();
+    let mut cur_env: HashMap<String, String> = HashMap::new();
     let mut saw_from = false;
     // The shell used to wrap shell-form RUN/CMD/ENTRYPOINT (`/bin/sh -c <script>`). `SHELL [...]`
     // replaces it for all subsequent instructions (Docker semantics).
@@ -584,7 +593,10 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
             "FROM" => {
                 // Substitute FIRST (a `FROM $BASE AS build` must expand `$BASE`), THEN split off a
                 // trailing `AS <name>` so the AS keyword/name can't come from a variable's contents.
-                let expanded = subst(rest, &vars);
+                // A FROM sees the global ARGs (and the automatic ones), never a stage's.
+                let mut from_vars = auto_args.clone();
+                from_vars.extend(globals.clone());
+                let expanded = subst(rest, &from_vars);
                 let mut toks = expanded.split_whitespace().peekable();
                 // Drop BuildKit `FROM` flags (e.g. `--platform=$BUILDPLATFORM`) - kern builds for the
                 // host platform, so a cross-platform hint is accepted and ignored, not a parse error.
@@ -617,6 +629,24 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     }
                     _ => return err("FROM takes '<image>' or '<image> AS <name>'"),
                 };
+                if saw_from {
+                    stage_envs.push(std::mem::take(&mut cur_env));
+                }
+                // A stage FROM an earlier stage (by name or index) starts with that stage's ENV.
+                let parent = stage_names
+                    .iter()
+                    .position(|n| n.as_deref() == Some(image.to_ascii_lowercase().as_str()))
+                    .or_else(|| {
+                        image
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|i| *i < stage_envs.len())
+                    });
+                cur_env = parent
+                    .and_then(|i| stage_envs.get(i).cloned())
+                    .unwrap_or_default();
+                vars = auto_args.clone();
+                vars.extend(cur_env.clone());
                 saw_from = true;
                 stage_names.push(as_name.clone());
                 out.push(Instr::From { image, as_name });
@@ -639,10 +669,18 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     if k.is_empty() {
                         return err("ARG needs a name");
                     }
-                    if let Some(v) = build_args.get(&k) {
-                        vars.insert(k, v.clone());
-                    } else if let Some(d) = def {
-                        vars.insert(k, d);
+                    // A --build-arg wins; else the default written here; else, for a bare `ARG K` in
+                    // a stage, the global ARG's value (how Docker brings one into a stage).
+                    let value = build_args
+                        .get(&k)
+                        .cloned()
+                        .or(def)
+                        .or_else(|| saw_from.then(|| globals.get(&k).cloned()).flatten());
+                    if let Some(v) = value {
+                        if !saw_from {
+                            globals.insert(k.clone(), v.clone());
+                        }
+                        vars.insert(k, v);
                     }
                 }
             }
@@ -661,8 +699,10 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     // `/FFF:/FFF:/usr/local/sbin:...` while the image itself was correct.
                     if v.contains('$') {
                         vars.remove(&k);
+                        cur_env.remove(&k);
                     } else {
                         vars.insert(k.clone(), v.clone());
+                        cur_env.insert(k.clone(), v.clone());
                     }
                     out.push(Instr::Env(k, v));
                 }
@@ -2092,13 +2132,54 @@ mod tests {
     fn arg_default_and_build_arg_override() {
         let mut ba = HashMap::new();
         ba.insert("VER".to_string(), "9".to_string());
-        let df = "ARG VER=1\nARG NAME=box\nFROM alpine\nRUN echo $VER-$NAME\n";
+        // GLOBAL ARGs reach a stage only when the stage names them again, as Docker scopes them;
+        // there, --build-arg VER=9 wins over the default and NAME takes its global default.
+        let df = "ARG VER=1\nARG NAME=box\nFROM alpine\nARG VER\nARG NAME\nRUN echo $VER-$NAME\n";
         let got = parse(df, &ba).unwrap();
-        // --build-arg VER=9 wins over the ARG default; NAME uses its default.
         assert_eq!(
             got[1],
             Instr::Run(vec!["/bin/sh".into(), "-c".into(), "echo 9-box".into()])
         );
+        // Not named again: left to the RUN's shell, where Docker has it unset.
+        let df = "ARG VER=1\nFROM alpine\nRUN echo $VER\n";
+        assert_eq!(
+            parse(df, &ba).unwrap()[1],
+            Instr::Run(vec!["/bin/sh".into(), "-c".into(), "echo $VER".into()])
+        );
+    }
+
+    /// An ARG or ENV of one stage does not reach the next, unless it is built FROM that stage (ENV
+    /// then carries); a FROM sees only the global ARGs. MEASURED before: `--build-arg V=secret`
+    /// declared in stage one was expanded in stage two, which never declared it.
+    #[test]
+    fn arg_and_env_are_scoped_to_their_stage() {
+        let mut ba = HashMap::new();
+        ba.insert("V".to_string(), "secret".to_string());
+        let df = "FROM alpine AS a\nARG V\nENV E=one\nRUN echo $V $E\nFROM alpine\nRUN echo X${V}Y $E\nFROM a\nRUN echo $E $V\n";
+        let runs: Vec<Instr> = parse(df, &ba)
+            .unwrap()
+            .into_iter()
+            .filter(|i| matches!(i, Instr::Run(_)))
+            .collect();
+        let sh = |c: &str| Instr::Run(vec!["/bin/sh".into(), "-c".into(), c.into()]);
+        assert_eq!(runs[0], sh("echo secret one"));
+        assert_eq!(runs[1], sh("echo X${V}Y $E"), "stage two declared neither");
+        assert_eq!(
+            runs[2],
+            sh("echo one $V"),
+            "FROM a inherits its ENV, not its ARG"
+        );
+        // A FROM uses the global ARGs only.
+        let df = "ARG BASE=alpine\nFROM ${BASE}\nARG BASE=other\nFROM ${BASE} AS b\n";
+        let froms: Vec<String> = parse(df, &HashMap::new())
+            .unwrap()
+            .into_iter()
+            .filter_map(|i| match i {
+                Instr::From { image, .. } => Some(image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(froms, ["alpine", "alpine"]);
     }
 
     #[test]
