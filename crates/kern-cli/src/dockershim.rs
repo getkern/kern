@@ -1461,27 +1461,58 @@ fn disable() -> Result<(), Error> {
 }
 
 /// The `status` line of the socket.
-pub(crate) fn socket_status() -> String {
+/// The Docker API socket as systemd has it, read once for every surface that says it: `kern compat
+/// docker status`, `kern info` and `kern top`. Off costs a `stat`; on, two `systemctl is-active`.
+pub(crate) struct SocketState {
+    pub(crate) enabled: bool,
+    pub(crate) listening: bool,
+    /// The server behind it is up (it exits after a minute without a client).
+    pub(crate) serving: bool,
+    pub(crate) path: String,
+}
+
+pub(crate) fn socket_state() -> SocketState {
     let enabled = unit_dir().is_ok_and(|d| is_ours(&d.join(SOCKET_UNIT)));
     let path = socket_path()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    if !enabled {
+    let on = |unit| enabled && systemctl_user(&["is-active", "--quiet", unit]).0;
+    SocketState {
+        enabled,
+        listening: on(SOCKET_UNIT),
+        serving: on(SERVICE_UNIT),
+        path,
+    }
+}
+
+impl SocketState {
+    /// A few words for a table cell: `kern top`'s Overview.
+    pub(crate) fn short(&self) -> String {
+        match (self.enabled, self.listening) {
+            (false, _) => "off (`kern compat docker enable`)".to_string(),
+            (true, true) => format!("listening on {}", self.path),
+            (true, false) => "enabled, NOT listening".to_string(),
+        }
+    }
+}
+
+pub(crate) fn socket_status() -> String {
+    let st = socket_state();
+    let path = st.path.as_str();
+    if !st.enabled {
         return format!(
             "Docker API socket: off (`kern compat docker enable`, or `kern compat docker serve` in the foreground){}",
             if path.is_empty() { String::new() } else { format!("; it would be {path}") }
         );
     }
-    let listening = systemctl_user(&["is-active", "--quiet", SOCKET_UNIT]).0;
-    let serving = systemctl_user(&["is-active", "--quiet", SERVICE_UNIT]).0;
     format!(
         "Docker API socket: {} on {path}{}",
-        if listening {
+        if st.listening {
             "enabled, listening"
         } else {
             "enabled, NOT listening (systemctl --user status kern-compat-docker.socket)"
         },
-        if serving {
+        if st.serving {
             ", the server is running (it exits after a minute without a client)"
         } else {
             ", the server starts at the next connection"

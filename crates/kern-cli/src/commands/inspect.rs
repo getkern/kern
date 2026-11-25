@@ -1977,11 +1977,8 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             num(registry::box_deadline(&b.name, b.pid)
                 .filter(|d| d.at_unix_ms > 0)
                 .map(|d| d.at_unix_ms / 1000)),
-            // Docker's `RestartCount`: the restarts so far, from the supervisor's attempt record, or
-            // the unit's count for a `--restart always` box, which systemd runs again each time.
-            registry::box_attempt(&b.name, b.pid)
-                .map_or(0, registry::Attempt::restarts)
-                .max(crate::commands::managed_unit_runs(&b.name).map_or(0, |(_, n)| n)),
+            // Docker's `RestartCount`.
+            box_restarts(&b, None),
             box_oom_killed(&b),
         );
     } else {
@@ -2710,10 +2707,27 @@ static STOP_NARRATES_TO_STDERR: std::sync::atomic::AtomicBool =
 /// --json`, read from the box's OWN cgroup (its init's leaf); not `oom_kill_dir_for_pid`, which
 /// climbs to the ancestor every box shares and would charge one box's OOM to all of them.
 fn box_oom_killed(b: &registry::Instance) -> bool {
+    box_oom_kills(b) > 0
+}
+
+/// How many processes the OOM killer has ended in this running box, the count behind
+/// [`box_oom_killed`] and `kern top`'s `oom:N`, so the two cannot disagree. 0 when unreadable.
+pub(crate) fn box_oom_kills(b: &registry::Instance) -> u64 {
     b.live_pid1()
         .and_then(kern_isolation::box_cgroup_dir)
         .and_then(|d| kern_isolation::oom_kill_count_at(&d))
-        .is_some_and(|n| n > 0)
+        .unwrap_or(0)
+}
+
+/// Docker's `RestartCount` of a running box: the supervisor's attempt record, or the unit's count for
+/// a `--restart always` box, which systemd runs again each time. `unit` is that count when the caller
+/// already has it (`kern top` caches it, a `systemctl show` costs about 4 ms); `None` asks systemd.
+pub(crate) fn box_restarts(b: &registry::Instance, unit: Option<u32>) -> u32 {
+    let unit =
+        unit.unwrap_or_else(|| crate::commands::managed_unit_runs(&b.name).map_or(0, |(_, n)| n));
+    registry::box_attempt(&b.name, b.pid)
+        .map_or(0, registry::Attempt::restarts)
+        .max(unit)
 }
 
 /// The "stopped" line, on stdout unless [`STOP_NARRATES_TO_STDERR`] says otherwise.

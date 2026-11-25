@@ -780,19 +780,25 @@ pub(crate) fn status_line() -> String {
     if paths().is_none() {
         return "off (no home directory)".to_string();
     }
-    let Some(s) = summary() else {
-        return "off (`kern proxy trust` turns it on)".to_string();
-    };
+    match summary() {
+        Some(s) => summary_line(&s),
+        None => "off (`kern proxy trust` turns it on)".to_string(),
+    }
+}
+
+/// The sentence for a trusted authority. PURE, so a test reads it: it said "on on port 8443" once,
+/// both halves adding the word.
+fn summary_line(s: &Summary) -> String {
     let port = s
         .port
         .map(|p| format!("on port {p}"))
-        .unwrap_or_else(|| "(the router is not running: no box publishes a port)".to_string());
+        .unwrap_or_else(|| "on (the router is not running: no box publishes a port)".to_string());
     let kept = if s.stores > 0 {
         format!(", trusted in {} store(s)", s.stores)
     } else {
         String::new()
     };
-    format!("on {port}; local CA {}{kept}", s.cert.display())
+    format!("{port}; local CA {}{kept}", s.cert.display())
 }
 
 /// `kern __local-ca` (hidden): the authority's name and certificate, for `kern.exe`, which adds it to
@@ -814,6 +820,26 @@ pub(crate) fn print_authority() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One "on", with the router up and with it down.
+    #[test]
+    fn the_status_line_says_on_once() {
+        let mut s = Summary {
+            cert: std::path::PathBuf::from("/c/ca.pem"),
+            stores: 2,
+            port: Some(8443),
+        };
+        assert_eq!(
+            summary_line(&s),
+            "on port 8443; local CA /c/ca.pem, trusted in 2 store(s)"
+        );
+        s.port = None;
+        s.stores = 0;
+        assert_eq!(
+            summary_line(&s),
+            "on (the router is not running: no box publishes a port); local CA /c/ca.pem"
+        );
+    }
 
     #[test]
     fn certificates_are_made_only_for_the_names_the_router_routes() {

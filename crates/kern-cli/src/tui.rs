@@ -348,6 +348,14 @@ struct Row {
     /// pids, in the same second. A dashboard that contradicts the list is worse than either alone,
     /// because the reader has no way to tell which one is lying.
     orphaned: bool,
+    /// Processes the OOM killer ended in this box while it runs on (a child, under the per-process
+    /// default), the count behind `inspect`'s `State.OOMKilled`; 0 for none.
+    oom_kills: u64,
+    /// Docker's `RestartCount`, the one `inspect` reports: a `--restart` box run again counts here.
+    restarts: u32,
+    /// How it reaches out: `nat`, `pod`, `host` or `none`; empty when its init could not be read
+    /// (between two runs of a `--restart` box), which must not count as `none`. See [`net_kind`].
+    net: &'static str,
 }
 
 /// Restores the terminal on drop: leave the alternate screen, show the cursor, re-enable line
@@ -2334,6 +2342,11 @@ fn frame_json(s: &Snapshot, tabs: &[usize], ts_ms: u64) -> String {
         ",\"mem_used\":{},\"mem_total\":{},\"disk_used\":{},\"disk_total\":{},\"disk_fill_pct\":{},\"logs_used\":{},\"logs_total\":{},\"logs_fill_pct\":{}}}",
         h.mem_used, h.mem_total, h.disk_used, h.disk_total, h.disk_fill, h.logs_used, h.logs_total, h.logs_fill
     );
+    o.push_str(",\"services\":{\"docker_api\":");
+    put_str(&mut o, &h.docker_api);
+    o.push_str(",\"https\":");
+    put_str(&mut o, &h.https);
+    o.push('}');
     put_list(&mut o, "gpus", &h.gpus, |o, g| {
         let _ = write!(o, "{{\"index\":{},\"name\":", g.index);
         put_str(o, &g.name);
@@ -2395,6 +2408,14 @@ fn frame_json(s: &Snapshot, tabs: &[usize], ts_ms: u64) -> String {
         put_str(o, &r.iso);
         o.push_str(",\"confinement\":");
         put_str(o, &r.sec);
+        let _ = write!(
+            o,
+            ",\"oom_kills\":{},\"oom_killed\":{},\"restarts\":{},\"network\":",
+            r.oom_kills,
+            r.oom_kills > 0,
+            r.restarts
+        );
+        put_str(o, r.net);
         o.push('}');
     });
     let _ = write!(
@@ -2924,6 +2945,24 @@ fn box_isolation(pid: i32, pod: &str) -> String {
     flags.join(" ")
 }
 
+/// One word for how the box whose init is `pid1` reaches out, off the flags [`box_isolation`] read: a
+/// pod member with `net:host` is `host`. Empty when the init's network namespace cannot be read, which
+/// [`box_isolation`] answers with no flag, the same as `none`.
+fn net_kind(pid1: i32, pod: &str, iso: &str) -> &'static str {
+    let has = |f: &str| iso.split_whitespace().any(|x| x == f);
+    if pid1 <= 0 || std::fs::read_link(format!("/proc/{pid1}/ns/net")).is_err() {
+        ""
+    } else if has("net:host") {
+        "host"
+    } else if !pod.is_empty() {
+        "pod"
+    } else if has("net:nat") {
+        "nat"
+    } else {
+        "none"
+    }
+}
+
 /// Does the network namespace of `pid` have an interface other than `lo`?
 fn has_interface_beyond_lo(pid: i32) -> bool {
     pid > 0
@@ -2933,6 +2972,55 @@ fn has_interface_beyond_lo(pid: i32) -> bool {
                 .filter_map(|l| l.split(':').next())
                 .any(|n| n.trim() != "lo")
         })
+}
+
+/// How long a unit's restart count and the services' state are reused: each read is a `systemctl`,
+/// about 4 ms MEASURED, twice a frame's whole budget, and both change at a human pace.
+const SYSTEMD_READ_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// systemd's `NRestarts` of the unit a `--restart always|unless-stopped` box runs under, 0 for a box
+/// with none. A box without a unit costs one `stat` a frame; one with, a `systemctl show` every
+/// [`SYSTEMD_READ_EVERY`].
+fn unit_restarts(name: &str) -> u32 {
+    static SEEN: std::sync::Mutex<Option<HashMap<String, (Instant, u32)>>> =
+        std::sync::Mutex::new(None);
+    if !crate::commands::has_managed_unit(name) {
+        return 0;
+    }
+    let Ok(mut seen) = SEEN.lock() else {
+        return 0;
+    };
+    let seen = seen.get_or_insert_with(HashMap::new);
+    if let Some((at, n)) = seen.get(name) {
+        if at.elapsed() < SYSTEMD_READ_EVERY {
+            return *n;
+        }
+    }
+    let n = crate::commands::managed_unit_runs(name).map_or(0, |(_, n)| n);
+    seen.insert(name.to_string(), (Instant::now(), n));
+    n
+}
+
+/// The Docker API socket and HTTPS as `kern info` says them, read every [`SYSTEMD_READ_EVERY`].
+fn services() -> (String, String) {
+    static SEEN: std::sync::Mutex<Option<(Instant, String, String)>> = std::sync::Mutex::new(None);
+    let read = || {
+        (
+            crate::dockershim::socket_state().short(),
+            crate::localtls::status_line(),
+        )
+    };
+    let Ok(mut seen) = SEEN.lock() else {
+        return read();
+    };
+    if let Some((at, api, https)) = seen.as_ref() {
+        if at.elapsed() < SYSTEMD_READ_EVERY {
+            return (api.clone(), https.clone());
+        }
+    }
+    let (api, https) = read();
+    *seen = Some((Instant::now(), api.clone(), https.clone()));
+    (api, https)
 }
 
 fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, (u64, Instant)>) {
@@ -2957,7 +3045,9 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
         // supervisor lives in the host netns with the kernel's trivial uid_map, which would falsely flag
         // every box. `pid1 == 0` (unrecorded / old entry) → the /proc reads fail → no flag, no false
         // positive.
-        let iso = box_isolation(b.live_pid1().unwrap_or(0), &b.pod);
+        let pid1 = b.live_pid1().unwrap_or(0);
+        let iso = box_isolation(pid1, &b.pod);
+        let net = net_kind(pid1, &b.pod, &iso);
         let mut sec = String::new();
         if !b.egress.is_empty() {
             sec.push_str("egress");
@@ -2968,7 +3058,12 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
             }
             sec.push_str("landlock");
         }
+        let oom_kills = crate::commands::inspect::box_oom_kills(&b);
+        let restarts = crate::commands::inspect::box_restarts(&b, Some(unit_restarts(&b.name)));
         rows.push(Row {
+            net,
+            oom_kills,
+            restarts,
             uptime: now_u.saturating_sub(b.started),
             mem: st.mem,
             tasks: st.tasks,
@@ -3032,6 +3127,9 @@ struct HostStats {
     box_starts_spark: Vec<f64>,
     /// The host's NVIDIA cards, one entry each (see [`host_gpus`]). Empty on a host with none.
     gpus: Vec<GpuStat>,
+    /// The Docker API socket and HTTPS, in `kern info`'s words ([`services`]); empty when not read.
+    docker_api: String,
+    https: String,
 }
 
 /// One NVIDIA card as the Overview lists it. Every reading the driver may answer `N/A` for is an
@@ -3530,6 +3628,7 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
         .map_or(0, |(pct, _)| pct);
     let disk_fill = crate::commands::fs_fill("/").map_or(0, |(pct, _)| pct);
     let (load1, cores) = host_load_cores();
+    let (docker_api, https) = services();
     (
         HostStats {
             mem_used,
@@ -3553,6 +3652,8 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
             box_starts_peak: 0.0,
             box_starts_spark: Vec::new(),
             gpus: host_gpus(),
+            docker_api,
+            https,
         },
         sample,
     )
@@ -4859,6 +4960,28 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     s.push_str(&row("CPU", format!("{total_cpu:.1} %")));
     s.push_str(&row("Tasks", format!("{total_tasks}")));
     s.push_str(&row("Resource cap", format!("{d}{cap}{z}")));
+    // HOW THE RUNNING BOXES REACH OUT, from the same `iso` flags the Boxes tab prints: the default is
+    // a NAT of its own (Docker's), so the count a reader checks is the boxes that are not.
+    if !rows.is_empty() {
+        let parts: Vec<String> = ["nat", "pod", "host", "none", ""]
+            .iter()
+            .map(|w| (rows.iter().filter(|r| r.net == *w).count(), w))
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, w)| format!("{n} {}", if w.is_empty() { "not read" } else { w }))
+            .collect();
+        s.push_str(&row("Network", parts.join(" · ")));
+    }
+    let oom_boxes = rows.iter().filter(|r| r.oom_kills > 0).count();
+    if oom_boxes > 0 {
+        let kills: u64 = rows.iter().map(|r| r.oom_kills).sum();
+        s.push_str(&row(
+            "OOM kills",
+            format!(
+                "{}{kills}{z} {d}in {oom_boxes} running box(es): a process ended, the box ran on{z}",
+                p.y
+            ),
+        ));
+    }
     // SANDBOXES: the ones running, and the last hour of the ones that finished; the tab has the rest.
     let done = crate::history::sandboxes_newest_first();
     s.push_str(&row(
@@ -4884,9 +5007,19 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
         };
         s.push_str(&row("Fleet cap", format!("{mem} · {pids}")));
     }
+    // THE SERVICES a Docker client and a browser reach kern through, as `kern info` says them.
+    if !host.docker_api.is_empty() || !host.https.is_empty() {
+        s.push_str(&format!("\n  {b}SERVICES{z}\n"));
+        if !host.docker_api.is_empty() {
+            s.push_str(&row("Docker API", format!("{d}{}{z}", host.docker_api)));
+        }
+        if !host.https.is_empty() {
+            s.push_str(&row("HTTPS", format!("{d}{}{z}", host.https)));
+        }
+    }
     if rows.is_empty() {
         s.push_str(&format!(
-            "\n  {d}no running boxes - start one with `kern box <name> -d …`{z}\n"
+            "\n  {d}no running boxes - start one with `kern run -d <image>`{z}\n"
         ));
     }
     s
@@ -5183,7 +5316,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
     // It says `boxes` and not `running boxes` because a row here can be ORPHANED, and the guard
     // that catches a dashboard contradicting its own STATUS column reads the whole pane.
     let mut s =
-        format!("\n  {d}boxes (containers) - {z}{c}kern box <name>{z}{d} · pods grouped{z}\n");
+        format!("\n  {d}boxes (containers) - {z}{c}kern run -d --name <name> <image>{z}{d} · pods grouped{z}\n");
     // Box-START rate. The live list below shows only boxes alive right NOW, but a `kern box` lives ~ms:
     // an agent firing hundreds/sec (via the SDK / kern-mcp) flickers past a 1 s refresh and never appears
     // in the list. This header counts STARTS as a rate + sparkline (same daemonless counter as the Runs
@@ -5278,13 +5411,21 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         //
         // YELLOW, NOT RED: the box is running and reachable, and the thing that died is the process
         // that would have restarted it. Red would read as "the workload failed".
-        let status = if r.orphaned {
+        let mut status = if r.orphaned {
             format!("{y}orphaned{z}")
         } else if r.paused {
             format!("{d}paused{z}")
         } else {
             format!("{g}running{z}")
         };
+        // WHAT `ps` CANNOT SHOW IN A ROW: a child the OOM killer ended in a box that runs on (the
+        // per-process default), and a `--restart` box run again, whose uptime alone reads as new.
+        if r.oom_kills > 0 {
+            status.push_str(&format!(" {y}oom:{}{z}", r.oom_kills));
+        }
+        if r.restarts > 0 {
+            status.push_str(&format!(" {d}restarts:{}{z}", r.restarts));
+        }
         // HEALTH colored like `kern ps`: green healthy, red unhealthy, dim starting/none.
         let health = match r.health.as_str() {
             "healthy" => format!("{g}{:<9}{z}", "healthy"),
@@ -5609,6 +5750,66 @@ mod tests {
         );
     }
 
+    /// The two counts `ps` cannot show in a row are in the status cell, and only when not zero.
+    #[test]
+    fn a_box_row_says_its_oom_kills_and_restarts() {
+        let host = HostStats::default();
+        let mut r = row("web", false);
+        let quiet = boxes_table(&plain(), &[row("web", false)], 10, 0, &host);
+        assert!(
+            !quiet.contains("oom:") && !quiet.contains("restarts:"),
+            "{quiet}"
+        );
+        r.oom_kills = 2;
+        r.restarts = 3;
+        let out = boxes_table(&plain(), &[r], 10, 0, &host);
+        assert!(out.contains("running oom:2 restarts:3"), "{out}");
+    }
+
+    /// The Overview counts how the boxes reach out, one word per box and a box it could not read
+    /// apart, says the OOM kills, and names the services in `kern info`'s words.
+    #[test]
+    fn the_overview_counts_networks_and_names_the_services() {
+        let _g = crate::env_guard();
+        let with = |n: &str, net: &'static str| {
+            let mut r = row(n, false);
+            r.net = net;
+            r
+        };
+        let mut host_pod = with("d", "host");
+        host_pod.oom_kills = 4;
+        let (nat, none, pod, gap) = (
+            with("a", "nat"),
+            with("b", "none"),
+            with("c", "pod"),
+            with("e", ""),
+        );
+        let host = HostStats {
+            docker_api: "listening on /run/x.sock".into(),
+            https: "off".into(),
+            ..HostStats::default()
+        };
+        let out = overview(&plain(), &[nat, none, pod, host_pod, gap], &host);
+        assert!(
+            out.contains("1 nat · 1 pod · 1 host · 1 none · 1 not read"),
+            "{out}"
+        );
+        assert!(
+            out.contains("OOM kills") && out.contains("4 in 1 running box"),
+            "{out}"
+        );
+        assert!(
+            out.contains("SERVICES") && out.contains("listening on /run/x.sock"),
+            "{out}"
+        );
+        let empty = overview(&plain(), &[], &HostStats::default());
+        assert!(
+            !empty.contains("SERVICES") && !empty.contains("Network") && !empty.contains("OOM"),
+            "{empty}"
+        );
+        assert!(empty.contains("kern run -d <image>"), "{empty}");
+    }
+
     fn row(name: &str, paused: bool) -> Row {
         Row {
             name: name.into(),
@@ -5624,6 +5825,9 @@ mod tests {
             iso: String::new(),
             sec: String::new(),
             orphaned: false,
+            oom_kills: 0,
+            restarts: 0,
+            net: "",
         }
     }
 
@@ -6049,7 +6253,7 @@ mod tests {
             "the pane names what it lists, in the word a reader from another runtime searches for"
         );
         assert!(
-            out.contains("kern box <name>"),
+            out.contains("kern run -d --name <name> <image>"),
             "and the command that makes one, as every other pane's caption does"
         );
     }
@@ -6163,6 +6367,8 @@ mod tests {
             box_starts_peak: 0.0,
             box_starts_spark: Vec::new(),
             gpus: Vec::new(),
+            docker_api: String::new(),
+            https: String::new(),
         };
         let boxes = [row("a", false), row("b", false), row("c", false)];
         // A wide terminal (100 columns, about the 97 the counted bar takes with its zeros dropped)
@@ -6367,6 +6573,9 @@ mod tests {
             iso: String::new(),
             sec: String::new(),
             orphaned: false,
+            oom_kills: 0,
+            restarts: 0,
+            net: "",
         };
         let p = Palette::plain();
         let host = HostStats::default();
@@ -7664,6 +7873,9 @@ mod gpu_overview_tests {
             iso: iso.to_string(),
             sec: String::new(),
             orphaned: false,
+            oom_kills: 0,
+            restarts: 0,
+            net: "",
         };
         // Three boxes: one on card 0, one on both, one with none. The minors are SWAPPED against the
         // nvidia-smi index on purpose (bus 01 is minor 1), so a count keyed on the index is caught.

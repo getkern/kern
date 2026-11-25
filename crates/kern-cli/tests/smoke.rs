@@ -2945,6 +2945,7 @@ fn top_json_is_a_versioned_frame_and_the_stream_one_a_line() {
         "\"boxes\":[",
         "\"counts\":{",
         "\"runs\":{",
+        "\"services\":{\"docker_api\":",
     ] {
         assert!(frame.contains(key), "{key} missing: {frame}");
     }
