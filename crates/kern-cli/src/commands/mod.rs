@@ -1453,6 +1453,8 @@ struct BuildSpec<'a> {
     io_weight: Option<u64>,
     /// `--add-host NAME:IP` entries (`host-gateway` already resolved to a concrete address).
     extra_hosts: Vec<(String, String)>,
+    /// See [`kern_isolation::SandboxSpec::user_etc_files`].
+    user_etc_files: Vec<String>,
     memory_low: Option<u64>,
     cpu_weight: Option<u64>,
     dns: Vec<String>,
@@ -1828,6 +1830,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         io_max: b.io_max,
         io_weight: b.io_weight,
         extra_hosts: b.extra_hosts,
+        user_etc_files: b.user_etc_files,
         memory_low: b.memory_low,
         cpu_weight: b.cpu_weight,
         dns,

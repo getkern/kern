@@ -371,6 +371,10 @@ pub struct SandboxSpec {
     /// `--add-host NAME:IP`: extra `/etc/hosts` entries appended inside the box (`host-gateway` is
     /// already resolved to a concrete address by the caller). Empty for none.
     pub extra_hosts: Vec<(String, String)>,
+    /// The files of `/etc` the CALLER mounted (`hosts`, `hostname`, `resolv.conf`), which kern then
+    /// leaves exactly as mounted, as Docker leaves a container's: its own entries, `--add-host` and
+    /// `--dns` would otherwise be bound over the caller's file, or merged into it.
+    pub user_etc_files: Vec<String>,
     /// `--dns IP` (repeatable): the box's resolvers, written as `nameserver` lines in
     /// `/etc/resolv.conf`. Empty means kern does not touch that file at all, which is the behaviour
     /// every box had before this existed: the image's own file (usually absent, or empty on the
@@ -2071,29 +2075,46 @@ fn child_setup_and_exec(
     // entry there is written by the CLI; writing it here would race the other members on one file.
     let shared_hosts = spec.pod_holder.is_some() && !spec.net_slot && spec.pod_bridges.is_empty();
     let self_ip = box_own_ip(spec).unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+    // A file the caller mounted is theirs: nothing below binds over it or writes into it.
+    let user_owns = |f: &str| spec.user_etc_files.iter().any(|u| u == f);
+    let keep_hosts = shared_hosts || user_owns("hosts");
+    let keep_hostname = user_owns("hostname");
     // Bound from the box's own directory where the image has the file; written into the root for a
     // file it does not have (the debian family ships no `/etc/hosts`), as before.
     let bound = spec
         .etc_dir
         .as_deref()
-        .map(|dir| bind_etc_identity(&spec.root, dir, &spec.hostname, self_ip, shared_hosts))
+        .map(|dir| {
+            bind_etc_identity(
+                &spec.root,
+                dir,
+                &spec.hostname,
+                self_ip,
+                keep_hosts,
+                keep_hostname,
+            )
+        })
         .unwrap_or_default();
     setup_etc_identity(
         &spec.root,
         &spec.hostname,
         self_ip,
-        shared_hosts || bound.hosts,
-        bound.hostname,
+        keep_hosts || bound.hosts,
+        keep_hostname || bound.hostname,
     );
-    setup_extra_hosts(&spec.root, &spec.extra_hosts);
+    if !user_owns("hosts") {
+        setup_extra_hosts(&spec.root, &spec.extra_hosts);
+    }
     // AFTER the hosts files, because the two are independent and this one only fires when asked.
-    setup_resolv_conf(
-        &spec.root,
-        spec.etc_dir.as_deref(),
-        &spec.dns,
-        &spec.dns_search,
-        &spec.dns_options,
-    );
+    if !user_owns("resolv.conf") {
+        setup_resolv_conf(
+            &spec.root,
+            spec.etc_dir.as_deref(),
+            &spec.dns,
+            &spec.dns_search,
+            &spec.dns_options,
+        );
+    }
     // The store is opened while host paths still resolve; after the pivot it is reached only through
     // this descriptor.
     let ld_store = ld_key.and_then(|k| LdStore::open(spec.ldcache_dir.as_deref()?, k));
@@ -5644,6 +5665,7 @@ fn bind_etc_identity(
     hostname: &str,
     self_ip: std::net::Ipv4Addr,
     shared_hosts: bool,
+    skip_hostname: bool,
 ) -> EtcBound {
     const LOCALHOST_SEED: &[u8] = b"127.0.0.1\tlocalhost\n::1\tip6-localhost ip6-loopback\n";
     const LOCALHOST: &[u8] = b"localhost";
@@ -5687,7 +5709,7 @@ fn bind_etc_identity(
             unsafe { libc::close(target) };
         }
     }
-    if name_ok {
+    if name_ok && !skip_hostname {
         if let Some((target, had)) = etc_target(etc, "hostname") {
             let text = format!("{h}\n");
             out.hostname = bind_etc_file(dir, "hostname", text.as_bytes(), target, had);

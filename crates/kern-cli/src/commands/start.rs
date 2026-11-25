@@ -459,6 +459,23 @@ fn pod_nameservers(path: &std::path::Path) -> Vec<String> {
 /// its live holder PID, registers this box in the pod's shared `/etc/hosts` (so peers resolve it by
 /// name), and binds that hosts file over the box's `/etc/hosts`. Returns the holder PID, or `None`
 /// for a standalone box; pushes the pod's bind mounts onto `volumes`.
+/// Which of `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` a mount in `volumes` covers, by
+/// file name. A target is compared as a path, so `/etc//hosts` and `/etc/hosts/` are the same file.
+fn user_etc_files(volumes: &[kern_isolation::Volume]) -> Vec<String> {
+    ["hosts", "hostname", "resolv.conf"]
+        .iter()
+        .filter(|f| {
+            let want = std::path::PathBuf::from(format!("/etc/{f}"));
+            volumes.iter().any(|v| {
+                std::path::Path::new(&v.target)
+                    .components()
+                    .eq(want.components())
+            })
+        })
+        .map(|f| (*f).to_string())
+        .collect()
+}
+
 fn join_pod_and_bind_its_files(
     pod: Option<&str>,
     name: &str,
@@ -469,6 +486,8 @@ fn join_pod_and_bind_its_files(
     aliases: &[String],
 ) -> Result<Option<i32>, Error> {
     let Some(pod) = pod else { return Ok(None) };
+    // The caller's mounts are all that is in the list yet: a file of theirs gets no pod bind.
+    let user_etc_files = user_etc_files(volumes);
     // VALIDATED ON THE WAY IN, not only on the way out. `pod create` has always checked the name
     // against the shared resource-name rule (letters, digits, `_`, `-`, `.`, no traversal, no
     // leading `-`/`.`) because it becomes a DIRECTORY; the join path took the name straight from
@@ -542,11 +561,13 @@ fn join_pod_and_bind_its_files(
             .to_string_lossy()
             .into_owned()
     };
-    volumes.push(kern_isolation::Volume {
-        source: symlink_free(crate::pod::hosts_path(pod)),
-        target: "/etc/hosts".to_string(),
-        read_only: false,
-    });
+    if !user_etc_files.iter().any(|f| f == "hosts") {
+        volumes.push(kern_isolation::Volume {
+            source: symlink_free(crate::pod::hosts_path(pod)),
+            target: "/etc/hosts".to_string(),
+            read_only: false,
+        });
+    }
     // If the pod has outbound (a pasta NAT → a pod resolv.conf exists), bind it so DNS works.
     //
     // NOT WHEN THIS BOX ASKED FOR ITS OWN DNS. The bind is the pod's SHARED file, writable, and the
@@ -563,7 +584,7 @@ fn join_pod_and_bind_its_files(
     // line: those are carried out through `inherit_nameservers` and re-emitted into the private
     // file, so "add a search domain" cannot silently mean "and drop DNS".
     let rp = crate::pod::resolv_path(pod);
-    if rp.exists() {
+    if rp.exists() && !user_etc_files.iter().any(|f| f == "resolv.conf") {
         if dns_requested {
             inherit_nameservers.extend(pod_nameservers(&rp));
         } else {
@@ -1574,9 +1595,7 @@ fn decode_mount_record(
 /// A `--mount` as `BoxRunArgs` carries it: source, target, read-only.
 type Mount = (String, String, bool);
 
-fn resolve_volumes_from(
-    entries: &[String],
-) -> Result<(Vec<String>, Vec<Mount>), Error> {
+fn resolve_volumes_from(entries: &[String]) -> Result<(Vec<String>, Vec<Mount>), Error> {
     let mut volumes = Vec::new();
     let mut mounts = Vec::new();
     for e in entries {
@@ -2021,6 +2040,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             &format!("--mount src={source},dst={target}"),
         )?);
     }
+    // THE FILES OF `/etc` THE CALLER MOUNTED ARE THEIRS, as Docker leaves a container's: kern's
+    // own hosts entries, the pod's shared files, `--add-host` and `--dns` stay off them. MEASURED
+    // before (Grok's round 15, case d4): `-v ./resolv:/etc/resolv.conf` gave the box the host's
+    // resolvers, `-v ./hosts:/etc/hosts` had kern's lines merged in, and `/etc/hostname` was
+    // replaced; Docker shows each file as mounted. Only the caller's mounts are in the list here.
+    let user_etc_files = user_etc_files(&volumes);
     // A box "asked for DNS" if it named ANY of the three: a `search` line alone is still a request
     // to own the file, and owning it in a pod means not sharing the pod's.
     let dns_requested =
@@ -3249,6 +3274,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             h.extend(resolve_add_hosts(args.add_hosts, args.share_net));
             h
         },
+        user_etc_files,
         // The box's own servers win; the pod's are the FALLBACK for a box that only added a search
         // domain or an option. An empty result means neither existed, and the box then gets no
         // nameserver line at all, which is the same as it had before it asked.
@@ -6948,6 +6974,32 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
             unsafe { libc::close(write_fd) };
             scope_reexec_proxy(child, read_fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod user_etc_files_tests {
+    use super::user_etc_files;
+
+    fn vol(target: &str) -> kern_isolation::Volume {
+        kern_isolation::Volume {
+            source: "/tmp/x".to_string(),
+            target: target.to_string(),
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn a_mount_on_an_etc_identity_file_is_the_callers() {
+        let v = [vol("/etc/resolv.conf"), vol("/etc//hosts/"), vol("/data")];
+        assert_eq!(user_etc_files(&v), ["hosts", "resolv.conf"]);
+        assert_eq!(user_etc_files(&[vol("/etc/hostname")]), ["hostname"]);
+    }
+
+    #[test]
+    fn a_mount_of_etc_itself_or_a_neighbour_is_not() {
+        let v = [vol("/etc"), vol("/etc/hosts.allow"), vol("/x/etc/hosts")];
+        assert!(user_etc_files(&v).is_empty());
     }
 }
 

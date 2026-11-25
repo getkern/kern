@@ -247,8 +247,8 @@ pub fn start_scope_for_self(
 /// manager that is slow to answer costs a second and the scope, not five.
 pub fn attach_self_to_unit(unit: &str, subcgroup: &str) -> Result<(), ScopeError> {
     let started = Instant::now();
-    let sock = UnixStream::connect(SYSTEM_BUS)
-        .map_err(|e| ScopeError(format!("{SYSTEM_BUS}: {e}")))?;
+    let sock =
+        UnixStream::connect(SYSTEM_BUS).map_err(|e| ScopeError(format!("{SYSTEM_BUS}: {e}")))?;
     let mut conn = Conn {
         sock,
         buf: Vec::new(),
@@ -301,7 +301,9 @@ pub fn attach_self_to_unit(unit: &str, subcgroup: &str) -> Result<(), ScopeError
     {
         Ok(())
     } else {
-        Err(ScopeError(format!("not in {leaf} after the manager answered")))
+        Err(ScopeError(format!(
+            "not in {leaf} after the manager answered"
+        )))
     }
 }
 
