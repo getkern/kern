@@ -100,9 +100,21 @@ fn hashed_id(name: &str) -> String {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        out.push_str(&format!("{h:016x}"));
+        out.push_str(&format!("{:016x}", avalanche(h)));
     }
     out
+}
+
+/// splitmix64's finalizer: every input bit reaches every output bit. Without it the four rounds
+/// above differ only by their seed, and two names one byte apart got ids alike for their first ten
+/// hex digits (MEASURED: `g11img:q` 651325dd78c9e69e, `g11img:p` 651326dd78c9e851), which is the
+/// part a client shows and matches a prefix against.
+fn avalanche(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 /// THE ID SURVIVES A RENAME, as Docker's does: `docker compose up --force-recreate` creates the new
@@ -1957,10 +1969,71 @@ fn image_by_id_prefix(images: &[Value], r: &str) -> Option<Value> {
 /// image by the id it was given, could not tell the arm64 one from the amd64.
 fn image_entry_id(i: &Value) -> Option<String> {
     let n = i.get("image").and_then(Value::as_str)?;
+    if let Some(id) = i.get("cache").and_then(Value::as_str).and_then(content_id) {
+        return Some(id);
+    }
     Some(match image_entry_platform(i) {
         Some(p) => id_of(&format!("{n}#{p}")),
         None => id_of(n),
     })
+}
+
+/// AN IMAGE'S ID IS ITS CONTENT, as Docker's is its config's digest: the cache entry's config (the
+/// `.image` sidecar, history included) and its layers (`.layers`). Named after the NAME before, an
+/// image rebuilt under the same tag kept its id, and `docker compose up --build` (which recreates a
+/// container when the image id differs from the one in its `com.docker.compose.image` label) left
+/// the old container running the old code. MEASURED: v1 still answering after the rebuild to v2.
+///
+/// Read once per change of the two files: their modification times key a memo, so a listing costs a
+/// `stat` of each per image.
+fn content_id(stem: &str) -> Option<String> {
+    content_id_in(
+        &kern_common::xdg_cache_dir()?.join("kern").join("images"),
+        stem,
+    )
+}
+
+/// The memo of [`content_id_in`]: per entry, the modification times its id was read at.
+type ContentIds = HashMap<String, ((i64, i64), String)>;
+
+/// [`content_id`] in the image cache `dir`.
+fn content_id_in(dir: &std::path::Path, stem: &str) -> Option<String> {
+    static SEEN: Mutex<Option<ContentIds>> = Mutex::new(None);
+    if stem.is_empty() || stem.contains('/') || stem.starts_with('.') {
+        return None;
+    }
+    let (img, layers) = (
+        dir.join(format!("{stem}.image")),
+        dir.join(format!("{stem}.layers")),
+    );
+    let stamp = |p: &std::path::Path| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p).map_or(0, |m| m.mtime_nsec() + m.mtime() * 1_000_000_000)
+    };
+    let key = (stamp(&img), stamp(&layers));
+    if key.0 == 0 {
+        return None;
+    }
+    let memo = format!("{}/{stem}", dir.display());
+    if let Some(id) = SEEN.lock().ok().and_then(|g| {
+        g.as_ref()
+            .and_then(|m| m.get(&memo))
+            .filter(|(k, _)| *k == key)
+            .map(|(_, id)| id.clone())
+    }) {
+        return Some(id);
+    }
+    let mut text = String::from_utf8_lossy(&std::fs::read(&img).ok()?).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(
+        &std::fs::read(&layers).unwrap_or_default(),
+    ));
+    let id = hashed_id(&text);
+    if let Ok(mut g) = SEEN.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(memo, (key, id.clone()));
+    }
+    Some(id)
 }
 
 /// `os/arch` of a cache entry for another platform; `None` for this machine's.
@@ -5873,6 +5946,54 @@ mod tests {
                 build_argv(&q(&[("t", "x"), ("dockerfile", bad)]), "/c").is_err(),
                 "{bad}"
             );
+        }
+    }
+
+    /// An image's id follows its content: a rebuild under the same name (a new config, new layers)
+    /// is a new id, the same content the same id, and an entry with no sidecar has none here.
+    #[test]
+    fn an_image_id_follows_its_content() {
+        let dir = std::env::temp_dir().join(format!("kern-cid-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let write = |cfg: &str, secs: u64| {
+            for (ext, body) in [("image", cfg), ("layers", "alpine:3.21\nabc\n")] {
+                let p = dir.join(format!("app_dev.{ext}"));
+                std::fs::write(&p, body).expect("write");
+                let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+                std::fs::File::options()
+                    .write(true)
+                    .open(&p)
+                    .and_then(|f| f.set_modified(t))
+                    .expect("mtime");
+            }
+        };
+        write("cmd\tv1\n", 1_000);
+        let v1 = content_id_in(&dir, "app_dev").expect("id");
+        write("cmd\tv2\n", 2_000);
+        let v2 = content_id_in(&dir, "app_dev").expect("id");
+        write("cmd\tv1\n", 3_000);
+        let again = content_id_in(&dir, "app_dev").expect("id");
+        let missing = content_id_in(&dir, "missing");
+        let climbing = content_id_in(&dir, "../x");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(v1, v2, "a rebuild is a new id");
+        assert_eq!(v1, again, "the same content is the same id");
+        assert_eq!(v1.len(), 64);
+        assert!(missing.is_none() && climbing.is_none());
+    }
+
+    /// Names one byte apart get ids that differ from their first hex digits: a client shows 12 and
+    /// matches a prefix.
+    #[test]
+    fn ids_of_names_one_byte_apart_differ_at_once() {
+        for (a, b) in [("g11img:q", "g11img:p"), ("web-1", "web-2"), ("x", "y")] {
+            let (ia, ib) = (hashed_id(a), hashed_id(b));
+            let common = ia
+                .chars()
+                .zip(ib.chars())
+                .take_while(|(x, y)| x == y)
+                .count();
+            assert!(common < 4, "{a} {ia} / {b} {ib}: {common} digits alike");
         }
     }
 
