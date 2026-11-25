@@ -549,6 +549,13 @@ octal. Dropping a mount changes what the command does, so it is never dropped qu
 
 **`external: true` on a volume that does not exist**, as Docker refuses it.
 
+**A volume driver other than `local`, or `driver_opts` kern does not mount.** The local driver's
+options are honoured: `type: none, o: bind, device: <dir>` keeps the volume's files in that directory
+(a kern volume at that path, made at `up`, left in place by `down -v`), `type: nfs` (`o: addr=HOST`,
+`device: ":/export"`) and `type: cifs` (`device: //HOST/share`) mount as `-v nfs://` and `-v smb://`,
+`type: tmpfs` (`o: size=N`) is a tmpfs. Anything else is refused with what to write instead, and cifs
+credentials in `o:` are refused rather than passed.
+
 **Two services on the same internal port under `--pod`.** Declare the port each listens on, with
 `port:` or `expose:`. kern passes it as `PORT`, a convention and not a contract.
 

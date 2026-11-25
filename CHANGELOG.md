@@ -170,6 +170,10 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern top`: a box's log is live, and `s`, `p`, `u` act on that box from it.** Enter on the Boxes
   tab showed the log as it was when pressed, and any key closed it, so `s` pressed to stop the box
   only closed the log. It follows the output now, `s` asks to stop that box, Esc goes back.
+- **Compose: a volume's `driver_opts` are honoured, not ignored.** `type: none, o: bind, device: <dir>`
+  put the data in a kern volume of its own while `<dir>` stayed empty; it is now kept there, as Docker
+  keeps it. `type: nfs`, `cifs` and `tmpfs` mount as kern's `nfs://`, `smb://` and tmpfs; another
+  driver or type is refused with what to write instead.
 - **`kern run` prints nothing of its own for a box isolated as expected**, as `docker run`. A line
   still says so when a boundary is open (`--net host`, a shared rootfs); `--verbose` shows the panel.
 - **Each part of kern's data can have a disk of its own.** `images_dir`, `volumes_dir`, `logs_dir`
