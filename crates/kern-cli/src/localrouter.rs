@@ -112,20 +112,44 @@ fn spawn_router(exe: &std::path::Path, scoped: bool) -> Option<u16> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().ok()?;
-    // The router writes its state once it listens; it may also find another one already running
-    // and leave, which is fine: that one's state answers.
-    for _ in 0..300 {
-        if let Some(p) = running_port() {
-            return Some(p);
-        }
-        if let Ok(Some(_)) = child.try_wait() {
-            return running_port();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    // READY IS SAID, NOT POLLED FOR. The router writes one byte on this pipe once its state names
+    // the port (`READY_FD`); a router that finds another one running leaves, which closes the pipe,
+    // and that one's state answers. This used to read the state file every 10 ms for up to 3 s, so
+    // `kern box -d -p` and `compose up` paid up to 10 ms of polling granularity on a cold router.
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2 writes two descriptors into `fds`.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return None;
     }
-    None
+    let (rd, wr) = (fds[0], fds[1]);
+    cmd.env(READY_FD, wr.to_string());
+    // SAFETY: `fcntl` is async-signal-safe; it lets the write end, and only it, cross the exec.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
+            libc::fcntl(wr, libc::F_SETFD, 0);
+            Ok(())
+        });
+    }
+    let spawned = cmd.spawn();
+    // SAFETY: the parent's copy of the write end; the router holds its own.
+    unsafe { libc::close(wr) };
+    let Ok(_router) = spawned else {
+        unsafe { libc::close(rd) };
+        return None;
+    };
+    let mut pfd = libc::pollfd {
+        fd: rd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one pollfd owned here; 3 s, the bound the polling loop had.
+    let _ = unsafe { libc::poll(&mut pfd, 1, 3000) };
+    unsafe { libc::close(rd) };
+    running_port()
 }
+
+/// The variable naming the descriptor a starting router says "listening" on.
+const READY_FD: &str = "KERN_ROUTER_READY_FD";
 
 /// `kern __router-port` (hidden): the port the names answer on, for `kern.exe doctor`, which checks
 /// it from the Windows side (a port Windows reserves, or one a Windows program holds, breaks the
@@ -225,6 +249,18 @@ pub fn run() -> ! {
         let line = format!("{me} {} {port}\n", crate::registry::proc_starttime(me));
         if std::fs::write(&tmp, line).is_ok() {
             let _ = std::fs::rename(&tmp, &p);
+        }
+    }
+    // Tell whoever started this that the state names the port (see `spawn_router`).
+    if let Some(fd) = crate::global_env(READY_FD)
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|fd| *fd > 2)
+    {
+        // SAFETY: one byte from a local on the descriptor the starter handed over; closed after.
+        unsafe {
+            libc::write(fd, b"R".as_ptr().cast(), 1);
+            libc::close(fd);
         }
     }
     for l in listeners {
