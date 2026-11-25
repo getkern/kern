@@ -213,8 +213,10 @@ What Docker's `--privileged` also is, and a rootless box is not: the host's devi
 `pentest/pentest-privileged.sh`, 11 cases with positive controls: 200 MiB under a 64 MiB cap is
 killed from a cgroup the box made with `memory.max` at `max`, 200 forks under a 64 cap stop below it,
 and docker:28-dind runs a container with its bridge network out, a build and an exec;
-moby/buildkit run as the box's root builds, and a nested `kern run` runs. BuildKit's rootless mode
-does not: its `newuidmap` cannot map a range from inside the box.
+moby/buildkit run as the box's root builds, and a nested `kern run` runs. moby/buildkit:rootless
+builds too when the image's `/etc/subuid` names ids the box has: a box holds the caller's
+allocation (65536 ids on a stock host), and the image's default `user:100000:65536` lies past it, as
+under any rootless runtime given that allocation.
 
 **Rootless-only, and gated on the effective mapping rather than the caller's euid:** it is honoured
 only when the box's root maps to an unprivileged host uid, decided by reading `/proc/self/uid_map`
@@ -367,11 +369,19 @@ any of these paths.
   clears setuid and setgid, because that tree may be put where other users can reach it, and a
   setuid-root file pulled by root would then be a way to host root.
 
+- **File capabilities are kept with the setuid bits**, in the cache and not in a `--dest` tree:
+  Alpine's `newuidmap` is `cap_setuid=ep`, not setuid. Written by root of kern's extraction
+  namespace, the kernel stores one as a v3 capability whose root is the caller's uid: honoured in
+  a box, whose root is that uid, and by nothing on the host (measured: such a copy of `cat` runs
+  there with no effective capability). It is no wider than setuid: the kernel bounds it by the
+  box's capability set, and `no-new-privileges` disables both.
+
 - **`push`** and **`save`** pack the rootfs with ownership normalized to uid/gid 0, deciding each
   setuid/setgid bit on the tar stream: a file the box's root owned keeps it, as docker's `save` and
   `push` keep it, and one of another owner or group loses it, because making it 0:0 would forge a
   setuid-root binary the image never had. The tree itself is only read, so the cached image keeps
-  its bits.
+  its bits. A file capability goes out as a v2 one, as docker's layers carry it; a v3 one whose root
+  is not the box's is not the image's and is dropped.
 
 ## Registry authentication
 - Auth follows the standard registry-v2 challenge, so any compliant registry works, anonymously or

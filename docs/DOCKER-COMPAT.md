@@ -479,9 +479,14 @@ value and the container does not start.
 
 **`--privileged` is a box a container runtime runs in, not the host's root.** Every capability in the
 box's own user namespace, a cgroup tree below its caps, a sysfs; not the host's devices, and the
-host's kernel settings refuse it (see [SECURITY.md](../SECURITY.md)). An image's `VOLUME` gets no
-anonymous volume: docker-in-docker's `/var/lib/docker` stays in the box's layer, where its `dockerd`
-falls back to the `vfs` driver; `-v <name>:/var/lib/docker` gives it `overlay2`.
+host's kernel settings refuse it (see [SECURITY.md](../SECURITY.md)).
+
+**An image's `VOLUME` gets an anonymous volume, as under Docker**, unless `-v` or `--tmpfs` mounts
+something at the path: `kern-anon-<box>-<hash>` in `kern volume ls`, seeded from the image, kept
+across a restart and a `compose up` recreate, and removed with the box (`rm`, `--rm`, `compose down`
+and `rm`), where `docker rm` without `-v` leaves it unused on disk. docker-in-docker's
+`/var/lib/docker` is one, so its `dockerd` runs `overlay2` (measured; in the box's layer it fell back
+to `vfs`).
 
 **`ptrace` works in a box, `process_vm_readv` does not.** `strace` and `gdb` run as under Docker and
 Podman (measured, the same `strace -f true` on all three); `process_vm_readv`/`writev` answer `EPERM`,

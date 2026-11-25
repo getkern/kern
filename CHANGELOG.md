@@ -111,6 +111,22 @@ SDKs, the MCP server and `--security-profile untrusted` still deny it (with the 
 `process_vm_readv`/`writev` stay refused. A `kern exec` entering a box cannot be read or attached to
 before its command runs.
 
+**An image's `VOLUME` gets an anonymous volume.** A box wrote the image's declared volume paths into
+its own layer: postgres's data, redis's `/data`, and docker-in-docker's `/var/lib/docker`, where
+`dockerd` could not run `overlay2` and fell back to `vfs`. Now each gets a volume of kern's (unless
+`-v` or `--tmpfs` covers the path), seeded from the image, kept across a restart and a `compose up`
+recreate, removed with the box; `compose down` then `up` starts fresh, as under Docker (measured on
+both). `kern build` records `VOLUME`, and `save`/`push` write it. An empty volume now takes the image
+directory's owner from the box itself: a named volume's first start, and an anonymous one's, no
+longer spends two helper processes on it (+2.0 ms to +0.4 ms over a bind, measured on redis).
+
+**File capabilities survive pull, load, build and save.** They were stripped where setuid bits were
+kept: Alpine's `newuidmap` is `cap_setuid=ep`, so rootless BuildKit stopped at "Could not set caps".
+Kept in kern's cache (v3, inert on the host), carried through `kern build` (set after the owner,
+which a chown would clear), and written as v2 by `save`/`push` (measured: an image kern built and
+saved shows `cap_setuid=ep` under Docker). A cached image whose `newuidmap` lost its capability is
+re-extracted once.
+
 **`--privileged` runs a container runtime: docker-in-docker, BuildKit, a nested kern.** It relaxed
 the seccomp filter and kept `CAP_SYS_ADMIN`, and docker:dind stopped at its first container: the
 cgroup was read-only, `NET_ADMIN` was gone, runc found no sysfs to mount, no `/dev/tty` to bind, and
