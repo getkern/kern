@@ -1746,7 +1746,13 @@ pub fn list_exited_among(boxes: &[Instance]) -> Vec<ExitedBox> {
             labels: crate::ui::scrub(&keyed("labels")),
             restarts: keyed("restarts").trim().parse().unwrap_or(0),
             oom: keyed("oom").trim() == "1",
-            mounts: keyed("mounts"),
+            // A record from before kern wrote this line says nothing about the mounts, which is not
+            // the same as "none": `!` makes `--volumes-from` refuse it rather than mount nothing.
+            mounts: if body.lines().skip(4).any(|l| l.starts_with("mounts\t")) {
+                keyed("mounts")
+            } else {
+                "!".to_string()
+            },
             exited_ago: ago,
         });
     }

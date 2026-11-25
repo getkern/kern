@@ -514,22 +514,19 @@ pub(crate) fn data_dir() -> Option<std::path::PathBuf> {
 pub(crate) fn unread_data_place() -> Option<String> {
     let err = load_cached(None).err()?;
     let path = active_path()?;
-    // A FILE THAT IS NOT TEXT cannot be searched for a place, so it cannot be known not to name one:
-    // that fails closed too. MEASURED by Grok's round 15 (case i3): `\xff\x00not toml` gave a
-    // warning and a box that started with its data in the default place.
-    let raw = match std::fs::read(&path) {
-        Ok(b) => match String::from_utf8(b) {
-            Ok(t) => t,
-            Err(_) => {
-                return Some(format!(
-                    "{err}. That file is not text, so kern cannot tell whether it sets where kern \
-                     keeps its data; fix it first (`kern validate {}`)",
-                    path.display()
-                ))
-            }
-        },
-        Err(_) => return None,
-    };
+    // A FILE THAT IS NOT TEXT (a NUL in it) cannot be searched for a place, so it cannot be known
+    // not to name one: that fails closed too. MEASURED by Grok's round 15 (case i3): `\xff\x00not
+    // toml` gave a warning and a box that started with its data in the default place. A text file
+    // in another encoding (a Latin-1 comment) is searched as it reads, by the rule below.
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.contains(&0) {
+        return Some(format!(
+            "{err}. That file is not text, so kern cannot tell whether it sets where kern \
+             keeps its data; fix it first (`kern validate {}`)",
+            path.display()
+        ));
+    }
+    let raw = String::from_utf8_lossy(&bytes);
     let names_a_place = raw.lines().any(|l| {
         let t = l.trim_start();
         DIR_KEYS.iter().any(|(k, _)| {
@@ -3588,11 +3585,22 @@ mod tests {
             check("\u{ff}").is_none(),
             "valid UTF-8 garbage naming no place"
         );
-        std::fs::write(&f, b"\xff\x00not toml").expect("write");
-        forget_cached();
+        let bytes = |b: &[u8]| {
+            std::fs::write(&f, b).expect("write");
+            forget_cached();
+            unread_data_place()
+        };
         assert!(
-            unread_data_place().is_some(),
+            bytes(b"\xff\x00not toml").is_some(),
             "not text: it cannot be known not to name one"
+        );
+        assert!(
+            bytes(b"# caff\xe8\n[kern]\nlog_max_size = \"1m\"\n").is_none(),
+            "a Latin-1 comment naming no place keeps the defaults, with the parse warning"
+        );
+        assert!(
+            bytes(b"# caff\xe8\n[kern]\ndata_dir = \"/a\"\n").is_some(),
+            "but one naming a place is refused"
         );
         crate::unset_global_env("KERN_CONFIG");
         forget_cached();

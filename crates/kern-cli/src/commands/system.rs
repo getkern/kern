@@ -305,8 +305,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         refused rather than reinterpreted
     --name <box>        Name the box (the same field as the positional name; pass one, not both)
     --rm                Leave no exit record: `kern ps -a` will not list it and `kern wait` has
-                        nothing to read. A box is already thrown away at teardown; this drops the
-                        hour-long breadcrumb too
+                        nothing to read. Without it a detached (-d) box leaves one for an hour; a
+                        foreground box leaves none either way (keep one with --keep)
     --keep              Keep this box's writable layer after it exits, under
                         $XDG_DATA_HOME/kern/boxes/<name>, and record its command line: `kern start
                         <name>` runs it again on the same files, `kern restart` stops and starts

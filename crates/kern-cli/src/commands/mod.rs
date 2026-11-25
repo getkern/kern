@@ -2715,6 +2715,34 @@ enum StateRoot {
     Images,
 }
 
+/// THE WORDS THE SDKs READ. Python and Node turn kern's refusal of a mount into their `MountRefused`
+/// by finding this phrase on the stderr of a box that never started; changed here and not there,
+/// they would quietly go back to a `startup_failed` result. Pinned on both sides of that contract.
+#[cfg(test)]
+#[test]
+fn the_state_refusal_carries_the_phrase_the_sdks_read() {
+    const PHRASE: &str = "kern's own state (";
+    let p = std::path::Path::new;
+    for root in [
+        StateRoot::Data,
+        StateRoot::Config,
+        StateRoot::Registry,
+        StateRoot::Images,
+    ] {
+        assert!(kern_state_refusal("-v x", p("/a/b"), p("/a"), root).contains(PHRASE));
+    }
+    let py = include_str!("../../../../bindings/python/kern_sandbox/__init__.py");
+    let js = include_str!("../../../../bindings/node/index.js");
+    assert!(
+        py.contains(&format!("_KERN_STATE_REFUSAL = {PHRASE:?}")),
+        "python"
+    );
+    assert!(
+        js.contains(&format!("const KERN_STATE_REFUSAL = {PHRASE:?};")),
+        "node"
+    );
+}
+
 fn kern_state_refusal(
     spec: &str,
     canon: &std::path::Path,
