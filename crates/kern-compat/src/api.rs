@@ -131,6 +131,10 @@ struct Created {
     cmd: Vec<String>,
     exposed: Vec<String>,
     auto_remove: bool,
+    /// `OpenStdin` (`docker run -i`): the attach's bytes are the workload's stdin.
+    stdin: bool,
+    /// `Tty` (`docker run -t`): a terminal, and the attach is one raw stream, not frames.
+    tty: bool,
 }
 
 static CREATED: Mutex<Option<HashMap<String, Created>>> = Mutex::new(None);
@@ -150,6 +154,18 @@ fn created_put(name: &str, c: Created) {
 }
 
 /// Take a created container out (it starts, or is removed), waking whoever waits for that.
+/// Every container created and not yet started (or whose start failed), for the list.
+fn created_all() -> Vec<(String, Created)> {
+    CREATED
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        })
+        .unwrap_or_default()
+}
+
 fn created_take(name: &str) -> Option<Created> {
     let taken = CREATED
         .lock()
@@ -623,6 +639,7 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
         argv.push("--".into());
         argv.extend(cmd.iter().cloned());
     }
+    let flag = |k: &str| body.get(k).and_then(Value::as_bool) == Some(true);
     Ok(Created {
         argv,
         image,
@@ -632,6 +649,8 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
         cmd,
         exposed,
         auto_remove,
+        stdin: flag("OpenStdin"),
+        tty: flag("Tty"),
     })
 }
 
@@ -900,8 +919,8 @@ impl ListFilters {
         self.statuses.iter().any(|s| s != "running")
     }
 
-    fn keeps(&self, name: &str, running: bool, labels: &[(String, String)]) -> bool {
-        let state = if running { "running" } else { "exited" };
+    /// `state` is Docker's: `running`, `exited` or `created`.
+    fn keeps(&self, name: &str, state: &str, labels: &[(String, String)]) -> bool {
         let id = id_of(name);
         self.labels.iter().all(|w| match w.split_once('=') {
             Some((k, val)) => labels.iter().any(|(lk, lv)| lk == k && lv == val),
@@ -962,6 +981,11 @@ fn list(bin: &Path, req: &Request) -> Response {
         Err(e) => return error(400, &e),
     };
     let all = req.flag("all") || filters.wants_exited();
+    // A container created here and not started yet is listed as Docker's `created`, and a box a
+    // failed start left behind under its name is not listed twice.
+    let created = created_all();
+    let created_names: std::collections::HashSet<String> =
+        created.iter().map(|(n, _)| n.clone()).collect();
     let mut items = Vec::new();
     for (name, v) in kern_boxes(bin) {
         let running = box_running(&v);
@@ -969,7 +993,9 @@ fn list(bin: &Path, req: &Request) -> Response {
             continue;
         }
         let labels = labels_of(&v);
-        if !filters.keeps(&name, running, &labels) {
+        if created_names.contains(&name)
+            || !filters.keeps(&name, if running { "running" } else { "exited" }, &labels)
+        {
             continue;
         }
         let ports: Vec<String> = v
@@ -1016,7 +1042,7 @@ fn list(bin: &Path, req: &Request) -> Response {
             if listed.iter().any(|i| i.contains(&id)) {
                 continue;
             }
-            if !filters.keeps(&name, false, &r.created.labels) {
+            if !filters.keeps(&name, "exited", &r.created.labels) {
                 continue;
             }
             items.push(format!(
@@ -1028,6 +1054,23 @@ fn list(bin: &Path, req: &Request) -> Response {
                 r.created.created,
                 json_str(&format!("Exited ({})", r.exit.unwrap_or(-1))),
                 labels_json(&r.created.labels)
+            ));
+        }
+        // CREATED AND NOT STARTED, or whose start failed, as Docker lists them: `docker create`
+        // then `ps -a` showed nothing, and Testcontainers' cleanup, which lists by label, never
+        // found a container whose start had failed, so it stayed behind.
+        for (name, c) in &created {
+            if !filters.keeps(name, "created", &c.labels) {
+                continue;
+            }
+            items.push(format!(
+                "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"Command\":{},\"Created\":{},\"State\":\"created\",\"Status\":\"Created\",\"Ports\":[],\"Labels\":{}}}",
+                json_str(&id_of(name)),
+                json_str(&format!("/{name}")),
+                json_str(&c.image),
+                json_str(&c.cmd.join(" ")),
+                c.created,
+                labels_json(&c.labels)
             ));
         }
     }
@@ -1603,10 +1646,21 @@ fn pump(w: &crate::Out, out: Option<ChildStdout>, err: Option<ChildStderr>, raw:
 // ---------------------------------------------------------------------------------------------
 // attach: a container's output on the connection (`docker run` without `-d`).
 
-/// What a start hands the attach waiting for it: the box has started, and the attach is to follow
-/// its log. Dropping this sender, once the log has been followed to its end, is what tells the run
-/// that its output has been read (a `--rm` box is removed only then).
-type Started = mpsc::Sender<()>;
+/// What a start hands the attach waiting for it.
+enum Started {
+    /// The box runs detached and the attach follows its log. Dropping this sender, once the log
+    /// has been followed to its end, tells the run that its output has been read (a `--rm` box is
+    /// removed only then).
+    Detached(mpsc::Sender<()>),
+    /// The box runs in the foreground, its stdio the attach's: `docker run -i` (the attach's bytes
+    /// are its stdin) or `-t` (a terminal, one raw stream).
+    Foreground {
+        stdin: Option<std::process::ChildStdin>,
+        out: Option<ChildStdout>,
+        err: Option<ChildStderr>,
+        tty: bool,
+    },
+}
 
 /// The attaches waiting for their container's start.
 static ATTACHED: Mutex<Option<HashMap<String, mpsc::Sender<Started>>>> = Mutex::new(None);
@@ -1821,7 +1875,7 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
         (false, false) => (true, true),
         named => named,
     };
-    if created_get(name).is_some() {
+    if let Some(created) = created_get(name) {
         let (to, from) = mpsc::channel::<Started>();
         match ATTACHED.lock() {
             Ok(mut g) => {
@@ -1833,13 +1887,36 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
         let (bin, name) = (bin.to_path_buf(), name.to_string());
         return Response::Stream {
             status: 200,
-            content_type: "application/vnd.docker.multiplexed-stream",
+            // A terminal is one raw stream, as Docker sends it to a `-t` client.
+            content_type: if created.tty {
+                "application/vnd.docker.raw-stream"
+            } else {
+                "application/vnd.docker.multiplexed-stream"
+            },
             upgrade: req.upgrade,
             writer: Box::new(move |w: &mut crate::Out| {
                 // Ends without a word when the container is removed instead of started.
-                if let Ok(done) = from.recv() {
-                    kern_frames(&bin, &["logs", "--frames", "-f", &name], w, wanted);
-                    drop(done);
+                match from.recv() {
+                    Ok(Started::Detached(done)) => {
+                        kern_frames(&bin, &["logs", "--frames", "-f", &name], w, wanted);
+                        drop(done);
+                    }
+                    Ok(Started::Foreground {
+                        stdin,
+                        out,
+                        err,
+                        tty,
+                    }) => {
+                        let feeder = stdin.and_then(|sin| feed_stdin(w, sin));
+                        pump(w, out, err, tty);
+                        // The workload is done: a feeder still reading the client is woken by this
+                        // end closing for reading.
+                        if let Some(f) = feeder {
+                            let _ = w.socket().shutdown(std::net::Shutdown::Read);
+                            let _ = f.join();
+                        }
+                    }
+                    Err(_) => {}
                 }
             }),
         };
@@ -1900,7 +1977,7 @@ fn start_attached(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Started>
     }
     // The attach may have gone: then `done` is dropped at once, and nothing waits on it.
     let (done, read) = mpsc::channel::<()>();
-    let _ = to.send(done);
+    let _ = to.send(Started::Detached(done));
     let (bin, watched, created) = (bin.to_path_buf(), name.to_string(), c.clone());
     let reaper = std::thread::Builder::new()
         .name("kern-serve-run".into())
@@ -1925,6 +2002,67 @@ fn start_attached(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Started>
     no_content()
 }
 
+/// Start a created container that an attach waits on WITH ITS STDIN OR A TERMINAL (`docker run -i`,
+/// `-t`, `-it`): in the foreground, its stdio the attach's. A detached box's stdin is `/dev/null`
+/// and its output a log, so neither reaches it there. MEASURED before: `echo x | docker run -i
+/// alpine cat` printed nothing and exited 0 (the stdin dropped in silence), and `docker run -t`
+/// printed the frame headers, because the client of a terminal reads one raw stream.
+///
+/// THE PRICE: a foreground box is this server's child and ends with it, as a terminal ends the
+/// command it runs. A container run with neither stays detached (see [`start_attached`]).
+fn start_foreground(bin: &Path, name: &str, c: &Created, to: mpsc::Sender<Started>) -> Response {
+    // `box <name> -d --log-streams ...` -> `box <name> -q [-t|-i] ...`: in the foreground, with no
+    // status line in the client's stderr.
+    let mut argv: Vec<String> = without_flags(&c.argv, &["-d", "--log-streams"])
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut extra = vec!["-q".to_string()];
+    if c.tty {
+        extra.push("-t".into());
+    } else if c.stdin {
+        extra.push("-i".into());
+    }
+    let at = argv.len().min(2);
+    argv.splice(at..at, extra);
+    let mut child = match Command::new(bin)
+        .args(&argv)
+        .stdin(if c.stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            run_end(name, 125);
+            return error(500, &format!("cannot run kern box: {e}"));
+        }
+    };
+    let _ = to.send(Started::Foreground {
+        stdin: child.stdin.take(),
+        out: child.stdout.take(),
+        err: child.stderr.take(),
+        tty: c.tty,
+    });
+    crate::events::publish(&event_of("start", name, c, None));
+    let (watched, created) = (name.to_string(), c.clone());
+    let reaper = std::thread::Builder::new()
+        .name("kern-serve-run".into())
+        .spawn(move || {
+            let code = exit_code(&mut child);
+            crate::events::publish(&event_of("die", &watched, &created, Some(code)));
+            run_end(&watched, code);
+        });
+    if reaper.is_err() {
+        run_end(name, -1);
+    }
+    no_content()
+}
+
 /// How long a run's end is left to its attach's follow before `kern wait` waits for it.
 const FOLLOW_FIRST: Duration = Duration::from_secs(60);
 
@@ -1939,15 +2077,20 @@ fn start_detached(bin: &Path, name: &str, c: &Created, argv: &[&str]) -> Result<
     Ok(())
 }
 
-/// A `kern box` argv without its `--rm`, which stands among the flags (before the workload's `--`)
-/// and nowhere else: a workload argument spelled `--rm` is the workload's.
+/// A `kern box` argv without its `--rm`.
 fn without_rm(argv: &[String]) -> Vec<&str> {
+    without_flags(argv, &["--rm"])
+}
+
+/// A `kern box` argv without the valueless flags `drop`, which stand among the flags (before the
+/// workload's `--`) and nowhere else: a workload argument spelled the same is the workload's.
+fn without_flags<'a>(argv: &'a [String], drop: &[&str]) -> Vec<&'a str> {
     let mut out = Vec::with_capacity(argv.len());
     let mut in_flags = true;
     for a in argv {
         if in_flags && a == "--" {
             in_flags = false;
-        } else if in_flags && a == "--rm" {
+        } else if in_flags && drop.contains(&a.as_str()) {
             continue;
         }
         out.push(a.as_str());
@@ -2396,7 +2539,11 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             let resp = match attached_take(&name) {
                 Some(to) => {
                     run_begin(&name, &c);
-                    start_attached(bin, &name, &c, to)
+                    if c.stdin || c.tty {
+                        start_foreground(bin, &name, &c, to)
+                    } else {
+                        start_attached(bin, &name, &c, to)
+                    }
                 }
                 None => {
                     let argv: Vec<&str> = c.argv.iter().map(String::as_str).collect();
@@ -2473,6 +2620,9 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             if created_take(&name).is_some() {
                 // A pending attach ends with the container.
                 drop(attached_take(&name));
+                // A start that failed may have left kern a box under this name (a kept layer, an
+                // exit record): removed with the container, or `ps -a` keeps showing it.
+                let _ = kern(bin, &["rm", "-f", &name]);
                 return no_content();
             }
             // An attached run that ended: forgotten here, and its kept layer, if it has one, is
@@ -2780,8 +2930,8 @@ mod tests {
             r#"{"label":["devcontainer.local_folder=/w"]}"#,
         ] {
             let lf = ListFilters::parse(&list_req(f)).unwrap();
-            assert!(lf.keeps("mine", true, &mine), "{f}");
-            assert!(!lf.keeps("other", true, &other), "{f}");
+            assert!(lf.keeps("mine", "running", &mine), "{f}");
+            assert!(!lf.keeps("other", "running", &other), "{f}");
         }
         for bad in [
             r#"{"ancestor":["alpine"]}"#,
@@ -2791,19 +2941,22 @@ mod tests {
             assert!(ListFilters::parse(&list_req(bad)).is_err(), "{bad}");
         }
         let by_name = ListFilters::parse(&list_req(r#"{"name":["^web"]}"#)).unwrap();
-        assert!(by_name.keeps("web-1", true, &other));
-        assert!(!by_name.keeps("my-web", true, &other));
+        assert!(by_name.keeps("web-1", "running", &other));
+        assert!(!by_name.keeps("my-web", "running", &other));
         let exact = ListFilters::parse(&list_req(r#"{"name":{"^/web$":true}}"#)).unwrap();
-        assert!(exact.keeps("web", true, &other) && !exact.keeps("web-1", true, &other));
+        assert!(exact.keeps("web", "running", &other) && !exact.keeps("web-1", "running", &other));
         let sub = ListFilters::parse(&list_req(r#"{"name":["app.v2"]}"#)).unwrap();
-        assert!(sub.keeps("my-app.v2-1", true, &other));
+        assert!(sub.keeps("my-app.v2-1", "running", &other));
         let id = id_of("web");
         let by_id =
             ListFilters::parse(&list_req(&format!(r#"{{"id":["{}"]}}"#, &id[..12]))).unwrap();
-        assert!(by_id.keeps("web", true, &other) && !by_id.keeps("db", true, &other));
+        assert!(by_id.keeps("web", "running", &other) && !by_id.keeps("db", "running", &other));
         let exited = ListFilters::parse(&list_req(r#"{"status":["exited"]}"#)).unwrap();
         assert!(exited.wants_exited());
-        assert!(exited.keeps("x", false, &other) && !exited.keeps("x", true, &other));
+        assert!(exited.keeps("x", "exited", &other) && !exited.keeps("x", "running", &other));
+        let created = ListFilters::parse(&list_req(r#"{"status":["created"]}"#)).unwrap();
+        assert!(created.wants_exited());
+        assert!(created.keeps("x", "created", &other) && !created.keeps("x", "exited", &other));
     }
 
     /// A port binding with no `HostIp` is every address (kern's `-p <host>:<box>`, `0.0.0.0` and
@@ -2837,6 +2990,28 @@ mod tests {
         assert_eq!(
             without_rm(&argv),
             ["box", "n", "-d", "--image", "x", "--", "rm", "--rm", "f"]
+        );
+    }
+    /// The foreground run drops `-d` and `--log-streams` among the flags only.
+    #[test]
+    fn without_flags_leaves_the_workloads_arguments_alone() {
+        let argv: Vec<String> = [
+            "box",
+            "n",
+            "-d",
+            "--log-streams",
+            "--image",
+            "x",
+            "--",
+            "nginx",
+            "-d",
+        ]
+        .iter()
+        .map(|a| (*a).to_string())
+        .collect();
+        assert_eq!(
+            without_flags(&argv, &["-d", "--log-streams"]),
+            ["box", "n", "--image", "x", "--", "nginx", "-d"]
         );
     }
 

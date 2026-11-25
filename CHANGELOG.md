@@ -37,6 +37,12 @@ image and execs into it: `--mount`, `exec -i`, and `docker events` for the conta
 container keeps its filesystem until `docker rm` (a kept box), so the `docker start` of a reopen
 runs it again on the same files; `--rm` containers and a Testcontainers run's stay in memory.
 
+**`docker run -i` and `-t` through kern's Docker API work.** The stdin of `docker run -i` was
+dropped in silence (`echo x | docker run -i alpine cat` printed nothing and exited 0) and `-t`
+printed the stream's frame headers; such a run is now a foreground box with the client's stdin and,
+with `-t`, a terminal. `docker ps -a` lists created containers, and those whose start failed, as
+`Created`, so Testcontainers' cleanup finds them.
+
 **`history` answers only what it is: the boxes run lately.** `kern history <image>` dropped the
 name and printed the last boxes run, and `kern image history` and the shim's `docker history` ran
 the same verb, where Docker means an image's layers, which kern does not keep. A name is now

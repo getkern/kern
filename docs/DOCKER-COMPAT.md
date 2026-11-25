@@ -133,6 +133,12 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
   run made, which kern removes when the run ends. A kept box starts in about 25 ms here against 5 ms,
   most of it copying `/etc/hosts` into a layer on disk. `docker start` of a stopped container that kept
   nothing says so instead of starting it.
+- `docker run -i` and `-t` (`-it`) run the box in the foreground, its stdin the client's and, with
+  `-t`, a terminal sent as one raw stream: `echo x | docker run -i alpine cat` prints `x`, a 1 MB
+  stdin arrives whole, `-it sh` is a shell and its exit code is the run's. Such a box is this
+  server's child and ends with it, as a terminal ends the command it runs.
+- `docker ps -a` lists a container created and not started, or whose start failed, as `Created`,
+  and `docker rm` of it removes what a failed start left behind.
 - A container started attached (`docker run` without `-d`) is a detached box like any other, so it
   outlives the server and its client (measured: the server killed during a run, the box finished
   and logged every line; a dev container still `Up` after a server restart). The attach follows the
