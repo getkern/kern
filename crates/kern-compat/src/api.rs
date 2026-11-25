@@ -2673,6 +2673,19 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             // failed leaves it created, as Docker does.
             if matches!(resp, Response::Full { status: 204, .. }) {
                 drop(created_take(&name));
+            } else if c.auto_remove {
+                // EXCEPT ONE WITH `--rm`, which Docker removes when its start fails, and its
+                // client waits for that removal before it reports the error: MEASURED before,
+                // `docker run --rm` with a start that failed hung for good (its wait never woke),
+                // while `docker run -d` answered 125 at once.
+                // Its wait, woken by the removal, answers the 125 from a run recorded first (a
+                // `docker run -d --rm` has none, and its wait printed kern's "no running box").
+                run_begin(&name, &c);
+                run_end(&name, 125);
+                session_forget(&name);
+                drop(created_take(&name));
+                drop(attached_take(&name));
+                let _ = kern(bin, &["rm", "-f", &name]);
             }
             start_release(&name);
             resp
@@ -2904,6 +2917,84 @@ mod tests {
             .map(String::from)
             .collect())
         );
+    }
+
+    /// A start that kern refuses (MEASURED: an unreadable cache dir) answers its error, and the
+    /// client's wait is not left hanging: a `--rm` container is removed and its wait answers 125,
+    /// as Docker does; one without it stays created, as Docker leaves it.
+    #[test]
+    fn a_refused_start_removes_a_rm_container_and_wakes_its_wait() {
+        let dir = std::env::temp_dir().join(format!("kern-compat-refused-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let bin = dir.join("kern");
+        let script = "#!/bin/sh\ncase \"$1\" in\n box) echo 'cache dir: Permission denied (os error 13)' >&2; exit 1;;\n ps) echo '[]';;\nesac\nexit 0\n";
+        assert!(std::fs::write(&bin, script).is_ok());
+        use std::os::unix::fs::PermissionsExt;
+        assert!(std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).is_ok());
+        let start = |name: &str| Request {
+            method: "POST".into(),
+            path: format!("/containers/{name}/start"),
+            query: Vec::new(),
+            body: Vec::new(),
+            upgrade: false,
+            peer: None,
+            close: false,
+        };
+        for (name, rm, attached) in [
+            ("kd-refused-rm", true, true),
+            ("kd-refused-rm-d", true, false),
+            ("kd-refused-keep", false, true),
+        ] {
+            let b = body(&format!(
+                r#"{{"Image":"alpine:3.21","Cmd":["true"],"HostConfig":{{"AutoRemove":{rm}}}}}"#
+            ));
+            let Ok(c) = create_argv(name, &b) else {
+                panic!("create {name}")
+            };
+            assert_eq!(c.auto_remove, rm, "{name}");
+            created_put(name, c);
+            let from = attached.then(|| {
+                let (to, from) = mpsc::channel::<Started>();
+                if let Ok(mut g) = ATTACHED.lock() {
+                    g.get_or_insert_with(HashMap::new)
+                        .insert(name.to_string(), to);
+                }
+                from
+            });
+            let Response::Full { status, body, .. } = handle(&start(name), &bin) else {
+                panic!("a whole body for {name}");
+            };
+            assert_eq!(status, 500, "{name}");
+            assert!(
+                String::from_utf8_lossy(&body).contains("cache dir: Permission denied"),
+                "{name}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            // The attach ends without a word.
+            if let Some(from) = from {
+                assert!(from.recv_timeout(Duration::from_secs(5)).is_err(), "{name}");
+            }
+            if rm {
+                assert!(created_get(name).is_none(), "{name} must be removed");
+                let (tx, rx) = mpsc::channel();
+                let n = name.to_string();
+                std::thread::spawn(move || {
+                    wait_until_started(&n);
+                    let _ = tx.send(run_exit(&n));
+                });
+                assert_eq!(
+                    rx.recv_timeout(Duration::from_secs(5)),
+                    Ok(Some(125)),
+                    "{name}: the wait must answer 125 at once"
+                );
+            } else {
+                assert!(created_get(name).is_some(), "{name} must stay created");
+                drop(created_take(name));
+            }
+            run_forget(name);
+        }
+        let _ = std::fs::remove_file(&bin);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// A container keeps its layer (`--keep`, so `docker start` runs it again on the same files)

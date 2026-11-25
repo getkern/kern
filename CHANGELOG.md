@@ -97,6 +97,12 @@ API lists and inspects an ended container from kern's record, after a restart to
 container found by its label, its exit code and image). `kern ps --json` also gives a running box's
 `image`, and `docker ps` shows each container's image (it showed `<no image>` for all of them).
 
+**A `docker run --rm` whose start kern refuses ends with the error, as `docker run -d` did.** It
+hung for good (with an unreadable cache dir: killed after 25 s), because the client waits for the
+container's removal before it reports the error and the container stayed created. It is removed
+now, its wait answers 125, and the client exits 125 with kern's message in about 20 ms, attached
+or `-d`. A container without `--rm` stays created, as Docker leaves it.
+
 **`docker run --rm` through kern's API is removed by kern, whatever becomes of the server.** The
 server removed such a box itself after following its log, so a server stopped meanwhile left the
 box listed as exited for good. The box is `kern box --rm` now: its log stays for the server's
