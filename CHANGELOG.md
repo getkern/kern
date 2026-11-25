@@ -21,73 +21,69 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
-**Breaking: `kern run` runs an image, as `docker run` does; what it did before is gone.**
-`kern run [options] <image> [command...]` is `kern box` in `docker run`'s shape: the options are
-`box`'s, the first other word is the image and everything after it the command, the name is
-`--name` or one kern picks, and `kern container run` is the same verb. Capping a program of this
-host with no container, what `kern run [options] -- <command>` did, is no longer kern's: it is not a
-container and Docker has no such verb. systemd does it, and kern says so with the command written
-for it: `kern run [options] -- <command>`, a path where the image goes, and a `kern run <word>` whose
-image does not exist while `<word>` is a program of this host all answer `systemd-run --user
---scope -p MemoryMax=1G -p CPUQuota=200% -- <command>`. `--landlock-rw`, `--memory`, `--cpus`,
-`--cpuset-cpus` and `vcpu:` profiles stay, on boxes. `kern top --json` is schema 2: its `runs`
-object, the counters of that verb, went with it.
+**Breaking: `kern run` runs an image; what it did before is gone.** `kern run [options] <image>
+[command...]` is `kern box` with an image to run: the options are `box`'s, the first other word
+is the image and everything after it the command, the name is `--name` or one kern picks, and `kern
+container run` is the same verb. Capping a program of this host with no container, what `kern run
+[options] -- <command>` did, is no longer kern's: it is not a container. systemd does it, and kern
+says so with the command written for it: `kern run [options] -- <command>`, a path where the image
+goes, and a `kern run <word>` whose image does not exist while `<word>` is a program of this host
+all answer `systemd-run --user --scope -p MemoryMax=1G -p CPUQuota=200% -- <command>`.
+`--landlock-rw`, `--memory`, `--cpus`, `--cpuset-cpus` and `vcpu:` profiles stay, on boxes. `kern
+top --json` is schema 2: its `runs` object, the counters of that verb, went with it.
 
-**Breaking: A box reaches the internet by default, as a Docker container does.** `kern run alpine wget
-example.com` had no interface but `lo` and no `/etc/resolv.conf`; a box that names no network now
-gets a NAT of its own (`eth0`, the host's resolvers), and so do `docker run` through kern's socket and
-`--network bridge`. `--network none` is the box with loopback only it used to be by default, and
-`network_mode: none` in a compose file says it. The NAT costs one pasta per box, about 11 ms of its
-start (14.7 ms against 4.0 ms with `--network none`). A service the host binds to `127.0.0.1` stays
-out of reach, by the gateway, the host's LAN address or `host-gateway`, as under Docker (measured with
-a canary). The Python and Node sandboxes and the Rust `Sandbox` builder ask for `--network none` and
-are isolated as before.
+**Breaking: A box reaches the internet by default.** `kern run alpine wget example.com` had no
+interface but `lo` and no `/etc/resolv.conf`; a box that names no network now gets a NAT of its own
+(`eth0`, the host's resolvers), and so do `docker run` through kern's socket and `--network bridge`.
+`--network none` is the box with loopback only it used to be by default, and `network_mode: none` in
+a compose file says it. The NAT costs one pasta per box, about 11 ms of its start (14.7 ms against
+4.0 ms with `--network none`). A service the host binds to `127.0.0.1` stays out of reach, by the
+gateway, the host's LAN address or `host-gateway` (measured with a canary). The Python and Node
+sandboxes and the Rust `Sandbox` builder ask for `--network none` and are isolated as before.
 
-**Breaking: An OOM kills the process the kernel picks, and the box goes on, as under Docker.** kern wrote
+**Breaking: An OOM kills the process the kernel picks, and the box goes on.** kern wrote
 `memory.oom.group=1` on every box, so an `exec` that ran out of memory took the whole box with it
-(`exited`), where Docker's container stays `running`. That is now `--oom-group`, which the Python and
+(`exited`); the box now stays `running`. That is now `--oom-group`, which the Python and
 Node sandboxes pass, so their `oom` verdict covers every process of a cell as before.
 
-**Breaking: A denied syscall answers `EPERM`, as under Docker, instead of killing the caller.** A box that
-called a refused syscall (`unshare`, `mount`, `bpf`, `ptrace`, a namespace-creating `clone`) died with
-`Bad system call` (exit 159), where Docker's answer is `Operation not permitted` and the program goes
-on: a browser's or bubblewrap's sandbox probe, systemd's `bpf` probe and a debugger now report the
-refusal instead of crashing. The set of refused syscalls is unchanged, and none of them ever runs.
-`--security-opt seccomp-deny=kill` keeps the kill (so does `--security-profile untrusted`), `kern
-exec` and health probes get the box's own verdict, and the Python and Node sandboxes ask for the kill
-on every box, so their `escape_blocked` reads as before.
+**Breaking: A denied syscall answers `EPERM` instead of killing the caller.** A box that called a
+refused syscall (`unshare`, `mount`, `bpf`, `ptrace`, a namespace-creating `clone`) died with `Bad
+system call` (exit 159); the program now gets `Operation not permitted` and goes on: a browser's or
+bubblewrap's sandbox probe, systemd's `bpf` probe and a debugger now report the refusal instead of
+crashing. The set of refused syscalls is unchanged, and none of them ever runs. `--security-opt
+seccomp-deny=kill` keeps the kill (so does `--security-profile untrusted`), `kern exec` and health
+probes get the box's own verdict, and the Python and Node sandboxes ask for the kill on every box,
+so their `escape_blocked` reads as before.
 
-**Breaking: A box that names no memory is bounded by the machine, and swaps as Docker's does.** `kern
-run`, `kern box` and `docker run` through kern's socket capped every box at 512 MiB with no swap, where
-Docker sets no cap, and `kern compose` already gave the host's RAM: a database, a JVM or a build that
-runs under Docker was OOM-killed at a number written nowhere. A box with no `--memory` now has the
-host's RAM as its ceiling and the host's swap; `--memory M` alone allows M of swap, Docker's pairing
-(measured: `memory.swap.max` 268435456 under `--memory 256m` on both engines); `--memory-swap-max`
-sets it. The Python and Node sandboxes and the Rust `Sandbox` builder
-pass `--memory-swap-max 0` and keep 512 MiB as their whole budget.
+**Breaking: A box that names no memory is bounded by the machine, and swaps.** `kern run`, `kern
+box` and `docker run` through kern's socket capped every box at 512 MiB with no swap, while `kern
+compose` already gave the host's RAM: a database, a JVM or a build was OOM-killed at a number
+written nowhere. A box with no `--memory` now has the host's RAM as its ceiling and the host's swap;
+`--memory M` alone allows M of swap (measured: `memory.swap.max` 268435456 under `--memory 256m`);
+`--memory-swap-max` sets it. The Python and Node sandboxes and the Rust `Sandbox` builder pass
+`--memory-swap-max 0` and keep 512 MiB as their whole budget.
 
-**A box resolves the host's search domains, as a Docker container does.** A box on the default
-network, a compose service and a pod got the host's nameservers and not its `search` line, so a
-short LAN name resolved under Docker and not under kern. The host's domains are the box's now, unless
-`--dns-search` (or `dns_search:`) names its own.
+**A box resolves the host's search domains.** A box on the default network, a compose service and a
+pod got the host's nameservers and not its `search` line, so a short LAN name did not resolve. The
+host's domains are the box's now, unless `--dns-search` (or `dns_search:`) names its own.
 
 **`docker inspect` says `OOMKilled` through kern's socket.** It was always false. A container whose
-process the kernel's OOM killer ended reads true, and so does a running one that lost a child to it,
-as under Docker; `kern ps --json` and `kern inspect --json` carry it as `oom_killed`. The verdict a
-detached box recorded was the runner's latch read in the wrong process, so it was never set.
+process the kernel's OOM killer ended reads true, and so does a running one that lost a child to it;
+`kern ps --json` and `kern inspect --json` carry it as `oom_killed`. The verdict a detached box
+recorded was the runner's latch read in the wrong process, so it was never set.
 
 **kern's Docker API server survives a burst of clients.** 200 `docker run --rm` at once took it to its
 file limit (systemd's soft 1024), and it exited on `accept failed: No file descriptors available`,
 ending every request in flight with `EOF`. It now waits out a shortage of descriptors or memory with
-the connections queued, and runs with its soft file limit raised to the hard one, as Docker's daemon
-does; the boxes it starts keep the limit they had (soft 1024, as a Docker container's). Measured: 200
-at once, three times, 200 of 200 in about one second, the same server, no box left.
+the connections queued, and runs with its soft file limit raised to the hard one; the boxes it
+starts keep the limit they had (soft 1024). Measured: 200 at once, three times, 200 of 200 in about
+one second, the same server, no box left.
 
 **`kern run -d` prints the box's name, and `kern rm` only the names it removed.** `kern run` may pick
-the name itself, and it was in a sentence on stderr only: `id=$(kern run -d nginx)` was empty where
-`docker run -d` gives an id. The name is alone on stdout now, the narration on stderr; `kern box -d`
-keeps stdout empty. `kern rm -f web` printed `stopped 'web' (pid N)` before `web`, a restarting box no
-name, a kept box `removed kept box 'web'`: each is the name alone, as `docker rm` prints it.
+the name itself, and it was in a sentence on stderr only: `id=$(kern run -d nginx)` was empty. The
+name is alone on stdout now, the narration on stderr; `kern box -d` keeps stdout empty. `kern rm -f
+web` printed `stopped 'web' (pid N)` before `web`, a restarting box no name, a kept box `removed
+kept box 'web'`: each is the name alone.
 
 **`kern top` shows what the new defaults change.** A box row says `oom:N` when the OOM killer ended a
 process in a box that runs on, and `restarts:N` for a `--restart` box; the Overview counts how the
@@ -100,39 +96,38 @@ running boxes reach out (`3 nat · 1 none`) and names the Docker API socket and 
 was installed but didn't start": systemd holds such a unit in `activating` between runs, which the
 check read as a failure, and it left the unit behind, so the box came back after every `kern rm
 -f`. The start is judged by systemd's state, a unit that did not come up is removed, `kern rm` of a
-restarting box refuses without `-f` as Docker's does, and `kern rm -f` stops it for good. Between
-two runs it lists as `restarting`, with systemd's count of its restarts, and `kern ps --filter
-status=restarting` finds it. A kept one (every container
-made through kern's socket) starts at once: the launcher held its layer, so the unit's first run
-failed and ran a second later, and `docker run -d --restart always` took 1.4 s with a restart counted
-that never happened (now about 190 ms and 0).
+restarting box refuses without `-f`, and `kern rm -f` stops it for good. Between two runs it lists
+as `restarting`, with systemd's count of its restarts, and `kern ps --filter status=restarting`
+finds it. A kept one (every container made through kern's socket) starts at once: the launcher held
+its layer, so the unit's first run failed and ran a second later, and `docker run -d --restart
+always` took 1.4 s with a restart counted that never happened (now about 190 ms and 0).
 
-**A `--restart` box is one box from run to run, as a Docker container is.** Under `always` and
-`unless-stopped` each run started from the image again, so a file the box wrote was gone at the
-next run, and a box with no `--name` took a new name (`box-<pid>`) every time, listed beside the
-name of its unit. The box is now kept: its name and its files carry over, `kern stop` then `kern
-start` (or `kern restart`) brings it back with its policy, which `docker inspect` reports while
-it is stopped, and `kern rm -f` removes the box, its files and its unit. Between two runs it is
-up, as `docker ps` lists a `Restarting (1)` container: `restarting (1)` in `kern ps` without `-a`,
-in `kern top` (with no pid, `null` in `--json`) and through kern's socket, where it was missing,
-or `exited` for an instant. `kern rename` takes the box's earlier runs with it, records and logs.
+**A `--restart` box is one box from run to run.** Under `always` and `unless-stopped` each run
+started from the image again, so a file the box wrote was gone at the next run, and a box with no
+`--name` took a new name (`box-<pid>`) every time, listed beside the name of its unit. The box is
+now kept: its name and its files carry over, `kern stop` then `kern start` (or `kern restart`)
+brings it back with its policy, which `docker inspect` reports while it is stopped, and `kern rm -f`
+removes the box, its files and its unit. Between two runs it is listed as up: `restarting (1)` in
+`kern ps` without `-a`, in `kern top` (with no pid, `null` in `--json`) and through kern's socket,
+where it was missing, or `exited` for an instant. `kern rename` takes the box's earlier runs with
+it, records and logs.
 
 **`kern rename` of a `--restart` box renames its unit, and does not stop it.** The layer took the
 new name and the unit went on running the old one, so `ps -a` had two rows and the old name came
 back from an empty layer. Between two runs the unit is moved to the new name; a running box keeps
 running, and its unit is handed over to the new name when it next exits (a crash included). The
 logs of every earlier run follow the name. `kern wait` and `docker wait` of a box that is stopped
-or between two runs answer its last code at once, as Docker does (they refused, and the socket
-said -1). A `--restart always` command may span several lines: the unit writes a newline as its
-escape (it was refused).
+or between two runs answer its last code at once (they refused, and the socket said -1). A
+`--restart always` command may span several lines: the unit writes a newline as its escape (it was
+refused).
 
-**`kern inspect` reports a kept box, and its `-f` names the image as Docker does.** A box that is
-stopped or between two runs is shown from its record (status, image, command, policy, restarts),
-where it was refused. In `-f`, `.Config.Image` is the image's name and `.Image` its id; both printed
-the box's scratch path. `.State.Restarting` and `.HostConfig.RestartPolicy.Name` are answered where
-kern holds the policy (a `--restart` unit, a kept box's record), and refused elsewhere. `kern ps
---format json` prints Docker's line per box (it printed the word `json`), and `--format` says
-`restarting` / `Restarting (1) ...` for a box between two runs.
+**`kern inspect` reports a kept box, and its `-f` names the image.** A box that is stopped or
+between two runs is shown from its record (status, image, command, policy, restarts), where it was
+refused. In `-f`, `.Config.Image` is the image's name and `.Image` its id; both printed the box's
+scratch path. `.State.Restarting` and `.HostConfig.RestartPolicy.Name` are answered where kern holds
+the policy (a `--restart` unit, a kept box's record), and refused elsewhere. `kern ps --format json`
+prints one JSON line per box (it printed the word `json`), and `--format` says `restarting` /
+`Restarting (1) ...` for a box between two runs.
 
 **Fixes from the last mixed test round.**
 - **`docker tag` cannot replace a kept box's image.** `docker tag` or `kern tag` onto a
@@ -193,21 +188,21 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
   `[kern] log_driver`: every line also goes to the systemd journal, tagged with the box's name, stdout
   as info and stderr as err; `kern logs` keeps working from the file. Refused where there is no journal.
   `kern info` names the driver, and as root suggests `/var/lib/kern` for a server's data.
-- **Box logs are kept on disk, so a reboot keeps them**, as Docker keeps a container's: in the data
-  dir's `logs/` (or `logs_dir`). An ended box's log goes after 7 days (`log_keep_ended`), a kept box's
-  when the box is removed. A box started before the upgrade keeps its `kern logs`. Measured, a
-  detached box's start pays nothing for it.
+- **Box logs are kept on disk, so a reboot keeps them**: in the data dir's `logs/` (or `logs_dir`).
+  An ended box's log goes after 7 days (`log_keep_ended`), a kept box's when the box is removed. A
+  box started before the upgrade keeps its `kern logs`. Measured, a detached box's start pays
+  nothing for it.
 - **Compose: a volume's `driver_opts` are honoured, not ignored.** `type: none, o: bind, device: <dir>`
-  put the data in a kern volume of its own while `<dir>` stayed empty; it is now kept there, as Docker
-  keeps it. `type: tmpfs` is a tmpfs; `nfs` and `cifs` are refused with the way that works (mount the
-  share on the host and bind it); another driver or type is refused with what to write instead. The
-  Docker API's `POST /volumes/create` takes the same `DriverOpts`.
-- **`kern run` prints nothing of its own for a box isolated as expected**, as `docker run`. A line
-  still says so when a boundary is open (`--net host`, a shared rootfs); `--verbose` shows the panel.
+  put the data in a kern volume of its own while `<dir>` stayed empty; it is now kept there. `type:
+  tmpfs` is a tmpfs; `nfs` and `cifs` are refused with the way that works (mount the share on the
+  host and bind it); another driver or type is refused with what to write instead. The Docker API's
+  `POST /volumes/create` takes the same `DriverOpts`.
+- **`kern run` prints nothing of its own for a box isolated as expected**. A line still says so when
+  a boundary is open (`--net host`, a shared rootfs); `--verbose` shows the panel.
 - **Each part of kern's data can have a disk of its own.** `images_dir`, `volumes_dir`, `logs_dir`
   (logs then kept across reboots) and `history_dir`, set with `kern config set` or from `kern top`
   (Storage, `m`: what, then where), and one volume anywhere with `kern volume create <n> --path <dir>`
-  (or Docker's `--opt device=<dir>`). `kern info` says where each part is.
+  (or `--opt device=<dir>`). `kern info` says where each part is.
 - **`kern top` shows where kern's data is and moves it.** The Disk figure and the "Disk full" alert
   measured `/`, not the disk the data is on. Both follow `data_dir` now; the Storage tab names the
   place and its free space, and `m` lists the mounted disks (with what an exFAT card or a disk not
@@ -225,8 +220,8 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
   are 20 ms or more apart; back to back, half of them), 114 to 33 ms on a VPS as root. What the box
   sees is the same, compared line by line on four hosts. One is kept ready per user (an idle holder
   and its pasta, about 32 MB); `kern info` shows it, `KERN_NET_POOL=0` turns it off.
-- **`kern stop` of a box that is already stopped** prints its name and exits 0, as `docker stop` does;
-  it answered "no running box". A name that is no box at all is still an error.
+- **`kern stop` of a box that is already stopped** prints its name and exits 0; it answered "no
+  running box". A name that is no box at all is still an error.
 - **`kern doctor` says when kern is not where the AppArmor profile looks**, and to copy it to
   `~/.local/bin/kern` first; it said "if that path is not in its attachment line".
 - **`kern top` has one tab for boxes.** Its "Runs" tab counted the capped host processes of the
@@ -242,19 +237,18 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 
 **`kern cp` and `docker cp` reach a kept box that is not running, and a kept box keeps its image.**
 A box that is stopped, never started, or between two runs of its `--restart` policy was refused as
-"not running", where `docker cp` copies into and out of a stopped container. kern now starts a box
-on its layer for the copy, with no network, a PID 1 that runs nothing, and the box's own volumes,
-so a path under an image `VOLUME` reaches the box's data. It takes about 15 ms. Its layer is held
-meanwhile, so a run of the box cannot mount it at the same time. A kept box now runs the image it
-was created from, as a Docker container does: when its tag is rebuilt or pulled again, its runs
-and `cp` still use the old content. That content is kept as a pin, made with hard links (no data
-copied) once per image and off the box's start path; the image list does not show it, and it goes
-with the last box created from it. When that content is gone (`kern gc --images`), the box is
+"not running". kern now starts a box on its layer for the copy, with no network, a PID 1 that runs
+nothing, and the box's own volumes, so a path under an image `VOLUME` reaches the box's data. It
+takes about 15 ms. Its layer is held meanwhile, so a run of the box cannot mount it at the same
+time. A kept box now runs the image it was created from: when its tag is rebuilt or pulled again,
+its runs and `cp` still use the old content. That content is kept as a pin, made with hard links (no
+data copied) once per image and off the box's start path; the image list does not show it, and it
+goes with the last box created from it. When that content is gone (`kern gc --images`), the box is
 refused by name instead of putting its layer on another base.
 
 **A container keeps the image id it was started from.** The id is recorded when the box starts,
 so a rebuild of its tag no longer moves the id `docker inspect` and `kern inspect` report for a
-box that still runs the old image, as Docker keeps it.
+box that still runs the old image.
 
 **`docker compose up --profile <p>` adds a service to a running stack.** A file with one plain
 service and one under a profile got a stack without a bridge, and the later `up --profile` failed
@@ -262,29 +256,28 @@ to attach the second service. The wiring is decided on every service the file de
 
 **`docker inspect` reports a container's image id.** `Image` in `inspect` and `ImageID` in the list
 are the image's id, the `Id` `docker images` gives it; its name is `Config.Image` and the list's
-`Image`. Both said the name. `docker inspect` of a name that does not exist ends with Docker's `no
+`Image`. Both said the name. `docker inspect` of a name that does not exist ends with `no
 such object`.
 
-**`ptrace` works in a box.** `strace`, `gdb` and profilers failed with `Operation not permitted`
-where Docker's and Podman's default profiles permit `ptrace`; a box permits it now, and the sandbox
-SDKs, the MCP server and `--security-profile untrusted` still deny it (with the kill).
-`process_vm_readv`/`writev` stay refused. A `kern exec` entering a box cannot be read or attached to
-before its command runs.
+**`ptrace` works in a box.** `strace`, `gdb` and profilers failed with `Operation not permitted`; a
+box permits it now, and the sandbox SDKs, the MCP server and `--security-profile untrusted` still
+deny it (with the kill). `process_vm_readv`/`writev` stay refused. A `kern exec` entering a box
+cannot be read or attached to before its command runs.
 
 **An image's `VOLUME` gets an anonymous volume.** A box wrote the image's declared volume paths into
 its own layer: postgres's data, redis's `/data`, and docker-in-docker's `/var/lib/docker`, where
 `dockerd` could not run `overlay2` and fell back to `vfs`. Now each gets a volume of kern's (unless
 `-v` or `--tmpfs` covers the path), seeded from the image, kept across a restart and a `compose up`
-recreate, removed with the box; `compose down` then `up` starts fresh, as under Docker (measured on
-both). `kern build` records `VOLUME`, and `save`/`push` write it. An empty volume now takes the image
-directory's owner from the box itself: a named volume's first start, and an anonymous one's, no
-longer spends two helper processes on it (+2.0 ms to +0.4 ms over a bind, measured on redis).
+recreate, removed with the box; `compose down` then `up` starts fresh. `kern build` records
+`VOLUME`, and `save`/`push` write it. An empty volume now takes the image directory's owner from the
+box itself: a named volume's first start, and an anonymous one's, no longer spends two helper
+processes on it (+2.0 ms to +0.4 ms over a bind, measured on redis).
 
 **File capabilities survive pull, load, build and save.** They were stripped where setuid bits were
 kept: Alpine's `newuidmap` is `cap_setuid=ep`, so rootless BuildKit stopped at "Could not set caps".
 Kept in kern's cache (v3, inert on the host), carried through `kern build` (set after the owner,
 which a chown would clear), and written as v2 by `save`/`push` (measured: an image kern built and
-saved shows `cap_setuid=ep` under Docker). A cached image whose `newuidmap` lost its capability is
+saved keeps `cap_setuid=ep` once loaded). A cached image whose `newuidmap` lost its capability is
 re-extracted once.
 
 **`--privileged` runs a container runtime: docker-in-docker, BuildKit, a nested kern.** It relaxed
@@ -306,15 +299,15 @@ connection. kern drops such a segment before connection tracking now, as every s
 name, so a file with a `front` and a `back` network needed `kern compose`. A project's networks are now
 bridges of one pod: a service on both reaches a peer of each (aliases included), a service on one does
 not resolve the other's, an `internal` network does not go out, and `inspect` shows an address per
-network. Measured on the same four-service file against Docker, with the same output. A running
-container, or a network of another project, is still refused by name.
+network. Measured on a four-service file. A running container, or a network of another project, is
+still refused by name.
 
 **`kern compat docker -- <command>` points programs that use the Docker API at kern.** It put kern's
 `docker` first in PATH and nothing else, so Testcontainers, docker-py or the real `docker` by its full
-path reached whatever Docker the machine had, or nothing. The command now gets `DOCKER_HOST` on kern's
-API socket (a server is started for it when none listens), no `DOCKER_CONTEXT`, and the classic
-builder (`DOCKER_BUILDKIT=0`) and Ryuk off unless already set: with buildx installed, the real `docker
-build` builds through kern.
+path reached whatever engine the machine had, or nothing. The command now gets `DOCKER_HOST` on
+kern's API socket (a server is started for it when none listens), no `DOCKER_CONTEXT`, and the
+classic builder (`DOCKER_BUILDKIT=0`) and Ryuk off unless already set: with buildx installed, the
+real `docker build` builds through kern.
 
 **`docker compose up --build` recreates a rebuilt service.** Through kern's socket an image's id was
 derived from its name, so an image rebuilt under the same tag kept its id and compose left the old
@@ -329,14 +322,16 @@ builder kern's API serves.
 
 **`docker inspect` reports the restart policy, and `kern save` takes several images.**
 `HostConfig.RestartPolicy` was empty for every container; it is the policy the container was made
-with, as Docker reports it. `kern save a b` and `docker save a b` write one archive with both images.
+with. `kern save a b` and `docker save a b` write one archive with both images.
 
 **A closed port is refused behind pasta, and a lost SYN costs one retry.** With the pasta Ubuntu
-24.04 ships, a box's connection to a closed port waited for the client's timeout (`wget -T20`: 20 s;
-Docker: refused in 311 ms), and a SYN the remote dropped cost two seconds instead of one, which bursts
-of fast-starting boxes met often (23 of 300 fetches of example.com over 1.5 s). Two rules kern writes
-in the box's network namespace mend both with any pasta: refused in about 1 s, a dropped SYN 1.0 s as
-under Docker, a box's start unchanged. `kern info` shows them as `pasta tcp`, with the pasta's build date; `kern doctor` names a pasta older than 2025-02 and where a newer one comes from, and warns when it meets a kernel without nftables.
+24.04 ships, a box's connection to a closed port waited for the client's timeout (`wget -T20`: 20
+s), and a SYN the remote dropped cost two seconds instead of one, which bursts of fast-starting
+boxes met often (23 of 300 fetches of example.com over 1.5 s). Two rules kern writes in the box's
+network namespace mend both with any pasta: refused in about 1 s, a dropped SYN 1.0 s, a box's start
+unchanged. `kern info` shows them as `pasta tcp`, with the pasta's build date; `kern doctor` names a
+pasta older than 2025-02 and where a newer one comes from, and warns when it meets a kernel without
+nftables.
 
 **A stopped box is not run again by its own restart policy.** A box whose `--restart always` its
 supervisor keeps (a pod member: every compose service, and every container of kern's Docker API on a
@@ -346,7 +341,7 @@ retry. The policy now asks whether a stop has begun before it runs the box again
 
 **`docker build` and `docker save` through kern's socket.** Both answered "not served". A build is
 `kern build` of the context the client streams, with its tags, Dockerfile, build args, target,
-platform and `--no-cache`, its lines as Docker's and the image's id at the end (`-q` prints it
+platform and `--no-cache`, its output lines and the image's id at the end (`-q` prints it
 alone); `docker compose up --build` builds through it. `docker save` is `kern save`, streamed, one
 image an archive. `docker restart` publishes `kill die stop start restart`, once; a `--restart
 always` container's watch added its own `start` after the restart's.
@@ -355,19 +350,19 @@ always` container's watch added its own `start` after the restart's.
 container's stream was `create start die destroy` while systemd ran it ten times, and it read
 `exited`; it is a `start` and a `die` per run now, `restarting` between them, and visible from the
 moment `docker run -d` returns (it was "No such container" for about a second). `docker rename`
-publishes Docker's `rename` (`name` and `oldName`), and the renamed container's `die` comes under its
+publishes a `rename` event (`name` and `oldName`), and the renamed container's `die` comes under its
 new name.
 
-**`docker tag` through kern's socket, and image ids as short as Docker takes them.** `docker tag`
-answered "not served by kern's Docker API"; it is `kern tag`, the source by name or id, another
-platform's entry included (`kern tag --platform <os/arch>`). An image is found by name first and
-then by a unique id prefix of two characters or more, as Docker finds one; it took twelve.
+**`docker tag` through kern's socket, and short image ids.** `docker tag` answered "not served by
+kern's Docker API"; it is `kern tag`, the source by name or id, another platform's entry included
+(`kern tag --platform <os/arch>`). An image is found by name first and then by a unique id prefix of
+two characters or more; it took twelve.
 
-**A create through kern's socket takes the names Docker takes, and says what it changes.** A name
-over 63 characters was refused (kern's own limit is 200, as `kern run --name` has it); a relative
-working directory ran in the root where Docker refuses it, and now gets Docker's refusal; a hard
-`ulimit` above what a rootless box can have is applied at that ceiling with a warning the client
-prints, where it was lowered without a word to the client.
+**A create through kern's socket takes longer names, and says what it changes.** A name over 63
+characters was refused (kern's own limit is 200, as `kern run --name` has it); a relative working
+directory ran in the root, and is now refused; a hard `ulimit` above what a rootless box can have is
+applied at that ceiling with a warning the client prints, where it was lowered without a word to the
+client.
 
 **`kern info` and `kern top` say what 0.57 changed.** `kern info` names a box's network (its own NAT
 when pasta is here, loopback only when it is not), its memory default, whether the Docker API socket
@@ -376,11 +371,11 @@ is enabled and whether HTTPS for `.localhost` is on. `kern top` flags a box with
 none` one.
 
 **`kern cp` and `docker cp` into a box keep a sparse file sparse.** A tar carries a sparse file
-whole, and its zeros were written out: a 1 GiB file with 1 MiB of data took 1 GiB on the destination,
-as it does under Docker. A block of zeros is a hole now, so it takes the 1 MiB, with the same bytes.
+whole, and its zeros were written out: a 1 GiB file with 1 MiB of data took 1 GiB on the
+destination. A block of zeros is a hole now, so it takes the 1 MiB, with the same bytes.
 
-**io_uring, userfaultfd, perf_event_open, the keyring, syslog and open_by_handle_at answer `EPERM`, as
-under Docker.** They answered `ENOSYS`. They are still denied, and never kill under any verdict, as
+**io_uring, userfaultfd, perf_event_open, the keyring, syslog and open_by_handle_at answer
+`EPERM`.** They answered `ENOSYS`. They are still denied, and never kill under any verdict, as
 software probes them at start; `clone3` keeps `ENOSYS`, which glibc needs to fall back to `clone`.
 
 **A sandbox call that times out leaves no row in `kern ps -a`.** The Python and Node SDKs ended a
@@ -389,9 +384,9 @@ record listed it as `Exited (137)` for an hour; a cell that ended by itself left
 `kern rm -f`, the same teardown with the record removed.
 
 **`kern logs` and `docker logs` of a restarted container show every run.** A `--restart always`
-container systemd runs again (and any kept box) kept only its last run's log: six runs gave six lines
-under Docker, one through `kern logs` and none through kern's socket. The earlier runs' logs stay,
-the last 16 of them, and are read oldest first before the current one; `kern rm` takes them all.
+container systemd runs again (and any kept box) kept only its last run's log: six runs gave one line
+through `kern logs` and none through kern's socket. The earlier runs' logs stay, the last 16 of
+them, and are read oldest first before the current one; `kern rm` takes them all.
 
 **`docker run --gpus` through kern's socket, under the operator's GPU gate.** It was refused always.
 It is `kern box --gpus` (`all`, a count, `device=`) when `allow_gpu_grants` or `allow_device_grants`
@@ -415,9 +410,8 @@ container keeps its filesystem until `docker rm` (a kept box), so the `docker st
 runs it again on the same files; `--rm` containers and a Testcontainers run's stay in memory.
 
 **`kern logs` and `kern attach` give a box's stdout and stderr apart when it recorded them apart**
-(every container of kern's Docker API), as `docker logs` does, with `-t`, `--tail` and `-f`; a box
-started with kern directly, which records one stream, prints as it did, and `--all` stays one
-stream.
+(every container of kern's Docker API), with `-t`, `--tail` and `-f`; a box started with kern
+directly, which records one stream, prints as it did, and `--all` stays one stream.
 
 **`docker run -i` and `-t` through kern's Docker API work.** The stdin of `docker run -i` was
 dropped in silence (`echo x | docker run -i alpine cat` printed nothing and exited 0) and `-t`
@@ -430,18 +424,18 @@ chunked body that does not parse" for any image over 4 MiB, the cap on a request
 now streams into `kern load` with no cap (7.8 MB in 51 ms), and a body over the cap elsewhere says
 it is. `docker rmi` is `kern rmi`, `-f` included, an image a container uses answered 409. A command
 that leaves its stdin unread (`head -c 20M /dev/zero | docker exec -i c true`) exits with its own
-code, as with Docker; it ended the whole server with SIGPIPE, and then the connection was reset.
+code; it ended the whole server with SIGPIPE, and then the connection was reset.
 
-**`kern image history` and `docker history` list an image's steps.** Newest first, as Docker
-lists them: a pulled or loaded image's own history, each step that made a layer with that layer's
-compressed size from the manifest (what a pull downloads; kern unpacks the layers into one tree and
-does not keep a layer's own size); a built image's Dockerfile steps over its base's, recomputed at
-each build so a cached rebuild does not list them twice; a commit's step. `--no-trunc`, `-q` and
-`--json`, and kern's Docker API answers `GET /images/{name}/history`, which the `docker` CLI prints
-as its own. An image cached before gets its history at the next `kern pull` of it (measured: 1910 ms
-the first time, from the manifest and a config of a few KB, 2 ms after). `kern history <image>`,
-which dropped the name and printed the last boxes run, refuses the name and points at
-`kern image history`; `kern history [-n N]` is unchanged.
+**`kern image history` and `docker history` list an image's steps.** Newest first: a pulled or
+loaded image's own history, each step that made a layer with that layer's compressed size from the
+manifest (what a pull downloads; kern unpacks the layers into one tree and does not keep a layer's
+own size); a built image's Dockerfile steps over its base's, recomputed at each build so a cached
+rebuild does not list them twice; a commit's step. `--no-trunc`, `-q` and `--json`, and kern's
+Docker API answers `GET /images/{name}/history`, which the `docker` CLI prints as its own. An image
+cached before gets its history at the next `kern pull` of it (measured: 1910 ms the first time, from
+the manifest and a config of a few KB, 2 ms after). `kern history <image>`, which dropped the name
+and printed the last boxes run, refuses the name and points at `kern image history`; `kern history
+[-n N]` is unchanged.
 
 **`kern save` and `kern push` keep the image's labels, exposed ports, stop signal, healthcheck and
 history.** They wrote a config with the command, environment, working directory and user only, so
@@ -464,27 +458,27 @@ API lists and inspects an ended container from kern's record, after a restart to
 container found by its label, its exit code and image). `kern ps --json` also gives a running box's
 `image`, and `docker ps` shows each container's image (it showed `<no image>` for all of them).
 
-**`kern kill` kills at once, as `docker kill` does, and `-s SIGNAL` signals the box's init.** It was
-`stop` under a second name: it sent SIGTERM and waited the box's grace (10 s by default) before the
-kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with no grace (exit 137),
-`kern kill -s HUP <box>` sends HUP to the init and leaves the box running, `killall` kills every box
-at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
-for a container not running) do the same. For the graceful stop, `kern stop`.
+**`kern kill` kills at once, and `-s SIGNAL` signals the box's init.** It was `stop` under a second
+name: it sent SIGTERM and waited the box's grace (10 s by default) before the kill, where the docs
+called it immediate. Now `kern kill <box>` is SIGKILL with no grace (exit 137), `kern kill -s HUP
+<box>` sends HUP to the init and leaves the box running, `killall` kills every box at once, and
+`kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409 for a
+container not running) do the same. For the graceful stop, `kern stop`.
 
 **A compose service's `platform:` is honoured.** `platform: linux/arm64` was a warning and the
 service ran this machine's image; it runs the arm64 image now, through the kernel's qemu-user handler,
-and a `build:` with no `platforms:` builds for it, as under Docker.
+and a `build:` with no `platforms:` builds for it.
 
 **`docker pause`, `unpause`, `rename` and `top` through kern's socket.** They answered 501. A paused
 box is `paused` in `docker inspect` and `docker ps`, where it read `running`.
 
 **`docker stats`, exec events and terminal resizes through kern's socket.** `docker stats` answered
-501; it reads kern's figures now as Docker's (memory against the box's limit, CPU% from two
-readings, pids, network). `docker events` sends `exec_create`, `exec_start` and `exec_die`, and an
-`event=exec_start` filter matches them as Docker's does. A resize of `docker exec -it` or `docker run
--it` reaches the program in the box as `SIGWINCH` with the new size; it was accepted and dropped.
-`kern stats --json` carries the memory and pids limits, the tasks, the page cache and the network
-counters it reads them from.
+501; it reads kern's figures now (memory against the box's limit, CPU% from two readings, pids,
+network). `docker events` sends `exec_create`, `exec_start` and `exec_die`, and an
+`event=exec_start` filter matches them. A resize of `docker exec -it` or `docker run -it` reaches
+the program in the box as `SIGWINCH` with the new size; it was accepted and dropped. `kern stats
+--json` carries the memory and pids limits, the tasks, the page cache and the network counters it
+reads them from.
 
 **The Docker API server steps aside when kern is updated.** A server kept busy by a client
 (an IDE, a test suite) kept answering with the API of the binary it started from after a new kern
@@ -492,15 +486,14 @@ was installed, for as long as it was busy (measured: 21 minutes). It now exits o
 connection, test session or attached run, and the next connection starts the new binary (measured:
 20 ms for that request).
 
-**`kern cp` copies directories, as `docker cp` does, and `docker cp` works through kern's socket.**
-`kern cp` copied single files only. It copies a whole tree now, keeps a symlink as a symlink (`-L`
-follows the one SRC names) and a hardlink as a hardlink, takes Docker's destination rules (into an
-existing directory, renamed, `/.` for the contents) and `-` for a tar on stdout or stdin. Every path
-on the box's side is still resolved inside the box, and on the host side a member, or a link it goes
-through, that would leave the destination is refused. The Docker API serves
-`/containers/{id}/archive`, so `docker cp` works in both directions, and a file copied into a
-container that has been created and not started (how Testcontainers copies its files) is in place
-when its command starts.
+**`kern cp` copies directories, and `docker cp` works through kern's socket.** `kern cp` copied
+single files only. It copies a whole tree now, keeps a symlink as a symlink (`-L` follows the one
+SRC names) and a hardlink as a hardlink, takes the destination rules (into an existing directory,
+renamed, `/.` for the contents) and `-` for a tar on stdout or stdin. Every path on the box's side
+is still resolved inside the box, and on the host side a member, or a link it goes through, that
+would leave the destination is refused. The Docker API serves `/containers/{id}/archive`, so `docker
+cp` works in both directions, and a file copied into a container that has been created and not
+started (how Testcontainers copies its files) is in place when its command starts.
 
 **What a Docker client asks for at create reaches the box.** Through kern's socket only the memory
 and CPU limits were read; every other setting was accepted and dropped (`docker run --pids-limit 32`
@@ -513,18 +506,17 @@ log options, stop signal and timeout are now the box's flags, and what kern does
 the box's grace, and the record's own sweep of older runs listed the registry first, which dropped
 the box's entry before the code was written: the waiter printed "exited without a recorded exit
 code" (6 times in 6 on a kept box), and `docker wait` beside a `docker stop` through kern's socket
-answered -1 where Docker answers 137. The record is written first, and a waiter that sees the
-supervisor go while a stop is under way waits for that stop's code.
+answered -1. The record is written first, and a waiter that sees the supervisor go while a stop is
+under way waits for that stop's code.
 
 **`docker events` through kern's socket follows a container to its end.** A container started
 detached made no `die` at all, not at its exit, a `stop` or an `rm -f`; `rm` made no `destroy`, and
-`stop`, `kill` and `restart` made no event. Each is published now in Docker's order (`kill`, `die`
-with the exit code, then `stop`, or `start` and `restart`, and `destroy` last), watched through a
-pidfd on the box's supervisor, so no process stays resident per container. A `--restart` container's
-every run is reported (`die` with its code, then `start`), as Docker reports it; a container running
-when the server started again, or started with kern directly, has its end reported once a stream is
-open. A `docker rm` refused with 409 no longer forgets the running container's id and network on the
-way.
+`stop`, `kill` and `restart` made no event. Each is published now in this order (`kill`, `die` with
+the exit code, then `stop`, or `start` and `restart`, and `destroy` last), watched through a pidfd
+on the box's supervisor, so no process stays resident per container. A `--restart` container's every
+run is reported (`die` with its code, then `start`); a container running when the server started
+again, or started with kern directly, has its end reported once a stream is open. A `docker rm`
+refused with 409 no longer forgets the running container's id and network on the way.
 
 **A compose service with `platform:` runs through kern's socket.** The `docker compose` client
 inspects a service's image and creates the container by the image's id, which kern's socket did not
@@ -535,8 +527,8 @@ create), and `docker rmi` of the arm64 id removes that entry and not this machin
 platform, `Architecture` is the image's own
 (it was the host's for every image), and `kern images --json` carries each entry's `cache` name.
 
-**An archive copied into a box resolves `..` as Docker does.** kern refused every member with a
-`..`, so an archive Docker extracts into `/` failed whole. A member is now resolved against the
+**An archive copied into a box resolves `..` against its destination.** kern refused every member
+with a `..`, so such an archive failed whole, into `/` too. A member is now resolved against the
 destination: into a box's `/` a `..` above the root stays at the root, a member that leaves any
 other destination is refused (`docker cp - c:/opt` of `../x`), and `a/../b` is `b`. Copied to the
 host, a member that leaves the directory is still refused.
@@ -550,13 +542,13 @@ isolated by default. It passes what the Python and Node SDKs pass: `--network no
 was not read, so the box had no check and the `docker compose` client refused the stack ("has no
 healthcheck configured"); it is the box's `--health-*` now, durations rounded up to whole seconds.
 
-**`docker.io/library/alpine` is `alpine`, as under Docker.** kern cached a Docker Hub image under the
-name it was given, so `docker pull` through kern's socket (which says `docker.io/library/...`) stored
-a second copy beside the familiar name and a create naming `wordpress:php8.2-apache` answered "No
-such image". The three spellings of Docker Hub's host are one name now.
+**`docker.io/library/alpine` is `alpine`.** kern cached a Docker Hub image under the name it was
+given, so `docker pull` through kern's socket (which says `docker.io/library/...`) stored a second
+copy beside the familiar name and a create naming `wordpress:php8.2-apache` answered "No such
+image". The three spellings of Docker Hub's host are one name now.
 
 **Images with a named pipe in a layer pull.** A FIFO in a layer was refused "by policy", which made
-the official `mysql:8.0` unpullable; it is extracted, as Docker extracts it, and vetted as any member.
+the official `mysql:8.0` unpullable; it is extracted, and vetted as any member.
 
 **`kern cp` copies the box's files as the box's root.** A file of mode 000, or one that belongs to
 another user of the box (a service's data), could not be read from the host: `kern cp` failed with
@@ -567,63 +559,60 @@ on the host is still yours. A copy that fails part-way is now an error for the D
 **`docker compose up` twice, and `--force-recreate`, through kern's socket.** The second `up` crashed
 the compose client (the container list carried no networks), and a recreate failed, because the new
 container is renamed before its start and a created container could not be renamed. A renamed
-container keeps its id, as under Docker.
+container keeps its id.
 
 **`docker compose` works through kern's socket.** Its first network call answered 501 and it
 stopped there. Networks are served now as kern pods (a service is reached by its name from every
 member, the ones already running included) and volumes as kern volumes, with the labels compose finds
 them by: `up`, `ps`, `logs`, `exec` and `down -v` run a two-service file with a named volume. A
 container on two networks is refused by name; `kern compose` runs such a file. `kern box
---network-alias` gives a box another name on its pod's network, as Docker's does. An endpoint still
-not served (`build`) answers 501 naming `kern build`, where it named an internal server.
+--network-alias` gives a box another name on its pod's network. An endpoint still not served
+(`build`) answers 501 naming `kern build`, where it named an internal server.
 
-**`kern compose -f -` reads the file from stdin, as `docker compose -f -` does.** It answered "reading
--: No such file or directory". The current directory is the project's, for its name and for relative
-paths, as under Docker, and a `${VAR:?message}` the file requires stops it with that message.
+**`kern compose -f -` reads the file from stdin.** It answered "reading -: No such file or
+directory". The current directory is the project's, for its name and for relative paths, and a
+`${VAR:?message}` the file requires stops it with that message.
 
 **A secret is read-only in the box, for its root too.** The write bit of `/run/secrets/<name>` was
 dropped, which binds every user but the box's root: `echo x >> /run/secrets/s` from a compose service
-succeeded, where Docker answers "Read-only file system". `/run/secrets` is a read-only mount once the
+succeeded; it now answers "Read-only file system". `/run/secrets` is a read-only mount once the
 secrets are written, with `--ssh` as without it; the host's file was never touched either way.
 
-**`kern run --platform os/arch`, as `docker run --platform`.** `kern run --platform linux/arm64
-alpine uname -m` was refused as an unknown flag, while Docker prints `aarch64` on the same amd64
-machine. It runs that platform's image now, through the kernel's qemu-user handler, from the cache
-entry `kern pull --platform` and `kern build --platform` fill, so this machine's `alpine` is still
-this machine's afterwards. `kern box` takes it too, and the Docker API reads `?platform=` on a create
-and a pull. Without the handler the run is refused before any pull, saying what to install.
-`kern images` names the platform of an entry that is not this machine's (`alpine:3.20 (linux/arm64)`,
-`"platform"` in `--json`, `{{.Platform}}` in `--format`): three platforms of one tag were three
-identical rows.
+**`kern run --platform os/arch`.** `kern run --platform linux/arm64 alpine uname -m` was refused as
+an unknown flag. It runs that platform's image now, through the kernel's qemu-user handler, from the
+cache entry `kern pull --platform` and `kern build --platform` fill, so this machine's `alpine` is
+still this machine's afterwards. `kern box` takes it too, and the Docker API reads `?platform=` on a
+create and a pull. Without the handler the run is refused before any pull, saying what to install.
+`kern images` names the platform of an entry that is not this machine's (`alpine:3.20
+(linux/arm64)`, `"platform"` in `--json`, `{{.Platform}}` in `--format`): three platforms of one tag
+were three identical rows.
 
 **An image's size counts a hardlinked file once.** busybox is one binary under some 400 names, and
-each name was added: `kern images` said 394.6M for an image of 4.2M (4417150 bytes, the 4.42MB
-Docker prints), and `kern rmi` reported freeing the inflated figure. A volume's size in `kern volume
-ls`/`inspect` had the same count. Sizes recorded by an earlier kern are measured again on the next
-listing.
+each name was added: `kern images` said 394.6M for an image of 4.2M (4417150 bytes), and `kern rmi`
+reported freeing the inflated figure. A volume's size in `kern volume ls`/`inspect` had the same
+count. Sizes recorded by an earlier kern are measured again on the next listing.
 
-**A build's `ARG` and `ENV` are scoped to their stage, as Docker scopes them.** A `--build-arg` for an
-`ARG` declared in one stage was expanded in a later stage that never declared it, so a value passed
-for one stage reached another; and an `ARG` before the first `FROM` was used inside every stage. Now
-a global `ARG` reaches the `FROM` lines, and a stage only through `ARG NAME`; a stage's `ARG` and
-`ENV` end with it, and a stage built `FROM` an earlier one inherits its `ENV`. A Dockerfile that used
-a global `ARG` in a stage without naming it there built differently from Docker; name it there.
+**A build's `ARG` and `ENV` are scoped to their stage.** A `--build-arg` for an `ARG` declared in
+one stage was expanded in a later stage that never declared it, so a value passed for one stage
+reached another; and an `ARG` before the first `FROM` was used inside every stage. Now a global
+`ARG` reaches the `FROM` lines, and a stage only through `ARG NAME`; a stage's `ARG` and `ENV` end
+with it, and a stage built `FROM` an earlier one inherits its `ENV`. A Dockerfile that used a global
+`ARG` in a stage without naming it there builds differently now; name it there.
 
-**`kern build -` reads stdin, as `docker build -` does.** A Dockerfile on stdin builds with an empty
-context, a tar (plain or gzip) on stdin is the context, and `-f -` takes the Dockerfile from stdin for
-a context on disk; both at once is refused. It answered "unknown build flag '-'".
+**`kern build -` reads stdin.** A Dockerfile on stdin builds with an empty context, a tar (plain or
+gzip) on stdin is the context, and `-f -` takes the Dockerfile from stdin for a context on disk;
+both at once is refused. It answered "unknown build flag '-'".
 
-**The `--health-*` times and `--timeout` take Docker's durations.** `--health-interval 30s`, the form
-`docker run` requires, was a usage error; `30s`, `1m30s` and `2h` work now beside a plain number of
-seconds, and a duration that is not a whole number of seconds (`500ms`) is refused rather than
-rounded. `kern inspect -f` answers `{{.HostConfig.Memory}}` (the cap, 0 for none) and
-`{{.RestartCount}}`.
+**The `--health-*` times and `--timeout` take durations.** `--health-interval 30s` was a usage
+error; `30s`, `1m30s` and `2h` work now beside a plain number of seconds, and a duration that is not
+a whole number of seconds (`500ms`) is refused rather than rounded. `kern inspect -f` answers
+`{{.HostConfig.Memory}}` (the cap, 0 for none) and `{{.RestartCount}}`.
 
 **`docker run --restart` through kern's Docker API is honoured, and the restart count is reported.**
 The API did not read `HostConfig.RestartPolicy`, so `--restart on-failure:2` ran once and stayed down.
-It is `kern box --restart` now (`on-failure:N`, `always`, `unless-stopped`), refused with
-`AutoRemove` as Docker refuses the pair, and `docker inspect` gives `RestartCount`, as do
-`kern inspect --json` and `kern ps -a --json` (`restart_count`), counted as Docker counts them.
+It is `kern box --restart` now (`on-failure:N`, `always`, `unless-stopped`), refused together with
+`AutoRemove`, and `docker inspect` gives `RestartCount`, as do `kern inspect --json` and `kern ps -a
+--json` (`restart_count`).
 
 **A `kern commit` of a `--net` box no longer bakes the host's resolver into the image.** The host's
 `/etc/resolv.conf` was copied into the box's writable layer, so it was a change like any other and a
@@ -637,13 +626,12 @@ the `kern.toml` whose profiles and grants kern applies to later boxes. They are 
 runtime registry and `~/.local/share/kern` already were, with the reason; a sibling directory of
 `~/.config` is still mountable.
 
-**A `--rm` box ended by `kern stop` or `kern kill` is removed, as Docker removes it.** It stayed in
-`ps -a` as `exit 137` (0.56.0 the same), because the stop wrote the exit record and only the box's
-supervisor knew the box was `--rm`. The record of a running box now says so (`rm=1`; one written by
-an older kern reads as before), and a stop of such a box leaves only the hidden record a waiter reads
-its code from. `docker stop` of a `--rm` container through kern's API is the same. And `docker kill`
-of a container created and never started answers 409, as Docker does; it answered 304 and the CLI
-exited 0.
+**A `--rm` box ended by `kern stop` or `kern kill` is removed.** It stayed in `ps -a` as `exit 137`
+(0.56.0 the same), because the stop wrote the exit record and only the box's supervisor knew the box
+was `--rm`. The record of a running box now says so (`rm=1`; one written by an older kern reads as
+before), and a stop of such a box leaves only the hidden record a waiter reads its code from.
+`docker stop` of a `--rm` container through kern's API is the same. And `docker kill` of a container
+created and never started answers 409; it answered 304 and the CLI exited 0.
 
 **`kern --help` names `kern version`, and the shell completions offer `compat`, `proxy` and
 `unshare`.** The check that compares the completions with the reference stopped reading at the
@@ -660,15 +648,15 @@ a `.sha256` and is signed with the other assets (see SECURITY.md). Every action 
 pinned to a commit, and the release jobs read the repository only, except the one that writes the
 draft.
 
-**`--restart on-failure:N` works on `kern box` and `kern run`, as in Docker.** It is `on-failure`
-with `--restart-max N`, which is what compose's `restart: on-failure:N` already was; before, the
-command line refused it as an unexpected argument.
+**`--restart on-failure:N` works on `kern box` and `kern run`.** It is `on-failure` with
+`--restart-max N`, which is what compose's `restart: on-failure:N` already was; before, the command
+line refused it as an unexpected argument.
 
 **A `docker run --rm` whose start kern refuses ends with the error, as `docker run -d` did.** It
 hung for good (with an unreadable cache dir: killed after 25 s), because the client waits for the
 container's removal before it reports the error and the container stayed created. It is removed
 now, its wait answers 125, and the client exits 125 with kern's message in about 20 ms, attached
-or `-d`. A container without `--rm` stays created, as Docker leaves it.
+or `-d`. A container without `--rm` stays created.
 
 **`docker run --rm` through kern's API is removed by kern, whatever becomes of the server.** The
 server removed such a box itself after following its log, so a server stopped meanwhile left the
@@ -723,33 +711,33 @@ nothing, and a renamed `--rm` box left its logs in the store.
 
 **A pull records the image's repository digest, and `kern images --digests` shows it.** It is the
 digest of the manifest the registry answered for the reference (the index of a multi-arch image),
-what Docker lists as `RepoDigests` and what `name@sha256:...` pulls the same image again by:
-`images --digests` adds the DIGEST column, `--format {{.Digest}}` and `--json --digests` give it,
-`kern inspect --json` of an image lists `RepoDigests`, and so does kern's Docker API. A build, a
-commit and a load have none, as with Docker. An image cached before gets it at the next
-`kern pull` of it, from the manifest alone, when the registry still names the same image. Measured
-against Docker Hub's `Docker-Content-Digest`: `alpine:3.21` and `alpine:3.19` match. A pull by a digest the
-registry does not have says so (`no such manifest`), where it reported a digest mismatch and advised
-pulling again for a damaged blob.
+and what `name@sha256:...` pulls the same image again by: `images --digests` adds the DIGEST column,
+`--format {{.Digest}}` and `--json --digests` give it, `kern inspect --json` of an image lists
+`RepoDigests`, and so does kern's Docker API. A build, a commit and a load have none. An image
+cached before gets it at the next `kern pull` of it, from the manifest alone, when the registry
+still names the same image. Measured against Docker Hub's `Docker-Content-Digest`: `alpine:3.21` and
+`alpine:3.19` match. A pull by a digest the registry does not have says so (`no such manifest`),
+where it reported a digest mismatch and advised pulling again for a damaged blob.
 
 **A port published through kern's Docker API with no address is on every address.** `HostIp` left
-empty became `0.0.0.0`, IPv4 alone, where Docker binds `0.0.0.0` and `::`; a Windows client asking
-for `localhost` (.NET, PowerShell) tries `::1` first and waited 2068 ms for its refusal on every new
-connection. Measured with Testcontainers for .NET from Windows: the port case 2508 ms, then 564 ms.
+empty became `0.0.0.0`, IPv4 alone; a Windows client asking for `localhost` (.NET, PowerShell) tries
+`::1` first and waited 2068 ms for its refusal on every new connection. Measured with Testcontainers
+for .NET from Windows: the port case 2508 ms, then 564 ms.
 
 **`kern logs -f` and `kern wait` wake when the box writes or ends, not on a timer.** They polled every
 200 and 100 ms; measured on a box that lives 250 ms, `logs -f` returned after 251 ms instead of 402,
 and `wait` after 251 ms instead of 302. A box's supervisor now finishes its log before it leaves
 the registry, so a follower that stops there has the last line. `kern wait`, `ps -a` and `rm`
 right after a box that ended at once saw it neither running nor exited for about 10 ms; they see its
-exit record now. `kern rm` of an exited box removes its logs too, as `docker rm` does.
+exit record now. `kern rm` of an exited box removes its logs too.
 
-**`kern start` starts a kept box detached, as `docker start` does, and `start -a` follows it.** A box
-kept from a foreground `kern box --keep` ran again in the foreground and `kern start` did not return
-until it ended, which its own help ("-a follows its output") does not say; `start -a` of such a box
-printed its output, then failed with "no logs". `kern ps -a --json` gives a kept row its `labels`
-and, once a run has ended, `exited_ago`; an exited row its `started`; `kern inspect --json` gives
-`image` and `created` (a kept box's stays the same across its restarts). See [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
+**`kern start` starts a kept box detached, and `start -a` follows it.** A box kept from a foreground
+`kern box --keep` ran again in the foreground and `kern start` did not return until it ended, which
+its own help ("-a follows its output") does not say; `start -a` of such a box printed its output,
+then failed with "no logs". `kern ps -a --json` gives a kept row its `labels` and, once a run has
+ended, `exited_ago`; an exited row its `started`; `kern inspect --json` gives `image` and `created`
+(a kept box's stays the same across its restarts). See
+[docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
 
 **`kern proxy trust`: the `.localhost` names over HTTPS, once you ask for it.** It makes a
 certificate authority of your own that can sign `localhost` names only, adds it to your user's
@@ -762,7 +750,7 @@ Firefox 157 and Windows' verifier. See [docs/CONFIG.md](docs/CONFIG.md).
 
 **`docker logs` through kern's socket keeps stdout and stderr apart.** A container made through
 the socket logs its two streams on two pipes and its log records which stretch came from which;
-`docker logs` and an `attach` after the start answer them as Docker does, with `--tail`, `-f`, `-t`,
+`docker logs` and an `attach` after the start answer them apart, with `--tail`, `-f`, `-t`,
 `--since` and `stdout=`/`stderr=`. The log file itself, and `kern logs`, are unchanged, and so is
 every other box. Measured: a detached start is the same with and without the record (-22.5 us, 95%
 interval -65.6 to +17.2), and a box alternating short lines on the two streams keeps them apart for
