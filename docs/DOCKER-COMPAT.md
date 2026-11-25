@@ -805,7 +805,9 @@ binaries through the kernel's qemu-user handler (registered with the F flag; ker
 install when it is missing). Several platforms, `--platform linux/amd64,linux/arm64`, build one variant
 each; the name is this machine's variant, and `kern push` publishes a manifest list, which docker
 pulls per platform (measured: `docker run --platform` ran both). `kern pull --platform` fetches into
-that platform's cache entry, and compose's `build: platforms:` is passed through. `kern run --platform
+that platform's cache entry, and compose's `build: platforms:` is passed through. A service's
+`platform: linux/arm64` (or `arm64`) runs that platform's image, and its `build:` builds for it when
+`platforms:` names none (measured: `uname -m` prints `aarch64` in both on an amd64 host). `kern run --platform
 linux/arm64` runs that entry (`uname -m` prints `aarch64` on an amd64 machine, as under Docker), the
 Docker API's `?platform=` on a create or a pull does the same, and `kern images` names the platform of
 every entry that is not this machine's.

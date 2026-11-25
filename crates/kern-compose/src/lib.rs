@@ -252,6 +252,10 @@ pub struct ComposeBox {
     /// reported as "not applied per service", which was true only while a stack was always one
     /// namespace.
     pub net_none: bool,
+    /// Compose `platform:` another machine's (`os/arch`, normalized): the service runs that
+    /// platform's image, `kern box --platform`, and a `build:` without `platforms:` builds for it.
+    /// `None` for this machine's, or none given.
+    pub platform: Option<String>,
     /// Compose `network_mode: service:X` - the service asked to live inside X's network namespace.
     ///
     /// A MEMBERSHIP, NOT A NOTE. The parser used to answer this key with a sentence saying kern
@@ -898,6 +902,9 @@ impl ComposeBox {
         }
         if self.init {
             cmd.arg("--init");
+        }
+        if let Some(p) = &self.platform {
+            cmd.arg("--platform").arg(p);
         }
         if self.net {
             cmd.arg("--net");
@@ -1559,6 +1566,7 @@ impl ComposeBox {
         }
         opt!(
             image,
+            platform,
             rootfs,
             build,
             workdir,

@@ -126,6 +126,10 @@ refusal instead of crashing. The set of refused syscalls is unchanged, and none 
 exec` and health probes get the box's own verdict, and the Python and Node sandboxes ask for the kill
 on every box, so their `escape_blocked` reads as before.
 
+**A compose service's `platform:` is honoured.** `platform: linux/arm64` was a warning and the
+service ran this machine's image; it runs the arm64 image now, through the kernel's qemu-user handler,
+and a `build:` with no `platforms:` builds for it, as under Docker.
+
 **`docker pause`, `unpause`, `rename` and `top` through kern's socket.** They answered 501. A paused
 box is `paused` in `docker inspect` and `docker ps`, where it read `running`.
 

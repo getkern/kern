@@ -4853,13 +4853,24 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     .unwrap_or_default()
                     .trim()
                     .to_ascii_lowercase();
+                // ANOTHER LINUX ARCHITECTURE RUNS, as under Docker: `kern box --platform`, through
+                // the kernel's qemu-user handler, which kern checks before anything is pulled and
+                // names when it is missing. MEASURED before: this was a warning and the service ran
+                // this machine's image. Another OS (`windows/amd64`) stays impossible on Linux.
                 if !v.is_empty() && !platform_matches_host(&v) {
-                    warn(&format!(
-                        "service '{name}': 'platform: {v}' cannot be honoured - kern runs this \
-                         machine's architecture ({}) and emulates nothing, so the image would pull \
-                         and then fail to exec. Run this service on a matching host",
-                        host_platform()
-                    ));
+                    let parts: Vec<&str> = v.split('/').filter(|p| !p.is_empty()).collect();
+                    match parts.as_slice() {
+                        [arch] => b.platform = Some(format!("linux/{arch}")),
+                        ["linux", arch] | ["linux", arch, _] => {
+                            b.platform = Some(format!("linux/{arch}"));
+                        }
+                        _ => warn(&format!(
+                            "service '{name}': 'platform: {v}' cannot be honoured - kern runs \
+                             Linux images ({}), so the image would pull and then fail to exec. \
+                             Run this service on a matching host",
+                            host_platform()
+                        )),
+                    }
                 }
             }
             // `volumes_from:` IS A COPY OF ANOTHER SERVICE'S MOUNTS, resolved after every service is
@@ -8747,6 +8758,51 @@ mod tests {
             parse("services:\n  a:\n    image: alpine\n    ulimits:\n      nofile: {soft: 99}\n")
                 .expect("parses");
         assert_eq!(one[0].ulimits, vec!["nofile=99".to_string()]);
+    }
+
+    /// `platform:` of another Linux architecture is run, `kern box --platform`; this machine's adds
+    /// nothing, and another OS is not a flag. MEASURED before: a warning, and the host's image ran.
+    #[test]
+    fn a_service_platform_becomes_the_boxs_platform() {
+        let svc = |p: &str| {
+            let src = format!("services:\n  a:\n    image: alpine\n    platform: {p}\n");
+            parse(&src).expect("parses").remove(0)
+        };
+        let other = if cfg!(target_arch = "x86_64") {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        assert_eq!(svc(other).platform, Some(format!("linux/{other}")));
+        assert_eq!(
+            svc(&format!("linux/{other}")).platform,
+            Some(format!("linux/{other}"))
+        );
+        assert_eq!(
+            svc(&format!("linux/{other}/v8")).platform,
+            Some(format!("linux/{other}"))
+        );
+        assert_eq!(
+            svc(&host_platform()).platform,
+            None,
+            "this machine's adds nothing"
+        );
+        assert_eq!(
+            svc("windows/amd64").platform,
+            None,
+            "another OS is not a flag"
+        );
+        let mut cmd = std::process::Command::new("kern");
+        svc(other).push_box_flags(&mut cmd);
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--platform" && w[1] == format!("linux/{other}")),
+            "{argv:?}"
+        );
     }
 
     #[test]

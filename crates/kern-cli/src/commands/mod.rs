@@ -6215,6 +6215,9 @@ pub(crate) fn resolve_builds_for(
         }
         if !bd.platforms.is_empty() {
             cmd.arg("--platform").arg(bd.platforms.join(","));
+        } else if let Some(p) = &b.platform {
+            // The service's `platform:` builds its image for that platform too, as Docker's does.
+            cmd.arg("--platform").arg(p);
         }
         for s in &bd.ssh {
             // A key path written relative to the file, or under `~`, made absolute here: `kern build`
