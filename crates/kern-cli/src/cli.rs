@@ -5823,7 +5823,12 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     // → box_run reports it. `--plan` wins (non-destructive preview).
     let cmd = if plan {
         Command::BoxPlan {
-            name: name.unwrap_or_default().to_string(),
+            // THE SAME DEFAULT AS THE RUN BELOW, `box-<pid>`: `kern run --plan alpine` named no box
+            // and was refused as "box name is empty" while `kern run alpine` ran (found from the
+            // field, writing the site's example).
+            name: name
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("box-{}", std::process::id())),
             profiles: profiles.clone(),
             config: config.clone(),
             gpus: gpus.clone(),
