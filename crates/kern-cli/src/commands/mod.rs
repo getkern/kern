@@ -6502,6 +6502,9 @@ pub enum ComposeAction {
     Down,
     /// Stop every service, KEEP the pod - so `start` can re-join the same shared network.
     Stop,
+    /// `kill [-s SIGNAL]`: Docker's `compose kill`. The services killed AT ONCE (a `Stop` with no
+    /// grace), or, with another signal, that signal to each one's init and nothing else.
+    Kill,
     /// Launch the services that are not currently running (the rest are left untouched).
     Start,
     /// `Stop` followed by a full `Up`.
@@ -6615,11 +6618,9 @@ pub const COMPOSE_VERBS: &[(&str, ComposeAction)] = &[
     ("rm", ComposeAction::Rm),
     ("top", ComposeAction::Top),
     ("version", ComposeAction::Version),
-    // `kill` IS `stop`, under the name Docker gives the harder one. kern's box-level `kill` is
-    // already documented as an alias rather than Docker's immediate SIGKILL (the grace comes from
-    // the box's own `--stop-timeout`, and `--stop-timeout 0` is how you skip it), so the compose
-    // verb inherits that one definition instead of growing a second answer to the same question.
-    ("kill", ComposeAction::Stop),
+    // `kill` is Docker's: at once, or the signal `-s` names. It used to be `stop` under a second
+    // name, waiting each box's grace, while docs/DOCKER-COMPAT.md called it immediate.
+    ("kill", ComposeAction::Kill),
 ];
 
 impl ComposeAction {
@@ -9472,6 +9473,8 @@ struct TerminalOpts<'a> {
     file: &'a str,
     /// `-t/--timeout <secs>`: the grace this teardown gives, replacing each box's own.
     stop_timeout: Option<u64>,
+    /// `compose kill -s <SIGNAL>`; `None` is SIGKILL.
+    kill_signal: Option<i32>,
     /// `--ignore-pull-failures`: a registry that cannot serve an image ends the image, not the run.
     ignore_pull_failures: bool,
     /// `build --build-arg K=V`, repeatable.
@@ -10448,7 +10451,7 @@ fn run_terminal_verb(
             }
             return Ok(true);
         }
-        ComposeAction::Stop => {
+        ComposeAction::Stop | ComposeAction::Kill => {
             // `stop` touches ONLY this file's services and never tears the pod down itself; `down`
             // removes the pod unconditionally. The distinction is real when the pod has members that
             // are NOT in this file (someone ran `kern box --pod <same>`): those keep running and the
@@ -10476,19 +10479,43 @@ fn run_terminal_verb(
                 .filter(|b| selected(b))
                 .map(|b| b.name.clone())
                 .collect();
-            let names = stop_stack(boxes, &chosen, pod, o.stop_timeout).stopped;
+            let kill = action == ComposeAction::Kill;
+            // `kill -s <SIGNAL>` other than KILL: the signal to each chosen service's init and
+            // nothing else, as `docker compose kill -s HUP` reloads rather than stops.
+            if let Some(sig) = o.kill_signal.filter(|s| kill && *s != libc::SIGKILL) {
+                let live: Vec<String> = chosen
+                    .iter()
+                    .filter(|n| registry::find(n).is_some())
+                    .cloned()
+                    .collect();
+                if live.is_empty() {
+                    return Err(Error::Compose(
+                        "compose kill: no running service to signal".to_string(),
+                    ));
+                }
+                crate::commands::inspect::signal_boxes(&live, false, sig)?;
+                return Ok(true);
+            }
+            // `kill` is the stop with no grace: SIGKILL now, the exit recorded as 137.
+            let grace = if kill { Some(0) } else { o.stop_timeout };
+            let names = stop_stack(boxes, &chosen, pod, grace).stopped;
+            let (verb, done) = if kill {
+                ("kill", "killed")
+            } else {
+                ("stop", "stopped")
+            };
             if was_no_pod {
                 // No pod is named, because none exists. `start` is still the way back, and it carries
                 // the mode forward on its own.
                 println!(
-                    "compose stop: {} box(es) stopped (this stack runs without a pod)",
+                    "compose {verb}: {} box(es) {done} (this stack runs without a pod)",
                     names.len()
                 );
                 return Ok(true);
             }
             let pod_alive = crate::pod::holder_pid(pod).is_some();
             println!(
-                "compose stop: {} box(es) stopped, pod '{pod}' {}",
+                "compose {verb}: {} box(es) {done}, pod '{pod}' {}",
                 names.len(),
                 if pod_alive {
                     "still up (other members remain)"
@@ -11078,6 +11105,8 @@ pub struct ComposeOpts<'a> {
     /// SENTRY'S INSTALLER RUNS `docker compose down -t 30 --remove-orphans`, and kern answered
     /// `unknown flag '-t'`.
     pub stop_timeout: Option<u64>,
+    /// `compose kill -s <SIGNAL>`; `None` is SIGKILL, the kill with no grace.
+    pub kill_signal: Option<i32>,
     /// `--ignore-pull-failures` on `pull`: a registry that cannot serve an image is reported and the
     /// run continues, instead of ending it. kern already does this for a service that declares
     /// `build:`; the flag asks for it unconditionally, and Sentry's installer passes it.

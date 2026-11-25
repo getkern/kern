@@ -19732,3 +19732,105 @@ fn a_box_with_the_none_log_driver_keeps_no_output_and_logs_says_so() {
         String::from_utf8_lossy(&shipped.stderr)
     );
 }
+
+/// `kern kill` IS DOCKER'S. `-s USR1` reaches the box's init and the box keeps running; a bare
+/// `kill` ends a box that ignores SIGTERM at once, with 137, where it used to wait the box's grace
+/// (10 s); a second `kill` of the same box is refused, as Docker refuses a container not running.
+#[test]
+fn kill_is_at_once_and_kill_s_signals_the_init_only() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "killnow");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-killnow-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let k = || {
+        let mut c = kern();
+        c.env("XDG_RUNTIME_DIR", &xdg);
+        c
+    };
+    let script = "trap '' TERM; trap 'echo got-usr1' USR1; echo UP; \
+                  while :; do /bin/busybox sleep 0.05; done";
+    let out = k()
+        .args([
+            "box",
+            "killnow",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let logs_have = |needle: &str| {
+        let up = std::time::Instant::now();
+        while up.elapsed() < std::time::Duration::from_secs(5) {
+            let l = k().args(["logs", "killnow"]).output().expect("logs");
+            if String::from_utf8_lossy(&l.stdout).contains(needle) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    };
+    assert!(logs_have("UP"), "the box never came up");
+    let sig = k()
+        .args(["kill", "-s", "USR1", "killnow"])
+        .output()
+        .expect("kill -s");
+    assert!(
+        sig.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sig.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&sig.stdout).trim(), "killnow");
+    assert!(logs_have("got-usr1"), "the USR1 handler did not run");
+    let ps = k().args(["ps"]).output().expect("ps");
+    assert!(
+        String::from_utf8_lossy(&ps.stdout).contains("killnow"),
+        "kill -s USR1 must not stop the box"
+    );
+    let t = std::time::Instant::now();
+    let kill = k().args(["kill", "killnow"]).output().expect("kill");
+    let took = t.elapsed();
+    assert!(
+        kill.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+    assert!(
+        took < std::time::Duration::from_secs(3),
+        "kill took {took:?}: it waited a grace (a box that ignores SIGTERM)"
+    );
+    let wait = k().args(["wait", "killnow"]).output().expect("wait");
+    assert_eq!(String::from_utf8_lossy(&wait.stdout).trim(), "137");
+    let again = k().args(["kill", "killnow"]).output().expect("kill again");
+    assert!(
+        !again.status.success(),
+        "a kill of a box that is not running must fail"
+    );
+    let _ = k().args(["rm", "killnow"]).output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}

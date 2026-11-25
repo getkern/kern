@@ -353,6 +353,14 @@ pub enum Command {
         /// keeps each box's own `--stop-timeout`.
         grace: Option<u64>,
     },
+    /// `kern kill -s SIGNAL <name>... | --all`: SIGNAL to each box's init, as `docker kill -s`
+    /// sends it to the container's PID 1. The box is not stopped by kern: its init decides. A
+    /// `kern kill` without `-s`, or with `-s KILL`, is a [`Command::Stop`] with no grace.
+    Signal {
+        names: Vec<String>,
+        all: bool,
+        signal: i32,
+    },
     /// `kern pause <name>... | --all` / `kern unpause …`: freeze / thaw running box(es).
     Pause {
         names: Vec<String>,
@@ -820,6 +828,8 @@ pub enum Command {
         pull: Option<String>,
         /// `-t/--timeout <secs>` on `stop`/`down`/`restart`: the grace before the SIGKILL.
         stop_timeout: Option<u64>,
+        /// `kill -s <SIGNAL>`: what `compose kill` sends (default SIGKILL, the kill with no grace).
+        kill_signal: Option<i32>,
         /// `--ignore-pull-failures`: a registry that cannot serve an image ends the image, not the run.
         ignore_pull_failures: bool,
         /// `build --build-arg K=V`, repeatable: forwarded to every service built by this invocation.
@@ -1661,9 +1671,16 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 limit,
             }
         }
-        // `stop <name>` / `kill <name>`: stop running box(es). kern's `stop` already SIGKILLs the
-        // box's process group, so `kill` is a Docker-parity alias. `killall` = `stop --all`.
-        Some(v @ ("stop" | "kill")) => {
+        // `kill [-s SIGNAL] <name>...`: Docker's `kill`. Without `-s` (or with `-s KILL`) the box is
+        // killed AT ONCE: a stop with no grace, so its exit is recorded as 137 and its log closed as
+        // `stop` closes them. With another signal, that signal goes to the box's init and nothing
+        // else happens, as `docker kill -s HUP` reloads a server rather than stopping it.
+        // MEASURED before: `kill` was `stop` under a second name, so it waited the box's grace
+        // (10 s by default) for a workload that traps SIGTERM, where `docker kill` returns at once,
+        // and `-s` was refused; docs/DOCKER-COMPAT.md said it was immediate.
+        Some("kill") => parse_kill(&rest)?,
+        // `stop <name>`: stop running box(es), the box's stop signal, then its grace, then the kill.
+        Some(v @ "stop") => {
             // `-t/--timeout N` (and Docker's older `--time`) on `stop`: the grace before the kill.
             // MEASURED: `kern stop -t 0 web` answered `unknown flag "-t"`, which is the form every
             // Docker script uses; `kill` has no grace to set, as `docker kill` has none.
@@ -1702,12 +1719,13 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
             Command::Stop { names, all, grace }
         }
+        // `killall`: every running box killed at once, `kill --all` under kern's own name for it.
         Some("killall") => {
             reject_unknown_flags("killall", &rest, &[])?;
             Command::Stop {
                 names: Vec::new(),
                 all: true,
-                grace: None,
+                grace: Some(0),
             }
         }
         // `pause`/`unpause` (aka `freeze`/`unfreeze`): freeze/thaw box(es) via the cgroup freezer.
@@ -2671,6 +2689,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut allow_device_grants = false;
             let mut pull: Option<String> = None;
             let mut stop_timeout: Option<u64> = None;
+            let mut kill_signal: Option<i32> = None;
             let mut ignore_pull_failures = false;
             let mut build_args: Vec<String> = Vec::new();
             let mut build_policy = commands::BuildPolicy::default();
@@ -2768,6 +2787,16 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // (`unreachable pattern`), which is how the ordering was found.
                     "-t" | "--timestamps" if action == Some(commands::ComposeAction::Logs) => {
                         log_timestamps = true
+                    }
+                    // `kill -s <SIGNAL>`: Docker's `compose kill -s`, on `kill` only.
+                    "-s" | "--signal" if action == Some(commands::ComposeAction::Kill) => {
+                        let raw = inline_or_next(inline, &mut it)
+                            .ok_or(Error::Usage("compose kill -s <SIGNAL>"))?;
+                        kill_signal = Some(parse_signal(&raw).map_err(|_| {
+                            Error::Usage(
+                                "compose kill -s <NAME|NUM>: TERM INT QUIT HUP USR1 USR2 KILL (or a number)",
+                            )
+                        })?);
                     }
                     // `-t/--timeout <secs>`: the stop grace for THIS teardown, replacing what each
                     // box recorded at start. `0` is a real value (Docker reads it as "kill now"), so
@@ -3181,6 +3210,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 action: action.unwrap_or(commands::ComposeAction::Up),
                 pull,
                 stop_timeout,
+                kill_signal,
                 ignore_pull_failures,
                 build_args,
                 build_policy,
@@ -3314,6 +3344,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 // override belongs to the explicit form.
                 pull: None,
                 stop_timeout: None,
+                kill_signal: None,
                 ignore_pull_failures: false,
                 build_args: Vec::new(),
                 build_policy,
@@ -3539,6 +3570,54 @@ fn parse_signal(s: &str) -> Result<i32, Error> {
         "USR2" => libc::SIGUSR2,
         "KILL" => libc::SIGKILL,
         _ => return Err(Error::Usage(USAGE)),
+    })
+}
+
+/// `kill [-s|--signal SIGNAL] <name>... | kill --all`. See the `kill` arm of [`parse`].
+fn parse_kill(rest: &[&str]) -> Result<Command, Error> {
+    const USAGE: &str = "kill [-s|--signal SIGNAL] <name>... | kill --all";
+    let (mut names, mut all, mut signal) = (Vec::new(), false, libc::SIGKILL);
+    let mut i = 1;
+    while let Some(a) = rest.get(i).copied() {
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with('-') => (f, Some(v)),
+            _ => (a, None),
+        };
+        match flag {
+            "--all" | "-a" if inline.is_none() => all = true,
+            "-s" | "--signal" => {
+                let v = match inline {
+                    Some(v) => v,
+                    None => {
+                        i += 1;
+                        rest.get(i).copied().ok_or(Error::Usage(USAGE))?
+                    }
+                };
+                signal = parse_signal(v).map_err(|_| {
+                    Error::Usage(
+                        "kill -s <NAME|NUM>: TERM INT QUIT HUP USR1 USR2 KILL (or a number)",
+                    )
+                })?;
+            }
+            f if f.starts_with('-') => {
+                reject_unknown_flags("kill", &["kill", a], &["--all", "-a", "-s", "--signal"])?;
+                return Err(Error::Usage(USAGE));
+            }
+            name => names.push(name.to_string()),
+        }
+        i += 1;
+    }
+    if !all && names.is_empty() {
+        return Err(Error::Usage(USAGE));
+    }
+    Ok(if signal == libc::SIGKILL {
+        Command::Stop {
+            names,
+            all,
+            grace: Some(0),
+        }
+    } else {
+        Command::Signal { names, all, signal }
     })
 }
 
@@ -7263,6 +7342,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 commands::DeafInit::WaitGrace,
             ),
         },
+        Command::Signal { names, all, signal } => {
+            commands::inspect::signal_boxes(&names, all, signal)
+        }
         Command::Pause { names, all, freeze } => commands::pause(&names, all, freeze),
         Command::Attach { name } => commands::attach(&name),
         Command::Cp { src, dst } => crate::boxcp::cp(&src, &dst),
@@ -7370,6 +7452,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             action,
             pull,
             stop_timeout,
+            kill_signal,
             ignore_pull_failures,
             build_args,
             build_policy,
@@ -7419,6 +7502,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             action,
             pull: pull.as_deref(),
             stop_timeout,
+            kill_signal,
             ignore_pull_failures,
             build_args: &build_args,
             build_policy,
@@ -7844,8 +7928,8 @@ mod tests {
     #[test]
     fn every_compose_verb_parses_and_the_absent_ones_are_refused_by_name() {
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
-        // The seven verbs added as thin scopings of a box-level verb, plus `kill`, which is `stop`
-        // under Docker's name for it.
+        // The seven verbs added as thin scopings of a box-level verb, plus `kill`, Docker's kill
+        // with no grace (or the signal `-s` names).
         for (verb, want) in [
             ("wait", commands::ComposeAction::Wait),
             ("events", commands::ComposeAction::Events),
@@ -7854,7 +7938,7 @@ mod tests {
             ("rm", commands::ComposeAction::Rm),
             ("top", commands::ComposeAction::Top),
             ("version", commands::ComposeAction::Version),
-            ("kill", commands::ComposeAction::Stop),
+            ("kill", commands::ComposeAction::Kill),
         ] {
             match p(&["compose", "f.yml", verb]) {
                 Ok((_, Command::Compose { action, .. })) => {
@@ -10881,6 +10965,73 @@ mod tests {
                 grace: None,
             }
         );
+    }
+
+    /// `kill` IS DOCKER'S: the box killed at once (a stop with no grace), or with `-s` a signal
+    /// to its init and nothing else. MEASURED before: it was `stop` under a second name, waiting the
+    /// box's grace, and `-s` was refused.
+    #[test]
+    fn kill_is_dockers_kill_at_once_or_the_signal_named() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let now = |names: &[&str], all: bool| Command::Stop {
+            names: names.iter().map(|s| (*s).to_string()).collect(),
+            all,
+            grace: Some(0),
+        };
+        for argv in [
+            &["kill", "web"][..],
+            &["kill", "-s", "KILL", "web"],
+            &["kill", "--signal=SIGKILL", "web"],
+            &["kill", "-s", "9", "web"],
+        ] {
+            assert_eq!(
+                p(argv).map(|(_, c)| c).ok(),
+                Some(now(&["web"], false)),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(p(&["killall"]).map(|(_, c)| c).ok(), Some(now(&[], true)));
+        assert_eq!(
+            p(&["kill", "--all"]).map(|(_, c)| c).ok(),
+            Some(now(&[], true))
+        );
+        for (argv, sig) in [
+            (&["kill", "-s", "HUP", "web"][..], libc::SIGHUP),
+            (&["kill", "--signal", "SIGUSR1", "web"], libc::SIGUSR1),
+            (&["kill", "-s=TERM", "web"], libc::SIGTERM),
+        ] {
+            assert_eq!(
+                p(argv).map(|(_, c)| c).ok(),
+                Some(Command::Signal {
+                    names: vec!["web".into()],
+                    all: false,
+                    signal: sig,
+                }),
+                "{argv:?}"
+            );
+        }
+        for bad in [
+            &["kill"][..],
+            &["kill", "-s"],
+            &["kill", "-s", "BOGUS", "web"],
+            &["kill", "-t", "0", "web"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?} must be refused");
+        }
+        match p(&["compose", "f.yml", "kill", "-s", "HUP", "web"]) {
+            Ok((
+                _,
+                Command::Compose {
+                    action,
+                    kill_signal,
+                    ..
+                },
+            )) => {
+                assert_eq!(action, commands::ComposeAction::Kill);
+                assert_eq!(kill_signal, Some(libc::SIGHUP));
+            }
+            other => panic!("compose kill -s: {other:?}"),
+        }
     }
 
     #[test]

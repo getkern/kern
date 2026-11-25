@@ -436,13 +436,20 @@ fn the_completions_and_the_reference_agree() {
         .expect("run kern");
     let comp = String::from_utf8_lossy(&comp.stdout);
 
-    // The reference's COMMANDS block, up to the first OPTIONS heading.
+    // The reference's COMMANDS block, up to the OPTIONS heading: the word at the start of a line.
+    // MEASURED: searching for "OPTIONS" anywhere stopped at `create [OPTIONS] IMAGE`, half way down
+    // the block, so every verb after it (`compat`, `unshare`, `proxy`, all of Multi-box, Config and
+    // Diagnostics) was compared against nothing, and three of them had no completion.
     let start = help
         .find("COMMANDS:")
         .expect("the reference has a COMMANDS block");
     let end = help[start..]
-        .find("OPTIONS")
+        .find("\nOPTIONS:")
         .map_or(help.len(), |o| start + o);
+    assert!(
+        help[start..end].contains("    completions "),
+        "the COMMANDS block was cut short: it must reach the last section (Diagnostics)"
+    );
     let mut documented: Vec<&str> = Vec::new();
     for line in help[start..end].lines().skip(1) {
         // A VERB LINE IS INDENTED EXACTLY FOUR, which is the reference's own shape: two for a section
@@ -712,5 +719,30 @@ fn every_flag_box_parses_is_advertised_in_its_help() {
     assert!(
         checked > 40,
         "expected `parse_box` to yield dozens of flags, found {checked} - the scan stopped matching"
+    );
+}
+
+/// EVERY LINE OF `kern --help` STANDS ON ITS OWN.
+///
+/// The overview drops each verb's continuation lines (they are in `kern <verb> --help`), so a
+/// description wrapped in the middle of a parenthesis is shown cut. MEASURED: the `proxy` line read
+/// "trust adds kern's local CA (localhost names" and stopped there. A line here must close every
+/// `(`, `[` and backtick it opens.
+#[test]
+fn every_overview_line_closes_what_it_opens() {
+    let help = kern().arg("--help").output().expect("run kern");
+    let help = String::from_utf8_lossy(&help.stdout);
+    let start = help.find("COMMANDS:").expect("a COMMANDS block");
+    let mut bad: Vec<&str> = Vec::new();
+    for line in help[start..].lines() {
+        let count = |c: char| line.chars().filter(|x| *x == c).count();
+        if count('(') != count(')') || count('[') != count(']') || count('`') % 2 == 1 {
+            bad.push(line.trim_end());
+        }
+    }
+    assert!(bad.len() < 200, "sanity");
+    assert!(
+        bad.is_empty(),
+        "lines of `kern --help` cut in the middle (wrap the description at a clause): {bad:#?}"
     );
 }

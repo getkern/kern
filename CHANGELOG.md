@@ -97,6 +97,18 @@ API lists and inspects an ended container from kern's record, after a restart to
 container found by its label, its exit code and image). `kern ps --json` also gives a running box's
 `image`, and `docker ps` shows each container's image (it showed `<no image>` for all of them).
 
+**`kern kill` kills at once, as `docker kill` does, and `-s SIGNAL` signals the box's init.** It was
+`stop` under a second name: it sent SIGTERM and waited the box's grace (10 s by default) before the
+kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with no grace (exit 137),
+`kern kill -s HUP <box>` sends HUP to the init and leaves the box running, `killall` kills every box
+at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
+for a container not running) do the same. For the graceful stop, `kern stop`.
+
+**`kern --help` names `kern version`, and the shell completions offer `compat`, `proxy` and
+`unshare`.** The check that compares the completions with the reference stopped reading at the
+first `OPTIONS` it met, inside `create [OPTIONS] IMAGE`, so half of the reference was never compared.
+The `proxy` line of the overview no longer stops mid-sentence.
+
 **The release's SBOM lists what each published file contains, and it is signed.** `kern.spdx.json`
 is built from what each build compiled (the graph cargo resolved, checked against the units the build
 compiled) rather than from a scan of the source tree, which listed the workflow's actions and crates

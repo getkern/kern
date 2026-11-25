@@ -2721,14 +2721,25 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 .filter(|t| t.bytes().all(|c| c.is_ascii_digit()) && !t.is_empty())
                 .unwrap_or("10")
                 .to_string();
+            // `kill?signal=HUP` is `kern kill -s HUP`: the signal to the init. Without one it is the
+            // kill with no grace, as Docker's. MEASURED before: the signal was ignored and the kill
+            // waited the box's grace (10 s for a workload that traps SIGTERM).
+            let signal = req
+                .param("signal")
+                .filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric()))
+                .unwrap_or("KILL")
+                .to_string();
             let args: Vec<&str> = match *verb {
-                "kill" => vec!["kill", &name],
+                "kill" => vec!["kill", "-s", &signal, &name],
                 "restart" => vec!["restart", "-t", &t, &name],
                 _ => vec!["stop", "-t", &t, &name],
             };
             let (code, _, err) = kern(bin, &args);
             if code == 0 {
                 no_content()
+            } else if *verb == "kill" && err.contains("no running box") {
+                // Docker's answer to a kill of a container that does not run: 409, not 304.
+                error(409, &format!("Container {name} is not running"))
             } else if err.contains("no running box") {
                 Response::Full {
                     status: 304,
@@ -2995,6 +3006,54 @@ mod tests {
         }
         let _ = std::fs::remove_file(&bin);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// `POST /containers/{id}/kill` is Docker's: `signal` reaches `kern kill -s`, no `signal` is
+    /// `KILL` (the kill with no grace), and a container that does not run answers 409, not 304.
+    #[test]
+    fn a_kill_passes_its_signal_and_a_stopped_one_is_409() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kern-compat-kill-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let bin = dir.join("kern");
+        let argv_log = dir.join("argv");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n ps) echo '[{{\"name\":\"kd-kill1\",\"status\":\"running\"}}]';;\n \
+             kill) echo \"$*\" >> {log}; [ \"$4\" = kd-gone ] && {{ echo \"no running box named 'kd-gone'\" >&2; exit 1; }};;\nesac\nexit 0\n",
+            log = argv_log.display()
+        );
+        assert!(std::fs::write(&bin, script).is_ok());
+        assert!(std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).is_ok());
+        let kill = |id: &str, query: Vec<(String, String)>| Request {
+            method: "POST".into(),
+            path: format!("/containers/{id}/kill"),
+            query,
+            body: Vec::new(),
+            upgrade: false,
+            peer: None,
+            close: false,
+        };
+        let status = |r: Response| match r {
+            Response::Full { status, .. } => status,
+            _ => 0,
+        };
+        assert_eq!(
+            status(handle(
+                &kill("kd-kill1", vec![("signal".into(), "HUP".into())]),
+                &bin
+            )),
+            204
+        );
+        assert_eq!(status(handle(&kill("kd-kill1", Vec::new()), &bin)), 204);
+        let logged = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        assert_eq!(logged, "kill -s HUP kd-kill1\nkill -s KILL kd-kill1\n");
+        // A name the fake lists as not running: rewrite its listing to include it.
+        let script2 = std::fs::read_to_string(&bin)
+            .unwrap_or_default()
+            .replace("kd-kill1", "kd-gone");
+        assert!(std::fs::write(&bin, script2).is_ok());
+        assert_eq!(status(handle(&kill("kd-gone", Vec::new()), &bin)), 409);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A container keeps its layer (`--keep`, so `docker start` runs it again on the same files)

@@ -1556,6 +1556,7 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
         ComposeAction::Up
             | ComposeAction::Down
             | ComposeAction::Stop
+            | ComposeAction::Kill
             | ComposeAction::Start
             | ComposeAction::Restart
             | ComposeAction::Pull
@@ -1568,6 +1569,7 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
         action,
         pull: pull_override,
         stop_timeout,
+        kill_signal,
         ignore_pull_failures,
         build_args,
         build_policy,
@@ -1659,6 +1661,7 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
         action,
         ComposeAction::Down
             | ComposeAction::Stop
+            | ComposeAction::Kill
             | ComposeAction::Ps
             | ComposeAction::Logs
             | ComposeAction::Port
@@ -2831,6 +2834,7 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
         &mut boxes,
         &TerminalOpts {
             stop_timeout,
+            kill_signal,
             ignore_pull_failures,
             build_args,
             rmi,

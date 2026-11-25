@@ -5621,6 +5621,7 @@ mod port_collision_tests {
             pod: "xt-restart-gate",
             file: "compose.yml",
             stop_timeout: None,
+            kill_signal: None,
             ignore_pull_failures: false,
             build_args: &[],
             rmi: None,

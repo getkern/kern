@@ -2572,6 +2572,56 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     stop_with_grace(names, all, None, crate::commands::DeafInit::Kill)
 }
 
+/// `kern kill -s SIGNAL <name>... | --all`: `signal` to each named box's init, through a pidfd, as
+/// `docker kill -s` sends it to the container's PID 1. Nothing else: the box keeps running unless
+/// its init ends on that signal, and then it ends as any box does. Each box signalled is named on
+/// stdout, as `docker kill` prints each container.
+///
+/// A NAME THAT SELECTS NO RUNNING BOX IS AN ERROR, after the others are signalled, as Docker answers
+/// "container is not running": a signal that reached nothing must not exit 0.
+pub fn signal_boxes(names: &[String], all: bool, signal: i32) -> Result<(), Error> {
+    let running = registry::list();
+    let targets: Vec<registry::Instance> = if all {
+        running.clone()
+    } else {
+        boxes_matching_refs(running.clone(), names)
+    };
+    let live = live_name_set(&running);
+    let mut missing: Vec<String> = if all {
+        Vec::new()
+    } else {
+        names
+            .iter()
+            .filter(|n| !targets.iter().any(|b| ref_matches(b, n, &live)))
+            .map(|n| format!("'{n}'"))
+            .collect()
+    };
+    if all && targets.is_empty() {
+        return Err(Error::NotRunning("no running boxes to signal".to_string()));
+    }
+    for b in &targets {
+        // Through `live_pid1`, as `stop` signals: the recorded number names the init only while it
+        // is still the one registered, never a pid that has since been reused.
+        match b.live_pid1() {
+            Some(pid1) => {
+                let pin = crate::pidfd::PidFd::open(pid1);
+                // SAFETY: a pidfd (or -1) and the init's pid, as `stop` passes them.
+                unsafe { signal_box(crate::pidfd::PidFd::raw_of(&pin), pid1, signal) };
+                println!("{}", b.name);
+            }
+            None => missing.push(format!("'{}' (its init has already exited)", b.name)),
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::NotRunning(format!(
+            "no running box named {}",
+            missing.join(", ")
+        )))
+    }
+}
+
 /// [`stop`], with the per-invocation grace `docker compose down -t <secs>` sets.
 ///
 /// `None` keeps each box's OWN recorded grace, which is what every other caller wants: the value was

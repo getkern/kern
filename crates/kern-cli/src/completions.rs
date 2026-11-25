@@ -83,6 +83,11 @@ const VERBS: &[&str] = &[
     "export",
     "container",
     "rm",
+    // Documented and uncompletable until the test that compares the two lists read past
+    // `create [OPTIONS]`, where it used to stop.
+    "compat",
+    "unshare",
+    "proxy",
 ];
 
 /// Verbs whose first argument is a running box's name (so completion can offer `kern ps` names).

@@ -192,7 +192,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}cp{z} <box>:<src> <dst> | <src> <box>:<dst>                       Copy a file host<->box
     {c}pause{z} <name>... | --all                                        Freeze box(es) (cgroup freezer)
     {c}unpause{z} <name>... | --all                                      Thaw frozen box(es)
-    {c}kill{z} <name>... | killall                                       Stop box(es) (alias of stop)
+    {c}kill{z} [-s SIGNAL] <name>... | killall                           Kill box(es) at once (SIGKILL), or send SIGNAL to the init
     {c}create{z} [OPTIONS] IMAGE [CMD...]                                A kept box recorded and not started (box's options, --name N); prints its name
     {c}start{z} [-a] <name>...                                           Run a `box --keep`/`create` box again, on the layer it left behind; -a follows its output
     {c}restart{z} [-t N] <name>...                                       Stop a kept box and start it again, or start it if stopped (N: seconds before the kill)
@@ -209,8 +209,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      (chown/rm what a box's non-root users wrote in a bind), as podman unshare
     {c}compat docker{z} (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
                                                                      Windows programs: `kern compat docker pipe` in Windows (\\\\.\\pipe\\kern-docker)
-    {c}proxy{z} (trust|untrust|status)                                   HTTPS for the .localhost names: trust adds kern's local CA (localhost names
-                                                                     only) to your browsers' stores, untrust takes it out and deletes it
+    {c}proxy{z} (trust|untrust|status)                                   HTTPS for the .localhost names, with kern's own local CA
+                                                                     (localhost names only): trust adds it to your browsers' stores, untrust
+                                                                     takes it out and deletes it
     {c}events{z}                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     {c}prune{z}                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code
     {c}gc{z} [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
@@ -277,6 +278,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}doctor{z} [--apparmor-profile]                                    Preflight: will boxes run here?
     {c}probe{z}                                                          Host resources you can put in kern.toml
     {c}info{z}                                                           Runtime + host snapshot
+    {c}version{z} [--json]                                               kern's version; --json adds the `kern top --json` schema
     {c}bench{z} (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N] [--compare docker|podman] [--json]  Time box start→exit latency
                                                                      with the floor and an A/A noise interval; a comparison paired run by run
     {c}completions{z} <bash|zsh|fish>                                    Print a shell-completion script

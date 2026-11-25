@@ -44,7 +44,7 @@ COMMANDS:
     cp <box>:<src> <dst> | <src> <box>:<dst>                       Copy a file host<->box
     pause <name>... | --all                                        Freeze box(es) (cgroup freezer)
     unpause <name>... | --all                                      Thaw frozen box(es)
-    kill <name>... | killall                                       Stop box(es) (alias of stop)
+    kill [-s SIGNAL] <name>... | killall                           Kill box(es) at once (SIGKILL), or send SIGNAL to the init
     create [OPTIONS] IMAGE [CMD...]                                A kept box recorded and not started (box's options, --name N); prints its name
     start [-a] <name>...                                           Run a `box --keep`/`create` box again, on the layer it left behind; -a follows its output
     restart [-t N] <name>...                                       Stop a kept box and start it again, or start it if stopped (N: seconds before the kill)
@@ -58,7 +58,7 @@ COMMANDS:
     compat docker (-- CMD...|link <dir>|unlink <dir>|status)        Run CMD with `docker` answered by kern (kern-docker), or a recorded `docker` link
     unshare [--] [CMD...]                                          Run CMD (default: your shell) with the ids a box's files carry on disk
     compat docker (enable|disable|serve)                           The Docker API on a socket of this user, answered by kern (Testcontainers)
-    proxy (trust|untrust|status)                                   HTTPS for the .localhost names: trust adds kern's local CA (localhost names
+    proxy (trust|untrust|status)                                   HTTPS for the .localhost names, with kern's own local CA
     events                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     prune                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code
     gc [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
@@ -99,6 +99,7 @@ COMMANDS:
     doctor [--apparmor-profile]                                    Preflight: will boxes run here?
     probe                                                          Host resources you can put in kern.toml
     info                                                           Runtime + host snapshot
+    version [--json]                                               kern's version; --json adds the `kern top --json` schema
     bench (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N] [--compare docker|podman] [--json]  Time box start→exit latency
     completions <bash|zsh|fish>                                    Print a shell-completion script
 
