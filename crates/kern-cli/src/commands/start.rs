@@ -1542,12 +1542,14 @@ fn mount_record_of(
 /// `--volumes-from` takes a container's, `:ro` making every one read-only. Each still goes through
 /// every check a `-v` or `--mount` of this box would.
 /// Adds the mounts a [`mount_record_of`] record names to `volumes`/`mounts`; `ro` makes each read-only.
+/// An entry it cannot read is an error, not a mount left out: the box would run without a mount it
+/// was asked to have, and say nothing.
 fn decode_mount_record(
     record: &str,
     ro: bool,
     volumes: &mut Vec<String>,
     mounts: &mut Vec<(String, String, bool)>,
-) {
+) -> Result<(), String> {
     for item in registry::decode_labels(record.trim_end()) {
         let parts: Vec<&str> = item.split('\t').collect();
         match parts.as_slice() {
@@ -1563,14 +1565,18 @@ fn decode_mount_record(
             ["m", src, dst, r] => {
                 mounts.push(((*src).to_string(), (*dst).to_string(), ro || *r == "1"))
             }
-            _ => {}
+            _ => return Err(format!("unreadable entry {item:?}")),
         }
     }
+    Ok(())
 }
+
+/// A `--mount` as `BoxRunArgs` carries it: source, target, read-only.
+type Mount = (String, String, bool);
 
 fn resolve_volumes_from(
     entries: &[String],
-) -> Result<(Vec<String>, Vec<(String, String, bool)>), Error> {
+) -> Result<(Vec<String>, Vec<Mount>), Error> {
     let mut volumes = Vec::new();
     let mut mounts = Vec::new();
     for e in entries {
@@ -1597,7 +1603,11 @@ fn resolve_volumes_from(
                     ))
                 })?,
         };
-        decode_mount_record(&record, ro, &mut volumes, &mut mounts);
+        decode_mount_record(&record, ro, &mut volumes, &mut mounts).map_err(|e| {
+            Error::Sandbox(format!(
+                "--volumes-from {name}: its record of mounts cannot be read ({e}); name the mounts with -v instead"
+            ))
+        })?;
     }
     Ok((volumes, mounts))
 }
@@ -6947,7 +6957,7 @@ mod volumes_from_tests {
 
     fn decoded(record: &str, ro: bool) -> (Vec<String>, Vec<(String, String, bool)>) {
         let (mut v, mut m) = (Vec::new(), Vec::new());
-        decode_mount_record(record, ro, &mut v, &mut m);
+        decode_mount_record(record, ro, &mut v, &mut m).expect("readable");
         (v, m)
     }
 
@@ -6974,9 +6984,15 @@ mod volumes_from_tests {
     }
 
     #[test]
-    fn an_empty_or_foreign_record_adds_nothing() {
+    fn an_empty_record_adds_nothing_and_a_foreign_one_is_refused() {
         assert_eq!(decoded("", true), (vec![], vec![]));
-        assert_eq!(decoded("garbage", false), (vec![], vec![]));
+        let (mut v, mut m) = (Vec::new(), Vec::new());
+        assert!(decode_mount_record("garbage", false, &mut v, &mut m).is_err());
+        assert!(
+            decode_mount_record("!", false, &mut v, &mut m).is_err(),
+            "too long to record"
+        );
+        assert!(decode_mount_record("m\t/a\tb\t/c\t0", false, &mut v, &mut m).is_err());
     }
 }
 

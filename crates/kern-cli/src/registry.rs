@@ -1216,11 +1216,12 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance, oom: bool
         // Docker says true.
         // AND WHAT IT MOUNTED, so `--volumes-from` finds the mounts of a box that has exited, as
         // Docker's finds a stopped container's. WHOLE OR NOT AT ALL: a record cut at a cap would
-        // name a shorter path than the one the box mounted, and a later box would mount that.
+        // name a shorter path than the one the box mounted, and a later box would mount that. One
+        // too long is written as `!`, which `--volumes-from` refuses to read, rather than as none.
         let mounts = if b.mounts.len() <= 16384 && !b.mounts.contains(['\n', '\r']) {
             b.mounts.as_str()
         } else {
-            ""
+            "!"
         };
         let body = format!(
             "{code}\n{}\n{}\n{}\nimage\t{}\nimageid\t{}\nlabels\t{}\nrestarts\t{restarts}\noom\t{}\nmounts\t{mounts}",
