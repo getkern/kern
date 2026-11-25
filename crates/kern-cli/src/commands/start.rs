@@ -2138,7 +2138,25 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // mounting one overlay upperdir is undefined behaviour by the kernel's own message. See
             // `keepbox::hold_layer` for the two measured ways a name claim lets that happen.
             crate::keepbox::hold_layer(&dir)?;
-            let argv = kept_argv(std::env::args_os().skip(1).collect(), name.as_str());
+            let mut argv = kept_argv(std::env::args_os().skip(1).collect(), name.as_str());
+            // THE RUN A `--restart` UNIT DRIVES RECORDS THE POLICY, which its own argv does not
+            // carry (systemd does the restarting): `kern start` and `kern restart` replay the
+            // record with `-d`, and `-d --restart always` installs the unit again. MEASURED
+            // before: `kern stop` then `kern start` of an `always` box brought it back with no
+            // policy, where `docker start` restores the container's; kern's Docker API, which
+            // reads the record once the unit is gone, said `no`.
+            if kern_common::env_flag("KERN_MANAGED") && !recorded_restart(&argv) {
+                if let Some(policy) = crate::commands::managed_unit_policy(name.as_str()) {
+                    let at = argv.len().min(2);
+                    argv.splice(
+                        at..at,
+                        [
+                            std::ffi::OsString::from("--restart"),
+                            std::ffi::OsString::from(policy),
+                        ],
+                    );
+                }
+            }
             let previous = crate::keepbox::read(&dir);
             // A DIFFERENT IMAGE ON AN EXISTING LAYER IS REFUSED, because a kept layer is a DELTA and
             // a delta only means something on the base it was written against. MEASURED: `kern box
@@ -3088,14 +3106,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         drop(name_claim);
         // And the kept layer, for the same reason: the unit's run takes it.
         crate::keepbox::release_held_layer();
-        return install_persistent_box(
-            &name,
-            args.restart,
-            args.memory,
-            args.memory_swap_max,
-            cpus,
-            args.pids_limit,
-        );
+        return install_persistent_box(&name, &args, cpus);
     }
     // Each box records the named volumes it mounts (below, in the registry) BEFORE it mounts them, so
     // `kern volume rm` sees an in-use volume and refuses - race-free without holding an fd open on the
@@ -6545,30 +6556,19 @@ fn run_detached(
     unsafe { libc::_exit(0) };
 }
 
-/// `--restart always|unless-stopped` + `-d`: write and enable a systemd **user** unit that supervises
-/// this box, so it restarts on any exit AND survives reboot - WITHOUT a kern daemon (systemd, already
-/// running, is the supervisor). The unit re-runs THIS binary in the foreground with `KERN_MANAGED=1`
-/// (which registers the box for `kern ps`/`logs`/`stop`); `enable --now` starts it immediately and
-/// `enable-linger` makes it come up at boot without a login session. Resource caps (`--memory`,
-/// `--cpus`, `--pids-limit`) are applied by systemd via the unit's own service cgroup.
-fn install_persistent_box(
-    name: &BoxName,
-    policy: RestartPolicy,
-    memory: Option<u64>,
-    memory_swap_max: Option<u64>,
-    cpus: Option<f64>,
-    pids_max: Option<u64>,
-) -> Result<(), Error> {
-    let unit_name = unit_file_name(name.as_str());
-    let self_exe = std::env::current_exe()
-        .map_err(|e| Error::Sandbox(format!("cannot locate the kern binary: {e}")))?;
-    // Rebuild the argv for the managed foreground run so systemd re-runs exactly this each start.
-    // The DECIDED argv, for the same reason the scope re-exec uses it, and here the stakes are
-    // higher: the typed form gets FROZEN into a unit file. A `docker run --restart …` would bake
-    // docker syntax into a unit whose `ExecStart` names the resolved `kern` binary, so it would fail
-    // at every boot, on a machine nobody is watching.
-    let mut exec = vec![systemd_quote(&self_exe.to_string_lossy())];
-    let mut it = crate::invocation_args().into_iter().peekable();
+/// The `ExecStart=` argv of a `--restart` unit, each element quoted for systemd: this binary, then
+/// the DECIDED `invocation` without kern's `-d`/`--restart`, with `--keep` and `--name <name>`
+/// pinned when the command line did not give them (see the notes inside). PURE but for the
+/// refusal of a newline, which would break out of the quoted line.
+fn unit_exec_argv(
+    self_exe: &str,
+    invocation: Vec<String>,
+    name: &str,
+    name_given: bool,
+    keep: bool,
+) -> Result<Vec<String>, Error> {
+    let mut exec = vec![systemd_quote(self_exe)];
+    let mut it = invocation.into_iter().peekable();
     let mut past_sep = false;
     while let Some(a) = it.next() {
         // Strip kern's own `-d`/`--restart` only among the flags BEFORE the `--` command separator.
@@ -6601,6 +6601,66 @@ fn install_persistent_box(
         }
         exec.push(systemd_quote(&a));
     }
+    // THE BOX KEEPS ITS FILESYSTEM FROM ONE RUN TO THE NEXT, as a container with a restart policy
+    // does: Docker restarts the same container, its writable layer included, until it is removed.
+    // Each start of this unit is a new `kern run`, which without `--keep` begins from the image
+    // again. MEASURED before: a file the box wrote was gone after every restart, where the
+    // `on-failure` policy (restarted by the supervisor, in one run) kept it. `--keep` right after
+    // the verb, which both `run` and `box` accept there; the layer goes with `kern rm`, which
+    // removes the unit too. `--rm` never reaches here: it is refused beside `--restart`.
+    // AND ITS NAME. `kern run` without `--name` names a box `box-<pid>`, a new pid each start, so
+    // the unit called `kern-box-419431` ran `box-419452`, `box-419516`, ... and `ps -a` listed the
+    // unit's name beside a stranger's (MEASURED); a Docker container keeps its name across restarts.
+    // The PARSER says whether the command line named it (`name_given`): a scan of the argv here
+    // could not tell kern's `--name` from one in the workload's own command.
+    // The verb is this binary's next word, or the one after `container`: never a word further on,
+    // which may be the workload's own `run`.
+    let verb_at = exec
+        .iter()
+        .take(3)
+        .position(|a| a == &systemd_quote("run") || a == &systemd_quote("box"));
+    if let Some(at) = verb_at {
+        let mut pinned = Vec::with_capacity(3);
+        if !keep {
+            pinned.push(systemd_quote("--keep"));
+        }
+        if !name_given {
+            pinned.push(systemd_quote("--name"));
+            pinned.push(systemd_quote(name));
+        }
+        exec.splice(at + 1..at + 1, pinned);
+    }
+    Ok(exec)
+}
+
+/// `--restart always|unless-stopped` + `-d`: write and enable a systemd **user** unit that supervises
+/// this box, so it restarts on any exit AND survives reboot - WITHOUT a kern daemon (systemd, already
+/// running, is the supervisor). The unit re-runs THIS binary in the foreground with `KERN_MANAGED=1`
+/// (which registers the box for `kern ps`/`logs`/`stop`); `enable --now` starts it immediately and
+/// `enable-linger` makes it come up at boot without a login session. Resource caps (`--memory`,
+/// `--cpus`, `--pids-limit`) are applied by systemd via the unit's own service cgroup.
+fn install_persistent_box(
+    name: &BoxName,
+    args: &crate::commands::BoxRunArgs<'_>,
+    cpus: Option<f64>,
+) -> Result<(), Error> {
+    let (name_given, keep, policy) = (args.name_given, args.keep, args.restart);
+    let (memory, memory_swap_max, pids_max) = (args.memory, args.memory_swap_max, args.pids_limit);
+    let unit_name = unit_file_name(name.as_str());
+    let self_exe = std::env::current_exe()
+        .map_err(|e| Error::Sandbox(format!("cannot locate the kern binary: {e}")))?;
+    // Rebuild the argv for the managed foreground run so systemd re-runs exactly this each start.
+    // The DECIDED argv, for the same reason the scope re-exec uses it, and here the stakes are
+    // higher: the typed form gets FROZEN into a unit file. A `docker run --restart …` would bake
+    // docker syntax into a unit whose `ExecStart` names the resolved `kern` binary, so it would fail
+    // at every boot, on a machine nobody is watching.
+    let exec = unit_exec_argv(
+        &self_exe.to_string_lossy(),
+        crate::invocation_args(),
+        name.as_str(),
+        name_given,
+        keep,
+    )?;
     // [Service] body. `Restart=always` + `RestartSec=1` for both persistent policies (the
     // stop-survival nuance between `always`/`unless-stopped` is handled by `kern stop` removing the
     // unit). Resource caps go here so systemd's service cgroup enforces them for the managed run.
@@ -8144,6 +8204,14 @@ fn as_box_argv(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
 /// --name web ...`, and `kern start web` refused it as "not a command line this box can be started
 /// from", so a box kept that way could never start again. The name moves to position 1; everything
 /// after the workload's `--` is the workload's and is left as it is.
+/// Whether a recorded `box <name> ...` argv asks for a restart policy, among kern's flags (before
+/// the `--` of the workload). PURE.
+fn recorded_restart(argv: &[std::ffi::OsString]) -> bool {
+    argv.iter()
+        .take_while(|a| a.as_os_str() != "--")
+        .any(|a| a == "--restart" || a.to_str().is_some_and(|t| t.starts_with("--restart=")))
+}
+
 fn kept_argv(argv: Vec<std::ffi::OsString>, name: &str) -> Vec<std::ffi::OsString> {
     let argv = as_box_argv(argv);
     if argv
@@ -8732,5 +8800,120 @@ mod runtime_nvidia_message_tests {
             "--runtime nvidia: NVIDIA_VISIBLE_DEVICES=99: this host has no card 99. Present: 0, 1"
         );
         assert_eq!(runtime_nvidia_says("other text", "x"), "other text");
+    }
+}
+
+#[cfg(test)]
+mod restart_unit_tests {
+    use super::{recorded_restart, unit_exec_argv};
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn q(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| format!("\"{s}\"")).collect()
+    }
+
+    /// The unit of a `--restart always` box runs it under ONE name with ITS layer from start to
+    /// start, as Docker restarts one container: `--keep` and `--name` are pinned when the command
+    /// line did not give them, kern's own `-d`/`--restart` are taken out, and nothing after the
+    /// verb's place is read as the verb.
+    #[test]
+    fn a_restart_unit_pins_the_name_and_the_layer() {
+        let unnamed = unit_exec_argv(
+            "/k",
+            v(&[
+                "run",
+                "-d",
+                "--restart",
+                "always",
+                "alpine:3.21",
+                "sh",
+                "-c",
+                "run",
+            ]),
+            "box-7",
+            false,
+            false,
+        );
+        assert_eq!(
+            unnamed.ok(),
+            Some(q(&[
+                "/k",
+                "run",
+                "--keep",
+                "--name",
+                "box-7",
+                "alpine:3.21",
+                "sh",
+                "-c",
+                "run"
+            ]))
+        );
+        let named = unit_exec_argv(
+            "/k",
+            v(&[
+                "run",
+                "--keep",
+                "--name",
+                "web",
+                "-d",
+                "--restart",
+                "unless-stopped",
+                "nginx",
+            ]),
+            "web",
+            true,
+            true,
+        );
+        assert_eq!(
+            named.ok(),
+            Some(q(&["/k", "run", "--keep", "--name", "web", "nginx"])),
+            "given flags are not pinned twice"
+        );
+        let boxed = unit_exec_argv(
+            "/k",
+            v(&["box", "b1", "--image", "alpine", "-d", "--", "sh", "-d"]),
+            "b1",
+            true,
+            false,
+        );
+        assert_eq!(
+            boxed.ok(),
+            Some(q(&[
+                "/k", "box", "--keep", "b1", "--image", "alpine", "--", "sh", "-d"
+            ])),
+            "a `-d` of the workload stays"
+        );
+        assert!(
+            unit_exec_argv("/k", v(&["run", "alpine", "echo", "a\nb"]), "x", true, true).is_err(),
+            "a newline would break out of the ExecStart line"
+        );
+    }
+
+    /// The policy is read among kern's flags only: a `--restart` of the workload is not one.
+    #[test]
+    fn a_recorded_policy_is_one_of_kerns_flags() {
+        let os = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(recorded_restart(&os(&[
+            "box",
+            "w",
+            "--restart",
+            "always",
+            "--image",
+            "a"
+        ])));
+        assert!(recorded_restart(&os(&["box", "w", "--restart=always"])));
+        assert!(!recorded_restart(&os(&[
+            "box",
+            "w",
+            "--image",
+            "a",
+            "--",
+            "app",
+            "--restart"
+        ])));
+        assert!(!recorded_restart(&os(&["box", "w", "--keep"])));
     }
 }

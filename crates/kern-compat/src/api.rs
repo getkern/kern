@@ -1503,7 +1503,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
                 json_str(&id),
                 json_str(&rfc3339(c.created)),
                 json_str(&format!("/{name}")),
-                json_str(&c.image),
+                json_str(&container_image_id(&kern_images(bin, false), &c.image)),
                 json_str(&c.image),
                 str_array(&c.env),
                 str_array(&c.cmd),
@@ -1579,7 +1579,9 @@ fn inspect(bin: &Path, name: &str) -> Response {
     let labels = labels_of(&v);
     // The image the box was started from (`kern inspect --json`'s `image`, empty for a `--rootfs`
     // box and for a box that has exited, whose record no longer holds it).
-    let image = json_str(v.get("image").and_then(Value::as_str).unwrap_or_default());
+    let image_name = v.get("image").and_then(Value::as_str).unwrap_or_default();
+    let image = json_str(image_name);
+    let image_id = json_str(&container_image_id(&kern_images(bin, false), image_name));
     // Docker's `HostConfig.RestartPolicy`, from the argv the box was kept with, or the systemd unit
     // a standalone `always`/`unless-stopped` box runs under (its argv carries no `--restart`: systemd
     // does the restarting). MEASURED before: empty for every container.
@@ -1588,12 +1590,12 @@ fn inspect(bin: &Path, name: &str) -> Response {
     let mounts = mounts_json(&kept);
     let policy = match unit_restart_policy(name) {
         Some(p) => format!("{{\"Name\":{},\"MaximumRetryCount\":0}}", json_str(&p)),
-        None => restart_policy_json(&kept_argv(name)),
+        None => restart_policy_json(&kept),
     };
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{},\"Paused\":{paused},\"Restarting\":{restarting},\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"Privileged\":{privileged},\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":{mounts}}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image_id},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{},\"Paused\":{paused},\"Restarting\":{restarting},\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\",\"Privileged\":{privileged},\"RestartPolicy\":{policy}}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":{mounts}}}",
             json_str(&id),
             json_str(&created),
             json_str(&format!("/{name}")),
@@ -1731,6 +1733,7 @@ fn list(bin: &Path, req: &Request) -> Response {
     let created_names: std::collections::HashSet<String> =
         created.iter().map(|(n, _)| n.clone()).collect();
     let mut items = Vec::new();
+    let images = kern_images(bin, false);
     for (name, v) in kern_boxes(bin) {
         let running = box_running(&v);
         if !running && !all {
@@ -1780,10 +1783,14 @@ fn list(bin: &Path, req: &Request) -> Response {
             // compose's second `up` reads the networks from THIS list to decide whether a container
             // must be recreated. MEASURED before: the field was absent and the docker compose v5
             // client crashed with a nil pointer (`checkExpectedNetworks`).
-            "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":\"\",\"Command\":{},\"Created\":{},\"State\":{},\"Status\":{},\"Ports\":[{}],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":{}}}",
+            "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":{},\"Command\":{},\"Created\":{},\"State\":{},\"Status\":{},\"Ports\":[{}],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":{}}}",
             json_str(&id_of(&name)),
             json_str(&format!("/{name}")),
             json_str(v.get("image").and_then(Value::as_str).unwrap_or_default()),
+            json_str(&container_image_id(
+                &images,
+                v.get("image").and_then(Value::as_str).unwrap_or_default()
+            )),
             json_str(v.get("command").and_then(Value::as_str).unwrap_or_default()),
             // The same `Created` `inspect` says: when the box was made.
             v.get("created")
@@ -1820,10 +1827,11 @@ fn list(bin: &Path, req: &Request) -> Response {
             }
             let (net, aliases) = crate::netvol::created_network(&c.argv);
             items.push(format!(
-                "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":\"\",\"Command\":{},\"Created\":{},\"State\":\"created\",\"Status\":\"Created\",\"Ports\":[],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":{}}}",
+                "{{\"Id\":{},\"Names\":[{}],\"Image\":{},\"ImageID\":{},\"Command\":{},\"Created\":{},\"State\":\"created\",\"Status\":\"Created\",\"Ports\":[],\"Labels\":{},\"HostConfig\":{{\"NetworkMode\":{}}},\"NetworkSettings\":{{\"Networks\":{}}},\"Mounts\":{}}}",
                 json_str(&id_of(name)),
                 json_str(&format!("/{name}")),
                 json_str(&c.image),
+                json_str(&container_image_id(&images, &c.image)),
                 json_str(&c.cmd.join(" ")),
                 c.created,
                 labels_json(&c.labels),
@@ -2148,7 +2156,11 @@ fn image_list(bin: &Path, req: &Request) -> Response {
 /// bare name as `:latest`, or a repository pulled by digest. By name, this machine's entry before
 /// another platform's, as `kern run` picks it.
 fn cached_image(bin: &Path, name: &str) -> Option<Value> {
-    let images = kern_images(bin, false);
+    cached_image_in(&kern_images(bin, false), name).cloned()
+}
+
+/// [`cached_image`] over a listing already in hand. PURE.
+fn cached_image_in<'a>(images: &'a [Value], name: &str) -> Option<&'a Value> {
     // THE NAME FIRST, then the id, as Docker resolves them: an image called `bf` is that image, not
     // the one whose id starts with `bf`.
     let want_latest = if name.contains(':') || name.contains('@') {
@@ -2163,20 +2175,36 @@ fn cached_image(bin: &Path, name: &str) -> Option<Value> {
                 .and_then(Value::as_str)
                 .is_some_and(|n| n == name || n == want_latest || n.split('@').next() == Some(name))
         })
-        .min_by_key(|i| i.get("platform").is_some())
-        .cloned();
-    by_name.or_else(|| image_by_id_prefix(&images, name))
+        .min_by_key(|i| i.get("platform").is_some());
+    by_name.or_else(|| image_by_id_prefix(images, name))
 }
 
 /// The one cached entry whose id `r` names (`sha256:<hex>` or a prefix of 2 or more, as Docker
 /// takes one); `None` for no match and for an ambiguous prefix.
-fn image_by_id_prefix(images: &[Value], r: &str) -> Option<Value> {
+fn image_by_id_prefix<'a>(images: &'a [Value], r: &str) -> Option<&'a Value> {
     let hex = image_id_ref(r)?;
     let mut hits = images
         .iter()
         .filter(|i| image_entry_id(i).is_some_and(|id| id.starts_with(hex)));
     let one = hits.next()?;
-    hits.next().is_none().then(|| one.clone())
+    hits.next().is_none().then_some(one)
+}
+
+/// The image id of a container that runs `image`, as Docker reports it: `Image` in `inspect` and
+/// `ImageID` in the list are the id (`sha256:<hex>`), the name is `Config.Image` and the list's
+/// `Image`. MEASURED before: both said the name, where a client that compares a container's image
+/// with an image's `Id` (`docker inspect -f '{{.Image}}'` against `docker images -q`) never matched.
+/// An image no longer cached keeps an id, as Docker's container keeps the id of a removed image:
+/// the one derived from its name, which is also what a cache entry with no content id answers.
+/// `images` is one `kern images --json` per request (0.55 ms median, 6 images, measured).
+fn container_image_id(images: &[Value], image: &str) -> String {
+    if image.is_empty() {
+        return String::new();
+    }
+    let hex = cached_image_in(images, image)
+        .and_then(image_entry_id)
+        .unwrap_or_else(|| id_of(image));
+    format!("sha256:{hex}")
 }
 
 /// The id a client sees for a cached image: of its name, and for another platform's entry of the
@@ -2285,7 +2313,7 @@ fn image_by_id(bin: &Path, body: &Value) -> Option<(String, Option<String>)> {
     }
     let i = image_by_id_prefix(&images, r)?;
     let name = i.get("image").and_then(Value::as_str)?.to_string();
-    Some((name, image_entry_platform(&i).map(str::to_string)))
+    Some((name, image_entry_platform(i).map(str::to_string)))
 }
 
 /// Put the image `name` in place of the id a create gave (`--image`, and the event's image).
@@ -5272,6 +5300,11 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
         ("GET", ["info"]) => info(bin),
         ("POST", ["_kern", "session-ended"]) => session_ended(bin, req),
         ("GET", ["containers", "json"]) => list(bin, req),
+        // KERN HAS NO PLUGINS, so every plugin by name is one that is not there: Docker's 404, which
+        // its CLI reads as "no such object" at the end of `docker inspect <name>`'s search (it
+        // asks containers, images, networks, volumes, then plugins). MEASURED before: a 501, and
+        // `docker inspect` of a removed container printed "GET /plugins/<name>/json: not served".
+        ("GET", ["plugins", name, "json"]) => error(404, &format!("plugin \"{name}\" not found")),
         ("POST", ["containers", "create"]) => {
             let name = match req.param("name").filter(|n| !n.is_empty()) {
                 Some(n) if valid_name(n) => n.to_string(),
@@ -6686,6 +6719,34 @@ mod tests {
     /// `--pids-limit 32` through the socket let 100 forks through.
     /// An image id as a client hands one back is recognised, and another platform's entry of a
     /// tag has an id of its own; a create given an id runs the entry's name.
+    /// A container's image id is the id the image list gives the same image, for the name it was
+    /// run by (a bare name being `:latest`), and this machine's entry before another platform's:
+    /// what a client compares `inspect -f '{{.Image}}'` with. An image no longer cached keeps an
+    /// id; a container with no image has none.
+    #[test]
+    fn a_container_reports_the_id_the_image_list_gives_its_image() {
+        let images = [
+            json::parse(r#"{"image":"alpine:3.21","platform":"linux/arm64"}"#).unwrap(),
+            json::parse(r#"{"image":"alpine:3.21"}"#).unwrap(),
+            json::parse(r#"{"image":"nginx:latest"}"#).unwrap(),
+        ];
+        let listed = |i: &Value| format!("sha256:{}", image_entry_id(i).unwrap());
+        assert_eq!(
+            container_image_id(&images, "alpine:3.21"),
+            listed(&images[1])
+        );
+        assert_ne!(
+            container_image_id(&images, "alpine:3.21"),
+            listed(&images[0])
+        );
+        assert_eq!(container_image_id(&images, "nginx"), listed(&images[2]));
+        assert_eq!(
+            container_image_id(&images, "gone:1"),
+            format!("sha256:{}", id_of("gone:1"))
+        );
+        assert_eq!(container_image_id(&images, ""), "");
+    }
+
     #[test]
     fn image_ids_tell_platforms_apart_and_a_create_by_id_runs_the_name() {
         assert_eq!(

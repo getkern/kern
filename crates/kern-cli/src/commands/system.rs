@@ -141,6 +141,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      a row is an INSTANCE, not a name: a name reused after a box exited appears once per instance, identified by PID
                                                                      the exited rows are DETACHED boxes: the exit note is written by the supervisor, which a foreground box has none of
                                                                      -a also lists `box --keep` and `kern create` boxes, which are state on disk and NOT transient: status=kept selects exactly those, and `kern start` runs one
+                                                                     a `--restart` box between two runs is UP and listed without -a, as `restarting (code)`; status=restarting selects those
                                                                      --last N is about boxes that RAN, so it does not list the kept ones (they outlive the boot and share no clock with a run)
                                                                      --format fields: .Names .ID .Image .Command .Ports .URL .Pod .Service .Status .State .Health .ExitCode .RunningFor .Labels .Label \"k\"
                                                                      .Status is Docker's (Up 4 seconds (healthy), Exited (3) 4 seconds ago, Created), .State the word (running, exited); `table ...` prints headers
@@ -363,9 +364,12 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --ssh-key FILE      Authorize this public key instead of generating a throwaway keypair
     --restart [POLICY]  Restart a detached box when it exits: on-failure (a bare --restart),
                         always, unless-stopped, no. on-failure:N gives up after N retries
-                        (as --restart-max N). always and unless-stopped run under a unit of
-                        your systemd user manager: they survive a reboot, list as restarting
-                        between runs, and `kern rm -f` removes the unit
+                        (as --restart-max N). Every policy restarts the SAME box: its name
+                        and its files carry over from one run to the next. always and
+                        unless-stopped run under a unit of your systemd user manager: they
+                        survive a reboot, list as restarting between runs (in `kern ps` and
+                        `kern top` too), `kern stop` then `kern start` keeps the policy, and
+                        `kern rm -f` removes the unit and the files
     --health-cmd <cmd>  Shell command probed in the box; sets ps HEALTH (exit 0 = healthy)
     --health-cmd-argv A The same check with NO shell: one argv element per flag, repeated
                         (the exec form). Use it when the image has no /bin/sh

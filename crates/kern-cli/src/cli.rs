@@ -63,6 +63,10 @@ pub enum Command {
         /// for a container that removed itself.
         rm: bool,
         name: String,
+        /// Whether the command line NAMED the box (`--name` or the positional name), not the
+        /// `box-<pid>` given in its place: a `--restart` unit must pin a generated name, which the
+        /// next start would otherwise draw again (see `install_persistent_box`).
+        name_given: bool,
         rootfs: Option<String>,
         image: Option<String>,
         /// `--pull <missing|never|always>`: registry-image fetch policy (see [`commands::PullPolicy`]).
@@ -5816,6 +5820,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             rm,
             // The name is optional (Docker-style): omit it and kern assigns `box-<pid>`, so a quick
             // `kern box --image alpine -- sh` needs no invented name.
+            name_given: name.is_some(),
             name: name
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("box-{}", std::process::id())),
@@ -7284,6 +7289,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         ),
         Command::BoxRun {
             name,
+            name_given,
             rootfs,
             image,
             pull,
@@ -7438,6 +7444,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 commands::box_run(commands::BoxRunArgs {
                     rm,
                     name: &name,
+                    name_given,
                     rootfs: rootfs.as_deref(),
                     image: image.as_deref(),
                     pull,

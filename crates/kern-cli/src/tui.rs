@@ -356,6 +356,11 @@ struct Row {
     /// How it reaches out: `nat`, `pod`, `host` or `none`; empty when its init could not be read
     /// (between two runs of a `--restart` box), which must not count as `none`. See [`net_kind`].
     net: &'static str,
+    /// Between two runs of its `--restart` policy: systemd is about to start it again and no
+    /// process runs now (`pid` is 0 and shown as `-`). `kern ps` lists it `restarting (code)`.
+    restarting: bool,
+    /// The code its last run exited with, while systemd holds it; `None` otherwise.
+    last_code: Option<i32>,
 }
 
 /// Restores the terminal on drop: leave the alternate screen, show the cursor, re-enable line
@@ -2384,10 +2389,18 @@ fn frame_json(s: &Snapshot, tabs: &[usize], ts_ms: u64) -> String {
     put_list(&mut o, "boxes", &s.rows, |o, r| {
         o.push_str("{\"name\":");
         put_str(o, &r.name);
+        // `null` between two runs, never 0: a consumer that signals a row's pid must not be
+        // handed one that `kill(2)` reads as "the whole process group".
+        o.push_str(",\"pid\":");
+        if r.restarting {
+            o.push_str("null");
+        } else {
+            let _ = write!(o, "{}", r.pid);
+        }
         let _ = write!(
             o,
-            ",\"pid\":{},\"uptime_s\":{},\"mem_bytes\":",
-            r.pid, r.uptime
+            ",\"restarting\":{},\"uptime_s\":{},\"mem_bytes\":",
+            r.restarting, r.uptime
         );
         put_opt(o, r.mem);
         o.push_str(",\"cpu_pct\":");
@@ -3077,6 +3090,44 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
             iso,
             sec,
             orphaned: b.orphaned,
+            restarting: false,
+            last_code: None,
+        });
+    }
+    // A BOX BETWEEN TWO RUNS OF ITS `--restart` POLICY stays in the list, as `kern ps` and `docker
+    // ps` keep a `Restarting (1)` row: MEASURED before, a crash-looping service blinked out of this
+    // table for every gap, the one moment its row was the news. Asked of kern's units only (a
+    // `readdir`), and of systemd only for a unit whose box is not in the registry now (about 3.4 ms).
+    let live: std::collections::HashSet<String> = rows.iter().map(|r| r.name.clone()).collect();
+    for name in crate::commands::managed_unit_names() {
+        if live.contains(&name) {
+            continue;
+        }
+        let Some(u) = crate::commands::managed_unit_runs(&name) else {
+            continue;
+        };
+        if !u.restarting {
+            continue;
+        }
+        rows.push(Row {
+            name,
+            pid: 0,
+            uptime: 0,
+            mem: None,
+            cpu_pct: 0.0,
+            tasks: None,
+            paused: false,
+            health: String::new(),
+            ports: String::new(),
+            pod: String::new(),
+            iso: String::new(),
+            sec: String::new(),
+            orphaned: false,
+            oom_kills: 0,
+            restarts: u.restarts,
+            net: "",
+            restarting: true,
+            last_code: u.last_code,
         });
     }
     // Group for the pod-tree view: standalone boxes first, then each pod's members contiguous (pods in
@@ -5411,7 +5462,14 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         //
         // YELLOW, NOT RED: the box is running and reachable, and the thing that died is the process
         // that would have restarted it. Red would read as "the workload failed".
-        let mut status = if r.orphaned {
+        // BETWEEN TWO RUNS FIRST: there is no process to be orphaned or paused. Yellow like
+        // `orphaned`, a heads-up: the box is not up this instant and systemd is bringing it back.
+        let mut status = if r.restarting {
+            match r.last_code {
+                Some(c) => format!("{y}restarting ({c}){z}"),
+                None => format!("{y}restarting{z}"),
+            }
+        } else if r.orphaned {
             format!("{y}orphaned{z}")
         } else if r.paused {
             format!("{d}paused{z}")
@@ -5456,7 +5514,11 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         s.push_str(&format!(
             "  {lead}{name_col}{:<nw$}{z}  {:>7}  {:>8}  {:>8}  {:>4.0}%  {:>4}  {health}  {ports}  {status}{iso}{sec}\n",
             name_cell,
-            r.pid,
+            if r.restarting {
+                "-".to_string()
+            } else {
+                r.pid.to_string()
+            },
             fmt_uptime(r.uptime),
             mem,
             pct(r.cpu_pct),
@@ -5720,6 +5782,33 @@ mod tests {
     ///
     /// THE CONTROLS ARE THE OTHER TWO STATES, because a table that printed `orphaned` for everything
     /// would pass an assertion that only looked for the word.
+    /// A box between two runs of its `--restart` policy has a row with no process: `restarting`
+    /// with its last code, and `-` where a pid would be (0 is no box's pid). Neither `running` nor
+    /// `orphaned`, which would say a process exists.
+    #[test]
+    fn the_boxes_table_lists_a_box_between_runs_without_a_pid() {
+        let _g = crate::env_guard();
+        let p = Palette::plain();
+        let host = HostStats::default();
+        let mut gap = row("loop", false);
+        gap.pid = 0;
+        gap.restarting = true;
+        gap.last_code = Some(1);
+        gap.mem = None;
+        gap.tasks = None;
+        let out = boxes_table(&p, &[gap], 10, 0, &host);
+        let line = out.lines().find(|l| l.contains("loop")).unwrap_or_default();
+        assert!(line.contains("restarting (1)"), "{out}");
+        assert!(
+            !line.contains("running") && !line.contains("orphaned"),
+            "{out}"
+        );
+        assert!(
+            line.split_whitespace().skip_while(|w| *w != "loop").nth(1) == Some("-"),
+            "the pid column of a box with no process: {line:?}"
+        );
+    }
+
     #[test]
     fn the_boxes_table_reports_an_orphaned_box_as_orphaned_and_not_as_running() {
         let _g = crate::env_guard();
@@ -5828,6 +5917,8 @@ mod tests {
             oom_kills: 0,
             restarts: 0,
             net: "",
+            restarting: false,
+            last_code: None,
         }
     }
 
@@ -6576,6 +6667,8 @@ mod tests {
             oom_kills: 0,
             restarts: 0,
             net: "",
+            restarting: false,
+            last_code: None,
         };
         let p = Palette::plain();
         let host = HostStats::default();
@@ -7876,6 +7969,8 @@ mod gpu_overview_tests {
             oom_kills: 0,
             restarts: 0,
             net: "",
+            restarting: false,
+            last_code: None,
         };
         // Three boxes: one on card 0, one on both, one with none. The minors are SWAPPED against the
         // nvidia-smi index on purpose (bus 01 is minor 1), so a count keyed on the index is caught.

@@ -217,6 +217,8 @@ pub struct BoxRunArgs<'a> {
     /// `--rm`: leave no exit record behind. See `cli::Command::BoxRun::rm`.
     pub rm: bool,
     pub name: &'a str,
+    /// The command line named the box; see `cli::Command::BoxRun::name_given`.
+    pub name_given: bool,
     pub rootfs: Option<&'a str>,
     pub image: Option<&'a str>,
     /// `--pull <missing|never|always>`: registry-image fetch policy (see [`PullPolicy`]).
@@ -2755,6 +2757,23 @@ fn unit_active_state(unit: &str) -> Option<String> {
 /// Does `name` have a unit kern wrote (`--restart always|unless-stopped`)? One `stat` and a read.
 pub(crate) fn has_managed_unit(name: &str) -> bool {
     managed_unit_path(name).is_some_and(|p| is_kern_managed_unit(&p))
+}
+
+/// The policy of the unit kern wrote for `name` (its `X-KernRestart=`), `always` for a unit
+/// written before the key existed; `None` without a kern unit. The same reading kern's Docker API
+/// makes for `HostConfig.RestartPolicy`.
+pub(crate) fn managed_unit_policy(name: &str) -> Option<&'static str> {
+    let path = managed_unit_path(name)?;
+    if !is_kern_managed_unit(&path) {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(
+        match text.lines().find_map(|l| l.strip_prefix("X-KernRestart=")) {
+            Some("unless-stopped") => "unless-stopped",
+            _ => "always",
+        },
+    )
 }
 
 /// What systemd says of the unit a `--restart` box runs under ([`managed_unit_runs`]).

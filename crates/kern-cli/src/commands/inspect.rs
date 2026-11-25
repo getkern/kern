@@ -524,6 +524,30 @@ pub fn ps(
                 }
                 v
             })
+    } else if kept_possible && !filters.iter().any(|(k, _)| k == "status") {
+        // A BOX BETWEEN TWO RUNS OF ITS `--restart` POLICY IS UP, as `docker ps` lists a
+        // `Restarting (1)` container without `-a`: it is a process systemd is about to start again,
+        // not a layer on disk. MEASURED before: a plain `kern ps` dropped it for that instant, so a
+        // crash-looping service blinked in and out of the view an operator watches. Asked of the
+        // UNITS, not of every kept box (a host with 1000 kept boxes pays nothing here): a `readdir`
+        // of the systemd user dir, then one `systemctl show` per unit whose box is not live.
+        let name_want: Option<&str> = filters
+            .iter()
+            .find(|(k, _)| k == "name")
+            .map(|(_, v)| v.as_str());
+        crate::commands::managed_unit_names()
+            .into_iter()
+            .filter(|n| name_want.is_none_or(|w| n.contains(w)) && named(n))
+            .filter(|n| !live_names.contains(n))
+            .filter(|n| crate::commands::managed_unit_runs(n).is_some_and(|u| u.restarting))
+            .filter_map(|n| {
+                crate::keepbox::list_matching(|k| k == n)
+                    .into_iter()
+                    .next()
+                    .or_else(|| crate::commands::unit_only_box(&n))
+            })
+            .filter(|k| kept_matches(k, filters))
+            .collect()
     } else {
         Vec::new()
     };
