@@ -161,6 +161,8 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
   or not, with a tmpfs size; Dev Containers mounts its workspace this way. An option kern's mount does
   not have (a propagation other than `rprivate`, a non-recursive bind, volume driver options, a tmpfs
   mode) is refused by name. A bind (`-v src:dst`) is translated too.
+- `VolumesFrom` (`docker run --volumes-from c[:ro]`) becomes kern's `--volumes-from`: every volume,
+  bind and mount of that container, running or stopped; a container id is turned into its name.
 - `logs` keeps stdout and stderr apart for the containers made through the socket, and so do
   `kern logs` and `kern attach` for the same boxes (stdout on stdout, stderr on stderr): their box's log
   records which stretch came from which stream. When the two are written within microseconds of each
@@ -172,7 +174,7 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
 - A box run attached and ended without `--rm` is listed from kern's own exit record (or its kept
   layer) until `docker rm`, as any other container; a restarted server finds it there.
 - What kern refuses without a flag is refused here by name with a 400: `Devices`, `CapAdd`,
-  `SecurityOpt`, `VolumesFrom`, `Links`, and the host's pid, ipc or uts namespace. `Privileged` is
+  `SecurityOpt`, `Links`, and the host's pid, ipc or uts namespace. `Privileged` is
   `kern box --privileged` when the operator has set `compose_privileged` in their own `kern.toml`
   (the gate a compose file's `privileged: true` passes), refused naming that key otherwise. Measured:
   `docker run -d --privileged docker:28-dind`, then inside it a container reaching the internet over

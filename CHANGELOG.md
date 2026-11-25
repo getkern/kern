@@ -173,6 +173,9 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **An unreadable `kern.toml` that sets where data goes stops a box and `volume create`**, with the
   parse error, instead of using the default place in silence; a detached box whose logs directory cannot
   be used refuses to start instead of losing its output.
+- **`kern run --volumes-from BOX[:ro|:rw]`**, the Docker API's `VolumesFrom` and the docker shim's
+  flag: a box gets every volume, anonymous volume, bind and `--mount` of another box, running or kept,
+  read-only with `:ro`. A name that is neither is refused.
 - **`--log-driver journald`**, compose `logging: driver: journald`, the Docker API's `LogConfig` and
   `[kern] log_driver`: every line also goes to the systemd journal, tagged with the box's name, stdout
   as info and stderr as err; `kern logs` keeps working from the file. Refused where there is no journal.
