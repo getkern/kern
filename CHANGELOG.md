@@ -175,7 +175,11 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
   be used refuses to start instead of losing its output.
 - **`kern run --volumes-from BOX[:ro|:rw]`**, the Docker API's `VolumesFrom` and the docker shim's
   flag: a box gets every volume, anonymous volume, bind and `--mount` of another box, running or kept,
-  read-only with `:ro`. A name that is neither is refused.
+  read-only with `:ro`. A name that is neither is refused, and a box's own `-v`, `--mount` or `--tmpfs`
+  on the same destination wins over the copy.
+- **A mount on `/etc/resolv.conf`, `/etc/hosts` or `/etc/hostname` is shown as mounted**, in a box and
+  in a compose service: kern's own entries, the pod's shared files, `--add-host` and `--dns` no longer
+  cover or merge into it.
 - **`--log-driver journald`**, compose `logging: driver: journald`, the Docker API's `LogConfig` and
   `[kern] log_driver`: every line also goes to the systemd journal, tagged with the box's name, stdout
   as info and stderr as err; `kern logs` keeps working from the file. Refused where there is no journal.
