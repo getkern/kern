@@ -2921,6 +2921,62 @@ fn a_supervised_restart_always_box_stays_stopped_and_restarts_once() {
     );
 }
 
+/// A box behind pasta that connects to a CLOSED port is refused, as under Docker, and does not wait
+/// for its client's timeout. MEASURED before, with the pasta Ubuntu 24.04 ships: pasta's RST had no
+/// ACK, the box's socket discarded it, and `wget -T20` of a closed port of the host ran its 20 s.
+#[test]
+fn a_box_behind_pasta_is_refused_by_a_closed_port() {
+    if let Some(why) = no_box_here() {
+        eprintln!("skip: {why}");
+        return;
+    }
+    if !std::path::Path::new("/usr/bin/pasta").exists()
+        && !std::path::Path::new("/bin/pasta").exists()
+    {
+        eprintln!("skip: no pasta");
+        return;
+    }
+    // The host's own address on its default route: reached through pasta, and a port of it that
+    // nothing listens on (a listener bound and closed, so the port was free a moment ago).
+    let Some(host) = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|u| u.connect("192.0.2.1:9").map(|()| u))
+        .and_then(|u| u.local_addr())
+        .ok()
+        .map(|a| a.ip())
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+    else {
+        eprintln!("skip: no address on a default route");
+        return;
+    };
+    let port = std::net::TcpListener::bind((host, 0))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap_or(1);
+    let t = std::time::Instant::now();
+    let o = kern()
+        .args([
+            "run",
+            "--rm",
+            "alpine:latest",
+            "wget",
+            "-q",
+            "-T",
+            "20",
+            "-O",
+            "-",
+            &format!("http://{host}:{port}/"),
+        ])
+        .output()
+        .expect("kern run");
+    let took = t.elapsed();
+    let (_, err) = out_err(&o);
+    assert!(err.contains("refused"), "{err}");
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "refused after {took:?}"
+    );
+}
+
 /// `-d` with `--egress-allow`: the detached box gets its filter (refused before 2026-11-20). Checked
 /// with no internet: inside the box the pump answers on the proxy port, which only happens once the
 /// filter was delivered the box's PID 1; after `stop` the box is gone with it.

@@ -1160,6 +1160,8 @@ const PASTA_NO_PORT_MAP: [&str; 8] = ["-t", "none", "-u", "none", "-T", "none", 
 /// Which one is chosen belongs to the CALLER, because only the caller knows which namespace it is
 /// attaching to. A later pass caught the first version of this fix using the bridge name
 /// everywhere, which renamed the interface on two paths that never had the collision.
+/// Where the outcome of the TCP rules for pasta is written, in pasta's state directory.
+const PASTA_TCP_RULES: &str = "tcp-rules";
 const PASTA_IF_ALONE: &str = "eth0";
 const PASTA_IF_ON_BRIDGE: &str = "kern0";
 
@@ -1738,6 +1740,8 @@ fn setup_outbound_in(dir: &std::path::Path, holder: i32, ns_ifname: &str) -> Out
             PASTA_SPAWN_LIMIT,
         )
     };
+    // The TCP rules for pasta (below) are written by a child that works while pasta starts.
+    let rules = kern_isolation::nft::start_install(holder, ns_ifname);
     match spawn(true) {
         // The first attempt kept its netns watch, so this pasta exits by itself when the namespace
         // goes and `teardown` need not wait for it. Best-effort: if the write fails, teardown
@@ -1794,6 +1798,15 @@ fn setup_outbound_in(dir: &std::path::Path, holder: i32, ns_ifname: &str) -> Out
         }
         Err(e) => return Outbound::Failed(e.to_string()),
     }
+    // THE TWO TCP RULES the pasta of Ubuntu 24.04 needs, a closed port refused instead of hung and
+    // one lost SYN costing one second instead of two (see `kern_isolation::nft`, which has the
+    // measurements). Best effort: without nftables in the kernel the box keeps pasta's behaviour,
+    // and the outcome is left next to pasta's state for `kern doctor` to read.
+    let rules = match rules.map(kern_isolation::nft::Install::wait) {
+        Ok(Ok(())) => "ok\n".to_string(),
+        Ok(Err(e)) | Err(e) => format!("{e}\n"),
+    };
+    let _ = std::fs::write(dir.join(PASTA_TCP_RULES), rules);
     // Seed the pod resolv.conf with the host's real (non-loopback) nameservers - reachable through
     // the NAT, so split-horizon/LAN DNS keeps working. Only if the host has NONE that are usable from
     // the ns (e.g. systemd-resolved's 127.0.0.53 stub) do we fall back to a public resolver.

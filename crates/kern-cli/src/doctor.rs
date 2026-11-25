@@ -436,6 +436,23 @@ pub fn info() -> Result<(), Error> {
             "loopback only: pasta (passt) is not installed, which a box's NAT needs"
         },
     );
+    // WHETHER THE TCP RULES FOR PASTA HOLD HERE (see `kern_isolation::nft`): without them, under the
+    // pasta Ubuntu 24.04 ships, a closed port hangs a client until its timeout. One fork and a
+    // namespace made for the question.
+    if which("pasta") {
+        row(
+            "pasta tcp",
+            &match kern_isolation::nft::probe() {
+                Ok(()) => "a closed port is refused within about a second, and a lost SYN \
+                           costs one retry as under Docker, with any pasta"
+                    .to_string(),
+                Err(e) => format!(
+                    "as pasta does it ({e}): under a pasta before 2025-02, a closed port waits \
+                     for the client's timeout and a lost SYN costs two seconds"
+                ),
+            },
+        );
+    }
     row(
         "box memory",
         "the host's RAM and swap unless --memory, as Docker's (SDK sandboxes: 512 MiB, no swap)",
