@@ -23,7 +23,8 @@
 //!
 //! 1. A box's SYN for a connection pasta is still making is not sent again: the first goes, and the
 //!    retries are the HOST's, as under Docker, where the box's SYN itself crosses the NAT. Kept for
-//!    [`PENDING_MS`], under pasta's own SYN timeout, and dropped when the SYN-ACK arrives.
+//!    [`PENDING_MS`], under pasta's own SYN timeout, keyed by the SYN's sequence number too, so a new
+//!    connection on the same ports (another ISN) is not held.
 //! 2. A RST without ACK from pasta marks the connection refused, and the box's next SYN for it is
 //!    answered by this namespace's own RST|ACK, which the socket takes: `ECONNREFUSED` a second
 //!    after the SYN instead of at the client's timeout.
@@ -117,7 +118,6 @@ const NFTA_DYNSET_SET_ID: u16 = 2;
 const NFTA_DYNSET_OP: u16 = 3;
 const NFTA_DYNSET_SREG_KEY: u16 = 4;
 const NFT_DYNSET_OP_ADD: u32 = 0;
-const NFT_DYNSET_OP_DELETE: u32 = 2;
 const NFTA_IMMEDIATE_DREG: u16 = 1;
 const NFTA_IMMEDIATE_DATA: u16 = 2;
 const NFTA_REJECT_TYPE: u16 = 1;
@@ -233,8 +233,9 @@ fn prologue(out: &mut Vec<u8>, ifkey: u32, ifname: &str, family: u8, mask: u8, w
 
 /// The key every set holds: the remote address, the remote port, the box's port, loaded from the
 /// packet's `remote` side (`src` for one coming in, `dst` for one going out) into consecutive 32-bit
-/// registers from `NFT_REG32_00`.
-fn key(out: &mut Vec<u8>, family: u8, remote_is_src: bool) {
+/// registers from `NFT_REG32_00`; with `seq`, the segment's sequence number after them, which is
+/// what tells a SYN sent again (the same ISN) from a new connection on the same ports.
+fn key(out: &mut Vec<u8>, family: u8, remote_is_src: bool, seq: bool) {
     let (addr_off, addr_len) = match (family, remote_is_src) {
         (NFPROTO_IPV4, true) => (12, 4),
         (NFPROTO_IPV4, false) => (16, 4),
@@ -252,6 +253,9 @@ fn key(out: &mut Vec<u8>, family: u8, remote_is_src: bool) {
     let next = REG32_00 + addr_len / 4;
     payload(out, NFT_PAYLOAD_TRANSPORT_HEADER, rport, 2, next);
     payload(out, NFT_PAYLOAD_TRANSPORT_HEADER, lport, 2, next + 1);
+    if seq {
+        payload(out, NFT_PAYLOAD_TRANSPORT_HEADER, 4, 4, next + 2);
+    }
 }
 
 fn dynset(out: &mut Vec<u8>, set: &str, id: u32, op: u32) {
@@ -361,10 +365,13 @@ fn set_name(base: &str, family: u8) -> String {
     format!("{base}{}", if family == NFPROTO_IPV4 { 4 } else { 6 })
 }
 
-/// The whole table as one batch. PURE: what goes on the wire, for a test to read. `with_delete`
-/// adds the rule that forgets a pending SYN at its SYN-ACK, a `dynset` delete, which kernels before
-/// 5.13 refuse: the caller sends the batch without it when they do.
-fn table_batch(ifname: &str, with_delete: bool) -> (Vec<u8>, u32) {
+/// The whole table as one batch. PURE: what goes on the wire, for a test to read.
+///
+/// A HELD-BACK SYN IS KEYED BY ITS SEQUENCE NUMBER TOO, so nothing has to forget it: a SYN sent
+/// again carries the ISN of the first, a new connection on the same ports another. The first form
+/// forgot the entry at the SYN-ACK with a `dynset` delete, an operation older kernels do not have,
+/// and without it a new connection from the same port waited out the 9 s.
+fn table_batch(ifname: &str) -> (Vec<u8>, u32) {
     let mut b = Batch::new();
     // EXCLUSIVE: a table already there is an earlier attach's (a pod's pasta comes back on a restart,
     // on the same interface), whose rules stand, and the batch answers EEXIST. Not removed and made
@@ -390,15 +397,15 @@ fn table_batch(ifname: &str, with_delete: bool) -> (Vec<u8>, u32) {
         let (pending, refused) = (set_name("pending", family), set_name("refused", family));
         let (pending_id, refused_id) = (id + 1, id + 2);
         id += 2;
-        for (name, sid, ms) in [
-            (&pending, pending_id, PENDING_MS),
-            (&refused, refused_id, REFUSED_MS),
+        for (name, sid, ms, len) in [
+            (&pending, pending_id, PENDING_MS, key_len + 4),
+            (&refused, refused_id, REFUSED_MS, key_len),
         ] {
             b.msg(NFT_MSG_NEWSET, NLM_F_CREATE, |m| {
                 attr_str(m, NFTA_SET_TABLE, TABLE);
                 attr_str(m, NFTA_SET_NAME, name);
                 attr_u32(m, NFTA_SET_FLAGS, NFT_SET_TIMEOUT | NFT_SET_EVAL);
-                attr_u32(m, NFTA_SET_KEY_LEN, key_len);
+                attr_u32(m, NFTA_SET_KEY_LEN, len);
                 attr_u32(m, NFTA_SET_ID, sid);
                 attr(m, NFTA_SET_TIMEOUT, &ms.to_be_bytes());
             });
@@ -413,24 +420,9 @@ fn table_batch(ifname: &str, with_delete: bool) -> (Vec<u8>, u32) {
                 TCP_RST | TCP_ACK,
                 TCP_RST,
             );
-            key(e, family, true);
+            key(e, family, true, false);
             dynset(e, &refused, refused_id, NFT_DYNSET_OP_ADD);
         });
-        if with_delete {
-            // IN: the SYN-ACK ends the wait, so a new connection on the same ports is not held back.
-            b.rule("in", |e| {
-                prologue(
-                    e,
-                    NFT_META_IIFNAME,
-                    ifname,
-                    family,
-                    TCP_SYN | TCP_ACK,
-                    TCP_SYN | TCP_ACK,
-                );
-                key(e, family, true);
-                dynset(e, &pending, pending_id, NFT_DYNSET_OP_DELETE);
-            });
-        }
         // OUT, in this order: a refused connection's SYN gets a RST|ACK from here, a SYN for a
         // connection pasta is still making is held back, and any other SYN starts one.
         b.rule("out", |e| {
@@ -442,7 +434,7 @@ fn table_batch(ifname: &str, with_delete: bool) -> (Vec<u8>, u32) {
                 TCP_SYN | TCP_ACK,
                 TCP_SYN,
             );
-            key(e, family, false);
+            key(e, family, false, false);
             lookup(e, &refused, refused_id);
             reject_rst(e);
         });
@@ -455,7 +447,7 @@ fn table_batch(ifname: &str, with_delete: bool) -> (Vec<u8>, u32) {
                 TCP_SYN | TCP_ACK,
                 TCP_SYN,
             );
-            key(e, family, false);
+            key(e, family, false, true);
             lookup(e, &pending, pending_id);
             drop_verdict(e);
         });
@@ -468,7 +460,7 @@ fn table_batch(ifname: &str, with_delete: bool) -> (Vec<u8>, u32) {
                 TCP_SYN | TCP_ACK,
                 TCP_SYN,
             );
-            key(e, family, false);
+            key(e, family, false, true);
             dynset(e, &pending, pending_id, NFT_DYNSET_OP_ADD);
         });
     }
@@ -554,20 +546,12 @@ fn send_batch(batch: &[u8], acks: u32) -> io::Result<()> {
 }
 
 /// Install the two rules in the network namespace this process is in, for pasta's interface
-/// `ifname`. Without the SYN-ACK cleanup on a kernel that refuses a `dynset` delete.
+/// `ifname`. A table already there is an earlier attach's, and success.
 pub fn install_here(ifname: &str) -> io::Result<()> {
-    let (full, acks) = table_batch(ifname, true);
-    match send_batch(&full, acks) {
-        Ok(()) => Ok(()),
+    let (batch, acks) = table_batch(ifname);
+    match send_batch(&batch, acks) {
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
-        Err(e)
-            if e.raw_os_error() == Some(libc::EOPNOTSUPP)
-                || e.raw_os_error() == Some(libc::EINVAL) =>
-        {
-            let (plain, acks) = table_batch(ifname, false);
-            send_batch(&plain, acks)
-        }
-        Err(e) => Err(e),
+        other => other,
     }
 }
 
@@ -681,8 +665,8 @@ mod tests {
     /// length adds up to the whole, and one acknowledgement is expected per message but the frame.
     #[test]
     fn the_batch_is_framed_and_its_lengths_add_up() {
-        for with_delete in [true, false] {
-            let (buf, acks) = table_batch("eth0", with_delete);
+        {
+            let (buf, acks) = table_batch("eth0");
             let mut off = 0;
             let mut kinds = Vec::new();
             while off < buf.len() {
@@ -696,9 +680,8 @@ mod tests {
             assert_eq!(kinds.first(), Some(&NFNL_MSG_BATCH_BEGIN));
             assert_eq!(kinds.last(), Some(&NFNL_MSG_BATCH_END));
             assert_eq!(kinds.len() as u32, acks + 2);
-            // 1 table, 2 chains, per family 2 sets and 4 rules (5 with the delete).
-            let per_family = if with_delete { 7 } else { 6 };
-            assert_eq!(acks, 1 + 2 + 2 * per_family);
+            // 1 table, 2 chains, per family 2 sets and 4 rules.
+            assert_eq!(acks, 1 + 2 + 2 * 6);
         }
     }
 
@@ -928,11 +911,35 @@ mod against_a_stand_in {
     /// A non-blocking connect with a deadline: the local port, and the errno it ended with (0 for a
     /// connection, `ETIMEDOUT` for the deadline), and how long it took.
     fn connect(addr: &str, port: u16, limit_ms: i32) -> (u16, i32, u128) {
+        connect_from(addr, port, 0, limit_ms)
+    }
+
+    /// [`connect`] from the local port `lport` (0: any), bound with `SO_REUSEADDR`.
+    fn connect_from(addr: &str, port: u16, lport: u16, limit_ms: i32) -> (u16, i32, u128) {
         let sa: std::net::SocketAddr = format!("{addr}:{port}")
             .parse()
             .or_else(|_| format!("[{addr}]:{port}").parse())
             .expect("address");
         let sock = socket2_like(&sa);
+        if lport != 0 {
+            let one = 1i32;
+            unsafe {
+                libc::setsockopt(
+                    sock,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    std::ptr::addr_of!(one).cast(),
+                    4,
+                )
+            };
+            let any: std::net::SocketAddr = if sa.is_ipv6() {
+                format!("[::]:{lport}").parse().expect("any6")
+            } else {
+                format!("0.0.0.0:{lport}").parse().expect("any4")
+            };
+            let (raw, len) = sockaddr(&any);
+            unsafe { libc::bind(sock, raw.as_ptr().cast(), len) };
+        }
         let t = std::time::Instant::now();
         let (raw, len) = sockaddr(&sa);
         unsafe { libc::connect(sock, raw.as_ptr().cast(), len) };
@@ -1021,7 +1028,7 @@ mod against_a_stand_in {
 
     /// Per family (IPv4, IPv6): the refused port's errno and milliseconds, and how many SYNs to the
     /// silent port the stand-in saw.
-    type Seen = Vec<(i32, u128, u32)>;
+    type Seen = Vec<(i32, u128, u32, u32)>;
 
     fn scenario(with_rules: bool) -> Result<Seen, String> {
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
@@ -1096,15 +1103,20 @@ mod against_a_stand_in {
                 std::thread::spawn(move || {
                     let (_, errno, ms) = connect(target, REFUSING, 2500);
                     let (sport, _, _) = connect(target, SILENT, 2300);
-                    (errno, ms, sport)
+                    // TWO CONNECTIONS FROM ONE PORT, the second as soon as the first is closed: a
+                    // new ISN, so the rules must let it through rather than take it for a retry.
+                    let fixed = if target.contains(':') { 41002 } else { 41001 };
+                    connect_from(target, SILENT, fixed, 300);
+                    connect_from(target, SILENT, fixed, 300);
+                    (errno, ms, sport, fixed)
                 })
             })
             .collect();
         let mut seen = Vec::new();
         let mut silent_ports = Vec::new();
         for p in probes {
-            let (errno, ms, sport) = p.join().map_err(|_| "a probe thread panicked")?;
-            silent_ports.push(sport);
+            let (errno, ms, sport, fixed) = p.join().map_err(|_| "a probe thread panicked")?;
+            silent_ports.push((sport, fixed));
             seen.push((errno, ms));
         }
         drop(stop_w);
@@ -1125,8 +1137,18 @@ mod against_a_stand_in {
                 .sum::<u32>()
         };
         Ok(vec![
-            (seen[0].0, seen[0].1, count(false, silent_ports[0])),
-            (seen[1].0, seen[1].1, count(true, silent_ports[1])),
+            (
+                seen[0].0,
+                seen[0].1,
+                count(false, silent_ports[0].0),
+                count(false, silent_ports[0].1),
+            ),
+            (
+                seen[1].0,
+                seen[1].1,
+                count(true, silent_ports[1].0),
+                count(true, silent_ports[1].1),
+            ),
         ])
     }
 
@@ -1140,7 +1162,7 @@ mod against_a_stand_in {
             let line = match scenario(with_rules) {
                 Ok(s) => s
                     .iter()
-                    .map(|(e, ms, n)| format!("{e} {ms} {n}"))
+                    .map(|(e, ms, n, r)| format!("{e} {ms} {n} {r}"))
                     .collect::<Vec<_>>()
                     .join(";"),
                 Err(e) => format!("err {e}"),
@@ -1163,6 +1185,7 @@ mod against_a_stand_in {
                     v.first()?.parse().ok()?,
                     v.get(1)?.parse().ok()?,
                     v.get(2)?.parse().ok()?,
+                    v.get(3)?.parse().ok()?,
                 ))
             })
             .collect();
@@ -1209,6 +1232,11 @@ mod against_a_stand_in {
             assert_eq!(w.0, libc::ECONNREFUSED, "{fam}: {after:?}");
             assert!(w.1 < 1600, "{fam}: refused after {} ms", w.1);
             assert_eq!(w.2, 1, "{fam}: the retry must be held back: {after:?}");
+            assert_eq!(wo.3, 2, "{fam}: the control sends both SYNs: {before:?}");
+            assert_eq!(
+                w.3, 2,
+                "{fam}: a new connection on the same port is not a retry: {after:?}"
+            );
         }
     }
 }
