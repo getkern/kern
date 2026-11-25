@@ -141,7 +141,7 @@ A part can have a disk of its own, ahead of `data_dir`:
 |---|---|---|
 | `images_dir` | images and their layers | `data_dir`'s `cache/`, or `~/.cache/kern` |
 | `volumes_dir` | named volumes | `data_dir`'s `volumes/` |
-| `logs_dir` | box logs, then kept across reboots | the runtime directory, in memory |
+| `logs_dir` | box logs | `data_dir`'s `logs/` |
 | `history_dir` | the sandbox history kept on disk | `data_dir`'s `history/` |
 
 ```sh
@@ -255,10 +255,11 @@ A box's log holds at most `log_max_size` times `log_max_file`. A box's own `--lo
 win over these two, as `--log-opt` wins over Docker's `daemon.json`; they apply to boxes started
 after the change.
 
-Without `log_keep_ended`, the log of a box that ended stays until `kern prune`, `kern gc` or a
-reboot (the logs are in `$XDG_RUNTIME_DIR`, in memory). With it, kern removes those older than the
-period each time a box starts with `-d`, the only moment a new log is made; a running box's log is
-never touched. `30m`, `24h` and `7d` are periods.
+The logs are on disk, in the data dir's `logs/` (or `logs_dir`), so a reboot keeps them, as Docker
+keeps a container's. The log of a box that ended is removed after 7 days, or after `log_keep_ended`
+when it is set, each time a box starts with `-d`, the only moment a new log is made; a running box's
+log is never touched, and a kept box's (`--keep`) stays until the box is removed. `kern prune` and
+`kern gc` remove the ended ones at once. `30m`, `24h` and `7d` are periods.
 
 Without `build_keep`, every build record and its log is kept (`kern build prune --keep N` removes
 them by hand). With it, the records that ended longest ago go each time a build ends; a build still

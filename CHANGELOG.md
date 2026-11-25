@@ -170,6 +170,10 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern top`: a box's log is live, and `s`, `p`, `u` act on that box from it.** Enter on the Boxes
   tab showed the log as it was when pressed, and any key closed it, so `s` pressed to stop the box
   only closed the log. It follows the output now, `s` asks to stop that box, Esc goes back.
+- **Box logs are kept on disk, so a reboot keeps them**, as Docker keeps a container's: in the data
+  dir's `logs/` (or `logs_dir`). An ended box's log goes after 7 days (`log_keep_ended`), a kept box's
+  when the box is removed. A box started before the upgrade keeps its `kern logs`. Measured, a
+  detached box's start pays nothing for it.
 - **Compose: a volume's `driver_opts` are honoured, not ignored.** `type: none, o: bind, device: <dir>`
   put the data in a kern volume of its own while `<dir>` stayed empty; it is now kept there, as Docker
   keeps it. `type: nfs`, `cifs` and `tmpfs` mount as kern's `nfs://`, `smb://` and tmpfs; another
