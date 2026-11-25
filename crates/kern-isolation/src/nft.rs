@@ -133,6 +133,13 @@ const REG32_00: u32 = 8;
 const TABLE: &str = "kern";
 /// How long a box's SYN is held back for a connection pasta is making: under the 10 s after which
 /// pasta gives up on one, so a retry still reaches it if pasta lost the first.
+///
+/// WHAT IT COSTS IF PASTA DID LOSE ONE: the box waits this long. The one way found for a SYN not to
+/// reach pasta is the box's interface queue overflowing, and it does not drop: MEASURED, a box
+/// sending 3-3.8 GB to the host on 4 connections at full speed while opening 200 more, 0 packets
+/// dropped on its interface (`/proc/net/dev`), no connection over 4 ms. A full queue makes the
+/// sender wait. Kept rather than shortened: a retry let through while the old pasta is still
+/// connecting is reset by it, and that RST would read here as a refusal.
 pub const PENDING_MS: u64 = 9_000;
 /// How long a connection pasta refused stays refused: past the box's next SYN, a second later.
 const REFUSED_MS: u64 = 3_000;
