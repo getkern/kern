@@ -10,7 +10,7 @@ mod net;
 mod pull;
 mod push;
 mod search;
-pub use archive::{load, save, Loaded};
+pub use archive::{load, save, save_many, Loaded, SaveItem};
 pub use pull::{
     dir_mode, fetch_image_config, normalize_ref, pull, remote_config_digest,
     remote_config_digest_for, remote_digests_for, remote_record_for, salvage_layer_blobs,

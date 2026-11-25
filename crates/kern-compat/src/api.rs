@@ -3151,24 +3151,21 @@ pub(crate) fn image_build(
 }
 
 /// `GET /images/get?names=` and `GET /images/{name}/get` (`docker save`): `kern save`, its archive
-/// streamed as it is written, so an image of any size is not held here. One image an archive: `kern
-/// save` writes one, and more are refused by name rather than saved in part. MEASURED before: `docker
-/// save` through kern's socket answered "not served by kern's Docker API".
+/// streamed as it is written, so an image of any size is not held here; several names are one
+/// archive, as Docker's. MEASURED before: `docker save` through kern's socket answered "not served
+/// by kern's Docker API", and then, served, refused more than one image.
 fn image_save(bin: &Path, names: &[String]) -> Response {
-    let [name] = names else {
-        return error(
-            501,
-            &format!(
-                "docker save of {} images in one archive: kern's Docker API saves one an archive                  (`docker save <image> -o <file>` once per image)",
-                names.len()
-            ),
-        );
-    };
-    if cached_image(bin, name).is_none() {
-        return error(404, &format!("reference does not exist: {name}"));
+    if names.is_empty() {
+        return error(400, "no image to save");
+    }
+    for name in names {
+        if cached_image(bin, name).is_none() {
+            return error(404, &format!("reference does not exist: {name}"));
+        }
     }
     let child = Command::new(bin)
-        .args(["save", name])
+        .arg("save")
+        .args(names)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

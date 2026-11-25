@@ -26,7 +26,7 @@ COMMANDS:
     image ls|inspect|rm|pull|push|tag|save|load|build             The same verbs grouped under `image` (one parser each, not a second)
     image history <image> [--json] [--no-trunc] [-q] [--platform P] The image's steps, newest first, with each layer's compressed size
     rmi [-f] <image>...                                            Remove cached images (frees unshared layers); -f also one a box uses
-    save <image> [-o file]                                         Export an image to a tar (the common image-archive format)
+    save <image>... [-o file]                                      Export images to one tar (the common image-archive format)
     load [-i file]                                                 Import an image from a tar (the common image-archive format)
     builds [<tag>] [--status S] [-n N] [--json]                    List past builds; S is ok|warn|failed|running|interrupted
     build logs|inspect|rm|prune <id>                               Inspect/manage build-history records

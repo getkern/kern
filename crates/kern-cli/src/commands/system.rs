@@ -174,7 +174,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}image{z} ls|inspect|rm|pull|push|tag|save|load|build             The same verbs grouped under `image` (one parser each, not a second)
     {c}image history{z} <image> [--json] [--no-trunc] [-q] [--platform P] The image's steps, newest first, with each layer's compressed size
     {c}rmi{z} [-f] <image>...                                            Remove cached images (frees unshared layers); -f also one a box uses
-    {c}save{z} <image> [-o file]                                         Export an image to a tar (the common image-archive format)
+    {c}save{z} <image>... [-o file]                                      Export images to one tar (the common image-archive format)
     {c}load{z} [-i file]                                                 Import an image from a tar (the common image-archive format)
     {c}builds{z} [<tag>] [--status S] [-n N] [--json]                    List past builds; S is ok|warn|failed|running|interrupted
     {c}build{z} logs|inspect|rm|prune <id>                               Inspect/manage build-history records

@@ -1045,7 +1045,7 @@ fn push_once_to(
     result
 }
 
-pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
+pub fn save(images: &[String], out: Option<&str>) -> Result<(), Error> {
     // `-o` writes a tar to a host path: refuse a registry destination, or `save img -o <runtime>/kern/…`
     // would clobber a peer's posture record (same WRITE class as `kern cp` box→host).
     if let Some(o) = out {
@@ -1057,35 +1057,59 @@ pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
     // append a whole one after it.
     let retryable =
         |e: &Error| out.is_some() || !e.to_string().contains("tar of the archive failed");
-    as_user_then_mapped("save", retryable, || save_once(image, out))?;
+    as_user_then_mapped("save", retryable, || save_once(images, out))?;
     // On stderr so a `kern save img > img.tar` (stdout) stream stays clean.
     kern_common::progress!(
-        "✓ saved '{image}'{}",
+        "✓ saved '{}'{}",
+        images.join("', '"),
         out.map(|o| format!(" → {o}")).unwrap_or_default()
     );
     Ok(())
 }
 
-fn save_once(image: &str, out: Option<&str>) -> Result<(), Error> {
-    let (rootfs, config, cleanup) = materialize_image(image)?;
-    let work = cache_dir().join(format!(".save-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).map_err(|e| Error::Oci(format!("save work dir: {e}")))?;
-    // `docker load` REJECTS a bare repo with no tag ("invalid tag 'alpine'"), so the RepoTag must be a
-    // full `repo:tag` - normalise a tagless ref to `…:latest` (matching how `docker save alpine` writes
-    // `alpine:latest`). Keeps kern↔docker save/load interop working for the common `kern save alpine`.
-    let repo_tag = ensure_repo_tag(image);
-    let result = kern_oci::save(
-        &rootfs,
-        &config,
-        std::slice::from_ref(&repo_tag),
-        out.map(std::path::Path::new),
-        &work,
-    )
-    .map_err(|e| Error::Oci(e.to_string()));
-    let _ = std::fs::remove_dir_all(&work);
-    if let Some(tmp) = cleanup {
-        remove_build_tree(&tmp);
+fn save_once(images: &[String], out: Option<&str>) -> Result<(), Error> {
+    // Every image materialised first, so one that does not exist fails before any archive is begun.
+    let mut made = Vec::with_capacity(images.len());
+    let mut failed = None;
+    for image in images {
+        match materialize_image(image) {
+            Ok(m) => made.push(m),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    let result = match failed {
+        Some(e) => Err(e),
+        None => {
+            let work = cache_dir().join(format!(".save-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&work);
+            std::fs::create_dir_all(&work)
+                .map_err(|e| Error::Oci(format!("save work dir: {e}")))?;
+            // `docker load` REJECTS a bare repo with no tag ("invalid tag 'alpine'"), so the RepoTag
+            // must be a full `repo:tag` - normalise a tagless ref to `…:latest` (matching how `docker
+            // save alpine` writes `alpine:latest`). Keeps kern↔docker save/load interop working.
+            let tags: Vec<String> = images.iter().map(|i| ensure_repo_tag(i)).collect();
+            let items: Vec<kern_oci::SaveItem<'_>> = made
+                .iter()
+                .zip(&tags)
+                .map(|((rootfs, config, _), tag)| kern_oci::SaveItem {
+                    rootfs,
+                    config,
+                    repo_tags: std::slice::from_ref(tag),
+                })
+                .collect();
+            let r = kern_oci::save_many(&items, out.map(std::path::Path::new), &work)
+                .map_err(|e| Error::Oci(e.to_string()));
+            let _ = std::fs::remove_dir_all(&work);
+            r
+        }
+    };
+    for (_, _, cleanup) in made {
+        if let Some(tmp) = cleanup {
+            remove_build_tree(&tmp);
+        }
     }
     result
 }

@@ -59,44 +59,64 @@ pub fn save(
     out: Option<&Path>,
     work: &Path,
 ) -> Result<(), OciError> {
-    // 1. Pack the rootfs into an UNCOMPRESSED layer.tar (root-owned, setuid-stripped - same
-    //    normalization as push), and take its sha256 (= the layer's diff_id).
-    let layer_tar = work.join("layer.tar");
-    tar_rootfs_root_owned(rootfs, &layer_tar)?;
-    let diff_id = sha256_file(&layer_tar)?;
-    let layer_id = hex_of(&diff_id).to_string();
+    save_many(
+        &[SaveItem {
+            rootfs,
+            config,
+            repo_tags,
+        }],
+        out,
+        work,
+    )
+}
 
-    // 2. Config JSON (reused from the push builder) + its digest → `<confhex>.json`.
-    let config_json = build_config_json(config, &diff_id);
-    let conf_digest = sha256_bytes(config_json.as_bytes());
-    let conf_name = format!("{}.json", hex_of(&conf_digest));
+/// One image of a [`save_many`] archive.
+pub struct SaveItem<'a> {
+    pub rootfs: &'a Path,
+    pub config: &'a crate::ImageConfig,
+    pub repo_tags: &'a [String],
+}
 
-    // 3. Lay the docker-archive tree out under `work/layout`: `<confhex>.json`, `<layerid>/layer.tar`,
-    //    `manifest.json`. Single layer (kern images are flattened).
+/// Several images in ONE archive, as `docker save a b` writes them: one `manifest.json` listing each
+/// with its config and layer, a layer two images share stored once (its directory is its digest).
+pub fn save_many(items: &[SaveItem<'_>], out: Option<&Path>, work: &Path) -> Result<(), OciError> {
     let layout = work.join("layout");
     let _ = std::fs::remove_dir_all(&layout);
-    std::fs::create_dir_all(layout.join(&layer_id))
-        .map_err(|e| OciError::Extract(format!("save layout: {e}")))?;
-    std::fs::rename(&layer_tar, layout.join(&layer_id).join("layer.tar"))
-        .map_err(|e| OciError::Extract(format!("save layer: {e}")))?;
-    std::fs::write(layout.join(&conf_name), &config_json)
-        .map_err(|e| OciError::Extract(format!("save config: {e}")))?;
-    let tags_json = repo_tags
-        .iter()
-        .map(|t| jstr(t))
-        .collect::<Vec<_>>()
-        .join(",");
-    let manifest = format!(
-        "[{{\"Config\":{},\"RepoTags\":[{}],\"Layers\":[{}]}}]",
-        jstr(&conf_name),
-        tags_json,
-        jstr(&format!("{layer_id}/layer.tar")),
-    );
-    std::fs::write(layout.join("manifest.json"), manifest)
-        .map_err(|e| OciError::Extract(format!("save manifest: {e}")))?;
+    std::fs::create_dir_all(&layout).map_err(|e| OciError::Extract(format!("save layout: {e}")))?;
+    let mut entries = Vec::with_capacity(items.len());
+    for (n, item) in items.iter().enumerate() {
+        let layer_tar = work.join(format!("layer-{n}.tar"));
+        tar_rootfs_root_owned(item.rootfs, &layer_tar)?;
+        let diff_id = sha256_file(&layer_tar)?;
+        let layer_id = hex_of(&diff_id).to_string();
+        let config_json = build_config_json(item.config, &diff_id);
+        let conf_digest = sha256_bytes(config_json.as_bytes());
+        let conf_name = format!("{}.json", hex_of(&conf_digest));
+        std::fs::create_dir_all(layout.join(&layer_id))
+            .map_err(|e| OciError::Extract(format!("save layout: {e}")))?;
+        std::fs::rename(&layer_tar, layout.join(&layer_id).join("layer.tar"))
+            .map_err(|e| OciError::Extract(format!("save layer: {e}")))?;
+        std::fs::write(layout.join(&conf_name), &config_json)
+            .map_err(|e| OciError::Extract(format!("save config: {e}")))?;
+        let tags_json = item
+            .repo_tags
+            .iter()
+            .map(|t| jstr(t))
+            .collect::<Vec<_>>()
+            .join(",");
+        entries.push(format!(
+            "{{\"Config\":{},\"RepoTags\":[{}],\"Layers\":[{}]}}",
+            jstr(&conf_name),
+            tags_json,
+            jstr(&format!("{layer_id}/layer.tar")),
+        ));
+    }
+    std::fs::write(
+        layout.join("manifest.json"),
+        format!("[{}]", entries.join(",")),
+    )
+    .map_err(|e| OciError::Extract(format!("save manifest: {e}")))?;
 
-    // 4. Tar the layout to the destination (file or stdout). No compression - `docker save`'s default;
-    //    the caller can pipe through gzip/zstd if they want a smaller file.
     let layout_s = layout.to_string_lossy().into_owned();
     let status = match out {
         Some(p) => Command::new("tar")
@@ -116,10 +136,6 @@ pub fn save(
     Ok(())
 }
 
-/// Tar `rootfs`'s contents (`.`) into `out` (uncompressed), owners normalized to root and each
-/// setuid/setgid bit kept only where that cannot forge a privilege - the layer form both `push` and
-/// `save` need. The normalization is kern's own pass over the stream, so GNU and BusyBox tar give the
-/// same layer (BusyBox has no `--owner`).
 pub(crate) fn tar_rootfs_root_owned(rootfs: &Path, out: &Path) -> Result<(), OciError> {
     // THE TREE IS ONLY READ. `tar` records the real owners, and `normalize_for_export` makes them 0
     // and decides each setuid/setgid bit on the stream (see there for why the tree is never touched).
@@ -414,6 +430,60 @@ mod tests {
         assert_eq!(c.user.as_deref(), Some("1000"));
         // an empty/garbled config → empty runtime config, not a panic.
         assert!(parse_image_config("{}").entrypoint.is_empty());
+    }
+
+    /// Two images are one archive: a manifest with an entry each, their tags, and every config and
+    /// layer it names present in the tar. What `docker load` reads.
+    #[test]
+    fn two_images_are_one_archive_with_an_entry_each() {
+        let base = std::env::temp_dir().join(format!("kern-save2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b, work) = (base.join("a"), base.join("b"), base.join("w"));
+        for (d, f) in [(&a, "one"), (&b, "two")] {
+            std::fs::create_dir_all(d).expect("rootfs");
+            std::fs::write(d.join(f), f).expect("file");
+        }
+        std::fs::create_dir_all(&work).expect("work");
+        let cfg = crate::ImageConfig::default();
+        let (ta, tb) = (vec!["a:1".to_string()], vec!["b:2".to_string()]);
+        let out = base.join("two.tar");
+        let saved = save_many(
+            &[
+                SaveItem {
+                    rootfs: &a,
+                    config: &cfg,
+                    repo_tags: &ta,
+                },
+                SaveItem {
+                    rootfs: &b,
+                    config: &cfg,
+                    repo_tags: &tb,
+                },
+            ],
+            Some(&out),
+            &work,
+        );
+        let list = Command::new("tar").arg("-tf").arg(&out).output();
+        let manifest = Command::new("tar")
+            .arg("-xOf")
+            .arg(&out)
+            .arg("./manifest.json")
+            .output();
+        let _ = std::fs::remove_dir_all(&base);
+        saved.expect("save_many");
+        let list = String::from_utf8_lossy(&list.expect("tar -t").stdout).into_owned();
+        let manifest = String::from_utf8_lossy(&manifest.expect("tar -xO").stdout).into_owned();
+        assert_eq!(manifest.matches("\"Config\":").count(), 2, "{manifest}");
+        assert!(
+            manifest.contains("\"a:1\"") && manifest.contains("\"b:2\""),
+            "{manifest}"
+        );
+        for name in manifest
+            .split('"')
+            .filter(|p| p.ends_with(".json") || p.ends_with("layer.tar"))
+        {
+            assert!(list.contains(name), "{name} named and absent: {list}");
+        }
     }
 
     #[test]

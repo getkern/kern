@@ -613,9 +613,9 @@ pub enum Command {
         /// `-f`: remove an image a box uses, as `docker rmi -f`.
         force: bool,
     },
-    /// `kern save <image> [-o file]`: export a cached image to a `docker load`-compatible tar.
+    /// `kern save <image>... [-o file]`: export cached images to one `docker load`-compatible tar.
     Save {
-        image: String,
+        images: Vec<String>,
         out: Option<String>,
     },
     /// `kern load [-i file]`: import an image from a `docker save`-format tar (file or stdin).
@@ -1655,25 +1655,26 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             }
         }
         Some("save") => {
-            let (mut image, mut out) = (None, None);
+            // Several images in one archive, as `docker save a b` writes them.
+            let (mut images, mut out) = (Vec::new(), None);
             let mut it = rest.iter().skip(1);
             while let Some(a) = it.next() {
                 match *a {
                     "-o" | "--output" => {
                         out = Some(
                             it.next()
-                                .ok_or(Error::Usage("save <image> -o <file>"))?
+                                .ok_or(Error::Usage("save <image>... -o <file>"))?
                                 .to_string(),
                         )
                     }
-                    s if !s.starts_with('-') && image.is_none() => image = Some(s.to_string()),
-                    _ => return Err(Error::Usage("save <image> [-o <file>]")),
+                    s if !s.starts_with('-') => images.push(s.to_string()),
+                    _ => return Err(Error::Usage("save <image>... [-o <file>]")),
                 }
             }
-            Command::Save {
-                image: image.ok_or(Error::Usage("save <image> [-o <file>]"))?,
-                out,
+            if images.is_empty() {
+                return Err(Error::Usage("save <image>... [-o <file>]"));
             }
+            Command::Save { images, out }
         }
         Some("load") => {
             let mut input = None;
@@ -7677,7 +7678,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             commands::image_history(&image, json, no_trunc, quiet)
         }),
         Command::Rmi { images, force } => commands::image_rm_with(&images, force),
-        Command::Save { image, out } => commands::save(&image, out.as_deref()),
+        Command::Save { images, out } => commands::save(&images, out.as_deref()),
         Command::Load { input } => commands::load(input.as_deref()),
         Command::Builds {
             json,
