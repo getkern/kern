@@ -63,6 +63,21 @@ pub(crate) struct ProjNet {
 
 impl ProjNet {
     /// The subnet of its bridge.
+    /// The member called `old` is called `new` now (see [`rename`]); `true` when there was one.
+    fn rename_member(&mut self, old: &str, new: &str) -> bool {
+        let mut changed = false;
+        for (_, names) in &mut self.members {
+            if names.first().is_some_and(|n| n == old) {
+                names.retain(|n| n != new);
+                if let Some(first) = names.first_mut() {
+                    *first = new.to_string();
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub(crate) fn cidr(&self) -> String {
         format!("10.89.{}.0/24", self.bridge)
     }
@@ -414,6 +429,21 @@ pub(crate) fn detach_everywhere(bin: &Path, container: &str) {
     }
 }
 
+/// A container renamed: its membership of every project network goes by the new name. `docker
+/// compose` recreates a service under a TEMPORARY name (`<id>_<project>-<service>-1`) and renames it
+/// once the old one is gone, and the member kept the temporary name: removing the container by its
+/// real name then left it on the network, which `down` could not remove ("active endpoints").
+/// MEASURED in Grok's round 6, case 49. The new name becomes the member's own, once (it was
+/// usually one of its aliases already), and the record is written again.
+pub(crate) fn rename(bin: &Path, old: &str, new: &str) {
+    let _g = locked();
+    for mut p in all() {
+        if p.rename_member(old, new) && save(&p).is_ok() && pod_bridges(&p.project).is_some() {
+            let _ = write_record(bin, &p);
+        }
+    }
+}
+
 /// The project networks `container` is a member of, with its address on each.
 pub(crate) fn networks_of(container: &str) -> Vec<(String, Ipv4Addr, Vec<String>)> {
     let mut v: Vec<(String, Ipv4Addr, Vec<String>)> = all()
@@ -507,5 +537,34 @@ mod tests {
         assert_eq!(p.address_of("db-1"), Some(Ipv4Addr::new(10, 89, 1, 2)));
         assert_eq!(p.address_of("db"), None, "an alias is not a member");
         assert_eq!(decode("shop_back", &encode(&p)), Some(p));
+    }
+
+    /// `docker compose` recreates a service under a temporary name and renames it: the member takes
+    /// the new name once (it was one of its aliases), keeps its address and its other aliases, and a
+    /// member of another name is not touched.
+    #[test]
+    fn a_renamed_member_takes_its_new_name_once() {
+        let mut p = ProjNet {
+            name: "g_default".into(),
+            project: "g".into(),
+            network: "default".into(),
+            bridge: 0,
+            internal: false,
+            members: vec![
+                (
+                    Ipv4Addr::new(10, 89, 0, 3),
+                    vec!["b846550b81ee_g-s-1".into(), "g-s-1".into(), "s".into()],
+                ),
+                (
+                    Ipv4Addr::new(10, 89, 0, 2),
+                    vec!["g-db-1".into(), "db".into()],
+                ),
+            ],
+        };
+        assert!(p.rename_member("b846550b81ee_g-s-1", "g-s-1"));
+        assert_eq!(p.members[0].1, vec!["g-s-1".to_string(), "s".to_string()]);
+        assert_eq!(p.address_of("g-s-1"), Some(Ipv4Addr::new(10, 89, 0, 3)));
+        assert_eq!(p.members[1].1, vec!["g-db-1".to_string(), "db".to_string()]);
+        assert!(!p.rename_member("nobody", "x"));
     }
 }

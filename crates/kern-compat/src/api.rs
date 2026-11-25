@@ -5415,12 +5415,14 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 Some(name) => {
                     if created_get(&name).is_some() {
                         id_rename(&name, new);
+                        crate::projnet::rename(bin, &name, new);
                         crate::events::renamed(&name, new);
                         return rename_created(&name, new).unwrap_or_else(no_content);
                     }
                     let (code, _, err) = kern(bin, &["rename", &name, new]);
                     if code == 0 {
                         id_rename(&name, new);
+                        crate::projnet::rename(bin, &name, new);
                         watch_renamed(&name, new);
                         no_content()
                     } else if err.contains("in use") || err.contains("exists") {
