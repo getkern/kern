@@ -96,6 +96,17 @@ impl UidRange {
 /// `kern box --secret` keeps 0400 when no mode is given: that surface is kern's own, and a default
 /// nobody asked to widen stays where it was. The compose driver passes the specification's default
 /// explicitly, so the widening is visible at the call site that owes it.
+/// `--copy-in <archive>`: a tar extracted into the box's root at `dest` after its mounts and before
+/// its workload runs, every member resolved inside the box (`RESOLVE_IN_ROOT`). What the Docker API
+/// does with an archive a client copies into a container that has not started yet.
+#[derive(Clone, Debug)]
+pub struct CopyIn {
+    /// The archive on the host, opened before the root changes.
+    pub archive: String,
+    /// The directory in the box it is extracted into, created if missing.
+    pub dest: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Secret {
     /// The file name under `/run/secrets`. A single path component, validated by the caller.
@@ -284,6 +295,8 @@ pub struct SandboxSpec {
     /// on the host before the fork; the box writes them into a RAM-backed tmpfs so they never touch
     /// the persisted overlay upper and are gone when the box exits.
     pub secrets: Vec<Secret>,
+    /// `--copy-in` archives (see [`CopyIn`]), in the order given: a later one overwrites an earlier.
+    pub copy_in: Vec<CopyIn>,
     /// `--ssh`: stand up an in-box `sshd` (authorized to the given public key). `None` → no SSH. The
     /// caller also wires a `-p HOST:22` forwarder; sshd is forked just before the box execs PID 1.
     pub ssh: Option<crate::ssh::SshSetup>,
@@ -1963,6 +1976,7 @@ fn child_setup_and_exec(
         make_box_tmpfs(&spec.root, "run")?;
     }
     setup_secrets(&spec.root, &spec.secrets, run_tmpfs)?;
+    setup_copy_in(&spec.root, &spec.copy_in)?;
     // A pod member in the SHARED namespace has the pod's hosts file bound over its own, and its
     // entry there is written by the CLI; writing it here would race the other members on one file.
     let shared_hosts = spec.pod_holder.is_some() && spec.pod_bridges.is_empty();
@@ -5786,6 +5800,48 @@ fn setup_resolv_conf(
 /// `/run/secrets` (so a secret never lands in the persisted overlay upper) and write each file. Runs
 /// before pivot. A hostile image shipping `/run/secrets` as a symlink is neutralised, and each file
 /// is created `O_NOFOLLOW | O_EXCL` inside the tmpfs we own - the write can't be redirected out.
+/// Extract each [`CopyIn`] archive into the box's root, confined to it. Pre-pivot, after the volumes
+/// and the tmpfs mounts, so a destination on a volume lands in the volume, as Docker's does; the
+/// root is still the merged overlay, and every member is resolved against it with `RESOLVE_IN_ROOT`,
+/// so a link in the image (`/lib -> usr/lib`) is followed as the box sees it and never onto the host.
+fn setup_copy_in(root: &str, items: &[CopyIn]) -> Result<(), Error> {
+    use crate::archive::{read_archive, Confine, Dest};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if items.is_empty() {
+        return Ok(());
+    }
+    let rp = cstr(root)?;
+    let fd = unsafe {
+        libc::open(
+            rp.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::last("open(box root for --copy-in)"));
+    }
+    // SAFETY: `fd` was just returned by `open` and nothing else holds it.
+    let root_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    for item in items {
+        let base = root_fd
+            .try_clone()
+            .map_err(|e| Error::Syscall("dup(box root for --copy-in)", e))?;
+        let file = std::fs::File::open(&item.archive)
+            .map_err(|e| Error::Spec(format!("--copy-in {}: {e}", item.archive)))?;
+        let dest = Dest {
+            base,
+            confine: Confine::InRoot,
+            prefix: item.dest.as_bytes().to_vec(),
+            mode_mask: 0o7777,
+            guard: None,
+        };
+        dest.make_prefix()
+            .and_then(|()| read_archive(&mut std::io::BufReader::new(file), &dest))
+            .map_err(|e| Error::Spec(format!("copying into the box at {}: {e}", item.dest)))?;
+    }
+    Ok(())
+}
+
 fn setup_secrets(root: &str, secrets: &[Secret], run_tmpfs: bool) -> Result<(), Error> {
     if secrets.is_empty() {
         return Ok(());

@@ -41,7 +41,7 @@ COMMANDS:
     inspect <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
     port <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
     attach <name>                                                  Stream a box's output live (Ctrl-C detaches)
-    cp <box>:<src> <dst> | <src> <box>:<dst>                       Copy a file host<->box
+    cp [-L] <box>:<src> <dst> | [-L] <src> <box>:<dst>               Copy files or directories host<->box (- = a tar on stdout/stdin; -L follows a symlink SRC)
     pause <name>... | --all                                        Freeze box(es) (cgroup freezer)
     unpause <name>... | --all                                      Thaw frozen box(es)
     kill [-s SIGNAL] <name>... | killall                           Kill box(es) at once (SIGKILL), or send SIGNAL to the init

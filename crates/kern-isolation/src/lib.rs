@@ -53,6 +53,8 @@ macro_rules! userns_restricted {
 /// See [`userns_restricted!`]: what `kern-cli` matches to print the AppArmor remedy under the error.
 pub const USERNS_RESTRICTED: &str = userns_restricted!();
 
+/// The tar archive `kern cp` and `--copy-in` write and read, every path confined.
+pub mod archive;
 mod cgroup;
 mod landlock;
 /// RTNETLINK: the link operations that have no ioctl form (veth, bridge, master, netns move).
@@ -153,7 +155,6 @@ pub use real::want_exec_witness;
 pub use real::with_id_mapped_userns;
 /// Which of the host's NVIDIA cards a box may see in the driver's own `/proc` enumeration.
 pub use real::GpuEnumeration;
-pub use real::Secret;
 pub use real::BOX_ADDR;
 /// Bring `lo` UP in the CURRENT net namespace. Exported for the egress pump, which joins a box's
 /// net ns from outside and must not assume the box's init has already got there. See `real`.
@@ -163,6 +164,7 @@ pub use real::READY_PREPARED;
 pub use real::{abandon_id_mapped_userns_early, prepare_id_mapped_userns_early};
 /// Run a program as uid 0 of a user namespace with kern's subordinate id range (`kern unshare`).
 pub use real::{exec_in_id_mapped_userns, MappedExit};
+pub use real::{CopyIn, Secret};
 
 pub use cgroup::env_flag;
 /// Fork the workload into a capped leaf, reporting whether it got there.

@@ -1,21 +1,39 @@
-//! `kern cp` - copy a file between the host and a running box, with **symlink-confined** resolution
-//! of the in-box path.
+//! `kern cp` - copy files and directories between the host and a running box, as `docker cp` does,
+//! with every in-box path resolved **inside the box**.
 //!
-//! The box side of the path is resolved with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`
-//! against the box's root directory (`/proc/<pid1>/root`). `RESOLVE_IN_ROOT` reinterprets every
-//! absolute symlink and `..` as if that directory were `/`, so a hostile image cannot plant a symlink
-//! (or a `..` chain) that makes the copy read or write a **host** file outside the box - the class of
-//! bug behind CVE-2019-14271 (`docker cp` following a container symlink out to the host). We never
-//! exec anything inside the box, and `RESOLVE_NO_MAGICLINKS` refuses to traverse `/proc`-style magic
-//! links during resolution.
+//! Direction is Docker's: `kern cp <box>:<src> <dst>` (out) or `kern cp <src> <box>:<dst>` (in);
+//! `-` on the host side is a tar archive on stdout (out) or stdin (in). A directory is copied whole;
+//! a symlink is copied as a symlink (`-L` follows the one SRC names); a hardlink stays a hardlink.
 //!
-//! Direction is Docker-style: `kern cp <box>:<src> <hostdst>` (out) or `kern cp <hostsrc> <box>:<dst>`
-//! (in), where `<box>` is a running box name. Single regular files only for now.
+//! ONE ARCHIVE FORMAT FOR EVERY DIRECTION. The source side writes a tar stream, the destination side
+//! reads one, and a copy between two paths is the two joined by a pipe. So `kern cp box:/d -`, the
+//! Docker API's `GET /containers/{id}/archive` and `kern cp box:/d ./out` are one reader and one
+//! writer, not three copiers that can disagree on a symlink.
+//!
+//! CONFINEMENT, the class behind CVE-2019-14271 (`docker cp` following a container symlink out to the
+//! host). Neither side ever resolves a path the box controls with the host's root:
+//!
+//! * the box's paths go through `openat2(RESOLVE_IN_ROOT)` against `/proc/<pid1>/root`, so a link the
+//!   box planted, absolute or `..`, lands inside the box;
+//! * reading, every entry below the source is opened RELATIVE to its parent's descriptor with
+//!   `O_NOFOLLOW`, one name at a time, so the walk never crosses a link;
+//! * writing to the HOST, every member is resolved with `openat2(RESOLVE_BENEATH)` from the
+//!   destination directory: a member or a link that would leave it is refused, not followed, and
+//!   each file is checked against kern's own state ([`crate::secret::guard_host_write_path`]);
+//! * a member name with a `..` component is refused outright.
+//!
+//! Ownership is not restored (a rootless copy cannot: the box's ids live in a subuid range); the mode
+//! is, without the set-id bits on the host. The archive carries the ids the box sees.
 
 use crate::error::Error;
-use crate::openat2::{box_root_fd, openat2_in_root};
-use std::os::fd::AsRawFd;
-use std::os::unix::io::RawFd;
+use crate::openat2::box_root_fd;
+use kern_isolation::archive::{
+    cstr, is_dir, join, lstat_at, openat2_confined, owned, read_archive, write_archive, Confine,
+    Dest, IdMap,
+};
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 
 /// What one `kern cp` argument turned out to be.
 enum Side {
@@ -23,6 +41,8 @@ enum Side {
     Boxed(i32, String),
     /// `<name>:<path>`-shaped, naming no running box. Carries the name so the error can say it.
     NoSuchBox(String),
+    /// `-`: a tar archive on stdin or stdout.
+    Stdio,
     /// Anything else: a path on the host.
     Host,
 }
@@ -39,7 +59,11 @@ enum Side {
 /// copyable: `kern cp weird:name.txt web:/tmp/` used to work by falling through the old `None` and
 /// still does. A first field containing `/` is a host path too (`./a:b`, `/tmp/a:b`), never a box
 /// name. Only a spec that is box-shaped AND names nothing on disk is reported as a missing box.
+/// `-` is always the archive stream, as it is for `docker cp`.
 fn classify(spec: &str) -> Side {
+    if spec == "-" {
+        return Side::Stdio;
+    }
     if std::path::Path::new(spec).exists() {
         return Side::Host;
     }
@@ -65,8 +89,14 @@ fn classify(spec: &str) -> Side {
     Side::Boxed(pid1, path.to_string())
 }
 
-/// `kern cp <src> <dst>` - exactly one of `src`/`dst` must be `<box>:<path>`.
-pub fn cp(src: &str, dst: &str) -> Result<(), Error> {
+/// `KERN_CP_STAT=1 kern cp <box>:<path> -` prints the path's stat as Docker's
+/// `X-Docker-Container-Path-Stat` JSON instead of an archive: what the Docker API answers a `HEAD`
+/// of `/containers/{id}/archive` with, and puts in front of a `GET`. An environment switch and not a
+/// flag, because it is the API's question, not a user's.
+const STAT_ENV: &str = "KERN_CP_STAT";
+
+/// `kern cp [-L] <src> <dst>` - exactly one of `src`/`dst` must be `<box>:<path>`.
+pub fn cp(src: &str, dst: &str, follow: bool) -> Result<(), Error> {
     match (classify(src), classify(dst)) {
         // Checked first: a missing box is a definite answer, and reporting it as anything else
         // (bad syntax, or "needs a box") describes a problem the caller does not have.
@@ -76,159 +106,405 @@ pub fn cp(src: &str, dst: &str) -> Result<(), Error> {
         (Side::Boxed(..), Side::Boxed(..)) => Err(Error::Sandbox(
             "box-to-box copy isn't supported - copy via the host in two steps".into(),
         )),
-        (Side::Boxed(pid1, box_src), Side::Host) => copy_out(pid1, &box_src, dst),
-        (Side::Host, Side::Boxed(pid1, box_dst)) => copy_in(src, pid1, &box_dst),
-        (Side::Host, Side::Host) => Err(Error::Sandbox(
+        (Side::Boxed(pid1, box_src), Side::Stdio) => {
+            if crate::global_env(STAT_ENV).is_some() {
+                print_stat(pid1, &box_src, follow)
+            } else {
+                archive_out(pid1, &box_src, follow)
+            }
+        }
+        (Side::Stdio, Side::Boxed(pid1, box_dst)) => archive_in(pid1, &box_dst),
+        (Side::Boxed(pid1, box_src), Side::Host) => copy_out(pid1, &box_src, dst, follow),
+        (Side::Host, Side::Boxed(pid1, box_dst)) => copy_in(src, pid1, &box_dst, follow),
+        (Side::Host | Side::Stdio, Side::Host | Side::Stdio) => Err(Error::Sandbox(
             "kern cp needs a box: one side must be <box>:<path> (e.g. kern cp web:/etc/app.conf ./ )"
                 .into(),
         )),
     }
 }
 
-/// box → host. Reads the in-box file (confined) and writes it to the host `dst` (a directory dst
-/// takes the source basename).
-fn copy_out(pid1: i32, box_src: &str, host_dst: &str) -> Result<(), Error> {
-    let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
-    // `O_NONBLOCK`: a hostile image could plant a FIFO at `box_src` - a plain `O_RDONLY` open of a FIFO
-    // BLOCKS until a writer appears, hanging the operator's `cp`. Opening non-blocking returns
-    // immediately; we then `fstat` and reject anything but a regular file (below), for which the flag
-    // is a no-op.
-    let fd = openat2_in_root(
-        root.as_raw_fd(),
-        box_src,
-        libc::O_RDONLY | libc::O_NONBLOCK,
+// ---------------------------------------------------------------------------------------------
+// Paths.
+
+/// A copy source or destination split Docker's way: the directory it lives in, its own name, and
+/// whether it ended in `/.` ("the CONTENTS of this directory") or in `/` ("this must be a
+/// directory").
+struct Split {
+    parent: Vec<u8>,
+    name: Vec<u8>,
+    contents: bool,
+    trailing_slash: bool,
+}
+
+fn split_path(p: &[u8]) -> Split {
+    let contents = p.ends_with(b"/.") || p == b".";
+    let mut q = p;
+    if contents {
+        q = &q[..q.len() - 1];
+    }
+    let trailing_slash = q.len() > 1 && q.ends_with(b"/");
+    while q.len() > 1 && q.ends_with(b"/") {
+        q = &q[..q.len() - 1];
+    }
+    match q.iter().rposition(|&b| b == b'/') {
+        // `/` itself: its name is `.` under itself.
+        Some(0) if q.len() == 1 => Split {
+            parent: b"/".to_vec(),
+            name: b".".to_vec(),
+            contents,
+            trailing_slash,
+        },
+        Some(i) => Split {
+            parent: if i == 0 {
+                b"/".to_vec()
+            } else {
+                q[..i].to_vec()
+            },
+            name: q[i + 1..].to_vec(),
+            contents,
+            trailing_slash,
+        },
+        None => Split {
+            parent: b".".to_vec(),
+            name: if q.is_empty() {
+                b".".to_vec()
+            } else {
+                q.to_vec()
+            },
+            contents,
+            trailing_slash,
+        },
+    }
+}
+
+/// The thing a copy reads: a name in a directory, or (`name` empty) an already-open node.
+struct Source {
+    dir: OwnedFd,
+    name: CString,
+    st: libc::stat,
+}
+
+/// Open the source `path` under `root` (`Confine::InRoot` for a box, the host's `/` otherwise is
+/// [`host_source`]). Without `follow`, a symlink SRC is the link itself; with it, its target.
+fn box_source(root: RawFd, path: &[u8], follow: bool) -> Result<(Source, Split), Error> {
+    let sp = split_path(path);
+    let shown = String::from_utf8_lossy(path).into_owned();
+    if follow || sp.name == b"." {
+        let fd = openat2_confined(root, path, libc::O_PATH, 0, Confine::InRoot)
+            .map_err(|e| Error::Sandbox(format!("box:{shown}: {e}")))?;
+        let dir = owned(fd);
+        let name = CString::default();
+        let st = lstat_at(dir.as_raw_fd(), &name)
+            .map_err(|e| Error::Sandbox(format!("box:{shown}: {e}")))?;
+        return Ok((Source { dir, name, st }, sp));
+    }
+    let fd = openat2_confined(
+        root,
+        &sp.parent,
+        libc::O_PATH | libc::O_DIRECTORY,
         0,
+        Confine::InRoot,
     )
-    .map_err(|e| Error::Sandbox(format!("box:{box_src}: {e}")))?;
-    drop(root);
-    // Regular files ONLY (also excludes a directory, FIFO, socket, device).
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let meta = file
-        .metadata()
-        .map_err(|e| Error::Sandbox(format!("box:{box_src}: {e}")))?;
-    if !meta.file_type().is_file() {
-        return Err(Error::Sandbox(format!(
-            "box:{box_src} is not a regular file (kern cp copies single files)"
-        )));
-    }
-    let dst = resolve_host_dst(host_dst, box_src);
-    // Guard the host DESTINATION: `kern cp box:/x <runtime>/kern/instances/<peer>` would let a box's
-    // contents OVERWRITE a peer's recorded posture (the WRITE the `-v` guard warns about - forging a
-    // capability/seccomp record to elevate a later `kern exec`). Shared write-guard: refuse when the
-    // dst's PARENT resolves onto a trust-bearing registry dir (box-data dirs stay writable).
-    crate::secret::guard_host_write_path(&dst, "cp destination")?;
-    let mut out =
-        std::fs::File::create(&dst).map_err(|e| Error::Sandbox(format!("writing {dst}: {e}")))?;
-    // Stream with a fixed buffer + a hard size cap, so a multi-GB (or sparse-huge) in-box file can't
-    // OOM the operator's `cp` process.
-    let n = stream_capped(&mut file, &mut out)
-        .map_err(|e| Error::Sandbox(format!("copying box:{box_src}: {e}")))?;
-    println!("copied box:{box_src} → {dst} ({n} bytes)");
-    Ok(())
+    .map_err(|e| Error::Sandbox(format!("box:{shown}: {e}")))?;
+    let dir = owned(fd);
+    let name = cstr(&sp.name).map_err(|e| Error::Sandbox(format!("box:{shown}: {e}")))?;
+    let st = lstat_at(dir.as_raw_fd(), &name)
+        .map_err(|e| Error::Sandbox(format!("box:{shown}: {e}")))?;
+    Ok((Source { dir, name, st }, sp))
 }
 
-/// Max bytes `kern cp` moves in one call (streamed) - a self-DoS guard, not a security boundary.
-const MAX_CP_BYTES: u64 = 4 << 30; // 4 GiB
-
-/// Copy `src` → `dst` with a fixed buffer, refusing past [`MAX_CP_BYTES`]. Returns bytes copied.
-fn stream_capped(src: &mut std::fs::File, dst: &mut std::fs::File) -> std::io::Result<u64> {
-    use std::io::{Read, Write};
-    let mut buf = [0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = src.read(&mut buf)?;
-        if n == 0 {
-            break;
+/// The host side of a copy into a box: the path the user named, resolved as the host does (it is
+/// the user's own tree), its last component a link or not as `follow` says.
+fn host_source(path: &str, follow: bool) -> Result<(Source, Split), Error> {
+    let sp = split_path(path.as_bytes());
+    let open_path = |p: &[u8], flags: i32| -> Result<OwnedFd, Error> {
+        let c = cstr(p).map_err(|e| Error::Sandbox(format!("host {path}: {e}")))?;
+        let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(Error::Sandbox(format!(
+                "host {path}: {}",
+                std::io::Error::last_os_error()
+            )));
         }
-        total += n as u64;
-        if total > MAX_CP_BYTES {
-            return Err(std::io::Error::other(
-                "file exceeds the 4 GiB kern cp limit",
-            ));
-        }
-        dst.write_all(&buf[..n])?;
+        Ok(owned(fd))
+    };
+    if follow || sp.name == b"." {
+        let dir = open_path(path.as_bytes(), libc::O_PATH)?;
+        let name = CString::default();
+        let st = lstat_at(dir.as_raw_fd(), &name)
+            .map_err(|e| Error::Sandbox(format!("host {path}: {e}")))?;
+        return Ok((Source { dir, name, st }, sp));
     }
-    Ok(total)
+    let dir = open_path(&sp.parent, libc::O_PATH | libc::O_DIRECTORY)?;
+    let name = cstr(&sp.name).map_err(|e| Error::Sandbox(format!("host {path}: {e}")))?;
+    let st = lstat_at(dir.as_raw_fd(), &name)
+        .map_err(|e| Error::Sandbox(format!("host {path}: {e}")))?;
+    Ok((Source { dir, name, st }, sp))
 }
 
-/// host → box. Reads the host file and writes it to the in-box `dst` (confined). The box-side parent
-/// directory must already exist.
-fn copy_in(host_src: &str, pid1: i32, box_dst: &str) -> Result<(), Error> {
-    // Guard the host SOURCE against the registry - the SAME class the `-v`/`--secret`/`--env-file` guard
-    // closes, which `kern cp` was missing: `kern cp <runtime>/kern/ssh/<key> box:/x` (or a posture record
-    // under `instances/`) would copy a peer's secret/state INTO the box. The box side is already confined
-    // (`openat2_in_root`); this closes the host side. Canonicalize + refuse, then read the CANONICAL path
-    // so a symlink can't redirect the read after the check.
-    let canon = crate::secret::guard_host_path(host_src, "cp")?;
-    let meta =
-        std::fs::metadata(&canon).map_err(|e| Error::Sandbox(format!("host {host_src}: {e}")))?;
-    if !meta.file_type().is_file() {
+/// The name the archive gives the source: the source's own name, or the one the destination
+/// renames it to. `None` = the CONTENTS of a directory, with no entry for the directory itself.
+fn top_name(sp: &Split) -> Option<Vec<u8>> {
+    (!sp.contents && sp.name != b".").then(|| sp.name.clone())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The copies.
+
+/// Run the writer into a pipe on one thread and the reader from it on this one.
+fn pipe_through(src: &Source, top: Option<&[u8]>, ids: IdMap, dest: &Dest) -> Result<u64, Error> {
+    let mut fds = [0 as RawFd; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(Error::Sandbox(format!(
-            "{host_src} is not a regular file (kern cp copies single files)"
+            "kern cp: pipe: {}",
+            std::io::Error::last_os_error()
         )));
     }
-    if meta.len() > MAX_CP_BYTES {
-        return Err(Error::Sandbox(format!(
-            "{host_src} exceeds the 4 GiB kern cp limit"
-        )));
+    let mut rd = std::fs::File::from(owned(fds[0]));
+    let wr = std::fs::File::from(owned(fds[1]));
+    let (wrote, read) = std::thread::scope(|s| {
+        let h = s.spawn(move || {
+            write_archive(
+                src.dir.as_raw_fd(),
+                &src.name,
+                &src.st,
+                top,
+                ids,
+                std::io::BufWriter::new(wr),
+            )
+        });
+        let read = read_archive(&mut rd, dest);
+        // Unblock a writer still writing when the reader stopped on an error.
+        drop(rd);
+        (h.join(), read)
+    });
+    let read = read.map_err(|e| Error::Sandbox(format!("kern cp: {e}")))?;
+    match wrote {
+        Ok(Ok(_)) => Ok(read),
+        Ok(Err(e)) => Err(Error::Sandbox(format!("kern cp: {e}"))),
+        Err(_) => Err(Error::Sandbox("kern cp: the archive writer stopped".into())),
     }
-    let data =
-        std::fs::read(&canon).map_err(|e| Error::Sandbox(format!("host {host_src}: {e}")))?;
-    // If the box dst names an existing directory, drop the source basename into it.
+}
+
+/// Where a copy lands, Docker's rules: `(directory, top name)`, `None` top for a directory's
+/// contents. `dst_kind` is what the destination is now (`Some(true)` a directory, `Some(false)`
+/// something else, `None` nothing).
+fn landing(
+    src: &Source,
+    sp: &Split,
+    dst: &[u8],
+    dst_kind: Option<bool>,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), Error> {
+    let ds = split_path(dst);
+    let shown = String::from_utf8_lossy(dst);
+    match dst_kind {
+        Some(true) => Ok((dst.to_vec(), top_name(sp))),
+        Some(false) if is_dir(&src.st) => Err(Error::Sandbox(format!(
+            "cannot copy a directory to the file {shown}"
+        ))),
+        Some(false) => Ok((ds.parent, Some(ds.name))),
+        None if ds.trailing_slash && !is_dir(&src.st) => Err(Error::Sandbox(format!(
+            "the destination directory {shown} does not exist"
+        ))),
+        None => Ok((ds.parent, Some(ds.name))),
+    }
+}
+
+/// box → host path.
+fn copy_out(pid1: i32, box_src: &str, host_dst: &str, follow: bool) -> Result<(), Error> {
     let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
-    let box_dst = box_dst_path(root.as_raw_fd(), box_dst, host_src);
-    use std::os::unix::fs::PermissionsExt;
-    let mode = meta.permissions().mode() & 0o777;
-    let fd = openat2_in_root(
-        root.as_raw_fd(),
-        &box_dst,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-        mode,
-    )
-    .map_err(|e| {
-        Error::Sandbox(format!(
-            "box:{box_dst}: {e} (does the parent dir exist in the box?)"
-        ))
-    })?;
-    drop(root);
-    use std::io::Write;
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.write_all(&data)
-        .map_err(|e| Error::Sandbox(format!("writing box:{box_dst}: {e}")))?;
-    println!("copied {host_src} → box:{box_dst} ({} bytes)", data.len());
+    let (src, sp) = box_source(root.as_raw_fd(), box_src.as_bytes(), follow)?;
+    let kind = std::fs::metadata(host_dst).ok().map(|m| m.is_dir());
+    let (dir, top) = landing(&src, &sp, host_dst.as_bytes(), kind)?;
+    let dir_path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&dir));
+    let target = match &top {
+        Some(t) => dir_path.join(std::ffi::OsStr::from_bytes(t)),
+        None => dir_path.clone(),
+    };
+    crate::secret::guard_host_write_path(&target.to_string_lossy(), "cp destination")?;
+    let base = std::fs::File::open(&dir_path)
+        .map_err(|e| Error::Sandbox(format!("{}: {e}", dir_path.display())))?;
+    let dest = Dest {
+        base: OwnedFd::from(base),
+        confine: Confine::Beneath,
+        prefix: Vec::new(),
+        mode_mask: 0o1777,
+        // EVERY FILE checked against kern's own state, not only the top: a box's directory
+        // copied to `$XDG_RUNTIME_DIR` would otherwise put its `kern/...` members in the registry.
+        guard: Some(Box::new(move |member: &[u8]| {
+            let p = dir_path.join(std::ffi::OsStr::from_bytes(member));
+            crate::secret::guard_host_write_path(&p.to_string_lossy(), "cp destination").map_err(
+                |e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()),
+            )
+        })),
+    };
+    let n = pipe_through(&src, top.as_deref(), IdMap::of_box(pid1), &dest)?;
+    println!("copied box:{box_src} → {} ({n} bytes)", target.display());
     Ok(())
 }
 
-/// A host destination that is an existing directory gets the source basename appended.
-fn resolve_host_dst(host_dst: &str, box_src: &str) -> String {
-    if std::path::Path::new(host_dst).is_dir() {
-        let base = box_src
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("file");
-        format!("{}/{base}", host_dst.trim_end_matches('/'))
+/// The kind of `path` in the box, following its last link (confined): Docker's destination test.
+fn box_kind(root: RawFd, path: &[u8]) -> Result<Option<bool>, Error> {
+    match openat2_confined(root, path, libc::O_PATH, 0, Confine::InRoot) {
+        Ok(fd) => {
+            let fd = owned(fd);
+            let st = lstat_at(fd.as_raw_fd(), &CString::default()).map_err(|e| {
+                Error::Sandbox(format!("box:{}: {e}", String::from_utf8_lossy(path)))
+            })?;
+            Ok(Some(is_dir(&st)))
+        }
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT)) => Ok(None),
+        Err(e) => Err(Error::Sandbox(format!(
+            "box:{}: {e}",
+            String::from_utf8_lossy(path)
+        ))),
+    }
+}
+
+/// host path → box.
+fn copy_in(host_src: &str, pid1: i32, box_dst: &str, follow: bool) -> Result<(), Error> {
+    // Guard the host SOURCE against the registry - the SAME class the `-v`/`--secret`/`--env-file`
+    // guard closes: `kern cp <runtime>/kern/ssh/<key> box:/x` (or a posture record under
+    // `instances/`) would copy a peer's secret or state INTO the box. A directory source is checked
+    // the same way, since the registry may lie below it.
+    crate::secret::guard_host_path(host_src, "cp")?;
+    let (src, sp) = host_source(host_src, follow)?;
+    let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
+    let kind = box_kind(root.as_raw_fd(), box_dst.as_bytes())?;
+    let (dir, top) = landing(&src, &sp, box_dst.as_bytes(), kind)?;
+    if box_kind(root.as_raw_fd(), &dir)? != Some(true) {
+        return Err(Error::Sandbox(format!(
+            "box:{}: no such directory in the box",
+            String::from_utf8_lossy(&dir)
+        )));
+    }
+    let shown = match &top {
+        Some(t) => String::from_utf8_lossy(&join(&dir, t)).into_owned(),
+        None => String::from_utf8_lossy(&dir).into_owned(),
+    };
+    let dest = Dest {
+        base: root,
+        confine: Confine::InRoot,
+        prefix: dir,
+        mode_mask: 0o7777,
+        guard: None,
+    };
+    let n = pipe_through(&src, top.as_deref(), IdMap::default(), &dest)?;
+    println!("copied {host_src} → box:{shown} ({n} bytes)");
+    Ok(())
+}
+
+/// box → an archive on stdout (`kern cp <box>:<src> -`).
+fn archive_out(pid1: i32, box_src: &str, follow: bool) -> Result<(), Error> {
+    let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
+    let (src, sp) = box_source(root.as_raw_fd(), box_src.as_bytes(), follow)?;
+    let top = top_name(&sp);
+    let out = std::io::BufWriter::new(std::io::stdout().lock());
+    write_archive(
+        src.dir.as_raw_fd(),
+        &src.name,
+        &src.st,
+        top.as_deref(),
+        IdMap::of_box(pid1),
+        out,
+    )
+    .map_err(|e| Error::Sandbox(format!("kern cp: {e}")))?;
+    Ok(())
+}
+
+/// An archive on stdin → the box directory `box_dst` (`kern cp - <box>:<dst>`), which must exist.
+fn archive_in(pid1: i32, box_dst: &str) -> Result<(), Error> {
+    let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
+    match box_kind(root.as_raw_fd(), box_dst.as_bytes())? {
+        Some(true) => {}
+        Some(false) => {
+            return Err(Error::Sandbox(format!(
+                "box:{box_dst}: the destination of an archive must be a directory"
+            )))
+        }
+        None => {
+            return Err(Error::Sandbox(format!(
+                "box:{box_dst}: no such directory in the box"
+            )))
+        }
+    }
+    let dest = Dest {
+        base: root,
+        confine: Confine::InRoot,
+        prefix: box_dst.as_bytes().to_vec(),
+        mode_mask: 0o7777,
+        guard: None,
+    };
+    let mut input = std::io::stdin().lock();
+    let n = read_archive(&mut input, &dest).map_err(|e| Error::Sandbox(format!("kern cp: {e}")))?;
+    eprintln!("copied an archive → box:{box_dst} ({n} bytes)");
+    Ok(())
+}
+
+/// Docker's `os.FileMode` bits for a `stat` mode.
+fn go_file_mode(mode: u32) -> u64 {
+    let mut m = u64::from(mode & 0o777);
+    m |= match mode & libc::S_IFMT {
+        libc::S_IFDIR => 1 << 31,
+        libc::S_IFLNK => 1 << 27,
+        libc::S_IFIFO => 1 << 25,
+        libc::S_IFSOCK => 1 << 24,
+        libc::S_IFCHR => (1 << 26) | (1 << 21),
+        libc::S_IFBLK => 1 << 26,
+        _ => 0,
+    };
+    if mode & libc::S_ISUID != 0 {
+        m |= 1 << 23;
+    }
+    if mode & libc::S_ISGID != 0 {
+        m |= 1 << 22;
+    }
+    if mode & libc::S_ISVTX != 0 {
+        m |= 1 << 20;
+    }
+    m
+}
+
+/// The stat Docker's API puts in `X-Docker-Container-Path-Stat`, for `KERN_CP_STAT=1`.
+fn print_stat(pid1: i32, box_src: &str, follow: bool) -> Result<(), Error> {
+    let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
+    let (src, sp) = box_source(root.as_raw_fd(), box_src.as_bytes(), follow)?;
+    let mut link = String::new();
+    if src.st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+        let n = unsafe {
+            libc::readlinkat(
+                src.dir.as_raw_fd(),
+                src.name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n >= 0 {
+            buf.truncate(n as usize);
+            let t = if buf.starts_with(b"/") {
+                buf
+            } else {
+                join(&sp.parent, &buf)
+            };
+            link = String::from_utf8_lossy(&t).into_owned();
+        }
+    }
+    let name = if sp.name == b"." {
+        String::from_utf8_lossy(&split_path(sp.parent.as_slice()).name).into_owned()
     } else {
-        host_dst.to_string()
-    }
+        String::from_utf8_lossy(&sp.name).into_owned()
+    };
+    println!(
+        "{{\"name\":{},\"size\":{},\"mode\":{},\"mtime\":{},\"linkTarget\":{}}}",
+        kern_common::json_str(&name),
+        src.st.st_size.max(0),
+        go_file_mode(src.st.st_mode),
+        kern_common::json_str(&kern_common::rfc3339(src.st.st_mtime.max(0) as u64)),
+        kern_common::json_str(&link)
+    );
+    Ok(())
 }
-
-/// A box destination that resolves (confined) to an existing directory gets the source basename.
-fn box_dst_path(root: RawFd, box_dst: &str, host_src: &str) -> String {
-    // Probe whether box_dst is a directory, confined.
-    if let Ok(fd) = openat2_in_root(root, box_dst, libc::O_PATH | libc::O_DIRECTORY, 0) {
-        unsafe { libc::close(fd) };
-        let base = host_src
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("file");
-        return format!("{}/{base}", box_dst.trim_end_matches('/'));
-    }
-    box_dst.to_string()
-}
-
-use std::os::unix::io::FromRawFd;
 
 #[cfg(test)]
 mod tests {
@@ -272,14 +548,9 @@ mod tests {
         ] {
             assert!(matches!(classify(host), Side::Host), "{host} must be Host");
         }
-    }
-
-    #[test]
-    fn host_dst_basename_join() {
-        // Non-dir dst is returned as-is.
-        assert_eq!(
-            resolve_host_dst("/tmp/out.txt", "/etc/app.conf"),
-            "/tmp/out.txt"
+        assert!(
+            matches!(classify("-"), Side::Stdio),
+            "`-` is the archive stream"
         );
     }
 
@@ -296,5 +567,47 @@ mod tests {
             crate::secret::guard_host_write_path(&dst.to_string_lossy(), "cp destination").is_ok()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paths_split_the_way_docker_reads_them() {
+        let s = split_path(b"/d/sub");
+        assert_eq!(
+            (s.parent.as_slice(), s.name.as_slice()),
+            (&b"/d"[..], &b"sub"[..])
+        );
+        assert!(!s.contents && !s.trailing_slash);
+        let s = split_path(b"/d/.");
+        assert!(s.contents);
+        assert_eq!(s.name, b"d");
+        let s = split_path(b"out/");
+        assert!(s.trailing_slash);
+        assert_eq!(
+            (s.parent.as_slice(), s.name.as_slice()),
+            (&b"."[..], &b"out"[..])
+        );
+        let s = split_path(b"/f");
+        assert_eq!(
+            (s.parent.as_slice(), s.name.as_slice()),
+            (&b"/"[..], &b"f"[..])
+        );
+        let s = split_path(b"/");
+        assert_eq!(s.name, b".");
+        assert_eq!(
+            kern_isolation::archive::member_path(b"./a//b/./c"),
+            Some(b"a/b/c".to_vec())
+        );
+        assert_eq!(kern_isolation::archive::member_path(b"a/../../etc"), None);
+        assert_eq!(
+            kern_isolation::archive::member_path(b"/abs/x"),
+            Some(b"abs/x".to_vec())
+        );
+    }
+
+    #[test]
+    fn go_file_mode_marks_the_type_as_go_does() {
+        assert_eq!(go_file_mode(libc::S_IFDIR | 0o755), (1 << 31) | 0o755);
+        assert_eq!(go_file_mode(libc::S_IFLNK | 0o777), (1 << 27) | 0o777);
+        assert_eq!(go_file_mode(libc::S_IFREG | 0o644), 0o644);
     }
 }

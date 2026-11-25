@@ -2328,6 +2328,25 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--secret`: read the values on the host (files/stdin/inline) BEFORE the fork; the box writes
     // them into a RAM-backed `/run/secrets` tmpfs (mode 0400) that never touches the overlay upper.
     let mut secrets = crate::secret::parse_secrets(args.secrets, args.secret_mode)?;
+    // `--copy-in`: each archive guarded as any host source handed to a box, its destination read
+    // from the `<archive>.dir` the Docker API wrote beside it.
+    let mut copy_in: Vec<kern_isolation::CopyIn> = Vec::new();
+    for archive in args.copy_in {
+        let canon = crate::secret::guard_host_path(archive, "--copy-in")?;
+        let dir_file = format!("{}.dir", canon.display());
+        let dest = std::fs::read_to_string(&dir_file)
+            .map_err(|e| Error::Sandbox(format!("--copy-in {archive}: {dir_file}: {e}")))?;
+        let dest = dest.trim_end_matches('\n').to_string();
+        if !dest.starts_with('/') || dest.contains('\0') {
+            return Err(Error::Sandbox(format!(
+                "--copy-in {archive}: the destination {dest:?} is not an absolute path"
+            )));
+        }
+        copy_in.push(kern_isolation::CopyIn {
+            archive: canon.to_string_lossy().into_owned(),
+            dest,
+        });
+    }
     // The environment-sourced ones join the same list, so everything downstream sees one kind of
     // secret: a name and its bytes. Appended AFTER, and a name already delivered from a file is
     // refused rather than shadowed, because two sources for one `/run/secrets/<name>` is the file
@@ -2884,6 +2903,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         no_new_privs,
         vdisks,
         secrets,
+        copy_in,
         ssh,
         hostname,
         tun: args.tun,

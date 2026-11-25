@@ -308,6 +308,9 @@ pub struct BoxRunArgs<'a> {
     /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret as
     /// `/run/secrets/NAME` (mode 0400) without it hitting the image or the workload env.
     pub secrets: &'a [String],
+    /// INTERNAL `--copy-in <archive>` (repeatable): a tar the Docker API kept for a container that
+    /// had not started, extracted into the box's root at the directory named in `<archive>.dir`.
+    pub copy_in: &'a [String],
     /// `--secret-env <name>`: content from `KERN_SECRET_<name>` rather than from argv.
     pub secret_envs: &'a [String],
     /// `--secret-mode <octal>`: the file mode every `--secret` of this box is created with.
@@ -1420,6 +1423,7 @@ struct BuildSpec<'a> {
     no_new_privs: bool,
     vdisks: Vec<kern_isolation::VdiskMount>,
     secrets: Vec<kern_isolation::Secret>,
+    copy_in: Vec<kern_isolation::CopyIn>,
     ssh: Option<kern_isolation::SshSetup>,
     hostname: Option<String>,
     tun: bool,
@@ -1791,6 +1795,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         no_new_privs: b.no_new_privs,
         vdisks: b.vdisks,
         secrets: b.secrets,
+        copy_in: b.copy_in,
         ssh: b.ssh,
         tun: b.tun,
         init: b.init,
@@ -10664,7 +10669,7 @@ fn run_terminal_verb(
                     None => arg.clone(),
                 }
             };
-            crate::boxcp::cp(&to_box(a), &to_box(b))?;
+            crate::boxcp::cp(&to_box(a), &to_box(b), false)?;
             return Ok(true);
         }
         ComposeAction::Wait => {

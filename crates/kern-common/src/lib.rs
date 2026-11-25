@@ -327,6 +327,19 @@ pub fn json_array<T>(items: &[T], mut render: impl FnMut(&T) -> String) -> Strin
     out
 }
 
+/// `$XDG_CACHE_HOME`, or `$HOME/.cache` when it is unset or empty: the user's cache directory, which
+/// is where kern's image cache and the Docker API's staged archives live. `None` without either.
+pub fn xdg_cache_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+        })
+}
+
 /// Unix seconds as RFC 3339 UTC (`2026-11-21T12:00:00Z`), which Docker clients parse: one formatter
 /// for kern's Docker API and the image history kern records.
 pub fn rfc3339(secs: u64) -> String {

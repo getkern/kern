@@ -1172,6 +1172,7 @@ fn logs(bin: &Path, name: &str, req: &Request) -> Response {
         status: 200,
         content_type: "application/vnd.docker.multiplexed-stream",
         upgrade: false,
+        extra: Vec::new(),
         writer: Box::new(move |w: &mut crate::Out| {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             kern_frames(&bin, &args, w, wanted);
@@ -1208,6 +1209,7 @@ fn pull(bin: &Path, req: &Request) -> Response {
         status: 200,
         content_type: "application/json",
         upgrade: false,
+        extra: Vec::new(),
         writer: Box::new(move |w: &mut crate::Out| {
             let _ = writeln!(
                 w,
@@ -1402,6 +1404,264 @@ fn image_history(bin: &Path, name: &str) -> Response {
         })
         .collect();
     json_response(200, format!("[{}]", rows.join(",")))
+}
+
+// ---------------------------------------------------------------------------------------------
+// containers/{id}/archive: `docker cp`, onto `kern cp`.
+
+/// `KERN_CP_STAT=1 kern cp <name>:<path> -`: Docker's stat of the path, or kern's error.
+fn path_stat(bin: &Path, name: &str, path: &str) -> Result<String, String> {
+    let out = Command::new(bin)
+        .env("KERN_CP_STAT", "1")
+        .args(["cp", &format!("{name}:{path}"), "-"])
+        .stdin(Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+        Ok(o) => Err(kern_error(&String::from_utf8_lossy(&o.stderr))),
+        Err(e) => Err(format!("cannot run {}: {e}", bin.display())),
+    }
+}
+
+/// kern's refusal of a copy as Docker's status: a missing path 404, a box not running 409.
+fn copy_refusal(id: &str, path: &str, why: &str) -> Response {
+    if why.contains("No such file") || why.contains("no such directory") {
+        return error(
+            404,
+            &format!("Could not find the file {path} in container {id}"),
+        );
+    }
+    if why.contains("no box named") {
+        return error(409, &format!("Container {id} is not running"));
+    }
+    if why.contains("must be a directory") || why.contains("Not a directory") {
+        return error(400, &format!("{path}: not a directory"));
+    }
+    error(500, why)
+}
+
+/// `HEAD`/`GET /containers/{id}/archive?path=P`: the stat of P in `X-Docker-Container-Path-Stat`
+/// (what `docker cp` reads to know a file from a directory), and for `GET` P as a tar, streamed from
+/// `kern cp <box>:P -`, which resolves P inside the box and never follows a link out of it.
+fn archive_get(bin: &Path, req: &Request, id: &str, head: bool) -> Response {
+    let Some(path) = req.param("path").filter(|p| !p.is_empty()) else {
+        return error(400, "path is required");
+    };
+    let Some(name) = resolve(bin, id) else {
+        return error(404, &format!("No such container: {id}"));
+    };
+    if created_get(&name).is_some() {
+        return error(
+            409,
+            &format!("Container {id} is created and not started: kern copies out of a running box"),
+        );
+    }
+    let stat = match path_stat(bin, &name, path) {
+        Ok(s) => s,
+        Err(why) => return copy_refusal(id, path, &why),
+    };
+    let header = (
+        "X-Docker-Container-Path-Stat",
+        kern_common::registry_auth::b64_encode(stat.as_bytes()),
+    );
+    if head {
+        return Response::Full {
+            status: 200,
+            content_type: "application/json",
+            body: Vec::new(),
+            extra: vec![header],
+        };
+    }
+    let child = Command::new(bin)
+        .args(["cp", &format!("{name}:{path}"), "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return error(500, &format!("cannot run {}: {e}", bin.display())),
+    };
+    Response::Stream {
+        status: 200,
+        content_type: "application/x-tar",
+        upgrade: false,
+        extra: vec![header],
+        writer: Box::new(move |w: &mut crate::Out| {
+            if let Some(mut out) = child.stdout.take() {
+                let _ = std::io::copy(&mut out, w);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }),
+    }
+}
+
+/// Where the archives a client copies into a CREATED container wait for its start, one directory per
+/// container: `$XDG_CACHE_HOME/kern/compat-stage/<name>` (never the runtime dir, whose `kern/` is the
+/// registry and is never handed to a box).
+fn stage_dir(name: &str) -> Option<std::path::PathBuf> {
+    let cache = kern_common::xdg_cache_dir()?;
+    valid_name(name).then(|| cache.join("kern").join("compat-stage").join(name))
+}
+
+/// The container is gone: its staged archives go with it.
+fn stage_forget(name: &str) {
+    if let Some(d) = stage_dir(name) {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// A `PUT .../archive` on a container that is CREATED and not started, which is when Testcontainers
+/// copies its files (`withCopyToContainer`): Docker writes them into the container's filesystem
+/// before its process runs. kern has no box yet, so the archive is kept, and the start hands it to
+/// the box as `--copy-in`: extracted into the box's root after its mounts and before its workload,
+/// resolved inside the box as `kern cp` resolves a path. Kept until the container is removed, so a
+/// restart finds the same files.
+fn stage_archive(
+    name: &str,
+    path: &str,
+    r: &mut std::io::BufReader<UnixStream>,
+    framing: crate::Framing,
+) -> Response {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let Some(dir) = stage_dir(name) else {
+        return error(
+            500,
+            "no cache directory to keep the archive in (HOME is unset)",
+        );
+    };
+    if let Err(e) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+    {
+        return error(500, &format!("{}: {e}", dir.display()));
+    }
+    let n = std::fs::read_dir(&dir)
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "tar"))
+                .count()
+        })
+        .unwrap_or(0);
+    let tar = dir.join(format!("{n:04}.tar"));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tar);
+    let mut file = match file {
+        Ok(f) => f,
+        Err(e) => return error(500, &format!("{}: {e}", tar.display())),
+    };
+    match crate::copy_body(r, framing, &mut file) {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&tar);
+            return error(500, &format!("{}: {e}", tar.display()));
+        }
+        Err(why) => {
+            let _ = std::fs::remove_file(&tar);
+            return error(400, why);
+        }
+    }
+    let dest = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if let Err(e) = std::fs::write(dir.join(format!("{n:04}.tar.dir")), &dest) {
+        return error(500, &format!("{}: {e}", dir.display()));
+    }
+    let Some(mut c) = created_get(name) else {
+        return error(
+            409,
+            &format!("Container {name} started while the archive arrived"),
+        );
+    };
+    let at = c
+        .argv
+        .iter()
+        .position(|a| a == "--image")
+        .unwrap_or(c.argv.len());
+    c.argv.splice(
+        at..at,
+        ["--copy-in".to_string(), tar.to_string_lossy().into_owned()],
+    );
+    created_put(name, c);
+    Response::Full {
+        status: 200,
+        content_type: "text/plain",
+        body: Vec::new(),
+        extra: Vec::new(),
+    }
+}
+
+/// `PUT /containers/{id}/archive?path=DIR`: the client's tar, streamed into `kern cp - <box>:DIR`
+/// on its stdin (any size; the body is never held here), extracted inside the box.
+pub(crate) fn archive_put(
+    req: &Request,
+    bin: &Path,
+    r: &mut std::io::BufReader<UnixStream>,
+    framing: crate::Framing,
+) -> Response {
+    let segs: Vec<String> = req
+        .path
+        .trim_matches('/')
+        .split('/')
+        .map(|s| percent_decode(s, false))
+        .collect();
+    let Some(id) = segs.get(1).cloned() else {
+        return error(404, "No such container");
+    };
+    let Some(path) = req.param("path").filter(|p| !p.is_empty()) else {
+        return error(400, "path is required");
+    };
+    let Some(name) = resolve(bin, &id) else {
+        return error(404, &format!("No such container: {id}"));
+    };
+    if created_get(&name).is_some() {
+        return stage_archive(&name, path, r, framing);
+    }
+    let child = Command::new(bin)
+        .args(["cp", "-", &format!("{name}:{path}")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return error(500, &format!("cannot run {}: {e}", bin.display())),
+    };
+    let err = child.stderr.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = p.read_to_end(&mut v);
+            v
+        })
+    });
+    let copied = match child.stdin.take() {
+        Some(mut sin) => crate::copy_body(r, framing, &mut sin),
+        None => Err("kern cp took no stdin"),
+    };
+    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+    let err = err
+        .and_then(|h| h.join().ok())
+        .map(|v| String::from_utf8_lossy(&v).into_owned())
+        .unwrap_or_default();
+    if code != 0 {
+        return copy_refusal(&id, path, &kern_error(&err));
+    }
+    if let Err(why) = copied {
+        return error(400, why);
+    }
+    Response::Full {
+        status: 200,
+        content_type: "text/plain",
+        body: Vec::new(),
+        extra: Vec::new(),
+    }
 }
 
 /// `POST /images/load`: the archive the client sends, streamed into `kern load` on its stdin, so an
@@ -1752,6 +2012,7 @@ fn session_ended(bin: &Path, req: &Request) -> Response {
 
 /// Remove `name` whatever its state: created, running (stopped at once) or ended.
 fn remove_container(bin: &Path, name: &str) {
+    stage_forget(name);
     if created_take(name).is_some() {
         drop(attached_take(name));
         return;
@@ -1975,6 +2236,7 @@ fn wait(bin: &Path, name: String) -> Response {
         status: 200,
         content_type: "application/json",
         upgrade: false,
+        extra: Vec::new(),
         writer: Box::new(move |w: &mut crate::Out| {
             wait_until_started(&name);
             let body = match run_exit(&name) {
@@ -2032,6 +2294,7 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
                 "application/vnd.docker.multiplexed-stream"
             },
             upgrade: req.upgrade,
+            extra: Vec::new(),
             writer: Box::new(move |w: &mut crate::Out| {
                 // Ends without a word when the container is removed instead of started.
                 match from.recv() {
@@ -2061,6 +2324,7 @@ fn attach(bin: &Path, name: &str, req: &Request) -> Response {
         status: 200,
         content_type: "application/vnd.docker.multiplexed-stream",
         upgrade: req.upgrade,
+        extra: Vec::new(),
         writer: Box::new(move |w: &mut crate::Out| {
             let mut args = vec!["logs", "--frames", "-f"];
             if from_now {
@@ -2477,6 +2741,7 @@ fn exec_start(bin: &Path, id: &str, req: &Request) -> Response {
             "application/vnd.docker.multiplexed-stream"
         },
         upgrade: req.upgrade,
+        extra: Vec::new(),
         writer: Box::new(move |w: &mut crate::Out| {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
@@ -2781,6 +3046,9 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             Some(name) => inspect(bin, &name),
             None => error(404, &format!("No such container: {id}")),
         },
+        ("GET" | "HEAD", ["containers", id, "archive"]) => {
+            archive_get(bin, req, id, req.method == "HEAD")
+        }
         ("GET", ["containers", id, "logs"]) => match resolve(bin, id) {
             Some(name) => logs(bin, &name, req),
             None => error(404, &format!("No such container: {id}")),
@@ -2848,6 +3116,7 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                 return error(404, &format!("No such container: {id}"));
             };
             session_forget(&name);
+            stage_forget(&name);
             if created_take(&name).is_some() {
                 // A pending attach ends with the container.
                 drop(attached_take(&name));

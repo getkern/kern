@@ -20020,6 +20020,156 @@ fn a_rm_box_stopped_or_killed_leaves_no_row() {
 
 /// A `--net` box gets the host's resolver through its own `/etc` directory, a bind, so a
 /// `kern commit` of it carries neither the host's resolver nor what the box wrote into the file.
+/// `kern cp` COPIES DIRECTORIES AND KEEPS LINKS AS LINKS, as `docker cp` does, and `--copy-in` hands a
+/// box an archive before its workload runs (what the Docker API does for a container created and not
+/// started, which is when Testcontainers copies its files). MEASURED before: `kern cp` refused a
+/// directory ("copies single files"), `docker cp` through kern's socket answered 501, and a file
+/// copied into a created container was not there when it started.
+#[test]
+fn cp_copies_trees_with_links_and_copy_in_lands_before_the_workload() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "cptree");
+    let rootfs = root.to_str().unwrap().to_string();
+    let base = std::env::temp_dir().join(format!("kern-it-cptree-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("run")).unwrap();
+    fs::create_dir_all(base.join("host/src/sub")).unwrap();
+    fs::write(base.join("host/src/sub/a"), "from-host\n").unwrap();
+    std::os::unix::fs::symlink("/etc/shadow", base.join("host/src/out-link")).unwrap();
+    let k = || {
+        let mut c = kern();
+        c.env("XDG_RUNTIME_DIR", base.join("run"));
+        c
+    };
+    let name = format!("cptree-{}", std::process::id());
+    let up = k()
+        .args([
+            "box",
+            &name,
+            "--rootfs",
+            &rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+        ])
+        .arg(
+            "/bin/busybox mkdir -p /d/sub /in && echo dati > /d/f && \
+             /bin/busybox ln -s /etc/passwd /d/l && /bin/busybox ln /d/f /d/hard && \
+             exec /bin/busybox sleep 60",
+        )
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&up.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&base);
+        return;
+    }
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let out = base.join("out");
+    let cp_out = k()
+        .args(["cp", &format!("{name}:/d"), out.to_str().unwrap()])
+        .output()
+        .expect("cp out");
+    let tar = k()
+        .args(["cp", &format!("{name}:/d"), "-"])
+        .output()
+        .expect("cp -");
+    let cp_in = k()
+        .args([
+            "cp",
+            base.join("host/src").to_str().unwrap(),
+            &format!("{name}:/in/"),
+        ])
+        .output()
+        .expect("cp in");
+    let inside = k()
+        .args(["exec", &name, "/bin/busybox", "sh", "-c"])
+        .arg("/bin/busybox cat /in/src/sub/a; /bin/busybox readlink /in/src/out-link")
+        .output()
+        .expect("exec");
+    let _ = k().args(["stop", "-t", "0", &name]).output();
+    // `--copy-in`: an archive and the directory it goes in, read by the box before its command.
+    let staged = base.join("stage.tar");
+    let made = std::process::Command::new("tar")
+        .args(["-C", base.join("host/src").to_str().unwrap(), "-cf"])
+        .arg(&staged)
+        .arg("sub")
+        .status();
+    fs::write(base.join("stage.tar.dir"), "/app").unwrap();
+    let pre = k()
+        .args([
+            "box",
+            &format!("{name}-ci"),
+            "--rootfs",
+            &rootfs,
+            "--copy-in",
+        ])
+        .arg(&staged)
+        .args(["--", "/bin/busybox", "cat", "/app/sub/a"])
+        .output()
+        .expect("copy-in");
+    let _ = fs::remove_dir_all(&root);
+    let host_link = fs::read_link(out.join("l")).ok();
+    let hard_same = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(out.join("f")).map(|m| m.ino()).ok()
+            == fs::metadata(out.join("hard")).map(|m| m.ino()).ok()
+    };
+    let got_f = fs::read_to_string(out.join("f")).unwrap_or_default();
+    let _ = fs::remove_dir_all(&base);
+    assert!(
+        cp_out.status.success(),
+        "cp out: {}",
+        String::from_utf8_lossy(&cp_out.stderr)
+    );
+    assert_eq!(got_f, "dati\n", "the directory's file arrives");
+    assert_eq!(
+        host_link,
+        Some(PathBuf::from("/etc/passwd")),
+        "a link stays a link"
+    );
+    assert!(hard_same, "a hardlink stays one");
+    let listing = String::from_utf8_lossy(&tar.stdout);
+    assert!(
+        tar.status.success() && tar.stdout.len() % 512 == 0 && listing.contains("d/f"),
+        "an archive on stdout: {}",
+        String::from_utf8_lossy(&tar.stderr)
+    );
+    assert!(
+        cp_in.status.success(),
+        "cp in: {}",
+        String::from_utf8_lossy(&cp_in.stderr)
+    );
+    let inside = String::from_utf8_lossy(&inside.stdout);
+    assert!(
+        inside.contains("from-host") && inside.contains("/etc/shadow"),
+        "a host tree arrives, its link as a link: {inside}"
+    );
+    if made.is_ok_and(|s| s.success()) {
+        assert!(
+            String::from_utf8_lossy(&pre.stdout).contains("from-host"),
+            "--copy-in landed before the command: {} {}",
+            String::from_utf8_lossy(&pre.stdout),
+            String::from_utf8_lossy(&pre.stderr)
+        );
+    }
+}
+
 /// A secret is READ-ONLY in the box, for its root too, as Docker's bind of a secret file is.
 /// MEASURED before: the write bit was dropped, which binds every user but root, and `echo x >>
 /// /run/secrets/s` from a compose service succeeded under kern where Docker said "Read-only file

@@ -125,7 +125,8 @@ fn write_0600(path: &std::path::Path, body: &str) -> std::io::Result<()> {
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn b64_encode(input: &[u8]) -> String {
+/// Standard base64 with padding (also the encoding of Docker's `X-Docker-Container-Path-Stat`).
+pub fn b64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b = [

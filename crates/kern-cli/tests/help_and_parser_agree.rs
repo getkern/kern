@@ -693,7 +693,9 @@ fn every_flag_box_parses_is_advertised_in_its_help() {
         //  --overlay-lower   the build path hands a RUN step an already-resolved layer chain.
         //  --overlay-upper   the build path hands it the persistent upper for that step.
         //  --log-streams     `kern compat docker` asks for stdout and stderr kept apart in the log.
+        //  --copy-in         `kern compat docker` hands a created container's copied archives on.
         const INTERNAL: &[&str] = &[
+            "--copy-in",
             "--def-hash",
             "--log-streams",
             "--overlay-lower",

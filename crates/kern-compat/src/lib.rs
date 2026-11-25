@@ -111,8 +111,9 @@ fn strip_version(path: &str) -> &str {
 /// What reading one request ended in.
 enum Read1 {
     Request(Request),
-    /// `POST /images/load`, its body left on the connection: an image archive is as large as the
-    /// image, so it is streamed to `kern load` rather than read into memory under [`MAX_BODY`].
+    /// `POST /images/load` or `PUT /containers/<id>/archive`, its body left on the connection: an
+    /// archive is as large as what it carries, so it is streamed to `kern load` or `kern cp` rather
+    /// than read into memory under [`MAX_BODY`].
     Load(Request, Framing),
     /// The client closed between requests.
     Closed,
@@ -252,7 +253,10 @@ fn read_request(r: &mut BufReader<UnixStream>) -> Read1 {
         }
     }
     let (raw_path, raw_query) = target.split_once('?').unwrap_or((target, ""));
-    let streamed = method == "POST" && strip_version(raw_path) == "/images/load";
+    // A body as large as what it carries goes to its handler on the connection, not into memory:
+    // an image archive to `kern load`, a `docker cp` archive to `kern cp - <box>:<dir>`.
+    let streamed = (method == "POST" && strip_version(raw_path) == "/images/load")
+        || (method == "PUT" && is_archive_path(strip_version(raw_path)));
     let body = if streamed {
         Vec::new()
     } else if chunked {
@@ -299,6 +303,12 @@ fn read_request(r: &mut BufReader<UnixStream>) -> Read1 {
     Read1::Request(req)
 }
 
+/// `/containers/<id>/archive`, the path `docker cp` writes into a container with `PUT`.
+fn is_archive_path(p: &str) -> bool {
+    let segs: Vec<&str> = p.trim_matches('/').split('/').collect();
+    matches!(segs.as_slice(), ["containers", id, "archive"] if !id.is_empty())
+}
+
 /// A `Transfer-Encoding: chunked` body, bounded by [`MAX_BODY`]: [`copy_body`] into memory, a
 /// body over the cap said as such (MEASURED: a 7.8 MB `docker load` was answered "a chunked body
 /// that does not parse", which sent the reader looking for a fault in the client).
@@ -338,6 +348,8 @@ pub(crate) enum Response {
         content_type: &'static str,
         /// Answer `101` and hand the connection over, as Docker does when the client asked for it.
         upgrade: bool,
+        /// More head lines (an archive's `X-Docker-Container-Path-Stat`).
+        extra: Vec<(&'static str, String)>,
         writer: Box<dyn FnOnce(&mut Out) + Send>,
     },
 }
@@ -485,8 +497,10 @@ fn write_response(w: &mut UnixStream, resp: Response, head_only: bool, input: &[
             status,
             content_type,
             upgrade,
+            extra,
             writer,
         } => {
+            let extra: String = extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
             let head = if upgrade {
                 format!(
                     "HTTP/1.1 101 UPGRADED\r\nContent-Type: {content_type}\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nApi-Version: {}\r\n\r\n",
@@ -494,7 +508,7 @@ fn write_response(w: &mut UnixStream, resp: Response, head_only: bool, input: &[
                 )
             } else {
                 format!(
-                "HTTP/1.1 {status} {}\r\nServer: kern/{}\r\nApi-Version: {}\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} {}\r\nServer: kern/{}\r\nApi-Version: {}\r\nContent-Type: {content_type}\r\n{extra}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
                 reason(status),
                 kern_common::VERSION,
                 api::API_VERSION
@@ -541,7 +555,11 @@ fn serve_connection(stream: UnixStream, kern: &Path) {
             // The connection ends after a load: its body was read by the load itself, and one that
             // stopped early leaves the rest of it on the connection.
             Read1::Load(req, framing) => {
-                let resp = api::image_load(&req, kern, &mut r, framing);
+                let resp = if req.method == "PUT" {
+                    api::archive_put(&req, kern, &mut r, framing)
+                } else {
+                    api::image_load(&req, kern, &mut r, framing)
+                };
                 let _ = write_response(&mut w, resp, false, &[]);
                 return;
             }

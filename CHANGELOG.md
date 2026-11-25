@@ -104,6 +104,16 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**`kern cp` copies directories, as `docker cp` does, and `docker cp` works through kern's socket.**
+`kern cp` copied single files only. It copies a whole tree now, keeps a symlink as a symlink (`-L`
+follows the one SRC names) and a hardlink as a hardlink, takes Docker's destination rules (into an
+existing directory, renamed, `/.` for the contents) and `-` for a tar on stdout or stdin. Every path
+on the box's side is still resolved inside the box, and on the host side a member, or a link it goes
+through, that would leave the destination is refused. The Docker API serves
+`/containers/{id}/archive`, so `docker cp` works in both directions, and a file copied into a
+container that has been created and not started (how Testcontainers copies its files) is in place
+when its command starts.
+
 **The Docker API's 501 says what does the job.** An endpoint it does not serve (networks, volumes,
 build) answered "not translated by kern-serve in this phase"; `docker compose` through the socket
 stops at its first network call, and the answer now names `kern compose -f <file> up` (or `kern

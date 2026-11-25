@@ -67,6 +67,9 @@ pub enum Command {
         image: Option<String>,
         /// `--pull <missing|never|always>`: registry-image fetch policy (see [`commands::PullPolicy`]).
         pull: commands::PullPolicy,
+        /// INTERNAL `--copy-in <archive>` (repeatable, written by the Docker API): see
+        /// [`commands::BoxRunArgs::copy_in`].
+        copy_in: Vec<String>,
         /// `--platform <os/arch>`: run that platform's image, through the kernel's binfmt handler
         /// when it is not this machine's (`docker run --platform`). `None`: this machine's.
         platform: Option<kern_oci::Platform>,
@@ -378,6 +381,8 @@ pub enum Command {
     Cp {
         src: String,
         dst: String,
+        /// `-L`/`--follow-link`: copy what a symlink SRC points to, not the link.
+        follow: bool,
     },
     /// `kern pull <image>`: fetch an OCI image into the cache. `--dest <dir>` extracts a rootfs
     /// instead.
@@ -1773,17 +1778,20 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "cp -a/--archive preserves uid/gid, which a rootless copy cannot: the box's ids live in a subuid range and do not exist on the host (a box's uid 999 is the host's 100998). The mode IS preserved without the flag; for ownership, copy inside the box and set it there".to_string(),
                 ));
             }
-            reject_unknown_flags("cp", &rest, &[])?;
+            reject_unknown_flags("cp", &rest, &["-L", "--follow-link"])?;
+            let follow = rest.iter().any(|a| *a == "-L" || *a == "--follow-link");
+            // `-` is a positional: the archive on stdin or stdout, as `docker cp` reads it.
             let pos: Vec<&str> = rest
                 .iter()
                 .skip(1)
-                .filter(|a| !a.starts_with('-'))
+                .filter(|a| !a.starts_with('-') || **a == "-")
                 .copied()
                 .collect();
             match pos.as_slice() {
                 [src, dst] => Command::Cp {
                     src: (*src).to_string(),
                     dst: (*dst).to_string(),
+                    follow,
                 },
                 _ => {
                     return Err(Error::Usage(
@@ -4121,6 +4129,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--overlay-lower",
     "--overlay-upper",
     "--pids-limit",
+    "--copy-in",
     "--platform",
     "--pod",
     "--pod-bridge",
@@ -4259,6 +4268,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut image: Option<String> = None;
     let mut pull = commands::PullPolicy::default();
     let mut platform: Option<kern_oci::Platform> = None;
+    let mut copy_in: Vec<String> = Vec::new();
     let mut plan = false;
     let mut detached = false;
     let mut read_only = false;
@@ -5001,6 +5011,14 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // force a fresh network pull with an atomic cache swap.
                 // `--platform <os/arch>` (Docker parity): the image of that platform, from its own
                 // cache entry, the one `kern pull --platform` and `kern build --platform` fill.
+                "--copy-in" => {
+                    i += 1;
+                    copy_in.push(
+                        rest.get(i)
+                            .ok_or(Error::Usage("--copy-in <archive>"))?
+                            .to_string(),
+                    );
+                }
                 "--platform" => {
                     i += 1;
                     let want = rest
@@ -5672,6 +5690,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             image,
             pull,
             platform,
+            copy_in,
             command,
             entrypoint,
             detached,
@@ -7090,6 +7109,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             image,
             pull,
             platform,
+            copy_in,
             command,
             entrypoint,
             detached,
@@ -7244,6 +7264,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     tty,
                     ports: &ports,
                     secrets: &secrets,
+                    copy_in: &copy_in,
                     secret_envs: &secret_envs,
                     secret_mode,
                     ssh_port,
@@ -7519,7 +7540,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         }
         Command::Pause { names, all, freeze } => commands::pause(&names, all, freeze),
         Command::Attach { name } => commands::attach(&name),
-        Command::Cp { src, dst } => crate::boxcp::cp(&src, &dst),
+        Command::Cp { src, dst, follow } => crate::boxcp::cp(&src, &dst, follow),
         Command::Ps {
             json,
             quiet,

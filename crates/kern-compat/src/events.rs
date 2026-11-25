@@ -153,6 +153,7 @@ pub(crate) fn events(req: &Request) -> Response {
         status: 200,
         content_type: "application/json",
         upgrade: false,
+        extra: Vec::new(),
         writer: Box::new(move |w: &mut crate::Out| stream(&rx, &filters, w)),
     }
 }
