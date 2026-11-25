@@ -2148,6 +2148,19 @@ fn compose_inner(o: ComposeOpts<'_>) -> Result<(), Error> {
     // split, so `config` prints the name that will be mounted and `down -v` removes the name that
     // was. See `scope_named_volumes` for the measurement that made this necessary.
     let owned_volumes = scope_named_volumes(&mut boxes, &pod);
+    // A VOLUME THE FILE PUTS AT A DIRECTORY (`driver_opts: {type: none, o: bind, device: <dir>}`)
+    // is a kern volume at that directory, made here, on the verbs that start boxes only: `config`
+    // reports the file and makes nothing. Scoped as every named volume of the project is.
+    if matches!(
+        action,
+        ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart | ComposeAction::Run
+    ) {
+        for b in &boxes {
+            for (key, dir) in &b.volume_paths {
+                crate::volume::ensure_at_path(&format!("{pod}_{key}"), dir)?;
+            }
+        }
+    }
     // THE OLD NAME'S VOLUMES ARE MOVED TO THE NEW ONE, so taking Docker's project name loses no
     // data: `<old>_<volume>` becomes `<project>_<volume>` when the new name does not exist yet and
     // nothing has the old one mounted. Only by a bring-up, which is about to mount them.

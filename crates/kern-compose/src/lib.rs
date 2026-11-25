@@ -464,6 +464,11 @@ pub struct ComposeBox {
     /// declaration carries one and the compose key otherwise - the same rewrite is applied to
     /// `volumes` so the existence check and the mount cannot be about two different volumes.
     pub external_volumes: Vec<String>,
+    /// Volumes the top-level block puts at a directory (`driver_opts: {type: none, o: bind, device:
+    /// <dir>}`, Docker's local driver), as `(volume key, directory)`. The compose driver makes each
+    /// one a kern volume at that directory (`kern volume create --path`) before the box starts; the
+    /// mount stays an ordinary named entry in `volumes`.
+    pub volume_paths: Vec<(String, String)>,
     pub env: Vec<String>,
     pub env_file: Vec<String>,
     pub ports: Vec<String>,
@@ -1674,6 +1679,7 @@ impl ComposeBox {
             expose,
             volumes,
             external_volumes,
+            volume_paths,
             env,
             env_file,
             ports,
@@ -5007,6 +5013,12 @@ mod contract_tests {
                 "the YAML parser resolves it into `volumes` after the whole file is read (the named \
                  service may be defined below the one that inherits it), so the box sees ordinary \
                  `--volume` arguments and this field is the record of where they came from",
+            ),
+            (
+                "volume_paths",
+                "the compose driver makes each one a kern volume at its directory before the box \
+                 starts (`kern volume create --path`); the mount itself is an ordinary named entry in \
+                 `volumes`",
             ),
             (
                 "external_volumes",

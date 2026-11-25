@@ -825,6 +825,8 @@ fn parse_document(
         .take_while(|b| !imported_names.contains(&b.name))
         .count();
     mark_external_volumes(&mut boxes[..own_len], &external_volumes);
+    let drivers = collect_volume_drivers(&root)?;
+    apply_volume_drivers(&mut boxes[..own_len], &drivers);
     // AND THE EXTERNAL NETWORKS EACH SERVICE IS ON, which is the intersection of two blocks that may
     // appear in either order: the top-level `networks:` says which are external, each service's own
     // `networks:` says which it joined. Done here, after every service exists, for the same reason
@@ -3509,6 +3511,152 @@ fn collect_external_volumes(
         out.insert(key, real);
     }
     Ok(out)
+}
+
+/// What a top-level volume's `driver`/`driver_opts` ask for, read as Docker's `local` driver reads them.
+#[derive(Debug, Clone, PartialEq)]
+enum VolumeDriverDecl {
+    /// `type: none` (or `bind`), `o: bind`, `device: <dir>`: the volume's files are in that directory.
+    Bind(String),
+    /// `type: nfs` / `cifs`: a network share, mounted as kern mounts `-v nfs://` / `-v smb://`.
+    Url(String),
+    /// `type: tmpfs`: memory, with `o: size=N` when given.
+    Tmpfs(Option<String>),
+}
+
+/// The top-level volumes whose `driver`/`driver_opts` say where their files are.
+///
+/// SILENTLY IGNORED BEFORE, and MEASURED: `driver_opts: {type: none, o: bind, device: /srv/x}` put
+/// the data in a kern volume of its own while `/srv/x`, where Docker writes it, stayed empty. On a
+/// server that is the form a stack keeps its data on a disk with. Every shape Docker's local driver
+/// takes is honoured, and anything else is refused with what to write instead: nothing is ignored.
+fn collect_volume_drivers(
+    root: &Node,
+) -> Result<std::collections::HashMap<String, VolumeDriverDecl>, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(vols) = root.child("volumes") else {
+        return Ok(out);
+    };
+    let text = |n: Option<&Node>| -> Option<String> {
+        n.and_then(|n| n.scalar.as_deref())
+            .map(scalar_str)
+            .filter(|s| !s.is_empty())
+    };
+    for (key, def) in &vols.children {
+        let key = key.trim().to_string();
+        if def.child("external").is_some_and(scalar_is_true) {
+            continue;
+        }
+        let driver = text(def.child("driver"));
+        if let Some(d) = driver.as_deref().filter(|d| *d != "local") {
+            return Err(format!(
+                "volume '{key}' uses the volume driver '{d}'; kern has Docker's local driver only. \
+                 For a NAS use `driver_opts: {{type: nfs, o: addr=HOST, device: \":/export\"}}` or \
+                 mount it on the host and use `device:` with `type: none, o: bind`"
+            ));
+        }
+        let Some(opts) = def.child("driver_opts") else {
+            continue;
+        };
+        let typ = text(opts.child("type"));
+        let o = text(opts.child("o")).unwrap_or_default();
+        let device = text(opts.child("device"));
+        let o_has = |k: &str| o.split(',').any(|x| x.trim() == k);
+        let o_val = |k: &str| {
+            o.split(',')
+                .find_map(|x| x.trim().strip_prefix(&format!("{k}=")).map(str::to_string))
+        };
+        let decl = match typ.as_deref() {
+            Some("none" | "bind") | None if o_has("bind") || o_has("rbind") || typ.is_some() => {
+                let dev = device.ok_or_else(|| {
+                    format!("volume '{key}': a bind volume names its directory in `device:`")
+                })?;
+                if !dev.starts_with('/') {
+                    return Err(format!(
+                        "volume '{key}': `device: {dev}` must be an absolute path, as Docker's local \
+                         driver requires"
+                    ));
+                }
+                VolumeDriverDecl::Bind(dev)
+            }
+            Some("nfs" | "nfs4") => {
+                let dev = device.unwrap_or_default();
+                let (host, path) = match (o_val("addr"), dev.split_once(':')) {
+                    (Some(a), Some((_, p))) => (a, p.to_string()),
+                    (None, Some((h, p))) if !h.is_empty() => (h.to_string(), p.to_string()),
+                    _ => {
+                        return Err(format!(
+                            "volume '{key}': an nfs volume needs `o: addr=HOST` and `device: \":/export\"`"
+                        ))
+                    }
+                };
+                VolumeDriverDecl::Url(format!("nfs://{host}{path}"))
+            }
+            Some("cifs" | "smb") => {
+                if o_val("username").is_some() || o_val("password").is_some() {
+                    return Err(format!(
+                        "volume '{key}': kern does not pass share credentials from a compose file; \
+                         mount the share on the host and use `type: none, o: bind, device: <dir>`"
+                    ));
+                }
+                let dev = device.unwrap_or_default();
+                let share = dev.trim_start_matches('/');
+                if share.is_empty() {
+                    return Err(format!("volume '{key}': a cifs volume names `device: //HOST/share`"));
+                }
+                VolumeDriverDecl::Url(format!("smb://{share}"))
+            }
+            Some("tmpfs") => VolumeDriverDecl::Tmpfs(o_val("size")),
+            Some(t) => {
+                return Err(format!(
+                    "volume '{key}': `driver_opts` type '{t}' is not one kern mounts (it takes none \
+                     with o: bind, nfs, cifs and tmpfs); mount it on the host and use `type: none, \
+                     o: bind, device: <dir>`"
+                ))
+            }
+            None => continue,
+        };
+        out.insert(key, decl);
+    }
+    Ok(out)
+}
+
+/// Point each service's mount of a declared volume where its driver options say.
+fn apply_volume_drivers(
+    boxes: &mut [ComposeBox],
+    drivers: &std::collections::HashMap<String, VolumeDriverDecl>,
+) {
+    if drivers.is_empty() {
+        return;
+    }
+    for b in boxes.iter_mut() {
+        let mut keep = Vec::with_capacity(b.volumes.len());
+        for v in std::mem::take(&mut b.volumes) {
+            let decl = v.split_once(':').and_then(|(src, _)| drivers.get(src).map(|d| (src, d)));
+            match decl {
+                Some((src, VolumeDriverDecl::Bind(dev))) => {
+                    let pair = (src.to_string(), dev.clone());
+                    if !b.volume_paths.contains(&pair) {
+                        b.volume_paths.push(pair);
+                    }
+                    keep.push(v);
+                }
+                Some((_, VolumeDriverDecl::Url(url))) => {
+                    let rest = v.split_once(':').map_or("", |(_, r)| r);
+                    keep.push(format!("{url}:{rest}"));
+                }
+                Some((_, VolumeDriverDecl::Tmpfs(size))) => {
+                    let dst = v.split(':').nth(1).unwrap_or_default();
+                    b.tmpfs_from_volumes.push(match size {
+                        Some(n) => format!("{dst}:size={n}"),
+                        None => dst.to_string(),
+                    });
+                }
+                None => keep.push(v),
+            }
+        }
+        b.volumes = keep;
+    }
 }
 
 /// Mark (and, where `name:` renames them, rewrite) the mounts of volumes declared `external: true`.
@@ -11011,6 +11159,42 @@ mod tests {
     /// without the scratch mount it asked for. It is kept in its OWN field rather than appended to
     /// `tmpfs`, because the `tmpfs:` key assigns that field and would erase it depending on key
     /// order - the same defect `devices` had.
+    /// A TOP-LEVEL VOLUME'S `driver_opts` SAY WHERE ITS FILES ARE, as Docker's local driver reads
+    /// them, and were ignored: the data went to a kern volume while the `device:` stayed empty.
+    #[test]
+    fn local_driver_options_put_a_volume_where_they_say_or_are_refused() {
+        let file = |vols: &str| {
+            format!(
+                "services:\n  a:\n    image: alpine\n    volumes: [b:/b, n:/n, c:/c, t:/t, e:/e]\nvolumes:\n{vols}"
+            )
+        };
+        let ok = file(concat!(
+            "  b: {driver: local, driver_opts: {type: none, o: bind, device: /srv/data}}\n",
+            "  n: {driver_opts: {type: nfs, o: \"addr=10.0.0.5,rw\", device: \":/export/x\"}}\n",
+            "  c: {driver_opts: {type: cifs, device: //nas/share}}\n",
+            "  t: {driver_opts: {type: tmpfs, device: tmpfs, o: size=16m}}\n",
+            "  e: {external: true}\n",
+        ));
+        let b = parse(&ok).expect("parses").remove(0);
+        assert_eq!(b.volume_paths, vec![("b".to_string(), "/srv/data".to_string())]);
+        assert!(b.volumes.contains(&"b:/b".to_string()), "a bind volume stays a named mount");
+        assert!(b.volumes.contains(&"nfs://10.0.0.5/export/x:/n".to_string()), "{:?}", b.volumes);
+        assert!(b.volumes.contains(&"smb://nas/share:/c".to_string()), "{:?}", b.volumes);
+        assert!(!b.volumes.iter().any(|v| v.ends_with(":/t")), "tmpfs leaves the volumes");
+        assert_eq!(b.tmpfs_from_volumes, vec!["/t:size=16m".to_string()]);
+        assert!(b.volumes.contains(&"e:/e".to_string()), "an external volume is untouched");
+        for (bad, why) in [
+            ("  b: {driver: rexray}\n", "driver"),
+            ("  b: {driver_opts: {type: none, o: bind, device: rel/dir}}\n", "absolute"),
+            ("  b: {driver_opts: {type: ext4, device: /dev/sdb1}}\n", "type 'ext4'"),
+            ("  b: {driver_opts: {type: cifs, o: \"username=u,password=p\", device: //h/s}}\n", "credentials"),
+        ] {
+            let src = format!("services:\n  a:\n    image: alpine\n    volumes: [b:/b]\nvolumes:\n{bad}");
+            let e = parse(&src).expect_err(bad);
+            assert!(e.to_string().contains(why), "{bad}: {e}");
+        }
+    }
+
     #[test]
     fn a_long_form_tmpfs_volume_becomes_a_tmpfs_mount_whatever_the_key_order() {
         let svc = |body: &str| {

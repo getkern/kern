@@ -641,7 +641,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
     // through verbatim, so this is the first place the subcommand is known.
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.first().map(String::as_str) {
-        Some("create" | "c") => create(&args[1..]),
+        Some("create" | "c") => create(&args[1..]).map(|name| println!("{name}")),
         Some("ls" | "list") => {
             // `--format json` IS DOCKER'S SPELLING of what `--json` asks for here, and a script
             // ported across carries it. Mapped onto the one renderer; any other template is refused
@@ -721,7 +721,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
     }
 }
 
-fn create(args: &[String]) -> Result<(), Error> {
+/// `volume create`: the volume made, its name returned for the caller to print (the CLI does, as
+/// Docker does; `compose up` does not, its own output says what it brought up).
+fn create(args: &[String]) -> Result<String, Error> {
     let (mut name, mut size): (Option<&str>, Option<u64>) = (None, None);
     let mut path: Option<String> = None;
     // The `--name=` form owns its string (it is a slice of one argument, not an argument), so it is
@@ -878,8 +880,32 @@ fn create(args: &[String]) -> Result<(), Error> {
     // disposition.
     std::fs::write(vol.join("meta.json"), meta)
         .map_err(|e| Error::Volume(format!("cannot write volume metadata for '{name}': {e}")))?;
-    println!("{name}");
-    Ok(())
+    Ok(name.to_string())
+}
+
+/// The volume `name` at the directory `dir`, made when missing (`compose up` for a volume declared
+/// `driver_opts: {type: none, o: bind, device: <dir>}`). An existing volume must already be at that
+/// directory: one elsewhere, or in kern's volumes directory, is refused with how to fix it, because
+/// mounting it would put the stack's data somewhere the file does not say.
+pub(crate) fn ensure_at_path(name: &str, dir: &str) -> Result<(), Error> {
+    validate(name)?;
+    let vol = volumes_dir().join(name);
+    if !vol.join("data").is_dir() {
+        return create(&[name.to_string(), "--path".to_string(), dir.to_string()]).map(|_| ());
+    }
+    let want = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
+    match device_of(&vol) {
+        Some(d) if std::fs::canonicalize(&d).map_or(d == want, |c| c == want) => Ok(()),
+        now => Err(Error::Volume(format!(
+            "volume '{name}' already exists {}, and the compose file puts it at {dir}. Remove it \
+             (`kern compose down -v`, or `kern volume rm {name}`, which takes the data in kern's \
+             volumes directory with it) and bring the stack up again",
+            now.map_or_else(
+                || "in kern's volumes directory".to_string(),
+                |d| format!("at {}", d.display())
+            )
+        ))),
+    }
 }
 
 /// Rename and/or re-quota an existing volume. `new_name == orig` keeps the name; `size = None` clears
