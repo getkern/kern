@@ -3518,8 +3518,6 @@ fn collect_external_volumes(
 enum VolumeDriverDecl {
     /// `type: none` (or `bind`), `o: bind`, `device: <dir>`: the volume's files are in that directory.
     Bind(String),
-    /// `type: nfs` / `cifs`: a network share, mounted as kern mounts `-v nfs://` / `-v smb://`.
-    Url(String),
     /// `type: tmpfs`: memory, with `o: size=N` when given.
     Tmpfs(Option<String>),
 }
@@ -3579,32 +3577,17 @@ fn collect_volume_drivers(
                 }
                 VolumeDriverDecl::Bind(dev)
             }
-            Some("nfs" | "nfs4") => {
-                let dev = device.unwrap_or_default();
-                let (host, path) = match (o_val("addr"), dev.split_once(':')) {
-                    (Some(a), Some((_, p))) => (a, p.to_string()),
-                    (None, Some((h, p))) if !h.is_empty() => (h.to_string(), p.to_string()),
-                    _ => {
-                        return Err(format!(
-                            "volume '{key}': an nfs volume needs `o: addr=HOST` and `device: \":/export\"`"
-                        ))
-                    }
-                };
-                VolumeDriverDecl::Url(format!("nfs://{host}{path}"))
-            }
-            Some("cifs" | "smb") => {
-                if o_val("username").is_some() || o_val("password").is_some() {
-                    return Err(format!(
-                        "volume '{key}': kern does not pass share credentials from a compose file; \
-                         mount the share on the host and use `type: none, o: bind, device: <dir>`"
-                    ));
-                }
-                let dev = device.unwrap_or_default();
-                let share = dev.trim_start_matches('/');
-                if share.is_empty() {
-                    return Err(format!("volume '{key}': a cifs volume names `device: //HOST/share`"));
-                }
-                VolumeDriverDecl::Url(format!("smb://{share}"))
+            // A NETWORK SHARE IS REFUSED HERE, with the way that works. kern mounts `nfs://` and
+            // `smb://` for a foreground box only, and a stack's services are detached: translated, the
+            // mount failed at start with a sentence about `-d` (MEASURED). Mounted on the host, the
+            // share is a directory, and a bind volume puts the stack's data on it.
+            Some(t @ ("nfs" | "nfs4" | "cifs" | "smb")) => {
+                return Err(format!(
+                    "volume '{key}': `driver_opts: {{type: {t}}}` - kern mounts a network share for a \
+                     foreground box (`kern run -v nfs://host/path:/dst`), not for a stack's services. \
+                     Mount the share on the host (fstab, autofs, your file manager) and use `type: \
+                     none, o: bind, device: <its mount point>`"
+                ))
             }
             Some("tmpfs") => VolumeDriverDecl::Tmpfs(o_val("size")),
             Some(t) => {
@@ -3640,10 +3623,6 @@ fn apply_volume_drivers(
                         b.volume_paths.push(pair);
                     }
                     keep.push(v);
-                }
-                Some((_, VolumeDriverDecl::Url(url))) => {
-                    let rest = v.split_once(':').map_or("", |(_, r)| r);
-                    keep.push(format!("{url}:{rest}"));
                 }
                 Some((_, VolumeDriverDecl::Tmpfs(size))) => {
                     let dst = v.split(':').nth(1).unwrap_or_default();
@@ -11172,21 +11151,17 @@ mod tests {
     fn local_driver_options_put_a_volume_where_they_say_or_are_refused() {
         let file = |vols: &str| {
             format!(
-                "services:\n  a:\n    image: alpine\n    volumes: [b:/b, n:/n, c:/c, t:/t, e:/e]\nvolumes:\n{vols}"
+                "services:\n  a:\n    image: alpine\n    volumes: [b:/b, t:/t, e:/e]\nvolumes:\n{vols}"
             )
         };
         let ok = file(concat!(
             "  b: {driver: local, driver_opts: {type: none, o: bind, device: /srv/data}}\n",
-            "  n: {driver_opts: {type: nfs, o: \"addr=10.0.0.5,rw\", device: \":/export/x\"}}\n",
-            "  c: {driver_opts: {type: cifs, device: //nas/share}}\n",
             "  t: {driver_opts: {type: tmpfs, device: tmpfs, o: size=16m}}\n",
             "  e: {external: true}\n",
         ));
         let b = parse(&ok).expect("parses").remove(0);
         assert_eq!(b.volume_paths, vec![("b".to_string(), "/srv/data".to_string())]);
         assert!(b.volumes.contains(&"b:/b".to_string()), "a bind volume stays a named mount");
-        assert!(b.volumes.contains(&"nfs://10.0.0.5/export/x:/n".to_string()), "{:?}", b.volumes);
-        assert!(b.volumes.contains(&"smb://nas/share:/c".to_string()), "{:?}", b.volumes);
         assert!(!b.volumes.iter().any(|v| v.ends_with(":/t")), "tmpfs leaves the volumes");
         assert_eq!(b.tmpfs_from_volumes, vec!["/t:size=16m".to_string()]);
         assert!(b.volumes.contains(&"e:/e".to_string()), "an external volume is untouched");
@@ -11194,7 +11169,8 @@ mod tests {
             ("  b: {driver: rexray}\n", "driver"),
             ("  b: {driver_opts: {type: none, o: bind, device: rel/dir}}\n", "absolute"),
             ("  b: {driver_opts: {type: ext4, device: /dev/sdb1}}\n", "type 'ext4'"),
-            ("  b: {driver_opts: {type: cifs, o: \"username=u,password=p\", device: //h/s}}\n", "credentials"),
+            ("  b: {driver_opts: {type: nfs, o: addr=h, device: \":/x\"}}\n", "foreground box"),
+            ("  b: {driver_opts: {type: cifs, device: //h/s}}\n", "Mount the share on the host"),
         ] {
             let src = format!("services:\n  a:\n    image: alpine\n    volumes: [b:/b]\nvolumes:\n{bad}");
             let e = parse(&src).expect_err(bad);

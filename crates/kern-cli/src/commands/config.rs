@@ -244,6 +244,14 @@ fn prepare_dir(key: &str, value: &str) -> Result<(), Error> {
     // NOT INSIDE (OR AROUND) THE RUNTIME REGISTRY OR THE CONFIG, checked on the path it would have
     // before anything is made: the registry is cleared at reboot and holds what kern trusts about
     // running boxes, the config holds credentials, and neither is a place for data.
+    if let Some(open) = crate::registry::open_ancestor(std::path::Path::new(value.trim())) {
+        return Err(Error::Config(format!(
+            "{key}: {} can be written by any user and has no sticky bit, so anyone could rename or \
+             replace the directory under it; choose a place under one only you can write (or \
+             `chmod o-w` it)",
+            open.display()
+        )));
+    }
     if let Some(planned) = crate::commands::planned_bind_source(value.trim()) {
         let roots = [
             crate::registry::registry_root_pub(),

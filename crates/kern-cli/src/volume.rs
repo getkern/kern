@@ -842,6 +842,14 @@ fn create(args: &[String]) -> Result<String, Error> {
             }
             // CHECKED BEFORE IT IS MADE: creating first left an empty directory inside kern's own
             // state for a refused path (MEASURED: `--path /run/user/1000/kern/x`).
+            if let Some(open) = crate::registry::open_ancestor(&dir) {
+                return Err(Error::Volume(format!(
+                    "volume '{name}': {} can be written by any user and has no sticky bit, so anyone \
+                     could replace the directory under it; choose a place under one only you can \
+                     write (or `chmod o-w` it)",
+                    open.display()
+                )));
+            }
             if let Some(state) = crate::commands::planned_bind_source(&dir.to_string_lossy())
                 .and_then(|planned| crate::registry::trusted_state_overlap(&planned))
             {

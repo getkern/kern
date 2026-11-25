@@ -1399,6 +1399,12 @@ fn scope_named_volumes(boxes: &mut [crate::compose::ComposeBox], project: &str) 
     let mut owned: Vec<String> = Vec::new();
     for b in boxes.iter_mut() {
         for v in b.volumes.iter_mut() {
+            // A NETWORK MOUNT IS NOT A NAME (`nfs://host/x:/dst`, which a volume's `driver_opts:
+            // {type: nfs}` becomes): split at its first `:` it read as the volume `nfs` and came out
+            // `<project>_nfs://...`, a spec the box then refused for its shape (MEASURED).
+            if crate::volume::is_network(v) {
+                continue;
+            }
             let Some((src, rest)) = v.split_once(':') else {
                 continue; // malformed spec: `kern box` reports it precisely
             };

@@ -350,6 +350,18 @@ fn boot_time() -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
 }
 
+/// The first existing ancestor of `dir` (itself included) that any user may write to and that has no
+/// sticky bit: there anyone can rename or replace `dir`'s path, whatever `dir`'s own mode is, so a
+/// place for kern's data or a volume under it is not the user's to keep (the rule ssh's
+/// StrictModes applies to `~/.ssh`). `/tmp` has the sticky bit and passes.
+pub(crate) fn open_ancestor(dir: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    dir.ancestors()
+        .filter_map(|a| fs::metadata(a).ok().map(|m| (a, m)))
+        .find(|(_, m)| m.is_dir() && m.mode() & 0o002 != 0 && m.mode() & 0o1000 == 0)
+        .map(|(a, _)| a.to_path_buf())
+}
+
 /// `dir`, created `0700` when missing, and accepted only as a real directory this user owns.
 pub(crate) fn private_own_dir(dir: &Path) -> io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -4278,6 +4290,23 @@ mod deadline_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A PLACE UNDER A DIRECTORY ANY USER MAY WRITE, WITHOUT THE STICKY BIT, IS NOT THE USER'S: anyone
+    /// can rename or replace it there. With the sticky bit (as `/tmp`) it is.
+    #[test]
+    fn a_world_writable_parent_without_the_sticky_bit_is_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("kern-openanc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("dir");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert_eq!(open_ancestor(&d.join("vols/x")), Some(d.clone()));
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o1777)).expect("chmod");
+        assert_eq!(open_ancestor(&d.join("vols/x")), None, "the sticky bit protects it, as /tmp");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert_eq!(open_ancestor(&d.join("vols")), None);
+        let _ = fs::remove_dir_all(&d);
+    }
 
     /// A LOG FROM BEFORE THE BOOT IS ANOTHER RUN'S. On disk it survives the reboot, the pid comes
     /// round again, and appending to it showed that run's output as the new box's.

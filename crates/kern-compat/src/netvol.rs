@@ -682,15 +682,19 @@ fn volume_create(bin: &Path, req: &Request) -> Response {
             )
         }
     }
-    if body
-        .get("DriverOpts")
-        .and_then(Value::as_object)
-        .is_some_and(|o| !o.is_empty())
-    {
-        return error(
-            400,
-            "DriverOpts: kern's volumes take no driver options; create it with `kern volume create`",
-        );
+    // THE LOCAL DRIVER'S OPTIONS GO TO `kern volume create --opt`, which takes Docker's bind form
+    // (`type=none`, `o=bind`, `device=<dir>`: the volume's files in that directory) and refuses
+    // anything else with its reason. They were refused here wholesale, so a client creating a
+    // volume on a disk of its choosing could not (MEASURED: 400 for `device=`).
+    let mut opts: Vec<String> = Vec::new();
+    if let Some(o) = body.get("DriverOpts").and_then(Value::as_object) {
+        for (k, v) in o {
+            let Some(v) = v.as_str() else {
+                return error(400, &format!("DriverOpts {k:?}: a value is a string"));
+            };
+            opts.push("--opt".to_string());
+            opts.push(format!("{k}={v}"));
+        }
     }
     let name = match body
         .get("Name")
@@ -704,9 +708,12 @@ fn volume_create(bin: &Path, req: &Request) -> Response {
         return error(400, &format!("invalid volume name {name:?}"));
     }
     if !volume_names(bin).contains(&name) {
-        let (code, _, err) = kern(bin, &["volume", "create", &name]);
+        let mut args: Vec<&str> = vec!["volume", "create", &name];
+        args.extend(opts.iter().map(String::as_str));
+        let (code, _, err) = kern(bin, &args);
         if code != 0 {
-            return error(500, &kern_error(&err));
+            // Options kern refused are the request's fault, not the server's.
+            return error(if opts.is_empty() { 500 } else { 400 }, &kern_error(&err));
         }
         meta_write(
             "volumes",

@@ -3309,6 +3309,17 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             !log_none,
         )
     };
+    // A FOREGROUND BOX KEEPS NO LOG, journald included: its output is the terminal's, which is why
+    // `json-file` makes no file for it either. MEASURED: `kern run --rm --log-driver journald ...`
+    // printed its lines and the journal had none, the flag accepted and doing nothing. Said, on a
+    // terminal, rather than refused: `compose run` of a service that declares journald is the same
+    // shape, and it must still run.
+    if log_journald && !args.detached && args.log_driver_given && std::io::stderr().is_terminal() {
+        eprintln!(
+            "kern: note: --log-driver journald applies to a detached box (-d); this one's output goes \
+             to the terminal only, as kern keeps no log of a foreground box"
+        );
+    }
     // JOURNALD THAT IS NOT THERE IS A REFUSAL, as Docker refuses the container: a box started with a
     // driver that silently did nothing would leave the journal empty on the day it is read. WSL
     // without systemd, a container, a host without journald have no socket.
