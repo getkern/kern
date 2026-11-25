@@ -180,8 +180,9 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
   detached box's start pays nothing for it.
 - **Compose: a volume's `driver_opts` are honoured, not ignored.** `type: none, o: bind, device: <dir>`
   put the data in a kern volume of its own while `<dir>` stayed empty; it is now kept there, as Docker
-  keeps it. `type: nfs`, `cifs` and `tmpfs` mount as kern's `nfs://`, `smb://` and tmpfs; another
-  driver or type is refused with what to write instead.
+  keeps it. `type: tmpfs` is a tmpfs; `nfs` and `cifs` are refused with the way that works (mount the
+  share on the host and bind it); another driver or type is refused with what to write instead. The
+  Docker API's `POST /volumes/create` takes the same `DriverOpts`.
 - **`kern run` prints nothing of its own for a box isolated as expected**, as `docker run`. A line
   still says so when a boundary is open (`--net host`, a shared rootfs); `--verbose` shows the panel.
 - **Each part of kern's data can have a disk of its own.** `images_dir`, `volumes_dir`, `logs_dir`

@@ -551,10 +551,10 @@ octal. Dropping a mount changes what the command does, so it is never dropped qu
 
 **A volume driver other than `local`, or `driver_opts` kern does not mount.** The local driver's
 options are honoured: `type: none, o: bind, device: <dir>` keeps the volume's files in that directory
-(a kern volume at that path, made at `up`, left in place by `down -v`), `type: nfs` (`o: addr=HOST`,
-`device: ":/export"`) and `type: cifs` (`device: //HOST/share`) mount as `-v nfs://` and `-v smb://`,
-`type: tmpfs` (`o: size=N`) is a tmpfs. Anything else is refused with what to write instead, and cifs
-credentials in `o:` are refused rather than passed.
+(a kern volume at that path, made at `up`, left in place by `down -v`), `type: tmpfs` (`o: size=N`)
+is a tmpfs. `type: nfs` and `cifs` are refused with the way that works: kern mounts a network share
+for a foreground box (`-v nfs://...`), not for a stack's services, so mount the share on the host and
+bind its mount point. Anything else is refused with what to write instead.
 
 **Two services on the same internal port under `--pod`.** Declare the port each listens on, with
 `port:` or `expose:`. kern passes it as `PORT`, a convention and not a contract.
@@ -588,7 +588,7 @@ manual on purpose.
 | `create` | `create` | a kept box recorded and not started; `start` runs it |
 | `exec` | `exec` | joins the box's namespaces; `-t` allocates a PTY, `-i` does not |
 | `ps` / `inspect` / `stats` | same | `--filter`, `--format` (`--format json` is Docker's line per box), `--json`, `--no-trunc`; `inspect -f` takes docker's own paths (`.Image` the image's id, `.Config.Image` its name) for a running box and a kept one, stopped or between two runs; `kern top` is the live view |
-| `logs` | `logs` | `--tail`, `-f`, `-t`, `--since`/`--until`; the follow is a bounded read. Every box's output in one stream, ordered by time: `kern logs --all` (Docker has no CLI equivalent), and live in `kern top`, Logs tab, as Docker Desktop's Logs view (search, level and source filters, CSV export). `--log-driver none` (compose `logging: driver: none`) keeps nothing and `kern logs` says so, as Docker does; `json-file` and `local` are the default; `journald` (compose `logging: driver: journald`, the Docker API's `LogConfig`) also sends every line to the systemd journal with the box's name as `CONTAINER_NAME` and `SYSLOG_IDENTIFIER`, the file kept so `kern logs` still reads it (Docker's dual logging), and is refused where there is no journal; drivers that ship output elsewhere are refused |
+| `logs` | `logs` | `--tail`, `-f`, `-t`, `--since`/`--until`; the follow is a bounded read. Every box's output in one stream, ordered by time: `kern logs --all` (Docker has no CLI equivalent), and live in `kern top`, Logs tab, as Docker Desktop's Logs view (search, level and source filters, CSV export). `--log-driver none` (compose `logging: driver: none`) keeps nothing and `kern logs` says so, as Docker does; `json-file` and `local` are the default; `journald` (for a detached box, as kern keeps no log of a foreground one; compose `logging: driver: journald`, the Docker API's `LogConfig`) also sends every line to the systemd journal with the box's name as `CONTAINER_NAME` and `SYSLOG_IDENTIFIER`, the file kept so `kern logs` still reads it (Docker's dual logging), and is refused where there is no journal; drivers that ship output elsewhere are refused |
 | `stop` / `kill` | `stop` / `kill` | `stop` signals, waits 10 s, then SIGKILLs. `kill` is immediate (SIGKILL, exit 137); `kill -s SIGNAL` sends that signal to the box's init and nothing else, as `docker kill -s HUP` reloads a server; `compose kill` and `compose kill -s` the same, per service |
 | `pause` / `unpause` / `attach` | same | cgroup v2 freezer; Ctrl-C detaches and the box keeps running |
 | `cp` | `cp` | host↔box, running or kept (stopped, or between two runs, through a box on its layer that also mounts its volumes): files and directories, links kept as links (`-L` follows SRC), hardlinks kept, `-` a tar on stdout/stdin; symlinks cannot escape the box root |
