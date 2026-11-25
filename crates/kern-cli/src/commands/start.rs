@@ -760,7 +760,15 @@ fn seed_empty_named_volumes(lower: &[String], volumes: &[Volume]) -> Vec<String>
     let (own, seedable): (Vec<&Volume>, Vec<&Volume>) = seedable
         .into_iter()
         .partition(|v| image_dir_is_empty(lower, &v.target));
-    let own: Vec<String> = own.iter().map(|v| v.target.clone()).collect();
+    // NOT WHERE THE IMAGE HAS NOTHING: there is no owner or mode to inherit, and the box would give
+    // the volume's root the mode of the mount point kern itself creates (755), at every mount while
+    // the volume is empty. MEASURED (round 16, case c20): `chmod 777` on an empty volume was undone
+    // by the next box, so `--user 1000` could not write it; Docker keeps the volume's own mode there.
+    let own: Vec<String> = own
+        .iter()
+        .filter(|v| image_has_path(lower, &v.target))
+        .map(|v| v.target.clone())
+        .collect();
     if seedable.is_empty() {
         return own;
     }
@@ -785,6 +793,18 @@ fn seed_empty_named_volumes(lower: &[String], volumes: &[Volume]) -> Vec<String>
         // volume did before this existed.
     }
     own
+}
+
+/// Does any layer of the image have something at `target` (an empty directory counts)?
+fn image_has_path(lower: &[String], target: &str) -> bool {
+    let rel = target.trim_matches('/');
+    !rel.is_empty()
+        && lower.iter().any(|layer| {
+            std::path::Path::new(layer)
+                .join(rel)
+                .symlink_metadata()
+                .is_ok()
+        })
 }
 
 /// Does the image hold NOTHING at `target` but, at most, empty directories: in no layer a file, a
