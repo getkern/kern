@@ -59,7 +59,7 @@ by folder:
 | [serve-with-port.sh](edge/serve-with-port.sh) | Publish a box port to the host (`-p`), keep it up + health-checked (`--restart` / `--health-cmd`) |
 | [governed-run.sh](resources/governed-run.sh) | Govern CPU + memory, `kern limit` (no sandbox) and `--memory`/`--cpus` caps (OOM-enforced) |
 | [mounts-and-exec.sh](basics/mounts-and-exec.sh) | Data in/out with `-v` (+ `--env`/`--workdir`), and `kern exec` into a running box |
-| [with-network.sh](basics/with-network.sh) | Isolated by default; `--net` for outbound (DNS + fetch/install) |
+| [with-network.sh](basics/with-network.sh) | Outbound by default, as Docker's (DNS + fetch/install); `--network none` isolates |
 | [observe.sh](basics/observe.sh) | Daemonless observability: `kern logs` / `stats` / `top` |
 | [compose-stack.sh](compose/compose-stack.sh) + [stack.toml](compose/stack.toml) | Bring up a multi-box stack in dependency order |
 | [fan-out.sh](resources/fan-out.sh) | Run hundreds of isolated jobs in parallel (per-task sandboxing) |

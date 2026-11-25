@@ -22,10 +22,10 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # Build + test in a sandbox: repo mounted read-only, capped to 512 MiB, no host access.
+      # Build + test in a sandbox: repo mounted read-only, capped to 512 MiB, no network, no host access.
       # A non-zero exit from the workload propagates out as kern's exit code and fails the job.
       - name: Build and test in a kern box
         run: |
-          kern box ci --image alpine --read-only \
+          kern box ci --image alpine --read-only --tmpfs /tmp --network none \
             -v "$PWD:/src:ro" -w /src -m 512m -- \
             sh -c 'sh ci/build.sh'

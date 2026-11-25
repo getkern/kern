@@ -22,8 +22,8 @@ script='echo "[script] hello"; echo "[script] trying to read your SSH key..."; \
         echo "[script] writing /usr/local/bin/backdoor"; echo x > /usr/local/bin/backdoor; \
         echo "[script] done"'
 
-echo "==> running the untrusted script in an isolated box (no --net, no -v):"
-"$kern" box vet --image alpine -- sh -c "$script"
+echo "==> running the untrusted script in an isolated box (--network none, no -v):"
+"$kern" box vet --image alpine --network none -- sh -c "$script"
 
 echo
 echo "It ran in a throwaway overlay with no network and no access to your files."

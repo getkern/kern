@@ -1,7 +1,8 @@
 #!/bin/sh
-# Networking is OFF by default (isolated, loopback-only). Opt in with --net to share the host
-# network namespace - outbound connectivity for build/fetch steps. kern copies the host's
-# resolv.conf into the box so DNS resolves out of the box.
+# A box's network is Docker's by default: a NAT of its own, with outbound (DNS, fetch, install)
+# and no reach into the host's loopback-only services. `--network none` leaves the box loopback
+# only, which is what untrusted code should get. `--net` (`--network host`) shares the host's own
+# network namespace.
 #
 # Trade-off: --net means NO network isolation (host localhost + abstract sockets are reachable).
 # Use it for trusted work, not untrusted code. See SECURITY.md.
@@ -14,11 +15,11 @@ kern="${KERN:-kern}"
 printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
 
 
-echo "==> default (no --net): the box is isolated, outbound fails:"
-"$kern" box offline --image alpine -- \
-  sh -c 'wget -q -T3 -O- https://example.com >/dev/null 2>&1 && echo "reachable" || echo "no network (expected)"'
+echo "==> default: a NAT of the box's own, DNS + outbound work (install a package, fetch a URL):"
+"$kern" box online --image alpine -- \
+  sh -c 'apk add --no-cache curl >/dev/null 2>&1 && curl -fsS https://example.com | grep -o "<title>.*</title>"'
 
 echo
-echo "==> with --net: DNS + outbound work (install a package, fetch a URL):"
-"$kern" box online --image alpine --net -- \
-  sh -c 'apk add --no-cache curl >/dev/null 2>&1 && curl -fsS https://example.com | grep -o "<title>.*</title>"'
+echo "==> --network none: the box is isolated, outbound fails:"
+"$kern" box offline --image alpine --network none -- \
+  sh -c 'wget -q -T3 -O- https://example.com >/dev/null 2>&1 && echo "reachable" || echo "no network (expected)"'

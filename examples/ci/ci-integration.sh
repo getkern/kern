@@ -29,9 +29,10 @@ fi
 trap "$cleanup" EXIT
 
 echo "==> running the CI job in a kern box (same as github-actions.yml):"
-# --read-only + :ro: the build can read the repo but not mutate it or the host. -m caps memory.
-# No --net: hermetic build with no network. Exit code propagates so a failure stops you here too.
-if "$kern" box ci --image alpine --read-only \
+# --read-only + :ro: the build can read the repo but not mutate it or the host, with a fresh /tmp
+# (--tmpfs) for its scratch files, as `docker run --read-only --tmpfs /tmp` gives. -m caps memory.
+# --network none: hermetic build with no network. Exit code propagates so a failure stops you here too.
+if "$kern" box ci --image alpine --read-only --tmpfs /tmp --network none \
      -v "$root:/src:ro" -w /src -m 512m -- \
      sh -c 'sh ci/build.sh'; then
   echo "==> local CI green (exit 0) - CI will pass too"

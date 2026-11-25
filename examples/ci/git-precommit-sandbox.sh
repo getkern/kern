@@ -23,11 +23,11 @@ printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --
 #
 #   #!/bin/sh
 #   root="$(git rev-parse --show-toplevel)"
-#   kern box precommit --image alpine --read-only -v "$root:/src:ro" -w /src -- \
+#   kern box precommit --image alpine --read-only --network none -v "$root:/src:ro" -w /src -- \
 #     sh -c './ci/check.sh'          # <- your lint+test entrypoint; its exit code gates the commit
 #
 # --read-only + :ro binding: the checks can read the repo but cannot modify it or your host.
-# No --net: the checks cannot reach the network. Exit code propagates out as the hook's exit code.
+# --network none: the checks cannot reach the network. Exit code propagates out as the hook's exit code.
 # ---------------------------------------------------------------------------
 
 # --- Runnable demo of exactly what that hook does, on a throwaway repo ---
@@ -36,19 +36,25 @@ trap 'rm -rf "$repo"' EXIT
 # A stand-in project with a check script. Point the hook at your real repo instead.
 cat > "$repo/check.sh" <<'EOF'
 #!/bin/sh
-echo "[check] linting..."; grep -rq "TODO-BLOCKER" . && { echo "[check] found blocker marker"; exit 1; }
+# The marker is spelled in two halves, or this script would find it in itself.
+echo "[check] linting..."; grep -rq "TODO""-BLOCKER" . && { echo "[check] found blocker marker"; exit 1; }
 echo "[check] testing...";  [ "$(echo hi)" = "hi" ] || exit 1
 echo "[check] all green"
 EOF
 
 run_hook() {
   # Mirrors the hook body above: repo bound read-only, no network, exit code returned.
-  "$kern" box precommit --image alpine --read-only -v "$repo:/src:ro" -w /src -- \
+  "$kern" box precommit --image alpine --read-only --network none -v "$repo:/src:ro" -w /src -- \
     sh -c 'sh check.sh'
 }
 
 echo "==> commit #1: clean tree - checks pass, commit would be ALLOWED:"
-if run_hook; then echo "   hook exit 0 -> git proceeds with the commit"; fi
+if run_hook; then
+  echo "   hook exit 0 -> git proceeds with the commit"
+else
+  echo "   (unexpected) hook failed on a clean tree" >&2
+  exit 1
+fi
 
 echo
 echo "==> commit #2: someone left a blocker in the code - checks fail, commit is BLOCKED:"

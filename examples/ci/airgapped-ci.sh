@@ -30,15 +30,15 @@ fi
 echo "    -> refused (fail closed). A build step can't smuggle in an unpinned image."
 
 echo
-echo "==> [pipeline] every step is --pull never (cached base) AND network-off (kern's default):"
+echo "==> [pipeline] every step is --pull never (cached base) AND --network none:"
 echo "    build:"
-"$kern" box ci-build --image "$img" --pull never -v "$work:/out" -w /out -- \
+"$kern" box ci-build --image "$img" --pull never --network none -v "$work:/out" -w /out -- \
   sh -c 'echo compiled > artifact.txt; echo "      -> produced /out/artifact.txt"'
 echo "    test:"
-"$kern" box ci-test --image "$img" --pull never -v "$work:/out:ro" -- \
+"$kern" box ci-test --image "$img" --pull never --network none -v "$work:/out:ro" -- \
   sh -c '[ "$(cat /out/artifact.txt)" = compiled ] && echo "      -> tests green"'
 echo "    package:"
-"$kern" box ci-package --image "$img" --pull never -v "$work:/out" -w /out -- \
+"$kern" box ci-package --image "$img" --pull never --network none -v "$work:/out" -w /out -- \
   sh -c 'tar czf release.tgz artifact.txt && echo "      -> release.tgz built offline"'
 
 echo
