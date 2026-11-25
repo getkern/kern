@@ -170,6 +170,10 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
 - **`kern top`: a box's log is live, and `s`, `p`, `u` act on that box from it.** Enter on the Boxes
   tab showed the log as it was when pressed, and any key closed it, so `s` pressed to stop the box
   only closed the log. It follows the output now, `s` asks to stop that box, Esc goes back.
+- **`kern top` shows where kern's data is and moves it.** The Disk figure and the "Disk full" alert
+  measured `/`, not the disk the data is on. Both follow `data_dir` now; the Storage tab names the
+  place and its free space, and `m` lists the mounted disks (with what an exFAT card or a disk not
+  writable by you would take) to move it to, asking first.
 - **`kern top`: pasted text no longer answers a (y/n) prompt.** A command line pasted into top was
   read as keys, and `systemd` in it was `s` then `y`: the selected box was stopped. A `y` now confirms
   only when typed on its own, after the prompt.
