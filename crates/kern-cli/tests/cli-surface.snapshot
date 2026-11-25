@@ -38,7 +38,7 @@ COMMANDS:
     sandbox ls [--json] | history [-n N] [--failed] [--all] [--json] | stats [--all] [--json]  The SDK and MCP sandboxes: running now, finished, outcomes
     sandbox show [<box>] [-n N] [--json]                         The code SDK sandboxes ran and their output (kept with the history)
     sandbox keep|clear [memory|disk|off]                             Where the finished ones are kept (default memory: until reboot), or remove them
-    inspect <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
+    inspect <name> [--json] [-f|--format T] [--platform P]         Full detail for one box; -f renders a Go-style template
     port <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
     attach <name>                                                  Stream a box's output live (Ctrl-C detaches)
     cp [-L] <box>:<src> <dst> | [-L] <src> <box>:<dst>               Copy files or directories host<->box (- = a tar on stdout/stdin; -L follows a symlink SRC)

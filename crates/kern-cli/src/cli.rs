@@ -698,6 +698,9 @@ pub enum Command {
         json: bool,
         /// `--format <go template>`: Docker's, for the field set kern can answer truthfully.
         format: Option<String>,
+        /// `--platform <os/arch>`: an image's entry for that platform, as `docker image inspect
+        /// --platform` picks it.
+        platform: Option<kern_oci::Platform>,
     },
     /// `kern prune`: garbage-collect leftover logs/health/registry files of boxes no longer running.
     Prune,
@@ -2126,8 +2129,19 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             // is the line in every wait loop and every deploy script; `--format` was accepted and
             // `-f` was `unknown flag "-f"`, so a script ported across had to be edited for a flag
             // that does the same thing under a shorter name. Both spellings, one value.
-            reject_unknown_flags("inspect", &rest, &["--json", "--format", "-f"])?;
+            reject_unknown_flags(
+                "inspect",
+                &rest,
+                &["--json", "--format", "-f", "--platform"],
+            )?;
             let format = flag_value(&rest, "--format").or_else(|| flag_value(&rest, "-f"));
+            let platform = match flag_value(&rest, "--platform") {
+                Some(want) => Some(
+                    kern_oci::Platform::parse(&want)
+                        .map_err(|e| Error::Oci(format!("--platform {want}: {e}")))?,
+                ),
+                None => None,
+            };
             // The NAME is the first positional that is not a flag's value. Walked explicitly,
             // because `--format '{{.State.Running}}' <name>` puts a non-flag token immediately after
             // a flag and a naive "first token without a dash" takes the template for the box.
@@ -2138,7 +2152,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     skip_next = false;
                     continue;
                 }
-                if *a == "--format" || *a == "-f" {
+                if *a == "--format" || *a == "-f" || *a == "--platform" {
                     skip_next = true;
                     continue;
                 }
@@ -2151,10 +2165,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     name: n.to_string(),
                     json: rest.contains(&"--json"),
                     format,
+                    platform,
                 },
                 None => {
                     return Err(Error::Usage(
-                        "inspect <name> [--json] [--format <template>]",
+                        "inspect <name> [--json] [--format <template>] [--platform <os/arch>]",
                     ))
                 }
             }
@@ -7681,9 +7696,14 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             timestamps,
             window,
         } => crate::logview::print_all(tail, follow, timestamps, window),
-        Command::Inspect { name, json, format } => {
+        Command::Inspect {
+            name,
+            json,
+            format,
+            platform,
+        } => commands::with_image_platform(platform, || {
             commands::inspect_formatted(&name, json, format.as_deref())
-        }
+        }),
         Command::Prune => commands::prune(),
         Command::Gc { images } => commands::gc(images),
         Command::Doctor => crate::doctor::doctor(),
@@ -11182,7 +11202,8 @@ mod tests {
             Command::Inspect {
                 name: "web".into(),
                 json: false,
-                format: None
+                format: None,
+                platform: None
             }
         );
         assert_eq!(
@@ -11192,9 +11213,33 @@ mod tests {
             Command::Inspect {
                 name: "web".into(),
                 json: true,
-                format: None
+                format: None,
+                platform: None
             }
         );
+        // `--platform` takes a value, which is not the name; a bad one is refused.
+        match parse(&[
+            "inspect".into(),
+            "--platform".into(),
+            "linux/arm64".into(),
+            "alpine:3.20".into(),
+        ])
+        .unwrap()
+        .1
+        {
+            Command::Inspect { name, platform, .. } => {
+                assert_eq!(name, "alpine:3.20");
+                assert_eq!(platform.map(|p| p.arch), Some("arm64".to_string()));
+            }
+            other => panic!("expected Inspect, got {other:?}"),
+        }
+        assert!(parse(&[
+            "inspect".into(),
+            "--platform".into(),
+            "a/b/c/d".into(),
+            "x".into()
+        ])
+        .is_err());
         // Missing name → usage error (a lone `--json` is not a name).
         assert!(matches!(parse(&["inspect".into()]), Err(Error::Usage(_))));
         assert!(matches!(

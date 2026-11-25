@@ -178,6 +178,14 @@ with the exit code, then `stop`, or `start` and `restart`, and `destroy` last), 
 pidfd on the box's supervisor, so no process stays resident per container. A `docker rm` refused
 with 409 no longer forgets the running container's id and network on the way.
 
+**A compose service with `platform:` runs through kern's socket.** The `docker compose` client
+inspects a service's image and creates the container by the image's id, which kern's socket did not
+resolve ("No such image: sha256:..."), and both platforms' entries of one tag had the same id. Each
+entry has its own id now, an id resolves wherever an image name does (inspect, history, remove,
+create), and `docker rmi` of the arm64 id removes that entry and not this machine's. `kern inspect
+--platform <os/arch>` shows an image's entry for that platform, `Architecture` is the image's own
+(it was the host's for every image), and `kern images --json` carries each entry's `cache` name.
+
 **`depends_on: condition: service_healthy` through kern's socket.** A container's `Healthcheck`
 was not read, so the box had no check and the `docker compose` client refused the stack ("has no
 healthcheck configured"); it is the box's `--health-*` now, durations rounded up to whole seconds.

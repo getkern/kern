@@ -399,6 +399,7 @@ pub fn images(
             pulled: e.pulled,
             dangling: e.dangling,
             platform: e.platform.clone(),
+            stem: e.stem.clone(),
         })
         .collect();
 
@@ -442,11 +443,12 @@ pub fn images(
                 .as_deref()
                 .map_or_else(String::new, |p| format!(",\"platform\":{}", json_str(p)));
             format!(
-                "{{\"image\":{},\"size_bytes\":{},\"pulled\":{},\"dangling\":{}{digest}{platform}}}",
+                "{{\"image\":{},\"size_bytes\":{},\"pulled\":{},\"dangling\":{}{digest}{platform},\"cache\":{}}}",
                 json_str(&e.name),
                 e.size,
                 e.pulled,
-                e.dangling
+                e.dangling,
+                json_str(&e.stem)
             )
         });
         println!("{out}");
@@ -1475,6 +1477,7 @@ mod glob_tests {
             pulled: 0,
             dangling: false,
             platform: None,
+            stem: String::new(),
         };
         let r = |name: &str, t: &str| render_image_format(t, &row(name), None).unwrap();
         assert_eq!(r("alpine:3.19", "{{.Repository}}:{{.Tag}}"), "alpine:3.19");

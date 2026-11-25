@@ -185,8 +185,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}sandbox{z} ls [--json] | history [-n N] [--failed] [--all] [--json] | stats [--all] [--json]  The SDK and MCP sandboxes: running now, finished, outcomes
     {c}sandbox show{z} [<box>] [-n N] [--json]                         The code SDK sandboxes ran and their output (kept with the history)
     {c}sandbox{z} keep|clear [memory|disk|off]                             Where the finished ones are kept (default memory: until reboot), or remove them
-    {c}inspect{z} <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
-                                                                     (`-f '{{{{.State.Status}}}}'`, the common field paths)
+    {c}inspect{z} <name> [--json] [-f|--format T] [--platform P]         Full detail for one box; -f renders a Go-style template
+                                                                     (`-f '{{{{.State.Status}}}}'`, the common field paths);
+                                                                     --platform picks an image's entry for that platform
     {c}port{z} <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
     {c}attach{z} <name>                                                  Stream a box's output live (Ctrl-C detaches)
     {c}cp{z} [-L] <box>:<src> <dst> | [-L] <src> <box>:<dst>               Copy files or directories host<->box (- = a tar on stdout/stdin; -L follows a symlink SRC)

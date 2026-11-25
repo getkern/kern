@@ -4096,6 +4096,9 @@ pub(crate) struct ImageEntry {
     /// cache stem; `None` for this machine's. Without it `alpine:3.20` pulled for three platforms was
     /// three identical rows.
     pub platform: Option<String>,
+    /// The entry's name in the cache, which `kern rmi` also takes: the one handle that tells two
+    /// platforms' entries of one tag apart (`images --json` prints it as `cache`).
+    pub stem: String,
 }
 
 /// The `os/arch` of a cache entry for another platform: its stem ends in `platform_suffix`
@@ -4212,6 +4215,7 @@ pub(crate) fn image_entries_in(
                 pulled,
                 dangling,
                 platform,
+                stem,
             });
         }
     }

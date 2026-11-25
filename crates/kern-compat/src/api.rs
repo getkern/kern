@@ -1768,26 +1768,97 @@ fn image_list(bin: &Path, req: &Request) -> Response {
             });
         items.push(format!(
             "{{\"Id\":{},\"ParentId\":\"\",\"RepoTags\":[{tags}],\"RepoDigests\":[{digests}],\"Created\":{},\"Size\":{size},\"SharedSize\":-1,\"VirtualSize\":{size},\"Labels\":{{}},\"Containers\":-1}}",
-            json_str(&format!("sha256:{}", id_of(n))),
+            json_str(&format!(
+                "sha256:{}",
+                image_entry_id(&i).unwrap_or_else(|| id_of(n))
+            )),
             i.get("pulled").and_then(Value::as_i64).unwrap_or(0).max(0),
         ));
     }
     json_response(200, format!("[{}]", items.join(",")))
 }
 
-/// The cached image an API path names, as `kern images --json` lists it: the name itself, a bare
-/// name as `:latest`, or a repository pulled by digest.
+/// The cached image an API path names, as `kern images --json` lists it: its id (`sha256:<hex>`
+/// or a prefix of 12 or more, which is how a client hands an image back), else the name itself, a
+/// bare name as `:latest`, or a repository pulled by digest. By name, this machine's entry before
+/// another platform's, as `kern run` picks it.
 fn cached_image(bin: &Path, name: &str) -> Option<Value> {
+    let images = kern_images(bin, false);
+    if let Some(hex) = image_id_ref(name) {
+        if let Some(i) = images
+            .iter()
+            .find(|i| image_entry_id(i).is_some_and(|id| id.starts_with(hex)))
+        {
+            return Some(i.clone());
+        }
+    }
     let want_latest = if name.contains(':') || name.contains('@') {
         name.to_string()
     } else {
         format!("{name}:latest")
     };
-    kern_images(bin, false).into_iter().find(|i| {
-        i.get("image")
-            .and_then(Value::as_str)
-            .is_some_and(|n| n == name || n == want_latest || n.split('@').next() == Some(name))
+    images
+        .into_iter()
+        .filter(|i| {
+            i.get("image")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n == name || n == want_latest || n.split('@').next() == Some(name))
+        })
+        .min_by_key(|i| i.get("platform").is_some())
+}
+
+/// The id a client sees for a cached image: of its name, and for another platform's entry of the
+/// name and that platform, so the two entries of one tag are two images. MEASURED before: both
+/// `alpine:3.20` entries had one id, and the `docker compose` client, which inspects a service's
+/// image by the id it was given, could not tell the arm64 one from the amd64.
+fn image_entry_id(i: &Value) -> Option<String> {
+    let n = i.get("image").and_then(Value::as_str)?;
+    Some(match image_entry_platform(i) {
+        Some(p) => id_of(&format!("{n}#{p}")),
+        None => id_of(n),
     })
+}
+
+/// `os/arch` of a cache entry for another platform; `None` for this machine's.
+fn image_entry_platform(i: &Value) -> Option<&str> {
+    i.get("platform")
+        .and_then(Value::as_str)
+        .filter(|p| valid_platform(p))
+}
+
+/// The hex of an image id as a client passes one: `sha256:<hex>`, or a bare lowercase hex prefix
+/// of at least 12 (what `docker images` prints).
+fn image_id_ref(r: &str) -> Option<&str> {
+    let hex = r.strip_prefix("sha256:").unwrap_or(r);
+    (12..=64).contains(&hex.len()).then_some(hex).filter(|h| {
+        h.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The create's `Image` when it is an image id: the cached entry's name in its place, and that
+/// entry's platform when the create named none. `None` when it is not an id of a cached image.
+fn image_by_id(bin: &Path, body: &Value) -> Option<(String, Option<String>)> {
+    let hex = body
+        .get("Image")
+        .and_then(Value::as_str)
+        .and_then(image_id_ref)?;
+    let i = kern_images(bin, false)
+        .into_iter()
+        .find(|i| image_entry_id(i).is_some_and(|id| id.starts_with(hex)))?;
+    let name = i.get("image").and_then(Value::as_str)?.to_string();
+    Some((name, image_entry_platform(&i).map(str::to_string)))
+}
+
+/// Put the image `name` in place of the id a create gave (`--image`, and the event's image).
+fn with_image_name(mut c: Created, name: &str) -> Created {
+    if let Some(at) = c.argv.iter().position(|a| a == "--image") {
+        if let Some(v) = c.argv.get_mut(at + 1) {
+            *v = name.to_string();
+        }
+    }
+    c.image = name.to_string();
+    c
 }
 
 /// `GET /images/{name}/history`: `kern image history --json`, in Docker's shape, newest first.
@@ -1817,7 +1888,10 @@ fn image_history(bin: &Path, name: &str) -> Response {
             format!(
                 "{{\"Id\":{},\"Created\":{},\"CreatedBy\":{},\"Tags\":{},\"Size\":{},\"Comment\":{}}}",
                 if ix == 0 {
-                    json_str(&format!("sha256:{}", id_of(n)))
+                    json_str(&format!(
+                        "sha256:{}",
+                        image_entry_id(&i).unwrap_or_else(|| id_of(n))
+                    ))
                 } else {
                     json_str("<missing>")
                 },
@@ -2487,11 +2561,26 @@ fn image_remove(bin: &Path, name: &str, req: &Request) -> Response {
         return error(404, &format!("No such image: {name}"));
     };
     let n = i.get("image").and_then(Value::as_str).unwrap_or(name);
+    // ANOTHER PLATFORM'S ENTRY BY ITS CACHE NAME, which `kern rmi` takes: by the tag it would be
+    // this machine's entry that went.
+    let target = match (
+        image_entry_platform(&i),
+        i.get("cache").and_then(Value::as_str),
+    ) {
+        (Some(_), Some(cache)) => cache,
+        (Some(p), None) => {
+            return error(
+                500,
+                &format!("kern lists the {p} entry of {n} without its cache name: not removed"),
+            )
+        }
+        (None, _) => n,
+    };
     let mut args = vec!["rmi"];
     if req.flag("force") {
         args.push("-f");
     }
-    args.push(n);
+    args.push(target);
     let (code, _out, err) = kern(bin, &args);
     if code != 0 {
         let msg = kern_error(&err);
@@ -2509,7 +2598,10 @@ fn image_remove(bin: &Path, name: &str, req: &Request) -> Response {
         format!(
             "[{{\"Untagged\":{}}},{{\"Deleted\":{}}}]",
             json_str(n),
-            json_str(&format!("sha256:{}", id_of(n)))
+            json_str(&format!(
+                "sha256:{}",
+                image_entry_id(&i).unwrap_or_else(|| id_of(n))
+            ))
         ),
     )
 }
@@ -2524,14 +2616,23 @@ fn image_inspect(bin: &Path, name: &str) -> Response {
     // `Architecture`, `Size`, and the `Config` Dev Containers reads its `User` from); this adds what
     // the API has besides. Asked by the cache's own name, which always carries a `:tag` or an
     // `@digest`, so a running box with the image's bare name is never the one answered.
-    let (code, out, err) = kern(bin, &["inspect", "--json", n]);
+    // Another platform's entry is asked for by that platform, or kern answers this machine's.
+    let mut args = vec!["inspect", "--json"];
+    if let Some(p) = image_entry_platform(&i) {
+        args.extend(["--platform", p]);
+    }
+    args.push(n);
+    let (code, out, err) = kern(bin, &args);
     match image_object_members(&out) {
         Some(members) if code == 0 => json_response(
             200,
             format!(
                 // `RepoDigests` is in kern's own object, with the tags.
                 "{{\"Id\":{},\"Created\":{},{members}}}",
-                json_str(&format!("sha256:{}", id_of(n))),
+                json_str(&format!(
+                    "sha256:{}",
+                    image_entry_id(&i).unwrap_or_else(|| id_of(n))
+                )),
                 json_str(&rfc3339(
                     i.get("pulled").and_then(Value::as_i64).unwrap_or(0).max(0) as u64
                 )),
@@ -4009,7 +4110,18 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
                     return error(404, &format!("network {net} not found"));
                 }
             }
-            match create_argv(&name, &body).map(|c| with_platform(c, platform.as_deref())) {
+            // AN IMAGE ID FOR `Image`, as the `docker compose` client gives for a service with
+            // `platform:`: the cached entry's name, and its platform unless the create names one.
+            // MEASURED before: "No such image: sha256:4422...", and the service never started.
+            let by_id = image_by_id(bin, &body);
+            let platform = platform.or_else(|| by_id.as_ref().and_then(|(_, p)| p.clone()));
+            match create_argv(&name, &body)
+                .map(|c| match &by_id {
+                    Some((image, _)) => with_image_name(c, image),
+                    None => c,
+                })
+                .map(|c| with_platform(c, platform.as_deref()))
+            {
                 Ok(c) => {
                     net_remember(&name, &c.argv);
                     let session = in_session(&c.labels);
@@ -5059,6 +5171,49 @@ mod tests {
     /// The rest of `HostConfig` reaches the box: limits, mounts, names, resolvers, signals; a field
     /// kern has no flag for is a warning. MEASURED before: only Memory and NanoCpus were read, and
     /// `--pids-limit 32` through the socket let 100 forks through.
+    /// An image id as a client hands one back is recognised, and another platform's entry of a
+    /// tag has an id of its own; a create given an id runs the entry's name.
+    #[test]
+    fn image_ids_tell_platforms_apart_and_a_create_by_id_runs_the_name() {
+        assert_eq!(
+            image_id_ref("sha256:442210d3f5f95933ad9f"),
+            Some("442210d3f5f95933ad9f")
+        );
+        assert_eq!(image_id_ref("442210d3f5f9"), Some("442210d3f5f9"));
+        assert_eq!(
+            image_id_ref("442210d3f5f"),
+            None,
+            "shorter than docker images prints"
+        );
+        assert_eq!(image_id_ref("alpine:3.20"), None);
+        assert_eq!(
+            image_id_ref("ABCDEF012345"),
+            None,
+            "Docker ids are lowercase"
+        );
+        let native = json::parse(r#"{"image":"alpine:3.20"}"#).unwrap();
+        let arm = json::parse(r#"{"image":"alpine:3.20","platform":"linux/arm64"}"#).unwrap();
+        let (a, b) = (
+            image_entry_id(&native).unwrap(),
+            image_entry_id(&arm).unwrap(),
+        );
+        assert_eq!(a, id_of("alpine:3.20"), "this machine's id is unchanged");
+        assert_ne!(a, b);
+        assert_eq!(image_entry_platform(&arm), Some("linux/arm64"));
+        assert_eq!(image_entry_platform(&native), None);
+        let b = json::parse(&format!(r#"{{"Image":"sha256:{b}","Cmd":["uname","-m"]}}"#)).unwrap();
+        let c = with_platform(
+            with_image_name(create_argv("n", &b).unwrap(), "alpine:3.20"),
+            Some("linux/arm64"),
+        );
+        let at = c.argv.iter().position(|x| x == "--image").unwrap();
+        assert_eq!(c.argv[at + 1], "alpine:3.20");
+        assert_eq!(c.image, "alpine:3.20");
+        let p = c.argv.iter().position(|x| x == "--platform").unwrap();
+        assert_eq!(c.argv[p + 1], "linux/arm64");
+        assert!(p < at, "--platform before the image");
+    }
+
     /// A removal or a restart waits for the pending `die`, so it is published first; with none
     /// pending it does not wait.
     #[test]

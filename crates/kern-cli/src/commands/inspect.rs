@@ -1501,7 +1501,27 @@ fn mem_cap_row(
 /// reader templating `.Id` gets nothing instead of a fabricated value.
 fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
     let cache = crate::commands::imagecache::cache_dir();
-    let safe = crate::commands::imagecache::sanitize_ref(name);
+    let plain = crate::commands::imagecache::sanitize_ref(name);
+    // `--platform`: that platform's own cache entry, the one `run --platform` and `pull --platform`
+    // use; a flat image built here for it is under its plain name and says so in its config.
+    let safe = match crate::commands::imagecache::image_platform() {
+        Some(p) => {
+            let stem = crate::commands::imagecache::platform_stem(&plain, &p);
+            let built_for_it = !crate::commands::imagecache::image_present(&cache, &stem)
+                && crate::commands::imagecache::read_image_config(
+                    &cache.join(format!("{plain}.image")),
+                )
+                .architecture
+                .as_deref()
+                    == Some(p.arch.as_str());
+            if built_for_it {
+                plain
+            } else {
+                stem
+            }
+        }
+        None => plain,
+    };
     let present = crate::commands::imagecache::image_present(&cache, &safe);
     if !present {
         // THREE SUBJECTS, NOT TWO. A reader who reaches here has usually just watched a box run,
@@ -1572,14 +1592,18 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
             cfg.repo_digest.as_deref().map_or_else(String::new, |d| {
                 json_str(&kern_common::repo_digest_ref(name, d))
             }),
-            // DOCKER'S SPELLING FOR THIS FIELD, which is the Go one: `docker image inspect` says
-            // `amd64` where `docker info` says `x86_64`, and a consumer compares against a fixed
-            // string. Same table as the shim's `--format` renderer, for the same reason.
-            json_str(match std::env::consts::ARCH {
-                "x86_64" => "amd64",
-                "aarch64" => "arm64",
-                other => other,
-            }),
+            // THE IMAGE'S OWN, from its config, in Docker's spelling (the Go one: `amd64` where
+            // `docker info` says `x86_64`). The host's only for a config that names none: it was
+            // the host's always, so an arm64 image pulled with `--platform` read as amd64, and the
+            // `docker compose` client, which checks a service's `platform:` against it, refused.
+            json_str(&cfg.architecture.clone().unwrap_or_else(|| {
+                match std::env::consts::ARCH {
+                    "x86_64" => "amd64",
+                    "aarch64" => "arm64",
+                    other => other,
+                }
+                .to_string()
+            })),
             size,
             arr(&cfg.entrypoint),
             arr(&cfg.cmd),
