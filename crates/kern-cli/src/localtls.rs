@@ -744,29 +744,51 @@ pub(crate) fn untrust() -> Result<(), Error> {
 }
 
 /// `kern proxy status`.
-pub(crate) fn status() -> Result<(), Error> {
-    let Some(p) = paths() else {
-        println!("https: off (no home directory)");
-        return Ok(());
-    };
+/// What `kern proxy trust` left in place: the authority, the stores it went into, and the router's
+/// TLS port when it runs. `None` while HTTPS is off. One reading for `kern proxy status` and
+/// `kern doctor`, so the two cannot describe it differently.
+pub(crate) struct Summary {
+    pub(crate) cert: std::path::PathBuf,
+    pub(crate) stores: usize,
+    pub(crate) port: Option<u16>,
+}
+
+pub(crate) fn summary() -> Option<Summary> {
+    let p = paths()?;
     if !trusted() {
-        println!("https: off (`kern proxy trust` turns it on)");
-        return Ok(());
+        return None;
     }
     let stores = std::fs::read_to_string(&p.trusted)
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.trim().is_empty())
         .count();
-    let port = crate::localrouter::running_tls_port()
+    Some(Summary {
+        cert: p.cert,
+        stores,
+        port: crate::localrouter::running_tls_port(),
+    })
+}
+
+pub(crate) fn status() -> Result<(), Error> {
+    if paths().is_none() {
+        println!("https: off (no home directory)");
+        return Ok(());
+    }
+    let Some(s) = summary() else {
+        println!("https: off (`kern proxy trust` turns it on)");
+        return Ok(());
+    };
+    let port = s
+        .port
         .map(|p| format!("on port {p}"))
         .unwrap_or_else(|| "(the router is not running: no box publishes a port)".to_string());
-    let kept = if stores > 0 {
-        format!(", trusted in {stores} store(s)")
+    let kept = if s.stores > 0 {
+        format!(", trusted in {} store(s)", s.stores)
     } else {
         String::new()
     };
-    println!("https: on {port}; local CA {}{kept}", p.cert.display());
+    println!("https: on {port}; local CA {}{kept}", s.cert.display());
     Ok(())
 }
 

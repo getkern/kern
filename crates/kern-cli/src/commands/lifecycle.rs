@@ -1199,7 +1199,10 @@ enum Waited {
 /// force during the wait (SIGUSR1 unblocked) and blocked again after it.
 unsafe fn wait_exit_or_wake(pidfd: i32, ms: u64, mask: &libc::sigset_t) -> Waited {
     let ts = libc::timespec {
-        tv_sec: libc::time_t::try_from(ms / 1000).unwrap_or(libc::time_t::MAX),
+        // `i64`, not `libc::time_t`, which `libc` deprecates on musl (its width changed in musl
+        // 1.2): 64 bits on every target kern ships, and one where it is not would not build rather
+        // than truncate, the rule `kern_isolation`'s `TimeSecs` follows.
+        tv_sec: i64::try_from(ms / 1000).unwrap_or(i64::MAX),
         tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
     };
     let mut pfd = libc::pollfd {

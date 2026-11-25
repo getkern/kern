@@ -298,6 +298,7 @@ fn rows() -> Vec<R> {
     results.push(check_uid_range());
     results.extend(check_gpu());
     results.extend(check_wsl_drive());
+    results.extend(check_local_https());
     results.extend(check_wsl_interop());
     results.extend(check_docker_link());
     results.extend(check_windows_row());
@@ -1093,6 +1094,26 @@ fn check_identity() -> R {
         ),
         None => r,
     }
+}
+
+/// HTTPS for the `.localhost` names, once `kern proxy trust` turned it on. No row while it is off:
+/// it is opt-in, and off is not something to fix. On with the authority in no store, a browser
+/// refuses every page, which is the one state worth a warning.
+fn check_local_https() -> Option<R> {
+    let s = crate::localtls::summary()?;
+    let port = s.port.map(|p| format!(", port {p}")).unwrap_or_default();
+    if s.stores == 0 {
+        return Some(R::Warn(
+            format!("https .localhost: on{port}, but the local CA is in no browser store"),
+            "browsers refuse its pages: install NSS's certutil (libnss3-tools), then `kern proxy \
+             trust` again; `kern proxy untrust` turns it off"
+                .to_string(),
+        ));
+    }
+    Some(R::ok(format!(
+        "https .localhost: on{port}, local CA trusted in {} store(s)",
+        s.stores
+    )))
 }
 
 /// On WSL: how `C:\` (`/mnt/c`) is mounted, which decides what a box can do with a folder bound from it.
