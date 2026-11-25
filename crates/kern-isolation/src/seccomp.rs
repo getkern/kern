@@ -90,6 +90,25 @@ pub fn deny_kills() -> bool {
     DENY_KILLS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// `ptrace(2)` IS PERMITTED IN A BOX, as Docker's default profile permits it (on kernels from 4.8)
+/// and Podman's does: `strace`, `gdb` and profilers work in a container without a flag. MEASURED
+/// before, Docker 29 and Podman 4.9 on one host: `strace true` ran in both and was refused in kern.
+///
+/// UNDER THE KILL VERDICT IT STAYS DENIED: the sandbox SDKs, the MCP server and `--security-profile
+/// untrusted` run code nobody vetted, and there a `ptrace` is read as an escape attempt. ONE
+/// definition, read by both filter builders, so the denylist and the allowlist cannot disagree.
+///
+/// WHAT A BOX REACHES WITH IT is the processes of its own pid namespace (every box has one; kern
+/// shares none and has no `--pid host`) that share its uid and are dumpable. kern's own processes
+/// that enter a running box are not: a `kern exec` child clears `dumpable` from its `fork` to its
+/// `execve` (`exec_in_box`), the fix runc made for CVE-2016-9962, and the port relays and the
+/// pasta-rules installer enter its user and network namespaces only, never its pid namespace.
+/// `CAP_SYS_PTRACE` stays dropped, and `process_vm_readv`/`process_vm_writev` stay denied, as
+/// Docker grants those only with that capability.
+pub fn ptrace_permitted() -> bool {
+    !deny_kills()
+}
+
 fn deny_action() -> u32 {
     if deny_kills() {
         SECCOMP_RET_KILL_PROCESS
@@ -435,7 +454,11 @@ fn emit_kill_prologue(allow_nesting: bool) -> Vec<libc::sock_filter> {
         prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1)); // bit set → next (kill)
         prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     }
+    let ptrace_ok = ptrace_permitted();
     for nr in denylist(allow_nesting) {
+        if ptrace_ok && nr == libc::SYS_ptrace {
+            continue;
+        }
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (deny); else skip
         prog.push(stmt(BPF_RET | BPF_K, deny_action()));
     }
@@ -697,6 +720,17 @@ fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_fi
             prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nesting → next (JA ALLOW)
             prog.push(jump(BPF_JMP | BPF_JA, JA_ALLOW, 0, 0));
         }
+    }
+    // `ptrace` is outside the allow numbers (they exclude everything kern denies), so a box where it
+    // is permitted reaches it here, as the nesting syscalls above do; see `ptrace_permitted`.
+    if ptrace_permitted() {
+        prog.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::SYS_ptrace as u32,
+            0,
+            1,
+        ));
+        prog.push(jump(BPF_JMP | BPF_JA, JA_ALLOW, 0, 0));
     }
     // `socket(AF_VSOCK | AF_XDP, …)` → EAFNOSUPPORT, every other domain allowed. Same rule as
     // the denylist, so the two postures agree; self-contained (explicit `RET` exits), so it sits ahead of
@@ -1312,7 +1346,92 @@ mod tests {
     /// 85 nesting), two instructions per syscall there. The `ioctl` TIOCSTI/TIOCLINUX rule (18/11) adds
     /// 6 to all four. The deny-but-degrade numbers Docker answers `EPERM` (22/11) add 20 to the
     /// allowlist (215, 210 nesting), two instructions for each of ten, on the default terminal's path
-    /// only; the denylist already had one check per number and keeps its count.
+    /// only; the denylist already had one check per number and keeps its count. Permitting `ptrace`
+    /// outside the kill verdict (23/11) takes its two instructions out of the shared kill prologue: the
+    /// denylist is 103 (89 nesting); the allowlist adds the same two back as an explicit allow and
+    /// keeps 215 and 210. These are the counts under the default `EPERM` verdict, which tests run in.
+    /// ON THE KERNEL, not only on the BPF interpreter: in a forked child the filter is installed
+    /// and `ptrace` called. Under the `EPERM` verdict (a box) `PTRACE_TRACEME` succeeds and
+    /// `process_vm_readv` is refused with `EPERM`, as Docker's profile answers both; under the kill
+    /// verdict (a sandbox) `ptrace` ends the child with `SIGSYS`. Both filters, built fresh in the
+    /// child (the memoised one belongs to this process's verdict).
+    #[test]
+    fn ptrace_is_a_boxs_and_not_a_sandboxs_on_the_kernel() {
+        fn run(kill: bool, allowlist: bool) -> (bool, i32, i32) {
+            // SAFETY: fork in a test; the child installs a filter, makes two syscalls and exits.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                super::set_deny_kills(kill);
+                let prog = if allowlist {
+                    super::build_allowlist_filter(false, false)
+                } else {
+                    super::build_filter(false)
+                };
+                let fprog = libc::sock_fprog {
+                    len: prog.len() as u16,
+                    filter: prog.as_ptr() as *mut libc::sock_filter,
+                };
+                let code = unsafe {
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                        || libc::prctl(
+                            libc::PR_SET_SECCOMP,
+                            libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                            std::ptr::addr_of!(fprog) as libc::c_ulong,
+                            0,
+                            0,
+                        ) != 0
+                    {
+                        90
+                    } else {
+                        let traced = libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == 0;
+                        let mut b = [0u8; 1];
+                        let local = libc::iovec {
+                            iov_base: b.as_mut_ptr().cast(),
+                            iov_len: 1,
+                        };
+                        let remote = libc::iovec {
+                            iov_base: b.as_mut_ptr().cast(),
+                            iov_len: 1,
+                        };
+                        let vm = libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0);
+                        let eperm = vm < 0
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+                        match (traced, eperm) {
+                            (true, true) => 0,
+                            (true, false) => 1,
+                            (false, true) => 2,
+                            (false, false) => 3,
+                        }
+                    }
+                };
+                unsafe { libc::_exit(code) };
+            }
+            let mut st = 0;
+            unsafe { libc::waitpid(pid, &mut st, 0) };
+            (
+                libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGSYS,
+                if libc::WIFEXITED(st) {
+                    libc::WEXITSTATUS(st)
+                } else {
+                    -1
+                },
+                st,
+            )
+        }
+        for allowlist in [true, false] {
+            let (killed, code, st) = run(false, allowlist);
+            assert!(
+                !killed && code == 0,
+                "a box (allowlist={allowlist}): ptrace allowed and process_vm_readv EPERM, got code {code} status {st:#x}"
+            );
+            let (killed, _, st) = run(true, allowlist);
+            assert!(
+                killed,
+                "a sandbox (allowlist={allowlist}): ptrace kills, got status {st:#x}"
+            );
+        }
+    }
+
     #[test]
     fn the_seccomp_filter_instruction_counts_are_pinned() {
         for &nesting in &[false, true] {
@@ -1346,7 +1465,7 @@ mod tests {
             );
             #[cfg(target_arch = "x86_64")]
             {
-                let deny_expected = if nesting { 91 } else { 105 };
+                let deny_expected = if nesting { 89 } else { 103 };
                 assert_eq!(
                     deny, deny_expected,
                     "x86_64 denylist instruction count changed (nesting={nesting}): {deny} vs \
@@ -1427,6 +1546,9 @@ mod tests {
 
                 // The reference verdict, independent of the BPF layout.
                 let expect = |nr: u32, arg0: u64| -> u32 {
+                    if super::ptrace_permitted() && nr == libc::SYS_ptrace as u32 {
+                        return SECCOMP_RET_ALLOW;
+                    }
                     if killset.contains(&nr) {
                         return super::SECCOMP_RET_DENY;
                     }
