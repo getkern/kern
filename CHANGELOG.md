@@ -126,6 +126,9 @@ refusal instead of crashing. The set of refused syscalls is unchanged, and none 
 exec` and health probes get the box's own verdict, and the Python and Node sandboxes ask for the kill
 on every box, so their `escape_blocked` reads as before.
 
+**`docker pause`, `unpause`, `rename` and `top` through kern's socket.** They answered 501. A paused
+box is `paused` in `docker inspect` and `docker ps`, where it read `running`.
+
 **`docker stats`, exec events and terminal resizes through kern's socket.** `docker stats` answered
 501; it reads kern's figures now as Docker's (memory against the box's limit, CPU% from two
 readings, pids, network). `docker events` sends `exec_create`, `exec_start` and `exec_die`, and an

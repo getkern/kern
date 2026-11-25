@@ -845,6 +845,9 @@ fn inspect(bin: &Path, name: &str) -> Response {
         Some(ago) if !running => rfc3339(now().saturating_sub(u64::try_from(ago).unwrap_or(0))),
         _ => ZERO_TIME.to_string(),
     };
+    // `kern pause` freezes the box: Docker's `paused`, still `Running` as Docker reports it. MEASURED
+    // before: `docker pause` then `inspect` answered `running`, and `Paused` was false whatever.
+    let paused = running && v.get("status").and_then(Value::as_str) == Some("paused");
     let exit_code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
     // Docker's `RestartCount`, which kern records per run (0 for a box that never restarted).
     let restart_count = v.get("restart_count").and_then(Value::as_i64).unwrap_or(0);
@@ -869,12 +872,18 @@ fn inspect(bin: &Path, name: &str) -> Response {
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":false,\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":{paused},\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{{}}}},\"Mounts\":[]}}",
             json_str(&id),
             json_str(&created),
             json_str(&format!("/{name}")),
             json_str(command),
-            json_str(if running { "running" } else { "exited" }),
+            json_str(if paused {
+                "paused"
+            } else if running {
+                "running"
+            } else {
+                "exited"
+            }),
             json_str(&started),
             json_str(&finished),
             labels_json(&labels),
@@ -1003,10 +1012,17 @@ fn list(bin: &Path, req: &Request) -> Response {
         if !running && !all {
             continue;
         }
+        // A frozen box (`kern pause`) is Docker's `paused`, in the list as in `inspect`.
+        let paused = running && v.get("status").and_then(Value::as_str) == Some("paused");
         let labels = labels_of(&v);
-        if created_names.contains(&name)
-            || !filters.keeps(&name, if running { "running" } else { "exited" }, &labels)
-        {
+        let state = if paused {
+            "paused"
+        } else if running {
+            "running"
+        } else {
+            "exited"
+        };
+        if created_names.contains(&name) || !filters.keeps(&name, state, &labels) {
             continue;
         }
         let ports: Vec<String> = v
@@ -1043,8 +1059,20 @@ fn list(bin: &Path, req: &Request) -> Response {
                 .or_else(|| v.get("started"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
-            json_str(if running { "running" } else { "exited" }),
-            json_str(if running { "Up" } else { "Exited" }),
+            json_str(if paused {
+                "paused"
+            } else if running {
+                "running"
+            } else {
+                "exited"
+            }),
+            json_str(if paused {
+                "Up (Paused)"
+            } else if running {
+                "Up"
+            } else {
+                "Exited"
+            }),
             ports.join(","),
             labels_json(&labels)
         ));
@@ -1404,6 +1432,116 @@ fn image_history(bin: &Path, name: &str) -> Response {
         })
         .collect();
     json_response(200, format!("[{}]", rows.join(",")))
+}
+
+// ---------------------------------------------------------------------------------------------
+// containers/{id}/top: `docker top`, read from the host's /proc as Docker's daemon reads it.
+
+/// One process of a box, as `ps -ef` prints it: `UID PID PPID C STIME TTY TIME CMD`.
+fn ps_row(pid: i32, hz: u64, boot: u64) -> Option<Vec<String>> {
+    use std::os::unix::fs::MetadataExt;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` is in parentheses and may hold spaces: the fields after it start past the LAST `)`.
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let num = |i: usize| f.get(i).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+    let ppid = num(1);
+    let cpu_secs = (num(11) + num(12)) / hz.max(1);
+    let start = boot + num(19) / hz.max(1);
+    let uid = std::fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+    // A kernel thread, or a process that cleared its arguments, has none: `ps` shows `[comm]`.
+    let comm = stat
+        .find('(')
+        .zip(stat.rfind(')'))
+        .and_then(|(a, b)| stat.get(a + 1..b))
+        .map(|c| format!("[{c}]"))
+        .unwrap_or_default();
+    let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|b| {
+            b.split(|c| *c == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|c| !c.is_empty())
+        .unwrap_or(comm);
+    let hm = rfc3339(start);
+    Some(vec![
+        uid.to_string(),
+        pid.to_string(),
+        ppid.to_string(),
+        "0".into(),
+        hm.get(11..16).unwrap_or("").to_string(),
+        "?".into(),
+        format!(
+            "{:02}:{:02}:{:02}",
+            cpu_secs / 3600,
+            cpu_secs / 60 % 60,
+            cpu_secs % 60
+        ),
+        cmd,
+    ])
+}
+
+/// `GET /containers/{id}/top`: every process in the box's pid namespace (the one its PID 1 is in),
+/// in `ps -ef`'s columns, with host pids as Docker's daemon gives them.
+fn container_top(bin: &Path, id: &str) -> Response {
+    let Some(name) = resolve(bin, id) else {
+        return error(404, &format!("No such container: {id}"));
+    };
+    // `pid1` is in `inspect`, not in `ps`: the box's PID 1, whose pid namespace is the box's.
+    let (code, out, _) = kern(bin, &["inspect", "--json", &name]);
+    let pid1 = (code == 0)
+        .then(|| json::parse(out.trim()).ok())
+        .flatten()
+        .and_then(|v| v.get("pid1").and_then(Value::as_i64))
+        .and_then(|p| i32::try_from(p).ok())
+        .filter(|p| *p > 0);
+    let Some(pid1) = pid1 else {
+        return error(409, &format!("Container {id} is not running"));
+    };
+    let Ok(ns) = std::fs::read_link(format!("/proc/{pid1}/ns/pid")) else {
+        return error(409, &format!("Container {id} is not running"));
+    };
+    // SAFETY: sysconf has no preconditions.
+    let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap_or(100);
+    let boot = std::fs::read_to_string("/proc/stat")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let mut rows: Vec<(i32, Vec<String>)> = std::fs::read_dir("/proc")
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+                .filter(|p| std::fs::read_link(format!("/proc/{p}/ns/pid")).is_ok_and(|n| n == ns))
+                .filter_map(|p| Some((p, ps_row(p, hz, boot)?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_by_key(|(p, _)| *p);
+    let titles = ["UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"]
+        .iter()
+        .map(|t| json_str(t))
+        .collect::<Vec<_>>()
+        .join(",");
+    let procs = rows
+        .iter()
+        .map(|(_, r)| {
+            format!(
+                "[{}]",
+                r.iter().map(|c| json_str(c)).collect::<Vec<_>>().join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    json_response(
+        200,
+        format!("{{\"Titles\":[{titles}],\"Processes\":[{procs}]}}"),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3386,6 +3524,42 @@ pub(crate) fn handle(req: &Request, bin: &Path) -> Response {
             };
             wait(bin, name)
         }
+        ("POST", ["containers", id, verb @ ("pause" | "unpause")]) => match resolve(bin, id) {
+            None => error(404, &format!("No such container: {id}")),
+            Some(name) => {
+                let (code, _, err) = kern(bin, &[verb, &name]);
+                if code == 0 {
+                    no_content()
+                } else {
+                    error(409, &kern_error(&err))
+                }
+            }
+        },
+        ("POST", ["containers", id, "rename"]) => {
+            let Some(new) = req.param("name").filter(|n| !n.is_empty()) else {
+                return error(400, "name is required");
+            };
+            if !valid_name(new) {
+                return error(400, &format!("Invalid container name ({new})"));
+            }
+            match resolve(bin, id) {
+                None => error(404, &format!("No such container: {id}")),
+                Some(name) => {
+                    let (code, _, err) = kern(bin, &["rename", &name, new]);
+                    if code == 0 {
+                        no_content()
+                    } else if err.contains("in use") || err.contains("exists") {
+                        error(
+                            409,
+                            &format!("Conflict. The container name \"/{new}\" is already in use"),
+                        )
+                    } else {
+                        error(500, &kern_error(&err))
+                    }
+                }
+            }
+        }
+        ("GET", ["containers", id, "top"]) => container_top(bin, id),
         ("POST", ["containers", id, verb @ ("stop" | "kill" | "restart")]) => {
             let Some(name) = resolve(bin, id) else {
                 return error(404, &format!("No such container: {id}"));
@@ -4189,6 +4363,23 @@ mod tests {
             panic!("a whole body");
         };
         assert_eq!(status, 501);
+    }
+
+    /// `docker top` reads `ps -ef`'s eight columns; the row of this very process has its pid, its
+    /// parent and its command line. MEASURED before: `/containers/{id}/top` was a 501.
+    #[test]
+    fn a_top_row_is_ps_ef_shaped() {
+        let me = std::process::id() as i32;
+        let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap_or(100);
+        let row = ps_row(me, hz, 0).expect("this process has a row");
+        assert_eq!(row.len(), 8, "{row:?}");
+        assert_eq!(row[1], me.to_string());
+        assert_eq!(row[2], std::os::unix::process::parent_id().to_string());
+        assert!(
+            row[6].len() == 8 && row[6].as_bytes()[2] == b':',
+            "TIME is HH:MM:SS: {row:?}"
+        );
+        assert!(!row[7].is_empty(), "a command line: {row:?}");
     }
 
     /// `docker stats` reads Docker's `StatsJSON`: the CPU delta against `precpu_stats`, the memory
