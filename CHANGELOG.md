@@ -74,9 +74,11 @@ The image's steps are kept too, as metadata under the one layer kern writes, whi
 buildah still take as the base of a build. A rebuild answered entirely from the cache keeps its
 steps' times, so the same image saves and pushes under the same digest.
 
-**`kern build -q` is quiet on a terminal.** It drew the whole live view and printed every
-`RUN`'s output; it is now `--progress quiet`, as without a terminal: the `built` line, and on a
-failure the build's last lines and the error.
+**`-q` is quiet on a terminal: `kern build -q`, `kern pull -q`, `kern box -q`.** On a terminal,
+`build -q` drew the whole live view and printed every `RUN`'s output, and `pull -q`, and `box -q`
+for an image not yet cached, printed each layer's progress; without a terminal they were quiet.
+`-q` is now `--progress quiet` for all three: the result line, the workload's own output, and on a
+failure the error (for a build, its last lines). `docker run -q` through the shim is `box -q`.
 
 **`kern ps` no longer calls a renamed box lost.** After `kern rename r r2`, `ps` warned that a box
 `r` was running with no record, about the box it listed as `r2`: the cgroup directory and the

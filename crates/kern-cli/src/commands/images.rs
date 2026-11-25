@@ -708,6 +708,7 @@ pub fn pull(
     platform: Option<&str>,
     quiet: bool,
 ) -> Result<(), Error> {
+    crate::progress::quiet_flag(quiet);
     // `--platform` INTO THE CACHE goes to that platform's own entry (see `pull_to_cache`), never
     // under the host's: a foreign-arch rootfs stored under a host-arch key was cache poisoning, which
     // is why this used to be refused. A `--platform linux/arm64` build then finds it there.

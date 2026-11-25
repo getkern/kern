@@ -307,7 +307,8 @@ pub enum Command {
         config: Option<String>,
         /// `--show-config`: print the resolved box configuration and exit (no run).
         show_config: bool,
-        /// `--quiet` / `-q`: suppress the foreground status panel.
+        /// `--quiet` / `-q`: suppress the foreground status panel, and the pull progress of an image
+        /// not yet cached (Docker's `run -q`).
         quiet: bool,
         /// `--verbose`: expand the one-line summary into the full isolation posture panel.
         verbose: bool,
@@ -6783,6 +6784,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             profiles,
             rm,
         } => {
+            // `-q` is also Docker's `run -q`: no pull progress for an image not yet cached.
+            crate::progress::quiet_flag(quiet);
             // `--network <project>_<network>` onto a running stack: see `stack_network_join`.
             let (pod, pod_bridges, add_hosts, stack_outbound) =
                 commands::stack_network_join(pod, pod_bridges, add_hosts)?;

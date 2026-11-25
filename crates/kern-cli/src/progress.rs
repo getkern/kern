@@ -64,6 +64,18 @@ pub fn take_progress_flag(args: &[String]) -> Result<Vec<String>, crate::error::
     Ok(out)
 }
 
+/// A verb's `-q` IS `--progress quiet`, one rule for every verb that has both: its result line and
+/// nothing of the way there, on a terminal as in a pipe. MEASURED in the field (kern 0.56.0):
+/// `kern build -q` drew the live view and every RUN's output, and `kern pull -q` printed each
+/// layer's progress, on a terminal only, since without one the progress is not drawn at all. Not
+/// over `json`, the stream `compose` reads.
+pub(crate) fn quiet_flag(quiet: bool) {
+    if quiet && kern_common::progress_mode() != ProgressMode::Json {
+        kern_common::set_progress_mode(ProgressMode::Quiet);
+        crate::set_global_env("KERN_PROGRESS", ProgressMode::Quiet.word());
+    }
+}
+
 /// The live view's event pipe (write end), `-1` when no view is drawing.
 static BOARD_EVENTS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 

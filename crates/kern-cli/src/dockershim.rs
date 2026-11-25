@@ -167,6 +167,8 @@ const fn b(docker: &'static [&'static str], kern: &'static str) -> Flag {
 /// `docker run`, onto `kern box`.
 const RUN: &[Flag] = &[
     b(&["-d", "--detach"], "--detach"),
+    // Docker's "suppress the pull output", which is what `box -q` does (and its status panel).
+    b(&["-q", "--quiet"], "-q"),
     b(&["--rm"], "--rm"),
     b(&["-i", "--interactive"], "-i"),
     b(&["-t", "--tty"], "-t"),
@@ -1628,6 +1630,8 @@ mod tests {
             argv(Mode::Docker, &["images", "--digests"]),
             s(&["images", "--digests"])
         );
+        let run = argv(Mode::Docker, &["run", "-q", "--rm", "alpine", "true"]);
+        assert!(run.iter().any(|a| a == "-q"), "{run:?}");
     }
 
     #[test]
