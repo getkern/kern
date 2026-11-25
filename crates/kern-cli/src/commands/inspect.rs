@@ -3671,7 +3671,9 @@ pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
         eprintln!("kern: {f}");
     }
     Err(Error::Sandbox(format!(
-        "{} of {} kept box(es) could not be removed",
+        // "box(es)", not "kept box(es)": a running, restarting or exited box lands here too.
+        // MEASURED: `kern rm` of a box between two restarts said "1 of 1 kept box(es)".
+        "{} of {} box(es) could not be removed",
         failures.len(),
         names.len()
     )))
