@@ -162,6 +162,14 @@ kern holds the policy (a `--restart` unit, a kept box's record), and refused els
   directory is checked first, on the disk itself: yours, private, and keeping file modes and symlinks
   (a FAT or exFAT card is refused with what failed). Not while a box runs; what stays at the old
   place is said with the `mv` that moves it.
+- **A box started from an ssh session or a WSL shell no longer makes a systemd scope.** From outside
+  the systemd user manager every box asked for a transient scope, 17-23 ms on a VPS. kern now asks
+  PID 1 to move it into its own unit once per box and caps the box there, as from a desktop session:
+  on that VPS a default box 47 -> 39 ms, on WSL Ubuntu 38 -> 28 ms. Where that is refused, the scope
+  is taken as before.
+- **`kern top`: a box's log is live, and `s`, `p`, `u` act on that box from it.** Enter on the Boxes
+  tab showed the log as it was when pressed, and any key closed it, so `s` pressed to stop the box
+  only closed the log. It follows the output now, `s` asks to stop that box, Esc goes back.
 - **A box starts as fast where kern's runtime directory is on a disk.** Ending a box synced its
   scratch layer's filesystem, a journal commit on ext4: a default box took 14 ms there against 3 ms
   on tmpfs. The scratch layer, thrown away with the box, no longer asks for that sync; a kept box's
