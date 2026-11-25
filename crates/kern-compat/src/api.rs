@@ -858,6 +858,51 @@ fn create_argv(name: &str, body: &Value) -> Result<Created, String> {
         c.extend(cmd);
         cmd = c;
     }
+    // `Healthcheck`, as `kern box --health-*`: what `depends_on: condition: service_healthy` waits on.
+    // MEASURED before: it was not read, the box had no check, and the docker compose client refused
+    // the stack ("container ... has no healthcheck configured"). Docker's durations are nanoseconds;
+    // kern's are whole seconds, rounded up so a 500 ms interval is not 0.
+    if let Some(hc) = body.get("Healthcheck") {
+        let test = strings(hc.get("Test"));
+        match test.first().map(String::as_str) {
+            Some("CMD-SHELL") if test.len() > 1 => {
+                argv.push("--health-cmd".into());
+                argv.push(test[1..].join(" "));
+            }
+            Some("CMD") if test.len() > 1 => {
+                for a in &test[1..] {
+                    argv.push("--health-cmd-argv".into());
+                    argv.push(a.clone());
+                }
+            }
+            // `NONE` turns the image's check off, and an empty `Test` keeps the image's: neither has
+            // a command of its own to pass.
+            _ => {}
+        }
+        if test.first().is_some_and(|t| t == "CMD-SHELL" || t == "CMD") {
+            let secs = |k: &str| {
+                hc.get(k)
+                    .and_then(Value::as_i64)
+                    .filter(|n| *n > 0)
+                    .map(|ns| (ns + 999_999_999) / 1_000_000_000)
+            };
+            for (field, flag) in [
+                ("Interval", "--health-interval"),
+                ("Timeout", "--health-timeout"),
+                ("StartPeriod", "--health-start-period"),
+                ("StartInterval", "--health-start-interval"),
+            ] {
+                if let Some(n) = secs(field) {
+                    argv.push(flag.into());
+                    argv.push(n.to_string());
+                }
+            }
+            if let Some(r) = hc.get("Retries").and_then(Value::as_i64).filter(|n| *n > 0) {
+                argv.push("--health-retries".into());
+                argv.push(r.to_string());
+            }
+        }
+    }
     argv.push("--image".into());
     argv.push(image.clone());
     if !cmd.is_empty() {
@@ -4680,6 +4725,40 @@ mod tests {
         for bad in ["", "..", ".x", "a/b", "a b"] {
             assert!(tty_file(bad).is_none(), "{bad:?}");
         }
+    }
+
+    /// Docker's `Healthcheck` (nanosecond durations, `CMD-SHELL` or `CMD`) as `kern box --health-*`
+    /// in whole seconds rounded up; compose's `service_healthy` waits on it. MEASURED before: not read.
+    #[test]
+    fn a_healthcheck_becomes_the_boxs_health_flags() {
+        let b = body(
+            r#"{"Image":"x","Healthcheck":{"Test":["CMD-SHELL","pg_isready -U u"],"Interval":1000000000,"Timeout":3000000000,"Retries":30,"StartPeriod":500000000}}"#,
+        );
+        let a = create_argv("n", &b)
+            .map(|c| c.argv.join(" "))
+            .unwrap_or_default();
+        assert!(a.contains("--health-cmd pg_isready -U u"), "{a}");
+        assert!(
+            a.contains("--health-interval 1") && a.contains("--health-timeout 3"),
+            "{a}"
+        );
+        assert!(
+            a.contains("--health-retries 30") && a.contains("--health-start-period 1"),
+            "{a}"
+        );
+        let exec = body(r#"{"Image":"x","Healthcheck":{"Test":["CMD","mysqladmin","ping"]}}"#);
+        let a = create_argv("n", &exec)
+            .map(|c| c.argv.join(" "))
+            .unwrap_or_default();
+        assert!(
+            a.contains("--health-cmd-argv mysqladmin --health-cmd-argv ping"),
+            "{a}"
+        );
+        let none = body(r#"{"Image":"x","Healthcheck":{"Test":["NONE"]}}"#);
+        let a = create_argv("n", &none)
+            .map(|c| c.argv.join(" "))
+            .unwrap_or_default();
+        assert!(!a.contains("--health"), "{a}");
     }
 
     /// An endpoint this API does not serve answers 501 saying what does the job (here `kern build`),
