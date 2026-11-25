@@ -491,7 +491,13 @@ pub fn info() -> Result<(), Error> {
         // install has its images and volumes at the default place.
         // SAFETY: geteuid has no preconditions.
         let root = unsafe { libc::geteuid() } == 0;
-        let why = if set_by("data_dir") {
+        // AN UNREAD FILE THAT SETS THE PLACE is said here too: boxes and volumes refuse until it is
+        // fixed, and "default" on this row would describe a place nothing uses.
+        let unread = crate::config::unread_data_place().is_some();
+        let why = if unread {
+            "kern.toml does not parse and sets where data goes: boxes and volumes refuse until it is \
+             fixed, `kern validate`"
+        } else if set_by("data_dir") {
             "[kern] data_dir"
         } else if root {
             "default; on a server `kern config set data_dir /var/lib/kern` keeps it where Docker keeps its"
