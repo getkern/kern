@@ -17,8 +17,11 @@
 
 `kern box … --egress-allow pypi.org,files.pythonhosted.org` gives a box outbound network access **only
 to the listed domains** (and their subdomains). An agent can `pip install` from PyPI but cannot exfiltrate
-to an arbitrary host. Without the flag the box's default is unchanged: **no outbound at all** (an isolated
-loopback-only netns). `--egress-allow` is strictly *more* open than the default, never less.
+to an arbitrary host. With the flag the box has no NAT: an isolated netns whose one way out is the
+filtering proxy (measured: the allowed domain answers, a direct IP and raw TCP do not). Without it a
+`kern box` has Docker's default, a NAT with outbound anywhere, and `--network none` leaves it loopback
+only; every SDK sandbox starts with none. So `--egress-allow` is narrower than a box's default and wider
+than `--network none`.
 
 ## Addresses, ranges, `*` and `--egress-deny`
 

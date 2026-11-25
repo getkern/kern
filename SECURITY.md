@@ -86,7 +86,10 @@ the host network, the host's loopback and the services on it included. For code 
 shared hardware, see [kern or a microVM](#kern-or-a-microvm).
 
 ## What is enforced now
-- **Namespaces**: user, PID, network (loopback-only), UTS, IPC and mount.
+- **Namespaces**: user, PID, network, UTS, IPC and mount. The network namespace has a NAT of its own
+  by default, as a Docker container's does: outbound to the internet and the LAN, the host's
+  loopback-only services not reachable (measured with a canary on `127.0.0.1`). `--network none`
+  leaves it loopback only, and so does every SDK sandbox.
 
 - **`pivot_root`** into the rootfs. The default root is a writable overlay whose scratch is discarded on exit; `--read-only` remounts it read-only. The overlay `lowerdir` is the image cache, shared read-only across boxes, and every write lands in a per-box ephemeral upper.
 

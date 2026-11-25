@@ -27,8 +27,9 @@ network.
    `--secret` values and the posture `kern exec` reproduces. Reading it steals a peer's secrets; writing
    it forges a peer's posture.
 4. **The operator's registry credentials**, from argv, a readable file, or a token redirect.
-5. **Host network reachability** the box's netns should not grant: a host-loopback service, the LAN, or
-   a host-side transport such as vsock on WSL2.
+5. **Host network reachability** the box's netns should not grant: a host-loopback service, or a
+   host-side transport such as vsock on WSL2. The LAN and the internet are reachable from a box's
+   default network, as from a Docker container; with `--network none` (every SDK sandbox) nothing is.
 
 ## Entry points
 
@@ -57,6 +58,7 @@ network.
 | Registry integrity | TLS-pinned on every hop and redirect; realm pinning (CVE-2020-15157 class); credentials off argv |
 | Optional write confinement | `--apparmor <profile>` and `--landlock-rw`, both opt-in and fail-closed: no Landlock on this kernel refuses the box rather than running it unconfined |
 | Resource caps **where the controller is delegated** | cgroup v2 `memory.max` / `pids.max`, read back to confirm |
+| Host loopback from the default network | a NAT of the box's own (pasta with `--no-map-gw`): its gateway is not the host, and no address in it reaches a service the host binds to `127.0.0.1` (measured with a canary there: none of the gateway, the host's LAN address or `host-gateway` answered, while a service on every interface answered on the LAN address, as under Docker) |
 
 ## COOPERATIVE governors: shape an honest workload, not a boundary
 
@@ -75,7 +77,7 @@ network.
 |---|---|---|
 | Escape via a crafted image | in-process vetter + no-follow merge + digest verify | an exotic-but-safe image is refused rather than extracted (fail-closed) |
 | Nested-namespace escape | `clone` flag filter, `clone3` refused, mount API denied | the userns surface itself is kernel attack surface |
-| Remount root writable | seccomp kills the mount API; child-userns caps are ineffective over host-owned mounts | `--privileged` regains the classic `mount` syscalls, but root and cgroup stay unchanged and seccomp cannot be turned off |
+| Remount root writable | seccomp refuses the mount API; child-userns caps are ineffective over host-owned mounts | `--privileged` regains the classic `mount` syscalls, but root and cgroup stay unchanged and seccomp cannot be turned off |
 | Registry poisoning | sha256 on blobs and pinned manifests; TLS + realm pinning | trust in the host kernel's TLS stack |
 | Peer secret / posture theft | inverted-default registry guard at **every** host-path entry, by device+inode identity | the operator's own source paths are trusted as such |
 | Secret disclosure | `/run/secrets` tmpfs mode 0400, off argv, `O_EXCL\|O_NOFOLLOW` | inline `NAME=value` is visible in the host `ps`, and is warned about |
