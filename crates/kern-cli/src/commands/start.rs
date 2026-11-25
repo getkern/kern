@@ -6306,7 +6306,7 @@ fn install_persistent_box(
     // docker syntax into a unit whose `ExecStart` names the resolved `kern` binary, so it would fail
     // at every boot, on a machine nobody is watching.
     let mut exec = vec![systemd_quote(&self_exe.to_string_lossy())];
-    let mut it = std::env::args().skip(1).peekable();
+    let mut it = crate::invocation_args().into_iter().peekable();
     let mut past_sep = false;
     while let Some(a) = it.next() {
         // Strip kern's own `-d`/`--restart` only among the flags BEFORE the `--` command separator.
@@ -6576,7 +6576,7 @@ fn reexec_exec_in_bare_scope() {
     let Ok(self_exe) = std::env::current_exe() else {
         return;
     };
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = crate::invocation_args();
     let systemd_run = kern_isolation::trusted_helper("systemd-run")
         .unwrap_or_else(|| std::path::PathBuf::from("systemd-run"));
     let unit = format!("--unit=kern-exec-{}.scope", std::process::id());
@@ -6730,11 +6730,11 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     let Ok(self_exe) = std::env::current_exe() else {
         return;
     };
-    // The argv this process received, replayed verbatim. It used to come from a recorded
-    // post-translation copy, because a `docker …` invocation arrived in another tool's dialect and
-    // replaying the typed form would hand the second pass syntax kern's own parser rejects. kern no
-    // longer answers to that name, so what was typed and what runs are the same thing again.
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // THE ARGV KERN RAN, NOT THE ONE IT WAS TYPED IN: a `kern-docker` invocation arrived in docker's
+    // dialect, and replaying that hands the second pass a syntax kern's parser rejects (measured:
+    // `kern run: unknown flag` on every shim box of a host that takes the scope). See
+    // `crate::invocation_args`.
+    let args: Vec<String> = crate::invocation_args();
 
     // The scope's memory cap tracks `--memory` (so the outer scope never caps a box below what it
     // asked for); `--cpus` maps to a CPUQuota, `--cpuset-cpus` to AllowedCPUs. Swap tracks
@@ -6829,6 +6829,11 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
         .arg(self_exe)
         .args(&args)
         .env("KERN_SCOPE", "1");
+    // What `kern-docker` prints after the command (`docker run -d`: the container's name), which
+    // this process will not live to print: the re-executed kern does. See `crate::PRINT_AFTER_ENV`.
+    if let Some(text) = crate::invocation_print_after() {
+        cmd.env(crate::PRINT_AFTER_ENV, text);
+    }
     // Minimise the check-then-use window before the IRREVERSIBLE exec. The manager was probed earlier
     // in this function, but `current_exe`, `trusted_helper` and the arg building since then are a
     // gap in which the user manager could exit (a session teardown). Re-probe HERE, adjacent to the

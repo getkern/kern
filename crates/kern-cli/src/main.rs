@@ -250,6 +250,36 @@ pub(crate) fn xdg_var(var: &str) -> Option<std::path::PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+/// The argv `cli::run` was given, in KERN's dialect, and what the `docker` shim prints after it.
+///
+/// A RE-EXEC REPLAYS THIS, NOT `std::env::args()`. Under `kern-docker` the process arrived with a
+/// `docker …` command line and ran the translation; a scope re-exec (`systemd-run --scope -- kern
+/// ARGS`) or a `--restart` unit that copied the process's own argv handed kern docker's grammar.
+/// MEASURED on a VPS over ssh, where every box takes the scope: `kern compat docker -- docker run
+/// --rm alpine echo hi` answered `kern run: unknown flag`. On a host on the direct path nothing
+/// re-execs, which is why the desktop never showed it. Set once in `main`, before dispatch.
+static INVOCATION: std::sync::OnceLock<(Vec<String>, Option<String>)> = std::sync::OnceLock::new();
+
+/// The variable a re-executed kern finds the shim's after-text in: `docker run -d` prints the
+/// container's name, and the process that would have printed it was replaced by the re-exec.
+pub(crate) const PRINT_AFTER_ENV: &str = "KERN_DOCKER_PRINT_AFTER";
+
+/// The argv to replay for a re-exec of this invocation; see [`INVOCATION`]. Falls back to the
+/// process's own, read lossily (a non-UTF-8 argument must not panic here either).
+pub(crate) fn invocation_args() -> Vec<String> {
+    INVOCATION.get().map(|(a, _)| a.clone()).unwrap_or_else(|| {
+        std::env::args_os()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    })
+}
+
+/// What the shim prints when the command succeeds, for a re-exec to carry; see [`PRINT_AFTER_ENV`].
+pub(crate) fn invocation_print_after() -> Option<String> {
+    INVOCATION.get().and_then(|(_, p)| p.clone())
+}
+
 #[allow(clippy::disallowed_methods)] // this IS the chokepoint
 pub(crate) fn global_env(name: &str) -> Option<std::ffi::OsString> {
     #[cfg(test)]
@@ -428,6 +458,14 @@ fn main() -> ExitCode {
             Err(r) => return shim_refused(&r),
         }
     };
+    // THE RE-EXECUTED HALF OF A SHIM COMMAND: the process that translated it was replaced by the
+    // scope re-exec, so the after-text travels in the environment. Honoured only as that re-exec
+    // (`KERN_SCOPE`), and removed so the box never inherits it.
+    if print_after.is_none() && kern_common::env_flag("KERN_SCOPE") {
+        print_after = global_env(PRINT_AFTER_ENV).and_then(|v| v.into_string().ok());
+    }
+    unset_global_env(PRINT_AFTER_ENV);
+    let _ = INVOCATION.set((args.clone(), print_after.clone()));
     // Map the result to an exit code in exactly ONE place (the lib/command layer returns
     // `Result`, never calls `process::exit` itself).
     match progress::take_progress_flag(&args).and_then(|args| cli::run(&args)) {
