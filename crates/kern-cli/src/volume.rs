@@ -196,7 +196,9 @@ fn checked_device(name: &str, dev: &std::path::Path) -> Result<PathBuf, Error> {
             "volume '{name}': not the root directory itself"
         )));
     }
-    if let Some(state) = crate::registry::trusted_state_overlap(&canon) {
+    if let Some(state) = crate::registry::trusted_state_overlap(&canon)
+        .or_else(|| crate::registry::image_cache_overlap(&canon))
+    {
         return Err(Error::Volume(format!(
             "volume '{name}': {} overlaps kern's own state ({}); a box mounting it could reach \
              other boxes' records or volumes. Choose a directory outside it",
@@ -859,7 +861,10 @@ fn create(args: &[String]) -> Result<String, Error> {
                 )));
             }
             if let Some(state) = crate::commands::planned_bind_source(&dir.to_string_lossy())
-                .and_then(|planned| crate::registry::trusted_state_overlap(&planned))
+                .and_then(|planned| {
+                    crate::registry::trusted_state_overlap(&planned)
+                        .or_else(|| crate::registry::image_cache_overlap(&planned))
+                })
             {
                 return Err(Error::Volume(format!(
                     "volume '{name}': {} overlaps kern's own state ({}); a box mounting it could \

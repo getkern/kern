@@ -1116,6 +1116,26 @@ pub fn write_lands_on_trusted_state(parent: &Path, name: &std::ffi::OsStr) -> bo
     pm.dev() == rm.dev() && guarded_identities().contains(&(pm.dev(), pm.ino()))
 }
 
+/// The image cache (`~/.cache/kern`, `[kern] images_dir`, `data_dir/cache`) when `src` is it, is in
+/// it, or contains it: a source a CALLER names for a box mount (`-v`, `--mount`, `volume --path`) is
+/// refused there. NOT in [`trusted_state_overlap`], which kern's own build staging and `--rootfs`
+/// paths also pass, and they live in the cache. The SDKs refused it already, the CLI took it as the
+/// caller's choice. MEASURED (Grok's round 15): a box given `-v <cache>:/c` wrote into an
+/// extracted alpine layer, and the next `kern run alpine` ran the changed file. Docker's cache is
+/// root's, so no box of a user's can be handed it; this keeps kern's at that line.
+///
+/// The build cache inside it is the exception, as `logs` is the registry's: `RUN --mount=type=cache`
+/// mounts its directories into a build step writable by design, and they are no image's layers.
+pub fn image_cache_overlap(src: &Path) -> Option<PathBuf> {
+    let cache = crate::commands::cache_dir();
+    let cache = cache.parent()?;
+    let cache = fs::canonicalize(cache).unwrap_or_else(|_| cache.to_path_buf());
+    let build_cache = crate::commands::build_cache_root();
+    let build_cache = fs::canonicalize(&build_cache).unwrap_or(build_cache);
+    (mount_refused_by_path(src, &cache) == Some(true) && !src.starts_with(&build_cache))
+        .then_some(cache)
+}
+
 /// The PATH half of [`path_overlaps_trusted_state`], PURE so the inversion is unit-tested without a
 /// filesystem. `Some(true)` = refuse, `Some(false)` = allow (a box-data child), `None` = no path
 /// overlap, the caller falls through to the dev/ino identity check.

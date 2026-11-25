@@ -1627,6 +1627,31 @@ fn drop_shadowed(
     from_m.retain(|m| !own.iter().any(|d| same(d, &m.1)));
 }
 
+/// The first destination two of a box's own mounts share, compared as paths (`/data` and `/data/`
+/// are one). Docker refuses the run ("Duplicate mount point"); kern mounted both, the later over the
+/// earlier, and said nothing. MEASURED: `-v a:/data -v b:/data`, `--tmpfs /data -v a:/data` and
+/// `-v a:/data --mount ...,dst=/data` are each refused by Docker 29.
+fn duplicate_mount_point(volumes: &[String], mounts: &[Mount], tmpfs: &[String]) -> Option<String> {
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    let dsts = volumes
+        .iter()
+        .map(|v| v.split(':').nth(1).unwrap_or_default().to_string())
+        .chain(mounts.iter().map(|m| m.1.clone()))
+        .chain(
+            tmpfs
+                .iter()
+                .map(|t| t.split(':').next().unwrap_or_default().to_string()),
+        );
+    for d in dsts.filter(|d| !d.is_empty()) {
+        let p: std::path::PathBuf = std::path::Path::new(&d).components().collect();
+        if seen.contains(&p) {
+            return Some(p.display().to_string());
+        }
+        seen.push(p);
+    }
+    None
+}
+
 fn resolve_volumes_from(entries: &[String]) -> Result<(Vec<String>, Vec<Mount>), Error> {
     let mut volumes = Vec::new();
     let mut mounts = Vec::new();
@@ -1664,6 +1689,11 @@ fn resolve_volumes_from(entries: &[String]) -> Result<(Vec<String>, Vec<Mount>),
 }
 
 pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
+    if let Some(dst) = duplicate_mount_point(args.volumes, args.mounts, args.tmpfs) {
+        return Err(Error::Sandbox(format!(
+            "duplicate mount point: {dst} (two of this box's -v, --mount and --tmpfs name it; keep one)"
+        )));
+    }
     // `--volumes-from`: the other box's mounts join this box's own, before anything reads them.
     let (from_v, from_m);
     let args = if args.volumes_from.is_empty() {
@@ -7038,7 +7068,20 @@ mod user_etc_files_tests {
 
 #[cfg(test)]
 mod volumes_from_tests {
-    use super::{decode_mount_record, drop_shadowed, mount_record_of};
+    use super::{decode_mount_record, drop_shadowed, duplicate_mount_point, mount_record_of};
+
+    #[test]
+    fn two_of_a_boxs_own_mounts_on_one_path_are_refused() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            duplicate_mount_point(&s(&["a:/data", "b:/data/"]), &[], &[]).as_deref(),
+            Some("/data")
+        );
+        assert!(duplicate_mount_point(&s(&["a:/data"]), &[], &s(&["/data:size=1m"])).is_some());
+        let m = vec![("/x".to_string(), "/data".to_string(), false)];
+        assert!(duplicate_mount_point(&s(&["a:/data"]), &m, &[]).is_some());
+        assert!(duplicate_mount_point(&s(&["a:/data", "b:/data/sub"]), &[], &s(&["/t"])).is_none());
+    }
 
     #[test]
     fn the_boxs_own_mount_wins_over_a_copied_one() {

@@ -514,7 +514,22 @@ pub(crate) fn data_dir() -> Option<std::path::PathBuf> {
 pub(crate) fn unread_data_place() -> Option<String> {
     let err = load_cached(None).err()?;
     let path = active_path()?;
-    let raw = std::fs::read_to_string(&path).ok()?;
+    // A FILE THAT IS NOT TEXT cannot be searched for a place, so it cannot be known not to name one:
+    // that fails closed too. MEASURED by Grok's round 15 (case i3): `\xff\x00not toml` gave a
+    // warning and a box that started with its data in the default place.
+    let raw = match std::fs::read(&path) {
+        Ok(b) => match String::from_utf8(b) {
+            Ok(t) => t,
+            Err(_) => {
+                return Some(format!(
+                    "{err}. That file is not text, so kern cannot tell whether it sets where kern \
+                     keeps its data; fix it first (`kern validate {}`)",
+                    path.display()
+                ))
+            }
+        },
+        Err(_) => return None,
+    };
     let names_a_place = raw.lines().any(|l| {
         let t = l.trim_start();
         DIR_KEYS.iter().any(|(k, _)| {
@@ -3568,6 +3583,16 @@ mod tests {
         assert!(
             check("[kern]\ndata_dir = \"/a\"\n").is_none(),
             "read fine: nothing to refuse"
+        );
+        assert!(
+            check("\u{ff}").is_none(),
+            "valid UTF-8 garbage naming no place"
+        );
+        std::fs::write(&f, b"\xff\x00not toml").expect("write");
+        forget_cached();
+        assert!(
+            unread_data_place().is_some(),
+            "not text: it cannot be known not to name one"
         );
         crate::unset_global_env("KERN_CONFIG");
         forget_cached();

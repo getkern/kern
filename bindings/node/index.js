@@ -74,6 +74,9 @@ const WORKSPACE = "/workspace"; // where the persistent workspace is mounted ins
 // from an exit code, because `exec` reports a MISSING BOX and a workload that exited non-zero through
 // the same status, and only the first of the two is something the binding can repair.
 const RESIDENT_GONE = "no running box named";
+// How kern words a mount it refuses because the source is, holds or sits in kern's own state. Read only
+// from a box that NEVER STARTED, so it is kern's stderr and not the code's. Mirrors the Python binding.
+const KERN_STATE_REFUSAL = "kern's own state (";
 // Prefix for a resident box's name, so one cannot be confused with a box the user started by hand.
 const RESIDENT_PREFIX = "kern-sbx-";
 // The label a resident box's posture fingerprint is stamped into.
@@ -6087,6 +6090,14 @@ class Sandbox {
         }
         if (rc === 125 && fault && fault.type === "startup_failed") {
           return reject(new SandboxError(fault.message || "the box failed to start"));
+        }
+        // A MOUNT KERN REFUSED IS A `MountRefused`, as one this package refuses is: kern's list follows
+        // its `kern.toml` too (a moved data dir or image cache). Only when the box never started.
+        if (
+          fault && fault.type === "startup_failed" && !boxStarted &&
+          String(stderr || "").includes(KERN_STATE_REFUSAL)
+        ) {
+          return reject(new MountRefused(startupFailureMessage(stderr)));
         }
         // ASYNC, because a shared workspace's diff may ask the helper about what the box user closed to
         // us; the promise is settled from its result either way.

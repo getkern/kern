@@ -123,6 +123,9 @@ _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside ev
 #: from an exit code, because `exec` reports a MISSING BOX and a workload that exited non-zero through
 #: the same status, and only the first of the two is something the binding can repair.
 _RESIDENT_GONE = "no running box named"
+# How kern words a mount it refuses because the source is, holds or sits in kern's own state. Read only
+# from a box that NEVER STARTED, so it is kern's stderr and not the code's: see `MountRefused` below.
+_KERN_STATE_REFUSAL = "kern's own state ("
 
 
 def _workspace_usage(
@@ -6963,6 +6966,17 @@ class Sandbox:
             )
         if rc == 125 and fault is not None and fault.type == "startup_failed":
             raise SandboxError(fault.message or "the box failed to start")
+        # A MOUNT KERN REFUSED IS A `MountRefused`, as one this package refuses is. The package's own
+        # list follows the environment; kern's follows its `kern.toml` too, so a data dir or an image
+        # cache moved there was refused by kern and came back as a `startup_failed` result. MEASURED
+        # in Grok's round 15 (case c1). Only when the box never started, so the words are kern's.
+        if (
+            fault is not None
+            and fault.type == "startup_failed"
+            and not box_started
+            and _KERN_STATE_REFUSAL in stderr
+        ):
+            raise MountRefused(_startup_failure_message(stderr))
         # THE RESIDENT BOX IS GONE: recreate it once and run the call again, so a sandbox does not
         # become permanently unusable because one cell overran its memory cap. `oom.group=1` makes an
         # OOM take the whole box, and the TTL ends it on a longer clock; both land here identically.

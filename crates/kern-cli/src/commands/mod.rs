@@ -2196,6 +2196,14 @@ pub(crate) fn resolve_volume(
                     };
                     return Err(Error::Sandbox(kern_state_refusal(s, &canon, &state, root)));
                 }
+                if let Some(state) = crate::registry::image_cache_overlap(&canon) {
+                    return Err(Error::Sandbox(kern_state_refusal(
+                        s,
+                        &canon,
+                        &state,
+                        StateRoot::Images,
+                    )));
+                }
                 if let Some(msg) = host_ipc_source_refusal(s, &canon) {
                     return Err(Error::Sandbox(msg));
                 }
@@ -2703,6 +2711,8 @@ enum StateRoot {
     Data,
     /// `$XDG_CONFIG_HOME/kern`: `kern.toml` and the registry credentials.
     Config,
+    /// The image cache: the layers every later box of an image runs.
+    Images,
 }
 
 fn kern_state_refusal(
@@ -2726,6 +2736,9 @@ fn kern_state_refusal(
         StateRoot::Config => {
             "a box able to read that could take the registry credentials, and one able to write it \
              could set the profiles and grants kern applies to later boxes"
+        }
+        StateRoot::Images => {
+            "a box able to write that could change the files every later box of that image runs"
         }
         StateRoot::Registry => {
             "a box able to write that could forge another box's recorded capability/seccomp posture \
@@ -12735,7 +12748,7 @@ pub(crate) mod build;
 
 /// `RUN --mount=type=secret|ssh|cache|tmpfs|bind`: the build's inputs and each step's mounts.
 mod buildmounts;
-pub(crate) use buildmounts::ssh_agent_proxy;
+pub(crate) use buildmounts::{build_cache_root, ssh_agent_proxy};
 
 /// `compose watch`: rebuild and restart one service when its build context changes.
 mod watch;
