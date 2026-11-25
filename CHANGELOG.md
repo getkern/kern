@@ -105,6 +105,13 @@ made through kern's socket) starts at once: the launcher held its layer, so the 
 failed and ran a second later, and `docker run -d --restart always` took 1.4 s with a restart counted
 that never happened (now about 190 ms and 0).
 
+**A closed port is refused behind pasta, and a lost SYN costs one retry.** With the pasta Ubuntu
+24.04 ships, a box's connection to a closed port waited for the client's timeout (`wget -T20`: 20 s;
+Docker: refused in 311 ms), and a SYN the remote dropped cost two seconds instead of one, which bursts
+of fast-starting boxes met often (23 of 300 fetches of example.com over 1.5 s). Two rules kern writes
+in the box's network namespace mend both with any pasta: refused in about 1 s, a dropped SYN 1.0 s as
+under Docker, a box's start unchanged. `kern info` shows them as `pasta tcp`.
+
 **A stopped box is not run again by its own restart policy.** A box whose `--restart always` its
 supervisor keeps (a pod member: every compose service, and every container of kern's Docker API on a
 network) ran again a second after `kern stop`; `kern restart` and `docker restart` then failed with

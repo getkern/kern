@@ -145,7 +145,7 @@ software that probes one (a browser's or bubblewrap's `unshare`, a debugger's `p
 goes on instead of dying. `--security-opt seccomp-deny=kill` makes them **kill** the caller with
 `SIGSYS` instead, and so do `--security-profile untrusted` and every sandbox the SDKs start: the kill
 is the verdict a supervisor reads as "this code tried to leave" (`escape_blocked`). `kern exec` and a
-health probe get the box's own verdict. Twelve more, in eight
+health probe get the box's own verdict. Twelve, in eight
 families, are denied and never kill, under any verdict, because software probes them at start and
 falls back: ten (io_uring's three, `userfaultfd`, `perf_event_open`, the keyring's three, `syslog` and
 `open_by_handle_at`) return **`EPERM`**, as Docker's default profile answers them, and two (`clone3`

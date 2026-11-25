@@ -395,6 +395,15 @@ Pasta costs about **3.6 ms per round trip** and about 9% less download throughpu
 from every member through `localhost`: admin endpoints, `/metrics`, pprof, anything trusting
 `127.0.0.0/8` without authentication. The default bridge gives each service its own loopback.
 
+**A closed port is refused about a second later than under Docker.** A box reaches the network
+through pasta, which answers for every remote host. The pasta Ubuntu 24.04 ships (`0.0~git20240220`)
+refuses a connection with a RST a box's socket discards, and resets a connection it is still making
+when the box sends its SYN again; kern adds two rules in the box's network namespace that turn the
+first into `ECONNREFUSED` at the box's next SYN and keep the second from happening. Measured on that
+host: a closed port refused in 1081-1088 ms (Docker 311 ms; without the rules, the client's whole
+timeout), a first SYN the server drops costing 1000-1010 ms (Docker 1010-1059; without the rules
+2029). `kern info` says whether the rules hold (`pasta tcp`); a pasta from 2025-02 on needs none.
+
 **A published port binds `0.0.0.0` and `[::]`, like Docker.** On the corpus, 203 of 259 files (78%)
 publish at least one port. Every form is read as Docker reads it, measured against `docker port`:
 `8080:80` and `:8080:80` bind both families, `0.0.0.0:8080:80` IPv4 only, `[::]:8080:80` and
