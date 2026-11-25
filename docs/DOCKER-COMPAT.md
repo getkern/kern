@@ -402,7 +402,7 @@ when the box sends its SYN again; kern adds two rules in the box's network names
 first into `ECONNREFUSED` at the box's next SYN and keep the second from happening. Measured on that
 host: a closed port refused in 1081-1088 ms (Docker 311 ms; without the rules, the client's whole
 timeout), a first SYN the server drops costing 1000-1010 ms (Docker 1010-1059; without the rules
-2029). `kern info` says whether the rules hold (`pasta tcp`). A pasta from 2025-02 on needs none and the rules leave it be: with passt's own build of 2026-10-02, a closed port refused in 13 ms and a dropped first SYN cost 1009-1060 ms.
+2029). `kern info` says whether the rules hold and the pasta's build date (`pasta tcp`), and `kern doctor` warns when an older pasta meets a kernel without nftables, where a closed port waits for the client's timeout. A pasta from 2025-02 on needs none and the rules leave it be: with passt's own build of 2026-10-02, a closed port refused in 13 ms and a dropped first SYN cost 1009-1060 ms.
 
 **A published port binds `0.0.0.0` and `[::]`, like Docker.** On the corpus, 203 of 259 files (78%)
 publish at least one port. Every form is read as Docker reads it, measured against `docker port`:

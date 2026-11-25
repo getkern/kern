@@ -132,7 +132,7 @@ with, as Docker reports it. `kern save a b` and `docker save a b` write one arch
 Docker: refused in 311 ms), and a SYN the remote dropped cost two seconds instead of one, which bursts
 of fast-starting boxes met often (23 of 300 fetches of example.com over 1.5 s). Two rules kern writes
 in the box's network namespace mend both with any pasta: refused in about 1 s, a dropped SYN 1.0 s as
-under Docker, a box's start unchanged. `kern info` shows them as `pasta tcp`.
+under Docker, a box's start unchanged. `kern info` shows them as `pasta tcp`, with the pasta's build date; `kern doctor` names a pasta older than 2025-02 and where a newer one comes from, and warns when it meets a kernel without nftables.
 
 **A stopped box is not run again by its own restart policy.** A box whose `--restart always` its
 supervisor keeps (a pod member: every compose service, and every container of kern's Docker API on a
