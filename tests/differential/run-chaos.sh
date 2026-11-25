@@ -38,7 +38,7 @@ expected() {
     set1/case8 | set1/case7) echo "services that run concurrently print in either order; case 7 has no healthcheck on its proxy (a race in the file)" ;;
     set2/r2-9) echo "kern refuses a bind that leaves the project through a symlink (deliberate); r2-9abs is the same case with an absolute path" ;;
     set3/g1) echo "a failed migration under --exit-code-from: Docker exits 0, kern exits 1 (deliberate, owner decision)" ;;
-    set3/g8) echo "Docker itself sometimes hangs on --abort-on-container-exit with a restart policy (measured: 600 s timeout)" ;;
+    set3/g8) echo "Docker itself sometimes hangs on --abort-on-container-exit with a restart policy (cut at 90 s by this runner)" ;;
     set4/x3b) echo "a race in the file: the consumer depends on the producer having STARTED, not written; Docker's slower container start wins it (5/5), kern's sometimes loses (3/5); with the consumer 1 s later both read 3/3" ;;
     *) return 1 ;;
   esac
@@ -105,7 +105,11 @@ for sc in "${list[@]}"; do
       if [ -f setup.sh ] && [ ! -f "$src/.setup-done" ]; then sh setup.sh > setup.log 2>&1; fi
       [ -f compose-in-proj.yml ] && cp compose-in-proj.yml proj/docker-compose.yml
       start=$(date +%s)
-      COMPOSE="$C" timeout 600 bash run.sh > "$WORK/$suite-$name.out.$eng" 2>&1
+      # Docker's own hang on `set3/g8` (listed as expected below) is cut at 90 s instead of costing
+      # every run ten minutes; kern's side keeps the full limit.
+      limit=600
+      [ "$sc" = set3/g8 ] && [ "$eng" = docker ] && limit=90
+      COMPOSE="$C" timeout "$limit" bash run.sh > "$WORK/$suite-$name.out.$eng" 2>&1
       echo "WALL:$(( $(date +%s) - start ))s" >> "$WORK/$suite-$name.out.$eng"
     )
     # WHAT THIS CASE LEFT RUNNING, counted before the cleanup below so a leak is reported, then
