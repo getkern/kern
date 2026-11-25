@@ -249,6 +249,26 @@ pub(crate) fn kern_xdg_root(var: &str, home_rel: &str) -> Option<std::path::Path
             });
         }
     }
+    // A UNIT TEST NEVER WRITES THE DEVELOPER'S DATA DIR. Many isolate only `XDG_RUNTIME_DIR`, which
+    // was enough while box logs lived there; with the logs in the data dir, a rename test left
+    // `rennew-*.log` in `~/.local/share/kern/logs` (MEASURED). Unset, the data root of a test process
+    // is a directory of its own.
+    // ABSENT, not empty or relative: those are the fallback rule's own cases, tested as such. And in
+    // `/dev/shm`, not `/tmp`: a data root under `/tmp` makes `-v /tmp:...` contain kern's state, which
+    // tests mounting `/tmp` rely on not being so.
+    #[cfg(test)]
+    if var == "XDG_DATA_HOME" && global_env(var).is_none() {
+        let base = std::path::Path::new("/dev/shm");
+        let base = if base.is_dir() {
+            base.to_path_buf()
+        } else {
+            std::env::temp_dir()
+        };
+        return Some(
+            base.join(format!("kern-unit-data-{}", std::process::id()))
+                .join("kern"),
+        );
+    }
     xdg_base(var, home_rel).map(|b| b.join("kern"))
 }
 
