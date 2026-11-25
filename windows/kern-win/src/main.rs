@@ -862,29 +862,68 @@ fn parse_router_port(out: &str) -> Option<u16> {
 }
 
 /// The row, in the shape the Linux doctor prints its rows.
-fn router_row(port: u16, seen: &PortSeen) -> String {
+/// The row, as the doctor in the distro shows it: whether it is fine, what it says, and the fix.
+#[derive(Debug, PartialEq)]
+struct RouterVerdict {
+    ok: bool,
+    msg: String,
+    hint: String,
+}
+
+fn router_verdict(port: u16, seen: &PortSeen) -> RouterVerdict {
     const FIX: &str = "add `local_domains_port = <port>` under [kern] in ~/.config/kern/kern.toml \
                        inside the distro";
-    match seen {
-        PortSeen::RouterAnswers => format!(
-            "  \u{2714} names .localhost from Windows: kern's router answers on 127.0.0.1:{port}"
+    let (ok, msg, hint) = match seen {
+        PortSeen::RouterAnswers => (
+            true,
+            format!("names .localhost from Windows: kern's router answers on 127.0.0.1:{port}"),
+            String::new(),
         ),
-        PortSeen::Free => format!(
-            "  \u{2714} names .localhost from Windows: port {port} is free here, so they reach kern"
+        PortSeen::Free => (
+            true,
+            format!("names .localhost from Windows: port {port} is free here, so they reach kern"),
+            String::new(),
         ),
-        PortSeen::Reserved => format!(
-            "  ! names .localhost from Windows: Windows refuses to open port {port} here (access \
-             denied), so curl.exe and the browser may not reach kern\n      {FIX}"
+        PortSeen::Reserved => (
+            false,
+            format!(
+                "names .localhost from Windows: Windows refuses to open port {port} here (access \
+                 denied), so curl.exe and the browser may not reach kern"
+            ),
+            FIX.to_string(),
         ),
-        PortSeen::HeldByOther => format!(
-            "  ! names .localhost from Windows: a Windows program holds port {port}, so curl.exe \
-             and the browser reach it, not kern\n      {FIX}"
+        PortSeen::HeldByOther => (
+            false,
+            format!(
+                "names .localhost from Windows: a Windows program holds port {port}, so curl.exe \
+                 and the browser reach it, not kern"
+            ),
+            FIX.to_string(),
         ),
-        PortSeen::Unchecked(why) => format!(
-            "  ! names .localhost from Windows: port {port} could not be checked ({})",
-            short(why)
+        PortSeen::Unchecked(why) => (
+            false,
+            format!(
+                "names .localhost from Windows: port {port} could not be checked ({})",
+                short(why)
+            ),
+            String::new(),
         ),
-    }
+    };
+    RouterVerdict { ok, msg, hint }
+}
+
+/// The variable that carries the Windows row into the distro's `kern doctor`: `ok|warn`, the
+/// message and the hint, tab-separated (none of the three holds a tab).
+const DOCTOR_ROW_VAR: &str = "KERN_DOCTOR_WINDOWS_ROW";
+
+fn encode_row(v: &RouterVerdict) -> String {
+    let clean = |t: &str| t.replace(['\t', '\n', '\r'], " ");
+    format!(
+        "{}\t{}\t{}",
+        if v.ok { "ok" } else { "warn" },
+        clean(&v.msg),
+        clean(&v.hint)
+    )
 }
 
 /// Try the port from Windows: a request kern's router answers in its own words (`kern: ` opens
@@ -929,8 +968,13 @@ fn doctor_windows_rows(target: &Target) {
     let Some(port) = out.as_deref().and_then(parse_router_port) else {
         return;
     };
-    println!("\nfrom Windows (kern.exe):");
-    println!("{}", router_row(port, &probe_port(port)));
+    // CHECKED BEFORE THE DOCTOR RUNS AND HANDED TO IT, so the row is one of its rows: counted in its
+    // tally and in its exit code. Printed after it, a `!` here left "ready - N ok" and exit 0 above.
+    env::set_var(
+        DOCTOR_ROW_VAR,
+        encode_row(&router_verdict(port, &probe_port(port))),
+    );
+    selfupdate::pass_into_wsl(DOCTOR_ROW_VAR);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1314,6 +1358,9 @@ fn forward_to_kern(args: &[String], doctor: bool) -> i32 {
         };
 
         let translated: Vec<String> = args.iter().map(|a| translate_arg(a)).collect();
+        if doctor && attempt == 0 {
+            doctor_windows_rows(&target);
+        }
 
         // Best-effort perf hint: a `-v` source under /mnt/<drive> crosses WSL2's 9p bridge (~10x slower).
         if args
@@ -1335,12 +1382,7 @@ fn forward_to_kern(args: &[String], doctor: bool) -> i32 {
                 );
                 continue;
             }
-            Ok(s) => {
-                if doctor {
-                    doctor_windows_rows(&target);
-                }
-                return s.code().unwrap_or(1);
-            }
+            Ok(s) => return s.code().unwrap_or(1),
             Err(e) => {
                 clear_cache(); // wsl.exe not even spawnable - force a fresh probe next time
                 eprintln!("kern: could not invoke WSL2: {e}. Is WSL installed? Try: wsl -l -v");
@@ -1480,21 +1522,32 @@ mod tests {
     #[test]
     fn a_reserved_or_held_port_names_the_fix_and_a_good_one_does_not() {
         for bad in [PortSeen::Reserved, PortSeen::HeldByOther] {
-            let r = router_row(8780, &bad);
-            assert!(r.starts_with("  ! names .localhost from Windows"), "{r}");
-            assert!(r.contains("local_domains_port"), "{r}");
-            assert!(r.contains("8780"), "{r}");
+            let r = router_verdict(8780, &bad);
+            assert!(
+                !r.ok && r.msg.starts_with("names .localhost from Windows"),
+                "{r:?}"
+            );
+            assert!(r.hint.contains("local_domains_port"), "{r:?}");
+            assert!(r.msg.contains("8780"), "{r:?}");
         }
         for good in [PortSeen::RouterAnswers, PortSeen::Free] {
-            let r = router_row(8780, &good);
+            let r = router_verdict(8780, &good);
             assert!(
-                r.starts_with("  \u{2714} names .localhost from Windows"),
-                "{r}"
+                r.ok && r.msg.starts_with("names .localhost from Windows"),
+                "{r:?}"
             );
-            assert!(!r.contains("local_domains_port"), "{r}");
+            assert!(r.hint.is_empty(), "{r:?}");
         }
-        assert!(router_row(8780, &PortSeen::Reserved).contains("access denied"));
-        assert!(router_row(8780, &PortSeen::HeldByOther).contains("holds"));
+        assert!(router_verdict(8780, &PortSeen::Reserved)
+            .msg
+            .contains("access denied"));
+        assert!(router_verdict(8780, &PortSeen::HeldByOther)
+            .msg
+            .contains("holds"));
+        let line = encode_row(&router_verdict(8780, &PortSeen::HeldByOther));
+        let parts: Vec<&str> = line.split('\t').collect();
+        assert_eq!(parts.len(), 3, "{line}");
+        assert_eq!(parts[0], "warn");
     }
 
     #[test]

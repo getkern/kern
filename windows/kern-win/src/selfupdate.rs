@@ -272,7 +272,7 @@ fn distro_version() -> Result<Version, String> {
 
 /// `KERN_SELF_UPDATE_URL` (a mirror holding a release's assets) reaches the distro's kern too, so
 /// both halves read the same release: WSL passes a Windows variable only when `WSLENV` names it.
-fn pass_into_wsl(name: &str) {
+pub(crate) fn pass_into_wsl(name: &str) {
     if env::var_os(name).is_none() {
         return;
     }

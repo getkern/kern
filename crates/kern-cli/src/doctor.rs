@@ -300,6 +300,7 @@ fn rows() -> Vec<R> {
     results.extend(check_wsl_drive());
     results.extend(check_wsl_interop());
     results.extend(check_docker_link());
+    results.extend(check_windows_row());
     results.extend(check_tools());
     results.push(check_duplicate_installs());
     // How full the two stores are: the disk kern's data lives on, and the (RAM) log store.
@@ -1130,6 +1131,38 @@ fn check_wsl_interop() -> Option<R> {
     }
     let conf = std::fs::read_to_string("/etc/wsl.conf").unwrap_or_default();
     Some(interop_verdict(&conf))
+}
+
+/// The row `kern.exe` checked FROM WINDOWS before it forwarded `kern doctor` (whether Windows reaches
+/// the `.localhost` router port), handed over in `KERN_DOCTOR_WINDOWS_ROW` so it is one of this
+/// table's rows: in the tally and in the exit code. Printed by `kern.exe` after the table, a `!`
+/// there sat under "ready - N ok" and an exit 0. Read only in WSL, and only in its own shape.
+fn check_windows_row() -> Option<R> {
+    if !crate::commands::in_wsl() {
+        return None;
+    }
+    let raw = crate::global_env("KERN_DOCTOR_WINDOWS_ROW")?
+        .into_string()
+        .ok()?;
+    windows_row_of(&raw)
+}
+
+/// `ok|warn<TAB>message<TAB>hint`, bounded and free of control characters, or nothing.
+fn windows_row_of(raw: &str) -> Option<R> {
+    let mut parts = raw.splitn(3, '\t');
+    let (state, msg, hint) = (parts.next()?, parts.next()?, parts.next().unwrap_or(""));
+    let fine =
+        |t: &str| t.chars().count() <= 400 && !t.chars().any(kern_common::is_terminal_unsafe);
+    if msg.trim().is_empty() || !fine(msg) || !fine(hint) {
+        return None;
+    }
+    let msg = format!("{} (checked from Windows by kern.exe)", msg.trim());
+    match (state, hint.trim()) {
+        ("ok", "") => Some(R::ok(msg)),
+        ("ok", h) => Some(R::ok_note(&msg, h)),
+        ("warn", h) => Some(R::Warn(msg, h.to_string())),
+        _ => None,
+    }
 }
 
 /// The `docker` links `kern compat docker link` made: shown only when there is one, because the
@@ -3469,6 +3502,19 @@ mod tests {
     /// Only the LITERAL part is measured, so an interpolated `{path}` is not counted: what a host
     /// substitutes is not something this file can bound. That is a floor, not a ceiling, and it is
     /// the half that prose regressions live in.
+    #[test]
+    fn the_windows_row_is_read_in_its_own_shape_only() {
+        assert!(matches!(
+            windows_row_of("warn\tnames .localhost from Windows: held\tadd local_domains_port"),
+            Some(R::Warn(..))
+        ));
+        assert!(windows_row_of("ok\tnames .localhost from Windows: free\t").is_some());
+        assert!(windows_row_of("maybe\tx\ty").is_none());
+        assert!(windows_row_of("ok\t\t").is_none());
+        assert!(windows_row_of("ok\tbad \u{1b}[2J\t").is_none());
+        assert!(windows_row_of("garbage").is_none());
+    }
+
     #[test]
     fn no_verdict_in_this_file_is_a_paragraph() {
         /// Reads a Rust string literal starting at `bytes[i] == b'"'`, joining `\` continuations.
