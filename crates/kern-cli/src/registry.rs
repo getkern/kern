@@ -2047,6 +2047,15 @@ pub fn stop_in_progress(name: &str, pid: i32) -> bool {
     stop_marks(name, pid).is_some_and(|(marker, _)| marker.symlink_metadata().is_ok())
 }
 
+/// Has a `kern stop` begun on `name`/`pid`, whether or not it has written the line yet? The marker
+/// or its `.done` stands, and neither is consumed: the supervisor of a box with a restart policy
+/// asks it before running the box again, and the owner's claim comes after.
+pub fn stop_requested(name: &str, pid: i32) -> bool {
+    stop_marks(name, pid).is_some_and(|(marker, done)| {
+        marker.symlink_metadata().is_ok() || done.symlink_metadata().is_ok()
+    })
+}
+
 /// The stop's claim on the marker: `true` when this stop is the one that writes the line (it
 /// renamed the marker before the owner removed it). See [`owner_stop_claim`].
 pub fn claim_stop_record(name: &str, pid: i32) -> bool {

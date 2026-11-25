@@ -2861,6 +2861,66 @@ fn run_detached_prints_the_name_and_box_does_not() {
     );
 }
 
+/// A box whose `--restart always` its own supervisor keeps (a pod member: compose's services, and
+/// every container of kern's Docker API on a network) is not run again after a `kern stop`, and
+/// `kern restart` gives it one new run. MEASURED before: the supervisor ran the stopped workload
+/// again a second later, `restart` then failed with "already running", and the stop had removed
+/// the scratch under that run, which exited 125 on every retry.
+#[test]
+fn a_supervised_restart_always_box_stays_stopped_and_restarts_once() {
+    if let Some(why) = no_box_here() {
+        eprintln!("skip: {why}");
+        return;
+    }
+    let (pod, name) = (
+        format!("rsp-{}", std::process::id()),
+        format!("rsb-{}", std::process::id()),
+    );
+    let k = |args: &[&str]| kern().args(args).output().expect("kern");
+    let ps = || {
+        let o = k(&["ps", "--format", "{{.Names}}"]);
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|l| l == name)
+    };
+    let _ = k(&["pod", "create", &pod]);
+    let started = k(&[
+        "box",
+        &name,
+        "-d",
+        "--keep",
+        "--network",
+        &pod,
+        "--restart",
+        "always",
+        "--image",
+        "alpine:latest",
+        "--",
+        "sh",
+        "-c",
+        "trap 'exit 0' TERM; sleep 60 & wait",
+    ]);
+    let restarted = k(&["restart", "-t", "5", &name]);
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let up_after_restart = ps();
+    let _ = k(&["stop", "-t", "5", &name]);
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let up_after_stop = ps();
+    let _ = k(&["rm", "-f", &name]);
+    let _ = k(&["pod", "rm", &pod]);
+    assert!(started.status.success(), "{}", out_err(&started).1);
+    assert!(
+        restarted.status.success(),
+        "restart: {}",
+        out_err(&restarted).1
+    );
+    assert!(up_after_restart, "the restart's run is up");
+    assert!(
+        !up_after_stop,
+        "a stopped box is not run again by its policy"
+    );
+}
+
 /// `-d` with `--egress-allow`: the detached box gets its filter (refused before 2026-11-20). Checked
 /// with no internet: inside the box the pump answers on the proxy port, which only happens once the
 /// filter was delivered the box's PID 1; after `stop` the box is gone with it.

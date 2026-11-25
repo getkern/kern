@@ -6004,7 +6004,16 @@ fn supervise_box(
         // when the gate is still in force for retries (`!gate_dropped`), because once it is dropped a
         // retry execs without it and the answer would be about a gate nobody consults.
         let gate_shut = never_started && !gate_dropped && gate_can_still_release() == Some(false);
+        // A `kern stop` ENDED THIS RUN, and no policy brings back a box that was stopped, as
+        // `docker stop` of a `--restart always` container stops it. The stop's marker stands from
+        // before its first signal (see `registry::stop_requested`). MEASURED before: `kern restart`,
+        // and `docker restart` through kern's socket, of a compose service with `restart: always`
+        // stopped postgres, this loop ran it again a second later, the stop then removed the box's
+        // scratch under it, and every run after that exited 125 on a missing overlay directory.
+        adopt_current_name(inst);
+        let stopped = registry::stop_requested(&inst.name, inst.pid);
         let restart_now = !gate_shut
+            && !stopped
             && should_restart(
                 code,
                 restart.always,
@@ -6094,6 +6103,10 @@ fn supervise_box(
                 },
             );
             unsafe { libc::sleep(backoff) };
+            // A stop that came during the backoff ends the box here, before a run it would not see.
+            if registry::stop_requested(&inst.name, inst.pid) {
+                break code;
+            }
             // Read at the top of the next iteration to decide whether the pre-exec gate may be
             // dropped. See the block above the loop: dropping it after a box that NEVER STARTED
             // would exec a workload the launcher refused to release.
