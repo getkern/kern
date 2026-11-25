@@ -77,18 +77,26 @@ kern_macos() {
       limactl start --tty=false "$vm" || err "could not start the Lima VM '${vm}'."
     fi
   else
-    info "creating the Lima VM '${vm}': Ubuntu, no Docker, no containerd (a few minutes, once)"
+    # SAID BEFORE IT STARTS: the first run downloads Ubuntu's cloud image, 931 MiB measured on an
+    # Apple Silicon Mac (3.5 min at 4.4 MiB/s), and a reader who is not told waits on a bar.
+    info "creating the Lima VM '${vm}': Ubuntu, no Docker, no containerd (about 1 GB to download and a few minutes, once)"
+    # `template:default` since Lima 2.0, which warns at `template://default` ("should be written");
+    # a Lima from before 2.0, as an older Homebrew can have, knows only the old spelling.
+    lmaj="$(limactl --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p')"
+    if [ "${lmaj:-0}" -ge 2 ]; then ltpl="template:default"; else ltpl="template://default"; fi
     # KERN_LIMA_ARGS is split into flags on purpose, e.g. "--vm-type qemu".
     # shellcheck disable=SC2086
     limactl start --tty=false --name="$vm" --containerd=none --mount-writable \
-      ${KERN_LIMA_ARGS:-} template://default || err "could not create the Lima VM '${vm}'."
+      ${KERN_LIMA_ARGS:-} "$ltpl" || err "could not create the Lima VM '${vm}'."
   fi
 
   # kern inside the VM, through this script's Linux path, as root so it lands in /usr/local/bin:
   # on PATH in every shell, interactive or not, and named by the AppArmor profile kern carries.
   info "installing kern inside the VM"
   # shellcheck disable=SC2016
-  limactl shell "$vm" sh -c 'curl -fsSL "$1" | sudo env KERN_VERSION="$2" sh' \
+  # KERN_INSTALL_FROM_MAC: the AppArmor step below is done here, so the Linux path must not tell
+  # the reader to run it by hand (it did, in the middle of a Mac install that then did it itself).
+  limactl shell "$vm" sh -c 'curl -fsSL "$1" | sudo env KERN_VERSION="$2" KERN_INSTALL_FROM_MAC=1 sh' \
     sh "https://raw.githubusercontent.com/${REPO}/main/install.sh" "${KERN_VERSION:-latest}" ||
     err "installing kern inside the VM failed."
   # shellcheck disable=SC2016
@@ -97,6 +105,15 @@ kern_macos() {
       /usr/local/bin/kern doctor --apparmor-profile | sudo tee /etc/apparmor.d/kern >/dev/null &&
         sudo apparmor_parser -r /etc/apparmor.d/kern
     fi' || err "installing the AppArmor profile inside the VM failed."
+  # THE UID RANGE HELPERS: Lima's Ubuntu image gives the user an /etc/subuid range but ships no
+  # newuidmap, so every box ran with a single-uid map and an image that chowns to a service user
+  # failed at start. MEASURED on the Mac: nginx `chown(.., 101) failed (22: Invalid argument)`, redis
+  # `chown: .: Invalid argument`; with `uidmap` installed both start.
+  # shellcheck disable=SC2016
+  limactl shell "$vm" sh -c '
+    command -v newuidmap >/dev/null 2>&1 || ! command -v apt-get >/dev/null 2>&1 ||
+      sudo apt-get install -y -q uidmap >/dev/null 2>&1' ||
+    err "installing uidmap inside the VM failed (kern still runs, with a single-uid map)."
 
   # The `kern` command on the Mac.
   shimdir="$HOME/.local/bin"
@@ -308,7 +325,8 @@ esac
 # on a stock Ubuntu 24.04.4 cloud image: install succeeds, and the first command in the README fails.
 # The installer cannot fix it (the remedies need root, and this script may be piped into a plain sh),
 # but a reader who is told before trying loses a minute instead of an evening.
-if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+if [ -z "${KERN_INSTALL_FROM_MAC:-}" ] &&
+  [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
   printf "\n${DIM}    note: this host restricts unprivileged user namespaces (Ubuntu 23.10+ default),${ZZ}\n"
   printf "${DIM}    which lets the namespace be created and refuses its uid map - no box can start yet.${ZZ}\n"
   printf "${DIM}    install the profile kern carries, which keeps the restriction on for everything else:${ZZ}\n"
