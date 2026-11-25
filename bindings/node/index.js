@@ -65,6 +65,8 @@ const SANDBOX_POSTURE = [
   "--security-opt", "seccomp-deny=kill",
   // An OOM ends the whole box: the verdict reported as `oom` (a kern box follows docker by default).
   "--oom-group",
+  // And the memory cap is the whole budget, no swap (a kern box follows docker: swap equal to memory).
+  "--memory-swap-max", "0",
 ];
 
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box

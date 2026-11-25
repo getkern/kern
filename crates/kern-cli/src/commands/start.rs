@@ -1934,11 +1934,25 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // OOM-killed while the same program ran outside kern. The host's RAM keeps the cap a real number,
     // so a box that does exhaust memory is still killed against its own cgroup with kern's message;
     // `--memory` still sets any cap, and the sandbox SDKs pass their own.
-    let gpu_asked = args.gpus.is_some() || cdi_device.is_some() || args.runtime_nvidia;
+    //
+    // AND SO IS EVERY BOX THAT NAMES NO MEMORY, as a Docker container is: `kern run` and `docker
+    // run` through kern's socket gave 512 MiB and no swap, where Docker gives no limit and the
+    // host's swap, and `kern compose` already gave the machine's RAM (`service_memory_cap`).
+    // MEASURED on this desktop, `alpine` with no flag: Docker `memory.max=max swap.max=max`, kern
+    // `536870912` and `0`. A JVM, a database or a build that runs under Docker was OOM-killed here at
+    // a number written nowhere. The SWAP follows Docker's pairing, the one compose already applies
+    // (`service_swap_allowance`): `--memory M` alone allows M of swap (Docker's 2x total), no memory
+    // allows the host's swap, and `--memory-swap-max` wins. The sandbox SDKs pass `--memory` and
+    // `--memory-swap-max 0`: a hard cap is the `oom` verdict they report.
+    let asked_memory = memory;
     let memory = match memory {
-        None if gpu_asked => host_meminfo_bytes("MemTotal:"),
+        None => host_meminfo_bytes("MemTotal:"),
         other => other,
     };
+    let memory_swap_max = args.memory_swap_max.or(match asked_memory {
+        Some(m) => Some(m),
+        None => host_meminfo_bytes("SwapTotal:").filter(|s| *s > 0),
+    });
     // `--nice` (an explicit flag) overrides a profile's `nice`.
     let nice: Option<i32> = args.nice.map(|n| n as i32).or(nice);
     // Flatten the resolved vGPIO profiles into the device/sysfs paths the box will expose.
@@ -1993,7 +2007,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     if !managed && !build_step {
         reexec_in_scope_if_possible(ScopeReexec {
             memory,
-            memory_swap_max: args.memory_swap_max,
+            memory_swap_max,
             cpuset: cpuset.as_deref(),
             cpus,
             pids_max: args.pids_limit,
@@ -2895,7 +2909,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         }),
         memory,
         shm_size: args.shm_size,
-        memory_swap_max: args.memory_swap_max,
+        memory_swap_max,
         cpus,
         cpuset,
         vgpio_devs,
@@ -6050,7 +6064,14 @@ fn supervise_box(
             // stack at the first exit, and the service's status is 1.
             if !rm && !never_started {
                 adopt_current_name(inst);
-                registry::set_box_exit(std::process::id() as i32, inst.starttime, code, inst);
+                registry::set_box_exit(
+                    std::process::id() as i32,
+                    inst.starttime,
+                    code,
+                    inst,
+                    // The runner's verdict for this run: the latch is the runner's, not this process's.
+                    last_verdict.1,
+                );
             }
             restarts = restarts.saturating_add(1);
             registry::set_box_attempt(
@@ -6092,7 +6113,13 @@ fn supervise_box(
             ran_once.then_some(log_key.as_str()),
         );
     } else {
-        registry::set_box_exit(std::process::id() as i32, inst.starttime, final_code, inst);
+        registry::set_box_exit(
+            std::process::id() as i32,
+            inst.starttime,
+            final_code,
+            inst,
+            last_verdict.1,
+        );
     }
     // A DETACHED BOX'S LINE IN THE HISTORY, from the last attempt: its run time measured here to the
     // millisecond, its signal and OOM verdict from the runner (see `latch`), its image, GPUs and

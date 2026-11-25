@@ -113,6 +113,9 @@ _SANDBOX_POSTURE = (
     # And an OOM ends the whole box, which is the verdict this binding reports as `oom`; a kern box
     # follows docker by default and kills only the process the kernel picks.
     "--oom-group",
+    # And the memory cap is the whole budget: no swap. A kern box follows docker here too and gets
+    # as much swap as memory, which would turn an `oom` into a box that crawls through swap first.
+    "--memory-swap-max", "0",
 )
 
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box

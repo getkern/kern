@@ -881,6 +881,7 @@ mod ps_exited_tests {
     fn dead(name: &str, code: i32, pod: &str) -> registry::ExitedBox {
         registry::ExitedBox {
             restarts: 0,
+            oom: false,
             name: name.to_string(),
             pid: 42,
             starttime: 1000,
@@ -7631,8 +7632,8 @@ fn the_generated_config_shows_the_ram_backed_form_and_it_resolves() {
         resolved.backend_dir, None,
         "`backend = \"ram\"` must resolve to a tmpfs, not to a directory"
     );
-    // And the size fits inside the default box memory, or the first reader who runs the example
-    // without a --memory flag gets killed. Measured: a box with no memory profile gets 512 MiB.
+    // And the size fits inside a small box's memory (512 MiB, the SDK sandboxes' default), or the
+    // first reader who runs the example in one gets killed.
     let size = ram_vol
         .size
         .as_deref()
@@ -7640,7 +7641,7 @@ fn the_generated_config_shows_the_ram_backed_form_and_it_resolves() {
         .unwrap_or_else(|| panic!("the generated RAM volume has no readable size:\n{text}"));
     assert!(
         size <= 512 * MIB,
-        "the example is {size} bytes and a box with no memory profile gets 512 MiB"
+        "the example is {size} bytes and a 512 MiB box could not hold it"
     );
 }
 

@@ -1038,7 +1038,7 @@ fn waitexit_dir() -> io::Result<PathBuf> {
 /// Record a completed box's exit code for `kern wait`, keyed `<pid>-<starttime>`. Written by the
 /// detached supervisor as its LAST act (before it unregisters) and by `stop`/`kill` (which SIGKILL the
 /// supervisor before it can record its own). Best-effort.
-pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance) {
+pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance, oom: bool) {
     // ONE RECORD PER NAME, THE LAST RUN'S: a box that ends under a name takes the place of the
     // runs that ended under it before, with their logs, as `kern rm` removes them. MEASURED: three
     // runs of `kern run -d --name l19 ...` left three `l19` rows in `ps -a` (0.56.0 the same), where
@@ -1072,13 +1072,19 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, b: &Instance) {
         // AND HOW MANY TIMES IT WAS RESTARTED, from its supervisor's attempt record (which a stop
         // also finds), for Docker's `RestartCount`.
         let restarts = box_attempt(&b.name, b.pid).map_or(0, Attempt::restarts);
+        // AND WHETHER THE KERNEL'S OOM KILLER STRUCK IN THE BOX, for Docker's `State.OOMKilled`: the
+        // supervisor latched it from the box's own `memory.events` at the reap, and nothing that
+        // reads the record later can count it again (the cgroup is gone). MEASURED before: a
+        // container killed for its memory cap read `OOMKilled: false` through kern's socket, where
+        // Docker says true.
         let body = format!(
-            "{code}\n{}\n{}\n{}\nimage\t{}\nlabels\t{}\nrestarts\t{restarts}",
+            "{code}\n{}\n{}\n{}\nimage\t{}\nlabels\t{}\nrestarts\t{restarts}\noom\t{}",
             b.name,
             b.pod,
             one_line(&b.command, 512),
             one_line(&b.image, 1024),
             one_line(&b.labels, 8192),
+            u8::from(oom),
         );
         let _ = fs::write(d.join(format!("{pid}-{starttime}")), body);
     }
@@ -1366,6 +1372,8 @@ pub struct ExitedBox {
     pub labels: String,
     /// How many times it was restarted (Docker's `RestartCount`); 0 when not recorded.
     pub restarts: u32,
+    /// The OOM killer struck in the box (Docker's `State.OOMKilled`); false when not recorded.
+    pub oom: bool,
     /// Seconds since the box exited, from the sidecar's mtime.
     pub exited_ago: u64,
 }
@@ -1464,6 +1472,7 @@ pub fn list_exited_among(boxes: &[Instance]) -> Vec<ExitedBox> {
             image: crate::ui::scrub(&keyed("image")),
             labels: crate::ui::scrub(&keyed("labels")),
             restarts: keyed("restarts").trim().parse().unwrap_or(0),
+            oom: keyed("oom").trim() == "1",
             exited_ago: ago,
         });
     }
@@ -5973,12 +5982,17 @@ mod removed_record_tests {
             3,
             &parse("name=kept\npid=1\ncommand=true\nimage=alpine:3.21\nlabels=a=b\n")
                 .expect("an instance record"),
+            true,
         );
         let kept = list_exited().into_iter().find(|e| e.code == 3);
         assert!(
             kept.as_ref()
                 .is_some_and(|e| e.image == "alpine:3.21" && e.labels == "a=b"),
             "an exit record keeps the image and the labels"
+        );
+        assert!(
+            kept.as_ref().is_some_and(|e| e.oom),
+            "and whether the OOM killer struck, for Docker's State.OOMKilled"
         );
         let Ok(dir) = waitexit_dir() else {
             panic!("waitexit dir");

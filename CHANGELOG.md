@@ -55,10 +55,24 @@ refusal instead of crashing. The set of refused syscalls is unchanged, and none 
 exec` and health probes get the box's own verdict, and the Python and Node sandboxes ask for the kill
 on every box, so their `escape_blocked` reads as before.
 
+**Breaking: A box that names no memory is bounded by the machine, and swaps as Docker's does.** `kern
+run`, `kern box` and `docker run` through kern's socket capped every box at 512 MiB with no swap, where
+Docker sets no cap, and `kern compose` already gave the host's RAM: a database, a JVM or a build that
+runs under Docker was OOM-killed at a number written nowhere. A box with no `--memory` now has the
+host's RAM as its ceiling and the host's swap; `--memory M` alone allows M of swap, Docker's pairing
+(measured: `memory.swap.max` 268435456 under `--memory 256m` on both engines); `--memory-swap-max`
+sets it. `kern limit` keeps its 512 MiB. The Python and Node sandboxes and the Rust `Sandbox` builder
+pass `--memory-swap-max 0` and keep 512 MiB as their whole budget.
+
 **A box resolves the host's search domains, as a Docker container does.** A box on the default
 network, a compose service and a pod got the host's nameservers and not its `search` line, so a
 short LAN name resolved under Docker and not under kern. The host's domains are the box's now, unless
 `--dns-search` (or `dns_search:`) names its own.
+
+**`docker inspect` says `OOMKilled` through kern's socket.** It was always false. A container whose
+process the kernel's OOM killer ended reads true, and so does a running one that lost a child to it,
+as under Docker; `kern ps --json` and `kern inspect --json` carry it as `oom_killed`. The verdict a
+detached box recorded was the runner's latch read in the wrong process, so it was never set.
 
 **`kern compat docker enable`: the Docker Engine API on a socket of this user, answered by kern.**
 A `systemd --user` socket unit on `$XDG_RUNTIME_DIR/kern/compat-docker.sock` starts the server at the

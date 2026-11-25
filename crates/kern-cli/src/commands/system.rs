@@ -318,10 +318,10 @@ fn help_text(p: &crate::ui::Palette) -> String {
     -w, --workdir <dir> Working directory inside the box
         --entrypoint <a> Replace the image's ENTRYPOINT (repeat for an exec-form list;
                          `--entrypoint \"\"` clears it). Discards the image's CMD too
-    -m, --memory <size> Hard memory cap (e.g. 512m, 1g; default 512m, the host's RAM with --gpus)
+    -m, --memory <size> Hard memory cap (e.g. 512m, 1g; default the host's RAM, as Docker's)
     --cpus <n>          CPU cap in cores (e.g. 1.5, 2; default uncapped)
     --cpuset-cpus <list>  Pin to specific CPUs (e.g. 0-3, 0,2,4; default no pinning)
-    --memory-swap-max <size>  Swap allowance → cgroup-v2 memory.swap.max (default 0 = swap off)
+    --memory-swap-max <size>  Swap allowance → cgroup-v2 memory.swap.max (default: = --memory, else the host's)
     -it, -ti, -t        Allocate an interactive PTY (shells/REPLs); foreground only
     -i, --interactive   Keep stdin attached WITHOUT a PTY. stdin is
                         inherited either way, so this asks for what already happens: it is

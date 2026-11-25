@@ -1237,6 +1237,9 @@ fn inspect(bin: &Path, name: &str) -> Response {
     // `kern pause` freezes the box: Docker's `paused`, still `Running` as Docker reports it. MEASURED
     // before: `docker pause` then `inspect` answered `running`, and `Paused` was false whatever.
     let paused = running && v.get("status").and_then(Value::as_str) == Some("paused");
+    // Docker's `OOMKilled`: the OOM killer struck in the container, the one that ended it or a
+    // child it lost while it runs, as kern records and reads it (`oom_killed`).
+    let oom_killed = v.get("oom_killed").and_then(Value::as_bool) == Some(true);
     // The pod the box is in is its network; the aliases are the ones its create asked for.
     let pod = v.get("pod").and_then(Value::as_str).unwrap_or_default();
     let nets = crate::netvol::networks_json(Some(pod), &net_aliases(name));
@@ -1264,7 +1267,7 @@ fn inspect(bin: &Path, name: &str) -> Response {
     json_response(
         200,
         format!(
-            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":{paused},\"Restarting\":false,\"OOMKilled\":false,\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
+            "{{\"Id\":{},\"Created\":{},\"Name\":{},\"Path\":{},\"Args\":[],\"Image\":{image},\"RestartCount\":{restart_count},\"State\":{{\"Status\":{},\"Running\":{running},\"Paused\":{paused},\"Restarting\":false,\"OOMKilled\":{oom_killed},\"Dead\":false,\"Pid\":{pid},\"ExitCode\":{exit_code},\"Error\":\"\",\"StartedAt\":{},\"FinishedAt\":{}{health_json}}},\"Config\":{{\"Image\":{image},\"Labels\":{},\"Tty\":false,\"Env\":[]}},\"HostConfig\":{{\"NetworkMode\":\"default\"}},\"NetworkSettings\":{{\"Ports\":{},\"IPAddress\":\"\",\"Networks\":{nets}}},\"Mounts\":[]}}",
             json_str(&id),
             json_str(&created),
             json_str(&format!("/{name}")),

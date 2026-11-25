@@ -480,6 +480,10 @@ impl Sandbox {
                 "--security-opt",
                 "seccomp-deny=kill",
                 "--oom-group",
+                // The memory cap is the whole budget: a kern box gets swap equal to its memory, as
+                // docker's does, and `memory_swap_max_bytes` (emitted after this) overrides it.
+                "--memory-swap-max",
+                "0",
             ]
             .map(str::to_string),
         );
@@ -1371,6 +1375,10 @@ mod tests {
             );
         }
         assert!(a.iter().any(|x| x == "--oom-group"), "{a:?}");
+        assert!(
+            a.windows(2).any(|w| w[0] == "--memory-swap-max" && w[1] == "0"),
+            "a sandbox's memory cap is its whole budget: {a:?}"
+        );
         // Quiet + rootfs + command separator present.
         assert_eq!(a[0], "box");
         assert!(a.iter().any(|x| x == "-q"));

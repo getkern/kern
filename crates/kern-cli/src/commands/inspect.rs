@@ -710,8 +710,9 @@ pub fn ps(
                 // box carried it, `--filter label=` matched it, and no output surface printed it.
                 // An object rather than the registry's comma-joined text, because a consumer that
                 // has to re-split a string is doing the parsing this document exists to avoid.
+                let oom = box_oom_killed(b);
                 format!(
-                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"started\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"status\":{}}}",
+                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"started\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"status\":{},\"oom_killed\":{oom}}}",
                     json_str(&b.name),
                     b.pid,
                     json_str(&b.pod),
@@ -743,7 +744,7 @@ pub fn ps(
                 // read ONE key across live and exited rows instead of knowing that a dead box spells
                 // its state in the health field. `health` keeps saying `exited` because something may
                 // already read it.
-                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"image\":{},\"labels\":{},\"exit_code\":{},\"exited_ago\":{}{started},\"restart_count\":{},\"health\":{},\"status\":{}}}",
+                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"image\":{},\"labels\":{},\"exit_code\":{},\"exited_ago\":{}{started},\"restart_count\":{},\"health\":{},\"status\":{},\"oom_killed\":{}}}",
                 json_str(&e.name),
                 e.pid,
                 json_str(&e.pod),
@@ -755,6 +756,7 @@ pub fn ps(
                 e.restarts,
                 json_str("exited"),
                 json_str("exited"),
+                e.oom,
             ));
         }
         for k in &kept {
@@ -784,8 +786,14 @@ pub fn ps(
                 .map(|e| e.restarts)
                 .max()
                 .unwrap_or(0);
+            // Whether its last run met the OOM killer: the newest exit record of the name
+            // (`kept_runs` is newest first), false once that record has expired.
+            let oom = kept_runs
+                .iter()
+                .find(|e| e.name == k.name)
+                .is_some_and(|e| e.oom);
             items.push(format!(
-                "{{\"name\":{},\"command\":{},\"image\":{},\"created\":{}{exit},\"restart_count\":{restarts},\"labels\":{},\"health\":{},\"status\":{}}}",
+                "{{\"name\":{},\"command\":{},\"image\":{},\"created\":{}{exit},\"restart_count\":{restarts},\"oom_killed\":{oom},\"labels\":{},\"health\":{},\"status\":{}}}",
                 json_str(&k.name),
                 json_str(&crate::ui::scrub(&k.command)),
                 json_str(&crate::ui::scrub(&k.meta.image)),
@@ -1901,7 +1909,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&gpu)
         };
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"created\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{},\"restart_count\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"created\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{},\"restart_count\":{},\"oom_killed\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
@@ -1951,6 +1959,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
                 .map(|d| d.at_unix_ms / 1000)),
             // Docker's `RestartCount`: the restarts so far, from the supervisor's attempt record.
             registry::box_attempt(&b.name, b.pid).map_or(0, registry::Attempt::restarts),
+            box_oom_killed(&b),
         );
     } else {
         let p = crate::ui::Palette::detect();
@@ -2640,6 +2649,17 @@ pub fn top() -> Result<(), Error> {
 static STOP_NARRATES_TO_STDERR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Has the OOM killer struck in this running box (a child, under the per-process default)? Docker's
+/// `State.OOMKilled` says so for a running container too. ONE answer for `ps --json` and `inspect
+/// --json`, read from the box's OWN cgroup (its init's leaf); not `oom_kill_dir_for_pid`, which
+/// climbs to the ancestor every box shares and would charge one box's OOM to all of them.
+fn box_oom_killed(b: &registry::Instance) -> bool {
+    b.live_pid1()
+        .and_then(kern_isolation::box_cgroup_dir)
+        .and_then(|d| kern_isolation::oom_kill_count_at(&d))
+        .is_some_and(|n| n > 0)
+}
+
 /// The "stopped" line, on stdout unless [`STOP_NARRATES_TO_STDERR`] says otherwise.
 fn narrate_stop(line: &str) {
     if STOP_NARRATES_TO_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2659,7 +2679,8 @@ fn record_stop_exit(b: &registry::Instance, code: i32) {
         let log_key = format!("{}-{}", b.name, b.pid);
         registry::set_box_exit_removed(b.pid, b.starttime, code, Some(&log_key));
     } else {
-        registry::set_box_exit(b.pid, b.starttime, code, b);
+        // A stop's code is its signal's, never the OOM killer's.
+        registry::set_box_exit(b.pid, b.starttime, code, b, false);
     }
 }
 

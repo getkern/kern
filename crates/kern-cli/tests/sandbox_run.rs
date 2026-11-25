@@ -18172,9 +18172,11 @@ fn a_gpu_box_is_capped_at_the_hosts_ram_and_others_keep_the_default() {
         eprintln!("skip: no memory cap can be set here ({plain:?})");
         return;
     }
+    // Since 0.57 a box that names no memory is bounded by the machine, as a Docker container is
+    // (and a compose service was already), GPU or not; the SDK sandboxes pass their own 512 MiB.
     assert_eq!(
-        plain, "536870912",
-        "a box without a GPU lost the sandbox default"
+        plain, total,
+        "a box without --memory must be bounded by the host's RAM, as under Docker"
     );
     assert_eq!(gpu, total, "a GPU box was not capped at the host's RAM");
     assert_eq!(
