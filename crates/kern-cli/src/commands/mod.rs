@@ -75,13 +75,12 @@ pub fn banner() -> Result<(), Error> {
         "\
   {b}kern {ver}{z}{d}: {tag}{z}
 
-    {b}kern box{z} <name> --image alpine -- sh   {d}run a command in a sandbox{z}
-    {b}kern box{z} app --image alpine vcpu:big -- sh  {d}attach a resource profile (make one: {z}{b}kern config{z}{d}){z}
-    {b}kern run{z} --memory 512m -- <cmd>         {d}govern a command's CPU/memory (no sandbox){z}
+    {b}kern run{z} -it alpine sh                  {d}run a container, as docker run does{z}
+    {b}kern run{z} -d -p 8080:80 nginx            {d}one in the background, with a port published{z}
     {b}kern ps{z} {d}·{z} {b}logs{z} {d}·{z} {b}exec{z} {d}·{z} {b}stop{z}            {d}manage running boxes{z}
     {b}kern pull{z} {d}·{z} {b}build{z} {d}·{z} {b}push{z} {d}·{z} {b}images{z}       {d}work with OCI images{z}
-    {b}kern compose{z} stack.yml                  {d}bring up a stack (compose.yaml too){z}
-    {b}kern box{z} g --image <img> --gpus all    {d}a box with the host's GPUs{z}
+    {b}kern compose{z} up                         {d}bring up compose.yaml (docker-compose.yml too){z}
+    {b}kern run{z} --gpus all <image>             {d}a container with the host's GPUs{z}
     {b}kern sandbox{z} ls {d}·{z} {b}history{z} {d}·{z} {b}stats{z}       {d}SDK and MCP sandboxes: running, finished, outcomes{z}
     {b}kern sandbox keep{z} disk                  {d}keep their history across reboots (default: until reboot){z}
     {b}kern top{z}                                {d}live: host, GPUs, boxes, sandboxes{z}
