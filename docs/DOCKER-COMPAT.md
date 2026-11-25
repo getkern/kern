@@ -178,10 +178,16 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
   itself a card than a compose file can. Measured: `all` gives both cards, `device=1` the one at
   `06:00.0`, `1` one card. An endpoint that is not translated answers 501 naming it; kern never hands a
   request to a Docker daemon.
-- `docker compose` through the socket runs a file whose containers are each on one network: `up`,
+- `docker compose` through the socket runs a file whose services share several networks: `up`,
   `ps`, `logs`, `exec` and `down -v` measured on a two-service file with a named volume, the client
-  reaching the server by its service name. A container on two networks is refused by name (a kern box
-  is in one pod); `kern compose` runs such a file.
+  reaching the server by its service name, and on a four-service file with two networks, one of them
+  `internal`, run against Docker too with the same output: the service on both reaches a peer of
+  each (one by a network alias) and goes out, the one on the internal network alone does not resolve
+  the other network's service and does not go out. A project's networks are bridges of one kern pod,
+  each container's address planned when compose connects it, so `inspect` shows an `IPAddress` per
+  network; `down` removes the pod with the last network. `docker network connect` on a running
+  container, or a second network that is not the same project's, is refused by name (a kern box is in
+  one pod).
 
 ## What "compose compatibility" means, in three numbers
 
@@ -471,8 +477,9 @@ value and the container does not start.
 Podman (measured, the same `strace -f true` on all three); `process_vm_readv`/`writev` answer `EPERM`,
 which Docker lifts only with `--cap-add SYS_PTRACE`. The sandbox postures deny `ptrace` too.
 
-**Through kern's socket a container is on one network.** A `docker compose` service on two networks
-is refused by name; `kern compose` runs the same file. `docker pull --platform` keeps one entry per
+**Through kern's socket a container's networks are one compose project's.** A service on several
+networks of its file joins each of them; `docker network connect` on a running container, or onto a
+network outside the container's project, is refused by name, where Docker connects it. `docker pull --platform` keeps one entry per
 platform where Docker moves the tag, so `docker run` without `--platform` runs this machine's image.
 
 ## What is refused rather than dropped

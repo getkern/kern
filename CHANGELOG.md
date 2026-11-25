@@ -111,6 +111,13 @@ SDKs, the MCP server and `--security-profile untrusted` still deny it (with the 
 `process_vm_readv`/`writev` stay refused. A `kern exec` entering a box cannot be read or attached to
 before its command runs.
 
+**`docker compose` through kern's socket runs a service on several networks.** It was refused by
+name, so a file with a `front` and a `back` network needed `kern compose`. A project's networks are now
+bridges of one pod: a service on both reaches a peer of each (aliases included), a service on one does
+not resolve the other's, an `internal` network does not go out, and `inspect` shows an address per
+network. Measured on the same four-service file against Docker, with the same output. A running
+container, or a network of another project, is still refused by name.
+
 **`kern compat docker -- <command>` points programs that use the Docker API at kern.** It put kern's
 `docker` first in PATH and nothing else, so Testcontainers, docker-py or the real `docker` by its full
 path reached whatever Docker the machine had, or nothing. The command now gets `DOCKER_HOST` on kern's
