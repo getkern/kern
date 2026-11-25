@@ -37,6 +37,11 @@ image and execs into it: `--mount`, `exec -i`, and `docker events` for the conta
 container keeps its filesystem until `docker rm` (a kept box), so the `docker start` of a reopen
 runs it again on the same files; `--rm` containers and a Testcontainers run's stay in memory.
 
+**`kern logs` and `kern attach` give a box's stdout and stderr apart when it recorded them apart**
+(every container of kern's Docker API), as `docker logs` does, with `-t`, `--tail` and `-f`; a box
+started with kern directly, which records one stream, prints as it did, and `--all` stays one
+stream.
+
 **`docker run -i` and `-t` through kern's Docker API work.** The stdin of `docker run -i` was
 dropped in silence (`echo x | docker run -i alpine cat` printed nothing and exited 0) and `-t`
 printed the stream's frame headers; such a run is now a foreground box with the client's stdin and,

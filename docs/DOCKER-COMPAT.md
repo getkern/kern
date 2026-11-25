@@ -153,7 +153,8 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
   or not, with a tmpfs size; Dev Containers mounts its workspace this way. An option kern's mount does
   not have (a propagation other than `rprivate`, a non-recursive bind, volume driver options, a tmpfs
   mode) is refused by name. A bind (`-v src:dst`) is translated too.
-- `logs` keeps stdout and stderr apart for the containers made through the socket: their box's log
+- `logs` keeps stdout and stderr apart for the containers made through the socket, and so do
+  `kern logs` and `kern attach` for the same boxes (stdout on stdout, stderr on stderr): their box's log
   records which stretch came from which stream. When the two are written within microseconds of each
   other the order BETWEEN them can differ from the order they were written in, as with Docker's own
   log driver; each stream keeps its own order. A box started with `kern box -d` outside the socket

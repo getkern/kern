@@ -2436,32 +2436,55 @@ pub fn logs(
     frames: bool,
 ) -> Result<(), Error> {
     use std::io::Write;
+    // STDOUT AND STDERR APART when the box recorded them apart (`--log-streams`, every container
+    // of kern's Docker API), as `docker logs` gives them: the log is read as frames, cut at every
+    // recorded change, and taken apart again onto this process's stdout and stderr. A box that
+    // recorded one stream (every box started with kern directly) prints as it always did.
+    let resolved = registry::find_ref(name).map_or_else(|| name.to_string(), |i| i.name);
+    let split = !frames && crate::commands::boxlog::log_has_streams(&resolved);
+    let map = |e: std::io::Error| Error::Sandbox(format!("writing log: {e}"));
     let LogHead {
         f,
         path,
         name,
         mut stamper,
-    } = {
+    } = if split {
+        let mut w = crate::commands::boxlog::FrameDemux::new(
+            std::io::BufWriter::new(std::io::stdout().lock()),
+            std::io::stderr(),
+        );
+        let head = log_head(name, tail, follow, timestamps, window, true, &mut w)?;
+        w.flush().map_err(map)?;
+        head
+    } else {
         let out = std::io::stdout();
         let mut w = std::io::BufWriter::new(out.lock());
         let head = log_head(name, tail, follow, timestamps, window, frames, &mut w)?;
-        w.flush()
-            .map_err(|e| Error::Sandbox(format!("writing log: {e}")))?;
+        w.flush().map_err(map)?;
         head
     };
     let name = name.as_str();
     if follow {
         // Only a live box appends more output; a stopped box's log is already complete.
+        let mut demux =
+            crate::commands::boxlog::FrameDemux::new(crate::ui::data_out(), std::io::stderr());
+        let mut plain = crate::ui::data_out();
         if let Some(bx) = registry::find_ref(name) {
-            return follow_log(f, &path, name, bx.pid, stamper);
+            return if split {
+                follow_log(f, &path, name, bx.pid, stamper, &mut demux)
+            } else {
+                follow_log(f, &path, name, bx.pid, stamper, &mut plain)
+            };
         }
         // A stopped box under `-f`: nothing more is coming, so release the held fragment now.
         if let Some(s) = stamper.as_mut() {
-            let out = std::io::stdout();
-            let mut lock = out.lock();
-            s.flush(&mut lock)
-                .map_err(|e| Error::Sandbox(format!("writing log: {e}")))?;
-            let _ = lock.flush();
+            if split {
+                s.flush(&mut demux).map_err(map)?;
+                demux.flush().map_err(map)?;
+            } else {
+                s.flush(&mut plain).map_err(map)?;
+                plain.flush().map_err(map)?;
+            }
         }
     }
     Ok(())
@@ -2487,8 +2510,18 @@ pub fn attach(name: &str) -> Result<(), Error> {
         bx.pid
     );
     let f = std::fs::File::open(&path).map_err(|e| Error::Sandbox(format!("opening log: {e}")))?;
-    // Print the log so far (from offset 0), then poll appends until the box exits (shared with `logs -f`).
-    follow_log(f, &path, name, bx.pid, None)?;
+    // Print the log so far (from offset 0), then follow appends until the box exits (shared with
+    // `logs -f`); its two streams apart when it recorded them apart, as `kern logs` gives them.
+    if crate::commands::boxlog::log_has_streams(name) {
+        let frames = crate::commands::boxlog::Stamper::new(&path, 0)
+            .with_window(None, None, false)
+            .with_frames(true);
+        let mut demux =
+            crate::commands::boxlog::FrameDemux::new(crate::ui::data_out(), std::io::stderr());
+        follow_log(f, &path, name, bx.pid, Some(frames), &mut demux)?;
+    } else {
+        follow_log(f, &path, name, bx.pid, None, &mut crate::ui::data_out())?;
+    }
     eprintln!("kern: box '{name}' exited");
     Ok(())
 }

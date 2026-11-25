@@ -1220,6 +1220,80 @@ pub(crate) fn tail_file(f: &mut std::fs::File, n: usize) -> Result<Vec<u8>, Erro
     Ok(tail_lines(&buf, n).to_vec())
 }
 
+/// Docker's frames (what a [`Stamper`] with frames writes) taken apart again: stream 1's payload to
+/// `out`, stream 2's to `err`. How `kern logs` gives a box whose log recorded its two streams
+/// (`--log-streams`, every container of kern's Docker API) back on stdout and stderr, as
+/// `docker logs` does, through the one path that already cuts the log at every recorded change.
+pub(crate) struct FrameDemux<A: std::io::Write, B: std::io::Write> {
+    out: A,
+    err: B,
+    head: [u8; 8],
+    have: usize,
+    left: u64,
+    to_err: bool,
+}
+
+impl<A: std::io::Write, B: std::io::Write> FrameDemux<A, B> {
+    pub(crate) fn new(out: A, err: B) -> Self {
+        Self {
+            out,
+            err,
+            head: [0; 8],
+            have: 0,
+            left: 0,
+            to_err: false,
+        }
+    }
+}
+
+impl<A: std::io::Write, B: std::io::Write> std::io::Write for FrameDemux<A, B> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut i = 0;
+        while i < bytes.len() {
+            if self.left == 0 {
+                let take = (8 - self.have).min(bytes.len() - i);
+                self.head[self.have..self.have + take].copy_from_slice(&bytes[i..i + take]);
+                self.have += take;
+                i += take;
+                if self.have == 8 {
+                    self.have = 0;
+                    self.to_err = self.head[0] == STREAM_STDERR;
+                    let mut len = [0u8; 4];
+                    len.copy_from_slice(&self.head[4..]);
+                    self.left = u64::from(u32::from_be_bytes(len));
+                }
+                continue;
+            }
+            let take = usize::try_from(self.left)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len() - i);
+            if self.to_err {
+                self.err.write_all(&bytes[i..i + take])?;
+            } else {
+                self.out.write_all(&bytes[i..i + take])?;
+            }
+            self.left -= take as u64;
+            i += take;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()?;
+        self.err.flush()
+    }
+}
+
+/// Does the newest log of `name` record its two streams apart? Its `.streams` file EXISTS: the
+/// pump of a `--log-streams` box makes it at the start, and it stays empty until the first change
+/// of stream, so an attach to a box that has written nothing yet would read it as one stream.
+pub(crate) fn log_has_streams(name: &str) -> bool {
+    newest_log(name)
+        .ok()
+        .flatten()
+        .is_some_and(|p| streams_path(&p).exists())
+}
+
 /// Stream new appends of an already-open log to stdout, FOLLOWING THE NAME ACROSS ROTATIONS, woken by
 /// a [`BoxWaiter`] (a write, a rotation, the box leaving the registry, a 200 ms floor) until the box
 /// `(name, pid)` leaves the registry. Panic-free; a stdout write error (a
@@ -1235,16 +1309,16 @@ pub(crate) fn tail_file(f: &mut std::fs::File, n: usize) -> Result<Vec<u8>, Erro
 /// The fix is what `tail -F` does and what `tail -f` does not: compare the inode behind the NAME with
 /// the one being read, and when they differ, drain what is left of the old file and reopen. The drain
 /// comes first because the pump may have written the tail of a line before renaming.
-pub(crate) fn follow_log(
+pub(crate) fn follow_log<W: std::io::Write>(
     mut f: std::fs::File,
     path: &std::path::Path,
     name: &str,
     pid: i32,
     mut stamper: Option<Stamper>,
+    data: &mut W,
 ) -> Result<(), Error> {
-    use std::io::{Read, Write};
+    use std::io::Read;
     let mut buf = [0u8; 8192];
-    let mut data = crate::ui::data_out();
     let waiter = BoxWaiter::new(Some(path));
     if let Some(s) = stamper.as_mut() {
         s.follow_live();
@@ -1253,12 +1327,11 @@ pub(crate) fn follow_log(
         }
     }
     // Drain everything currently readable on `f`; `false` means the caller should stop (closed pipe).
-    let mut drain = |f: &mut std::fs::File, st: &mut Option<Stamper>| -> bool {
+    let mut drain = |f: &mut std::fs::File, st: &mut Option<Stamper>, lock: &mut W| -> bool {
         loop {
             match f.read(&mut buf) {
                 Ok(0) => return true,
                 Ok(k) => {
-                    let lock = &mut data;
                     let wrote = match st.as_mut() {
                         Some(s) => s.push(lock, &buf[..k]),
                         None => lock.write_all(&buf[..k]),
@@ -1273,7 +1346,7 @@ pub(crate) fn follow_log(
         }
     };
     loop {
-        if !drain(&mut f, &mut stamper) {
+        if !drain(&mut f, &mut stamper, data) {
             return Ok(());
         }
         // The name now points at a different file: the pump rotated under us.
@@ -1282,7 +1355,7 @@ pub(crate) fn follow_log(
                 if let Ok(mut next) = std::fs::File::open(path) {
                     // Whatever the old file still holds belongs to the reader before the new one
                     // starts; its own index is already gone, so a Stamper prints `-` for it.
-                    if !drain(&mut f, &mut stamper) {
+                    if !drain(&mut f, &mut stamper, data) {
                         return Ok(());
                     }
                     if let Some(s) = stamper.as_mut() {
@@ -1310,15 +1383,14 @@ pub(crate) fn follow_log(
             // ONE LAST READ: the log is complete once the box has left the registry
             // (`finish_log_pump`), and bytes written after the read at the top of this turn would
             // otherwise be lost.
-            if !drain(&mut f, &mut stamper) {
+            if !drain(&mut f, &mut stamper, data) {
                 return Ok(());
             }
-            // The box is gone, so a line still waiting for a newline will never get one: print it.
+            // The box is gone, so a line still waiting for a newline will never get one: print it,
+            // through the same writer (a frame demultiplexer included).
             if let Some(s) = stamper.as_mut() {
-                // A second handle on the same stateless writer: the one above is held by `drain`.
-                let mut out = crate::ui::data_out();
-                let _ = s.flush(&mut out);
-                let _ = out.flush();
+                let _ = s.flush(data);
+                let _ = data.flush();
             }
             return Ok(());
         }
@@ -3019,6 +3091,39 @@ mod log_cap_precedence_tests {
         let base = LogCap::default();
         let cap = LogCap::pick(Some(0), Some(0), Some(0), Some(0), true).with_base(base);
         assert_eq!(cap, base);
+    }
+}
+
+#[cfg(test)]
+mod demux_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Frames taken apart onto two writers, whatever the pieces they arrive in.
+    #[test]
+    fn frames_are_taken_apart_onto_stdout_and_stderr() {
+        let mut frames = Vec::new();
+        for (kind, data) in [
+            (STREAM_STDOUT, &b"o1\n"[..]),
+            (STREAM_STDERR, b"e1\n"),
+            (STREAM_STDOUT, b"o2\n"),
+        ] {
+            frames.extend_from_slice(&[kind, 0, 0, 0]);
+            frames.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+            frames.extend_from_slice(data);
+        }
+        for piece in [1, 3, 8, frames.len()] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            {
+                let mut d = FrameDemux::new(&mut out, &mut err);
+                for chunk in frames.chunks(piece) {
+                    d.write_all(chunk).unwrap();
+                }
+                d.flush().unwrap();
+            }
+            assert_eq!(out, b"o1\no2\n", "pieces of {piece}");
+            assert_eq!(err, b"e1\n", "pieces of {piece}");
+        }
     }
 }
 
