@@ -33,7 +33,16 @@ On Windows, `kern compat docker pipe` serves the same API on `\\.\pipe\kern-dock
 account only, with no TCP endpoint. Testcontainers for Python (Redis and Postgres modules), Java
 1.21.3 and Node 12.2.2 pass: log waits, `exec` exit codes, published ports, and an exited container
 failing its start at once. The Dev Containers CLI, which VS Code runs, brings a container up from an
-image and execs into it: `--mount`, `exec -i`, and `docker events` for the containers it makes. See [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
+image and execs into it: `--mount`, `exec -i`, and `docker events` for the containers it makes. A
+container keeps its filesystem until `docker rm` (a kept box), so the `docker start` of a reopen
+runs it again on the same files; `--rm` containers and a Testcontainers run's stay in memory.
+
+**`kern start` starts a kept box detached, as `docker start` does, and `start -a` follows it.** A box
+kept from a foreground `kern box --keep` ran again in the foreground and `kern start` did not return
+until it ended, which its own help ("-a follows its output") does not say; `start -a` of such a box
+printed its output, then failed with "no logs". `kern ps -a --json` gives a kept row its `labels`
+and, once a run has ended, `exited_ago`; an exited row its `started`; `kern inspect --json` gives
+`image` and `created` (a kept box's stays the same across its restarts). See [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md).
 
 **`kern proxy trust`: the `.localhost` names over HTTPS, once you ask for it.** It makes a
 certificate authority of your own that can sign `localhost` names only, adds it to your user's

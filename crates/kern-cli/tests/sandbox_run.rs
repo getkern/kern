@@ -16437,13 +16437,46 @@ fn a_kept_box_starts_again_on_the_layer_it_left_and_an_ordinary_box_does_not() {
             let (said, ok) = run(&["recover"]);
             assert!(ok, "`kern recover` failed:\n{said}");
         }
-        let (said, ok) = run(&["start", &name]);
-        assert!(ok, "`kern start` failed on run {want}:\n{said}");
+        // `-a`: started detached, as `docker start -a`, and its output followed from its log.
+        let (said, ok) = run(&["start", "-a", &name]);
+        assert!(ok, "`kern start -a` failed on run {want}:\n{said}");
         assert!(
             said.contains(&want.to_string()),
             "run {want} did not see {want} lines, so the layer was not reused:\n{said}"
         );
     }
+    // WITHOUT `-a` THE START RETURNS AT ONCE, the box running on: the `docker start` Dev
+    // Containers sends to reopen its container hung on a foreground replay before.
+    let slow = format!("{name}-fg");
+    let (said, ok) = run(&[
+        "box",
+        &slow,
+        "--image",
+        "alpine:3.19",
+        "--keep",
+        "--",
+        "sh",
+        "-c",
+        "sleep 0.2; exit 0",
+    ]);
+    assert!(ok, "the foreground kept box did not run:\n{said}");
+    let t = std::time::Instant::now();
+    let (said, ok) = run(&["start", &slow]);
+    assert!(ok, "`kern start` of a foreground kept box failed:\n{said}");
+    assert!(
+        said.contains("detached"),
+        "it was not started detached:\n{said}"
+    );
+    let (said, ok) = run(&["wait", &slow]);
+    assert!(
+        ok && said.trim().ends_with('0'),
+        "`kern wait` after the detached start: {said}"
+    );
+    assert!(
+        t.elapsed() >= std::time::Duration::from_millis(150),
+        "the box did not run"
+    );
+    let _ = run(&["rm", &slow]);
     // `ps -a` lists it as something `start` can run, with its last exit.
     let (listed, _) = run(&["ps", "-a"]);
     assert!(
@@ -16621,7 +16654,7 @@ fn twenty_concurrent_starts_of_one_kept_box_run_exactly_one() {
         .map(|_| {
             kern()
                 .env("XDG_DATA_HOME", &home)
-                .args(["start", &name])
+                .args(["start", "-a", &name])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -16655,7 +16688,7 @@ fn twenty_concurrent_starts_of_one_kept_box_run_exactly_one() {
     // wrote 2, so the next start must see 3.
     let out = kern()
         .env("XDG_DATA_HOME", &home)
-        .args(["start", &name])
+        .args(["start", "-a", &name])
         .output()
         .expect("run kern");
     let said = String::from_utf8_lossy(&out.stdout).into_owned();

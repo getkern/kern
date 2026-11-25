@@ -542,9 +542,11 @@ pub fn serve(listen: Listen, kern: PathBuf, idle: Option<Duration>) -> Result<()
             if ready == 0 {
                 let quiet = monotonic_secs().saturating_sub(LAST_END.load(Ordering::Acquire));
                 // Not while a test session's containers wait for their process to end: the
-                // reaper that removes them lives in this process.
+                // reaper that removes them lives in this process. Nor while an attached
+                // `docker run` box runs: it is this process's child, and would end with it.
                 if ACTIVE.load(Ordering::Acquire) == 0
                     && !api::sessions_open()
+                    && !api::runs_alive()
                     && quiet >= idle.as_secs()
                 {
                     return Ok(());

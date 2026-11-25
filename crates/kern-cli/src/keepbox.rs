@@ -425,6 +425,11 @@ pub struct KeptBox {
     pub meta: Meta,
     /// The workload argv, for the COMMAND column: everything after the `--` of the recorded command.
     pub command: String,
+    /// The recorded `--label` values ([`labels_of`]).
+    pub labels: Vec<String>,
+    /// Seconds since its last run ended, from the record's mtime (rewritten by [`set_exit`] at
+    /// that moment), `None` while it has never finished one.
+    pub exited_ago: Option<u64>,
 }
 
 /// Every kept box whose NAME passes `name_ok`, which is asked before the record is opened. Order is
@@ -451,8 +456,17 @@ pub fn list_matching(name_ok: impl Fn(&str) -> bool) -> Vec<KeptBox> {
         let Some((argv, meta)) = read(&e.path()) else {
             continue;
         };
+        let exited_ago = meta.last_exit.and_then(|_| {
+            let ended = std::fs::metadata(e.path().join(REC))
+                .ok()?
+                .modified()
+                .ok()?;
+            Some(ended.elapsed().map_or(0, |d| d.as_secs()))
+        });
         out.push(KeptBox {
             command: workload_of(&argv),
+            labels: labels_of(&argv),
+            exited_ago,
             name,
             meta,
         });
@@ -483,6 +497,24 @@ pub fn image_of(argv: &[std::ffi::OsString]) -> String {
         }
     }
     String::new()
+}
+
+/// The `-l`/`--label` values of a recorded `kern box` argv, as they were given (`k=v`, or a bare
+/// key), read out of the argv like [`image_of`] and for the same reason: they are what the next
+/// `kern start` will label the box with. Stops at the workload separator. A kept box that is not
+/// running has no registry entry to carry them, and a client finds its stopped container by them
+/// (Dev Containers: `docker ps -a --filter label=devcontainer.local_folder=...`).
+pub fn labels_of(argv: &[std::ffi::OsString]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = argv.iter().take_while(|a| a.as_os_str() != "--");
+    while let Some(a) = it.next() {
+        if matches!(a.to_str(), Some("-l" | "--label")) {
+            if let Some(v) = it.next().and_then(|v| v.to_str()) {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// The workload part of a recorded `kern box` argv: what follows the first bare `--`, joined with
@@ -566,6 +598,37 @@ pub fn remove(name: &str) -> Result<(), crate::error::Error> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    /// The labels the next `kern start` will give the box, in both spellings of the flag, and
+    /// none from the workload's own arguments.
+    #[test]
+    fn labels_of_reads_the_recorded_labels_and_stops_at_the_workload() {
+        let argv: Vec<OsString> = [
+            "box",
+            "web",
+            "-d",
+            "-l",
+            "a=1",
+            "--label",
+            "devcontainer.local_folder=/w",
+            "--label",
+            "bare",
+            "--image",
+            "alpine",
+            "--",
+            "sh",
+            "--label",
+            "lies=1",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(
+            labels_of(&argv),
+            ["a=1", "devcontainer.local_folder=/w", "bare"]
+        );
+        assert!(labels_of(&[OsString::from("box"), OsString::from("-l")]).is_empty());
+    }
 
     /// A temp `XDG_DATA_HOME` for one test, restored after it. `env_guard` serialises the tests that
     /// mutate the environment, which is the rule this repo already applies to every such test.

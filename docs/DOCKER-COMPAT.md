@@ -123,6 +123,16 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
 
 **What differs, and is said.**
 
+- A container keeps its filesystem until it is removed: it is a kept box (`--keep`), so `docker stop`
+  then `docker start` runs it again on the same files, and `docker rm` removes the layer. Dev
+  Containers relies on it at every reopen (measured: the same container back in 326 ms, a file written
+  before the stop still there, `postCreateCommand` not run again). Two exceptions keep their writes in
+  memory, where they are fastest: a container that removes itself (`--rm`), and one a Testcontainers
+  run made, which kern removes when the run ends. A kept box starts in about 25 ms here against 5 ms,
+  most of it copying `/etc/hosts` into a layer on disk. `docker start` of a stopped container that kept
+  nothing says so instead of starting it.
+- A container started attached (`docker run` without `-d`) is a box this server runs: the server does
+  not leave on idle while one runs, and stopping the server stops it, as stopping `dockerd` does.
 - Testcontainers' reaper (Ryuk) is refused, as above; with `TESTCONTAINERS_RYUK_DISABLED=true` each
   test removes its own containers, as the `with` block does.
 - `--mount` (`HostConfig.Mounts`) becomes kern's `--mount`, of type `bind`, `volume` or `tmpfs`, read-only

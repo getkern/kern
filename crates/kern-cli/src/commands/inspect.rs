@@ -754,20 +754,24 @@ pub fn ps(
             // while the box has never finished a run, where `0` would read as a clean one.
             //
             // WHAT A KEPT ROW DOES NOT HAVE, because it is not a process and never was in this
-            // boot: `pid`, `pod`, `ports`, `labels`, `started`, `rootfs`. Absent, not zeroed - the
-            // same rule the exited row follows for the fields that died with the box, so a consumer
-            // reading `.pid` across `ps -a --json` must handle its absence (it already had to: an
-            // exited row has no `started`, `ports` or `rootfs`).
-            let exit = match k.meta.last_exit {
-                Some(c) => format!(",\"exit_code\":{c}"),
-                None => String::new(),
+            // boot: `pid`, `pod`, `ports`, `started`, `rootfs`. Absent, not zeroed - the same rule
+            // the exited row follows for the fields that died with the box, so a consumer reading
+            // `.pid` across `ps -a --json` must handle its absence (it already had to: an exited
+            // row has no `started`, `ports` or `rootfs`). `labels` it has: they are in the
+            // recorded command the next `kern start` runs, and a client finds a stopped container
+            // by them. `exited_ago` once a run has ended, as on an exited row.
+            let exit = match (k.meta.last_exit, k.exited_ago) {
+                (Some(c), Some(ago)) => format!(",\"exit_code\":{c},\"exited_ago\":{ago}"),
+                (Some(c), None) => format!(",\"exit_code\":{c}"),
+                (None, _) => String::new(),
             };
             items.push(format!(
-                "{{\"name\":{},\"command\":{},\"image\":{},\"created\":{}{exit},\"health\":{},\"status\":{}}}",
+                "{{\"name\":{},\"command\":{},\"image\":{},\"created\":{}{exit},\"labels\":{},\"health\":{},\"status\":{}}}",
                 json_str(&k.name),
                 json_str(&crate::ui::scrub(&k.command)),
                 json_str(&crate::ui::scrub(&k.meta.image)),
                 k.meta.created,
+                labels_object(k.labels.iter().cloned()),
                 json_str("kept"),
                 json_str("kept"),
             ));
@@ -1848,7 +1852,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&gpu)
         };
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"image\":{},\"command\":{},\"created\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"url\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{},\"ends_at\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
@@ -1863,6 +1867,13 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
                 json_str(&b.image)
             },
             json_str(&b.command),
+            // When the box was MADE: a kept box's record says, across its restarts (`started` is
+            // this run's); any other box was made when it started. The Docker API's `Created` is
+            // this, and Dev Containers keys `postCreateCommand` on it: from `started`, it ran the
+            // command again at every reopen.
+            crate::keepbox::dir_of(&b.name)
+                .and_then(|d| crate::keepbox::read(&d))
+                .map_or(b.started, |(_, m)| m.created),
             b.started,
             up,
             json_str(&b.ports),
@@ -3439,7 +3450,21 @@ fn unescape_mountinfo(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// One box of [`start_kept`]: the recorded command, run to completion. Returns its exit code.
+/// Whether a recorded `kern box` argv runs detached: `-d`/`--detach` before the workload's `--`.
+fn recorded_detached(argv: &[std::ffi::OsString]) -> bool {
+    argv.iter()
+        .take_while(|a| a.as_os_str() != "--")
+        .any(|a| a == "-d" || a == "--detach")
+}
+
+/// One box of [`start_kept`]: the recorded command, run until it has started. Returns its exit code.
+///
+/// ALWAYS DETACHED, a box recorded in the foreground too, as `docker start` and `docker restart`
+/// start a container whatever `docker run` attached it to; `start -a` then follows it from its
+/// log. MEASURED before this: the kept box of an attached `docker run` (Dev Containers makes its
+/// container that way) ran again in the foreground, and the `docker start` that reopens it never
+/// answered; and `start -a` of such a box printed its output, then failed with "no logs", because a
+/// foreground box writes none to follow.
 fn start_one_kept(self_exe: &std::path::Path, name: &str) -> Result<i32, Error> {
     let Some(dir) = crate::keepbox::dir_of(name) else {
         return Err(Error::Sandbox(format!(
@@ -3504,6 +3529,11 @@ fn start_one_kept(self_exe: &std::path::Path, name: &str) -> Result<i32, Error> 
              Re-create it with `kern box {name} ... --keep` from where you want it to run",
             meta.cwd
         )));
+    }
+    let mut argv = argv;
+    if !recorded_detached(&argv) {
+        // Right after `box <name>`, where every `kern box` flag may stand.
+        argv.insert(2, std::ffi::OsString::from("-d"));
     }
     let mut cmd = std::process::Command::new(self_exe);
     cmd.args(&argv);
