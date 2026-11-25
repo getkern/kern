@@ -67,7 +67,10 @@ enum Mode {
     /// still act on THIS box (`s` asks first, `p`/`u` act), Esc/Enter go back, `q` quits. As a plain
     /// `Overlay` it was a snapshot taken when Enter was pressed, so it looked frozen, and any key
     /// closed it: `s` pressed to stop the box only closed the pane, and the `y` after it did nothing.
-    BoxLog { name: String, text: String },
+    BoxLog {
+        name: String,
+        text: String,
+    },
     /// A multi-field text form (volume create, profile new/edit).
     Form(Form),
     /// The "new profile" kind picker (Profiles tab `n`): choose vcpu / vgpio / vdisk / disk.
@@ -75,7 +78,9 @@ enum Mode {
     /// Where the sandbox history is kept (Sandboxes tab `m`): memory / disk / off, or clear it.
     PickHistory,
     /// Storage tab `m`: which part of kern's data to move (data, images, volumes, logs, history).
-    PickWhat { sel: usize },
+    PickWhat {
+        sel: usize,
+    },
     /// Where to put that part: its default place, the mounted disks, and a typed path.
     PickData {
         key: &'static str,
@@ -780,11 +785,23 @@ pub fn run() -> Result<(), crate::error::Error> {
                         .position(|(k, _)| k.as_bytes().first() == Some(c))
                 });
                 match key {
-                    [0x1b, b'[', b'A'] | [b'k'] => mode = Mode::PickWhat { sel: sel.saturating_sub(1) },
-                    [0x1b, b'[', b'B'] | [b'j'] => mode = Mode::PickWhat { sel: (sel + 1).min(n - 1) },
-                    [b'\r'] | [b'\n'] | [_] if by_letter.is_some() || matches!(key, [b'\r'] | [b'\n']) => {
+                    [0x1b, b'[', b'A'] | [b'k'] => {
+                        mode = Mode::PickWhat {
+                            sel: sel.saturating_sub(1),
+                        }
+                    }
+                    [0x1b, b'[', b'B'] | [b'j'] => {
+                        mode = Mode::PickWhat {
+                            sel: (sel + 1).min(n - 1),
+                        }
+                    }
+                    [b'\r'] | [b'\n'] | [_]
+                        if by_letter.is_some() || matches!(key, [b'\r'] | [b'\n']) =>
+                    {
                         let i = by_letter.unwrap_or(sel);
-                        let k = crate::config::DIR_KEYS.get(i).map_or("data_dir", |(k, _)| *k);
+                        let k = crate::config::DIR_KEYS
+                            .get(i)
+                            .map_or("data_dir", |(k, _)| *k);
                         mode = Mode::PickData {
                             key: k,
                             choices: data_choices(k),
@@ -796,7 +813,11 @@ pub fn run() -> Result<(), crate::error::Error> {
                 }
             }
             // Where to put it: arrows choose, Enter asks to move there, `e` types a path.
-            Mode::PickData { key: k, choices, sel } => match key {
+            Mode::PickData {
+                key: k,
+                choices,
+                sel,
+            } => match key {
                 [0x1b, b'[', b'A'] | [b'k'] => {
                     mode = Mode::PickData {
                         key: k,
@@ -1235,9 +1256,7 @@ fn nav_profiles(
 /// Storage-tab action keys: new / delete / inspect / prune named volumes (the persistent data layer).
 fn nav_storage(k: u8, sel: usize, vols: &[crate::volume::VolInfo], mode: &mut Mode) {
     match k {
-        b'm' => {
-            *mode = Mode::PickWhat { sel: 0 }
-        }
+        b'm' => *mode = Mode::PickWhat { sel: 0 },
         b'n' => *mode = Mode::Form(new_volume_form()),
         b'e' => {
             if let Some(v) = vols.get(sel) {
@@ -3775,9 +3794,10 @@ fn host_disk() -> Option<(u64, u64)> {
 fn data_root_measured() -> std::path::PathBuf {
     let root = crate::kern_xdg_root("XDG_DATA_HOME", ".local/share")
         .unwrap_or_else(|| std::path::PathBuf::from("/"));
-    root.ancestors()
-        .find(|a| a.exists())
-        .map_or_else(|| std::path::PathBuf::from("/"), std::path::Path::to_path_buf)
+    root.ancestors().find(|a| a.exists()).map_or_else(
+        || std::path::PathBuf::from("/"),
+        std::path::Path::to_path_buf,
+    )
 }
 
 /// The host's logical CPU count (per-CPU lines in `/proc/stat`), resolved once - the core count is
@@ -3829,8 +3849,8 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
         .as_ref()
         .and_then(|d| crate::commands::fs_fill(&d.to_string_lossy()))
         .map_or(0, |(pct, _)| pct);
-    let disk_fill = crate::commands::fs_fill(&data_root_measured().to_string_lossy())
-        .map_or(0, |(pct, _)| pct);
+    let disk_fill =
+        crate::commands::fs_fill(&data_root_measured().to_string_lossy()).map_or(0, |(pct, _)| pct);
     let (load1, cores) = host_load_cores();
     let (docker_api, https) = services();
     (
@@ -4498,20 +4518,23 @@ fn data_mounts(mountinfo: &str) -> Vec<MountRow> {
         };
         let f: Vec<&str> = pre.split(' ').collect();
         let g: Vec<&str> = post.split(' ').collect();
-        let (Some(dev), Some(root), Some(mnt), Some(opts), Some(fstype), Some(source)) = (
-            f.get(2),
-            f.get(3),
-            f.get(4),
-            f.get(5),
-            g.first(),
-            g.get(1),
-        ) else {
+        let (Some(dev), Some(root), Some(mnt), Some(opts), Some(fstype), Some(source)) =
+            (f.get(2), f.get(3), f.get(4), f.get(5), g.first(), g.get(1))
+        else {
             continue;
         };
         let mount = unescape(mnt);
-        let skip_place = ["/boot", "/efi", "/snap", "/var/snap", "/proc", "/sys", "/dev"]
-            .iter()
-            .any(|p| mount == *p || mount.starts_with(&format!("{p}/")));
+        let skip_place = [
+            "/boot",
+            "/efi",
+            "/snap",
+            "/var/snap",
+            "/proc",
+            "/sys",
+            "/dev",
+        ]
+        .iter()
+        .any(|p| mount == *p || mount.starts_with(&format!("{p}/")));
         if *root != "/"
             || !source.starts_with("/dev/")
             || source.starts_with("/dev/loop")
@@ -4592,7 +4615,9 @@ fn data_choices(key: &'static str) -> Vec<DataChoice> {
             free: total.saturating_sub(used),
             total,
             current,
-            elsewhere_here: here.then(|| now.as_ref().map(|n| n.display().to_string())).flatten(),
+            elsewhere_here: here
+                .then(|| now.as_ref().map(|n| n.display().to_string()))
+                .flatten(),
             problem,
         }
     };
@@ -4626,7 +4651,11 @@ fn data_choices(key: &'static str) -> Vec<DataChoice> {
 /// `path` with the home directory written `~`, so it fits its column.
 fn tilde(path: &std::path::Path) -> String {
     crate::xdg_var("HOME")
-        .and_then(|h| path.strip_prefix(&h).ok().map(|r| format!("~/{}", r.display())))
+        .and_then(|h| {
+            path.strip_prefix(&h)
+                .ok()
+                .map(|r| format!("~/{}", r.display()))
+        })
         .unwrap_or_else(|| path.display().to_string())
 }
 
@@ -4671,7 +4700,11 @@ fn where_lines(p: &Palette) -> Vec<String> {
             let path = now.as_deref().map_or_else(|| "?".to_string(), tilde);
             let free = now
                 .as_deref()
-                .and_then(|n| n.ancestors().find(|a| a.exists()).map(std::path::Path::to_path_buf))
+                .and_then(|n| {
+                    n.ancestors()
+                        .find(|a| a.exists())
+                        .map(std::path::Path::to_path_buf)
+                })
                 .and_then(|a| crate::commands::fs_usage(&a.to_string_lossy()))
                 .map(|(u, t)| format!("{} free", human_bytes(t.saturating_sub(u))))
                 .unwrap_or_default();
@@ -4692,7 +4725,11 @@ fn where_summary(p: &Palette) -> Vec<String> {
         let path = now.as_deref().map_or_else(|| "?".to_string(), tilde);
         let free = now
             .as_deref()
-            .and_then(|n| n.ancestors().find(|a| a.exists()).map(std::path::Path::to_path_buf))
+            .and_then(|n| {
+                n.ancestors()
+                    .find(|a| a.exists())
+                    .map(std::path::Path::to_path_buf)
+            })
             .and_then(|a| crate::commands::fs_usage(&a.to_string_lossy()))
             .map(|(u, t)| format!(" {d}({} free){z}", human_bytes(t.saturating_sub(u))))
             .unwrap_or_default();
@@ -4724,13 +4761,7 @@ fn what_pane(p: &Palette, sel: usize, _width: usize) -> String {
 }
 
 /// The disk picker for kern's data.
-fn data_pane(
-    p: &Palette,
-    key: &str,
-    choices: &[DataChoice],
-    sel: usize,
-    width: usize,
-) -> String {
+fn data_pane(p: &Palette, key: &str, choices: &[DataChoice], sel: usize, width: usize) -> String {
     let (b, d, g, y, z) = (p.b, p.d, p.g, p.y, p.z);
     let mut s = format!(
         "\n  {b}where to put {key}{z}  {d}{}{z}\n  {d}what is at the old place stays, with the \
@@ -4804,7 +4835,9 @@ fn unmounted_partitions() -> Vec<String> {
         mountinfo
             .lines()
             .any(|l| l.split(" - ").nth(1).and_then(|p| p.split(' ').nth(1)) == Some(dev.as_str()))
-            || swaps.lines().any(|l| l.split_whitespace().next() == Some(dev.as_str()))
+            || swaps
+                .lines()
+                .any(|l| l.split_whitespace().next() == Some(dev.as_str()))
     };
     let Ok(dir) = std::fs::read_dir("/sys/class/block") else {
         return Vec::new();
@@ -5243,7 +5276,11 @@ fn storage_table(
     // WHERE THE DATA IS, and the key that moves it: the disk images, volumes and kept boxes fill.
     let lines = where_summary(p);
     for (i, l) in lines.iter().enumerate() {
-        let head = if i == 0 { format!("{b}WHERE{z}") } else { "     ".to_string() };
+        let head = if i == 0 {
+            format!("{b}WHERE{z}")
+        } else {
+            "     ".to_string()
+        };
         s.push_str(&format!("\n  {head}  {l}"));
     }
     s.push_str(&format!("   {d}[m] to put a part on another disk{z}\n"));
@@ -7379,7 +7416,10 @@ mod tests {
     fn a_y_inside_a_burst_does_not_confirm() {
         assert!(confirms(b"y", false), "a y typed on its own confirms");
         assert!(confirms(b"Y", false));
-        assert!(!confirms(b"y", true), "a y with more input behind it is a paste");
+        assert!(
+            !confirms(b"y", true),
+            "a y with more input behind it is a paste"
+        );
         assert!(!confirms(b"n", false));
         assert!(!confirms(b"yes", false), "only the single key");
     }

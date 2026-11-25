@@ -268,8 +268,8 @@ fn prepare_dir(key: &str, value: &str) -> Result<(), Error> {
             }
         }
     }
-    let dir = crate::config::check_data_dir(value)
-        .map_err(|e| Error::Config(format!("{key}: {e}")))?;
+    let dir =
+        crate::config::check_data_dir(value).map_err(|e| Error::Config(format!("{key}: {e}")))?;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -336,7 +336,9 @@ fn what_stays_at(what: &str, old: &std::path::Path, new: &std::path::Path) -> Op
     if old == new || !old.is_dir() {
         return None;
     }
-    let n = std::fs::read_dir(old).map(|r| r.flatten().count()).unwrap_or(0);
+    let n = std::fs::read_dir(old)
+        .map(|r| r.flatten().count())
+        .unwrap_or(0);
     if n == 0 {
         return None;
     }
@@ -347,7 +349,11 @@ fn what_stays_at(what: &str, old: &std::path::Path, new: &std::path::Path) -> Op
             .unwrap_or(0)
     };
     let detail = if what == "data" {
-        format!("{} kept boxes, {} volumes", count("boxes"), count("volumes"))
+        format!(
+            "{} kept boxes, {} volumes",
+            count("boxes"),
+            count("volumes")
+        )
     } else {
         format!("{n} {}", if n == 1 { "entry" } else { "entries" })
     };

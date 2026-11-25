@@ -204,7 +204,8 @@ fn checked_device(name: &str, dev: &std::path::Path) -> Result<PathBuf, Error> {
             state.display()
         )));
     }
-    if let Some(msg) = crate::commands::host_ipc_source_refusal(&format!("volume '{name}'"), &canon) {
+    if let Some(msg) = crate::commands::host_ipc_source_refusal(&format!("volume '{name}'"), &canon)
+    {
         return Err(Error::Volume(msg));
     }
     Ok(canon)
@@ -813,7 +814,11 @@ fn create(args: &[String]) -> Result<String, Error> {
                 }
             }
             s if !s.starts_with('-') && name.is_none() => name = Some(s),
-            _ => return Err(Error::Usage("volume create <name> [--size <N> | --path <dir>]")),
+            _ => {
+                return Err(Error::Usage(
+                    "volume create <name> [--size <N> | --path <dir>]",
+                ))
+            }
         }
         i += 1;
     }
@@ -864,7 +869,10 @@ fn create(args: &[String]) -> Result<String, Error> {
                 )));
             }
             std::fs::create_dir_all(&dir).map_err(|e| {
-                Error::Volume(format!("volume '{name}': cannot create {}: {e}", dir.display()))
+                Error::Volume(format!(
+                    "volume '{name}': cannot create {}: {e}",
+                    dir.display()
+                ))
             })?;
             Some(checked_device(name, &dir)?)
         }
@@ -1819,7 +1827,15 @@ mod tests {
         let dk = tmp.join("ext/dk");
         let dev = format!("device={}", dk.display());
         create(&s(&[
-            "dk", "--driver", "local", "--opt", "type=none", "--opt", "o=bind", "--opt", &dev,
+            "dk",
+            "--driver",
+            "local",
+            "--opt",
+            "type=none",
+            "--opt",
+            "o=bind",
+            "--opt",
+            &dev,
         ]))
         .expect("create --opt device");
         assert_eq!(
@@ -1827,7 +1843,14 @@ mod tests {
             std::fs::canonicalize(&dk).expect("canon dk")
         );
         // No kern quota on a directory of the user's, and no network driver by this route.
-        assert!(create(&s(&["q", "--size", "1m", "--path", &tmp.join("ext/q").to_string_lossy()])).is_err());
+        assert!(create(&s(&[
+            "q",
+            "--size",
+            "1m",
+            "--path",
+            &tmp.join("ext/q").to_string_lossy()
+        ]))
+        .is_err());
         assert!(create(&s(&["n", "--opt", "type=nfs"])).is_err());
         // Inside kern's volumes directory: refused, and NOT created first.
         let inside = volumes_dir().join("sub");

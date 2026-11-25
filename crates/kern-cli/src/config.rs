@@ -517,9 +517,10 @@ pub(crate) fn unread_data_place() -> Option<String> {
     let raw = std::fs::read_to_string(&path).ok()?;
     let names_a_place = raw.lines().any(|l| {
         let t = l.trim_start();
-        DIR_KEYS
-            .iter()
-            .any(|(k, _)| t.strip_prefix(k).is_some_and(|r| r.trim_start().starts_with('=')))
+        DIR_KEYS.iter().any(|(k, _)| {
+            t.strip_prefix(k)
+                .is_some_and(|r| r.trim_start().starts_with('='))
+        })
     });
     names_a_place.then(|| {
         format!(
@@ -3560,8 +3561,14 @@ mod tests {
         };
         assert!(check("[kern]\ndata_dir = \"/a\"\ndata_dir = \"/b\"\n").is_some());
         assert!(check("[kern]\nlogs_dir = \"/a\"\nlog_max_size = \"zz\"\n").is_some());
-        assert!(check("[kern]\nlog_max_size = \"zz\"\n").is_none(), "no place named: defaults as before");
-        assert!(check("[kern]\ndata_dir = \"/a\"\n").is_none(), "read fine: nothing to refuse");
+        assert!(
+            check("[kern]\nlog_max_size = \"zz\"\n").is_none(),
+            "no place named: defaults as before"
+        );
+        assert!(
+            check("[kern]\ndata_dir = \"/a\"\n").is_none(),
+            "read fine: nothing to refuse"
+        );
         crate::unset_global_env("KERN_CONFIG");
         forget_cached();
         let _ = std::fs::remove_dir_all(&d);
@@ -3573,7 +3580,10 @@ mod tests {
         for (key, _) in DIR_KEYS {
             assert!(check_kern_value(key, "\"/mnt/ssd2/kern\"").is_ok(), "{key}");
             for bad in ["\"rel/x\"", "\"/a/../b\"", "\"/\""] {
-                assert!(check_kern_value(key, bad).is_err(), "{key} = {bad} must be refused");
+                assert!(
+                    check_kern_value(key, bad).is_err(),
+                    "{key} = {bad} must be refused"
+                );
             }
         }
         let c = parse("[kern]\nimages_dir = \"/mnt/a\"\nlogs_dir = \"/mnt/b\"\n").expect("parse");

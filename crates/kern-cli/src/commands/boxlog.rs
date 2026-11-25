@@ -941,7 +941,9 @@ impl Journal {
     }
 
     fn send(&self, stream: usize, line: &[u8]) {
-        let _ = self.sock.send(&journal_entry(&self.name, stream == 1, line));
+        let _ = self
+            .sock
+            .send(&journal_entry(&self.name, stream == 1, line));
     }
 }
 
@@ -2056,7 +2058,11 @@ mod journald_tests {
         }
         assert_eq!(got.len(), 4, "one entry per line");
         let msg = |e: &[u8]| -> Vec<u8> {
-            let at = e.windows(8).position(|w| w == b"MESSAGE\n").expect("MESSAGE") + 8;
+            let at = e
+                .windows(8)
+                .position(|w| w == b"MESSAGE\n")
+                .expect("MESSAGE")
+                + 8;
             let len = u64::from_le_bytes(e[at..at + 8].try_into().expect("len")) as usize;
             e[at + 8..at + 8 + len].to_vec()
         };

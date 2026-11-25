@@ -519,10 +519,7 @@ pub fn info() -> Result<(), Error> {
     };
     row(
         "volumes",
-        &format!(
-            "{} ({volumes_why})",
-            crate::volume::volumes_dir().display()
-        ),
+        &format!("{} ({volumes_why})", crate::volume::volumes_dir().display()),
     );
     row("sandbox history", &crate::history::keep_line());
     // THE RETENTION SETTINGS, each with where its value comes from, so `kern config set` has a
@@ -556,7 +553,9 @@ pub fn info() -> Result<(), Error> {
         .is_ok_and(|r| r.display().to_string() == logs_at);
     let ended = match k.and_then(|k| k.log_keep_ended_s) {
         Some(s) => format!("an ended box's removed after {}", period(s)),
-        None => "an ended box's removed after 7d (default), a kept box's when it is removed".to_string(),
+        None => {
+            "an ended box's removed after 7d (default), a kept box's when it is removed".to_string()
+        }
     };
     let logs_where = if crate::config::dir_setting("logs_dir").is_some() {
         format!("in {logs_at} ([kern] logs_dir)")
