@@ -2638,10 +2638,23 @@ fn labelled_prune(kind: &str, req: &Request) -> Response {
     json_response(200, body.to_string())
 }
 
+/// 501 for an endpoint this API does not serve, saying what does the job instead. MEASURED: `docker
+/// compose up` through the socket stopped at its first `networks` call with "not translated by
+/// kern-serve in this phase", which names an internal server and leaves the reader nowhere to go.
 fn not_translated(what: &str) -> Response {
+    let instead = if what.starts_with("networks") || what.starts_with("the volumes") {
+        "; a compose file runs with `kern compose -f <file> up`, which makes its networks and volumes"
+    } else if what == "build" {
+        "; `kern build` builds the same Dockerfile"
+    } else {
+        ""
+    };
     error(
         501,
-        &format!("{what}: not translated by kern-serve in this phase (kern never hands it to a docker engine)"),
+        &format!(
+            "{what}: not served by kern's Docker API, which never hands a request to a Docker \
+             engine{instead}"
+        ),
     )
 }
 
@@ -3570,6 +3583,29 @@ mod tests {
             panic!("a whole body");
         };
         assert_eq!(status, 501);
+    }
+
+    /// `docker compose` through the socket stops at its first network call: the 501 says what runs
+    /// the file instead, and names no internal server.
+    #[test]
+    fn a_networks_call_is_refused_naming_kern_compose() {
+        let req = Request {
+            method: "GET".into(),
+            path: "/networks".into(),
+            query: Vec::new(),
+            body: Vec::new(),
+            upgrade: false,
+            peer: None,
+            close: false,
+        };
+        let Response::Full { status, body, .. } = handle(&req, Path::new("/nonexistent/kern"))
+        else {
+            panic!("a whole body");
+        };
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 501, "{text}");
+        assert!(text.contains("kern compose -f"), "{text}");
+        assert!(!text.contains("kern-serve"), "{text}");
     }
 
     /// The `reference` filter of `GET /images/json`: a name, a bare name as `:latest`, a repository

@@ -104,6 +104,11 @@ kill, where the docs called it immediate. Now `kern kill <box>` is SIGKILL with 
 at once, and `kern compose kill [-s SIGNAL]` and the Docker API's `kill` (its `signal` parameter, 409
 for a container not running) do the same. For the graceful stop, `kern stop`.
 
+**The Docker API's 501 says what does the job.** An endpoint it does not serve (networks, volumes,
+build) answered "not translated by kern-serve in this phase"; `docker compose` through the socket
+stops at its first network call, and the answer now names `kern compose -f <file> up` (or `kern
+build`).
+
 **`kern compose -f -` reads the file from stdin, as `docker compose -f -` does.** It answered "reading
 -: No such file or directory". The current directory is the project's, for its name and for relative
 paths, as under Docker, and a `${VAR:?message}` the file requires stops it with that message.

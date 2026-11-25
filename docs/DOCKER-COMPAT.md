@@ -166,7 +166,9 @@ Measured on this machine (Linux x86_64) with the clients themselves, through the
 - What kern refuses without a flag is refused here by name with a 400: `Privileged`, `Devices`,
   `DeviceRequests` (GPUs), `CapAdd`, `SecurityOpt`, `VolumesFrom`, `Links`, and the host's pid, ipc or
   uts namespace. An endpoint that is not translated (networks, volumes, build) answers 501 and says
-  so; kern never hands a request to a Docker daemon.
+  so; kern never hands a request to a Docker daemon. `docker compose` through the socket therefore
+  stops at its first network call, and the 501 names `kern compose -f <file> up`, which runs the
+  same file.
 
 ## What "compose compatibility" means, in three numbers
 
