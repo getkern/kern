@@ -1839,6 +1839,13 @@ const SETUID_MARK: &[u8] = b"kept v3\n";
 /// What marks an entry whose re-extraction failed (a loaded image no registry has): asked once.
 const SETUID_GIVEN_UP: &[u8] = b"not repairable v3\n";
 
+/// The `v2` marks: an entry that has its setuid bits (and may lack only file capabilities). Read as
+/// "setuid kept" by [`stripped_setuid`], so a hardened image whose `su` is `0755` ON PURPOSE is not
+/// re-pulled for it. MEASURED when `v3` landed without this: the sandbox image (`su` 0755 by design)
+/// was downloaded again, 34 s, on its first start, and came back 0755.
+const SETUID_MARK_V2: &[u8] = b"kept v2\n";
+const SETUID_GIVEN_UP_V2: &[u8] = b"not repairable v2\n";
+
 /// Whether an entry was extracted with the image's setuid/setgid bits ([`record_setuid_kept`]).
 fn setuid_kept(cache: &std::path::Path, safe: &str) -> bool {
     std::fs::read(cache.join(format!("{safe}.setuid"))).is_ok_and(|m| m == SETUID_MARK)
@@ -1937,7 +1944,14 @@ fn stripped_setuid(cache: &std::path::Path, safe: &str) -> Option<&'static str> 
         return None;
     }
     let mark = std::fs::read(cache.join(format!("{safe}.setuid"))).unwrap_or_default();
-    if mark == SETUID_MARK || mark == SETUID_GIVEN_UP {
+    if [
+        SETUID_MARK,
+        SETUID_GIVEN_UP,
+        SETUID_MARK_V2,
+        SETUID_GIVEN_UP_V2,
+    ]
+    .contains(&mark.as_slice())
+    {
         return None;
     }
     let dir = cache.join(safe);
@@ -2926,6 +2940,19 @@ mod built_here_tests {
             stripped_privileges(&dir, "img"),
             Some(Stripped::Capability("usr/bin/newuidmap"))
         );
+        // A v2 entry's setuid bits are its image's: a `su` without one is a hardened image, not a
+        // stripped one, and is not re-pulled for it.
+        let su = dir.join("img/usr/bin/su");
+        std::fs::write(&su, b"x").expect("su");
+        std::fs::set_permissions(&su, std::fs::Permissions::from_mode(0o755)).expect("su mode");
+        std::fs::remove_file(&nu).expect("no newuidmap");
+        assert_eq!(
+            stripped_privileges(&dir, "img"),
+            None,
+            "a v2 entry's su is the image's"
+        );
+        std::fs::write(&nu, b"x").expect("newuidmap again");
+        std::fs::set_permissions(&nu, std::fs::Permissions::from_mode(0o755)).expect("mode");
         std::fs::set_permissions(&nu, std::fs::Permissions::from_mode(0o4755)).expect("setuid");
         assert_eq!(
             stripped_privileges(&dir, "img"),
